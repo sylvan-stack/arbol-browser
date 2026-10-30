@@ -1,0 +1,10 @@
+{
+  "name": "@sylvan-stack/arbol-browser",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Arbol Browser: a shared browser component of Arbol 2.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sylvan-stack/arbol-browser.git"
+  }
+}
