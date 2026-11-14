@@ -41,10 +41,52 @@ function signature(path: string, outer = false): void {
 export interface CandidateTrust {
   readonly bundle: string;
   readonly manifest: Readonly<Compatibility>;
+  readonly snapshotDigest: string;
   /** Cryptographic identity only. It cannot assert previous exit or production qualification. */
   assertIdentity(): void;
 }
+let attemptedTrust = false, poisonedTrust = false;
+let trustedCandidate: CandidateTrust | undefined;
+/** Complete physical signed bundle, including the outer seal and directories.
+ * No subprocess, expected-byte learning, or symlink traversal on later checks. */
+function completeSnapshot(root: string): string {
+  const entries: Record<string, string> = {};
+  function walk(directory: string): void {
+    if (realpathSync(directory) !== directory) return refuse();
+    for (const name of readdirSync(directory).sort()) {
+      const path = join(directory, name), key = relative(root, path), before = lstatSync(path);
+      if (before.isSymbolicLink()) {
+        const link = readlinkSync(path), target = realpathSync(path);
+        if (!target.startsWith(root + sep) || !resolve(dirname(path), link).startsWith(root + sep) || readlinkSync(path) !== link) refuse();
+        entries[key] = `symlink:${link}`;
+      } else if (before.isDirectory()) { entries[key] = `directory:${before.mode & 0o7777}`; walk(path); }
+      else if (before.isFile()) {
+        const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+        try {
+          const first = fstatSync(fd), bytes = readFileSync(fd), last = fstatSync(fd);
+          if (first.dev !== before.dev || first.ino !== before.ino || last.ino !== first.ino || last.dev !== first.dev ||
+              first.size !== bytes.length || first.size !== last.size || first.mtimeMs !== last.mtimeMs || first.ctimeMs !== last.ctimeMs) refuse();
+          entries[key] = `file:${first.mode & 0o7777}:${createHash('sha256').update(bytes).digest('hex')}`;
+        } finally { closeSync(fd); }
+      } else refuse();
+      const after = lstatSync(path);
+      if (after.dev !== before.dev || after.ino !== before.ino || after.mode !== before.mode || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs || Object.keys(entries).length > 4096) refuse();
+    }
+  }
+  walk(root); return stable(entries);
+}
+export function assertCandidateTrust(value: CandidateTrust): void {
+  if (poisonedTrust || value !== trustedCandidate) refuse();
+  value.assertIdentity();
+}
 export function verifyNativeCandidate(bundle: string): CandidateTrust {
+  if (poisonedTrust) refuse();
+  if (trustedCandidate) {
+    if (resolve(bundle) !== trustedCandidate.bundle) { poisonedTrust = true; return refuse(); }
+    trustedCandidate.assertIdentity(); return trustedCandidate;
+  }
+  if (attemptedTrust) refuse(); attemptedTrust = true;
+  try {
   if (!bundle.endsWith('.app') || realpathSync(bundle) !== resolve(bundle)) refuse();
   const root = resolve(bundle);
   const check = (): Compatibility => {
@@ -79,9 +121,22 @@ export function verifyNativeCandidate(bundle: string): CandidateTrust {
     if (stable(inventory) !== stable(value.files)) refuse();
     return value;
   };
+  const before = completeSnapshot(root);
   const initial = check(), encoded = stable(initial);
+  const after = completeSnapshot(root);
+  if (before !== after) refuse();
   // Snapshot validation cannot be bypassed by mutation through a caller-held object.
   function frozen<T>(value: T): T { if (value && typeof value === 'object') { for (const entry of Object.values(value)) frozen(entry); Object.freeze(value); } return value; }
   const manifest = frozen(initial);
-  return Object.freeze({ bundle: root, manifest, assertIdentity() { if (stable(check()) !== encoded) refuse(); } });
+  trustedCandidate = Object.freeze({ bundle: root, manifest,
+    snapshotDigest: createHash('sha256').update(before).digest('hex'),
+    assertIdentity() {
+      try {
+        if (poisonedTrust || realpathSync(root) !== root || completeSnapshot(root) !== before ||
+            stable(boundedJson(join(root, 'Contents/Resources/native-compatibility.json'))) !== encoded) refuse();
+      } catch { poisonedTrust = true; return refuse(); }
+    } });
+  return trustedCandidate;
+  } catch { poisonedTrust = true; return refuse(); }
 }
+
