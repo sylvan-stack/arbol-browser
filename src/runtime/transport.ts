@@ -34,7 +34,7 @@ export function capacityFailure(): BrowserFailure {
     retryable: true, remedy: 'Wait for outstanding work to settle, then inspect fresh state.' });
 }
 export function sanitizedLabel(value: string): string {
-  return [...value.normalize('NFC').replace(/[\p{Cc}\p{Cf}\p{Cs}]/gu, '')].slice(0, 80).join('');
+  return [...value.normalize('NFC').replace(/[\p{Cc}\p{Cf}\p{Cs}]/gu, '')].slice(0, 80).join('') || 'Browser client';
 }
 function fd(socket: Socket): number {
   // Node's libuv descriptor is private and version-pinned. Missing handle fails
@@ -143,6 +143,7 @@ export async function listenTransport(location: RuntimeLocation, record: Runtime
   dispatch: DispatchPort): Promise<TransportServer> {
   let admission = false, sealed = false, agents = 0, management = 0;
   const connections = new Set<() => void>(), servers: Server[] = [], scheduler = new Scheduler();
+  const fatal = () => { try { dispatch.fatal(); } catch { /* admission stays sealed; independent native fatal path remains armed */ } };
   function accepted(socket: Socket, endpoint: Endpoint): void {
     let context: ConnectionContext | undefined, dead = false, handshaking = true;
     let identity: ProcessIdentity;
@@ -153,12 +154,13 @@ export async function listenTransport(location: RuntimeLocation, record: Runtime
     const stop = () => {
       if (dead) return; dead = true; connections.delete(stop);
       clearTimeout(helloTimer); clearInterval(heartbeat);
+      try {
       connection.abort(); for (const controller of active.values()) controller.abort();
       if (context) {
         if (endpoint === 'agent') --agents; else --management;
-        try { dispatch.disconnect(context); } catch { dispatch.fatal(); }
+        try { dispatch.disconnect(context); } catch { fatal(); }
       }
-      socket.destroy();
+      } finally { socket.destroy(); }
     };
     connections.add(stop);
     try { if (!admission || connections.size > 64) throw capacityFailure(); identity = peer(socket, platform); }
@@ -223,7 +225,7 @@ export async function listenTransport(location: RuntimeLocation, record: Runtime
         // A timeout closes transport/admission and delegates actual drain/retire;
         // it never emits a synthetic successful cancellation or action outcome.
         const timer = setTimeout(() => {
-          try { dispatch.cancel(captured, request.id); } catch { dispatch.fatal(); }
+          try { dispatch.cancel(captured, request.id); } catch { fatal(); }
           controller.abort(); stop();
         }, Math.max(1, deadline - now()));
         void (async () => {
@@ -251,7 +253,7 @@ export async function listenTransport(location: RuntimeLocation, record: Runtime
       await location.assert();
       const path = endpoint === 'agent' ? location.agent : location.management;
       const server = createServer(socket => accepted(socket, endpoint)); servers.push(server);
-      server.on('error', () => { admission = false; for (const stop of [...connections]) stop(); dispatch.fatal(); });
+      server.on('error', () => { admission = false; for (const stop of [...connections]) stop(); fatal(); });
       await new Promise<void>((resolve, reject) => {
         server.once('error', reject); server.listen(path, () => { server.removeListener('error', reject); resolve(); });
       });
@@ -272,8 +274,10 @@ export async function listenTransport(location: RuntimeLocation, record: Runtime
 }
 
 export interface RuntimeClient {
+  readonly signal: AbortSignal;
   readonly hello: Contract<'wire.HelloResult'>['result'];
   call(request: Request, deadline?: number): Promise<unknown>;
+  cancel(requestId: string, deadline?: number): Promise<Contract<'wire.CancelResult'>>;
   close(): void;
 }
 /** One connection attempt only. Never reconnects or replays on loss. */
@@ -284,14 +288,16 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
   const path = endpoint === 'agent' ? location.agent : location.management;
   await assertSocket(location, path);
   const socket = createConnection(path), helloId = token('req'), seen = new Set<string>([helloId]);
+  const lost = new AbortController();
   let dead = false, hello: Contract<'wire.HelloResult'>['result'] | undefined;
-  const pending = new Map<string, { request?: Request; resolve(value: unknown): void; reject(error: unknown): void; timer: NodeJS.Timeout }>();
+  const pending = new Map<string, { check(value: unknown): boolean; resolve(value: unknown): void; reject(error: unknown): void; timer: NodeJS.Timeout }>();
   let heartbeat: NodeJS.Timeout, lastPong = now(), pingId: string | undefined;
   let resolveHello: (value: RuntimeClient) => void, rejectHello: (error: unknown) => void;
   const ready = new Promise<RuntimeClient>((resolve, reject) => { resolveHello = resolve; rejectHello = reject; });
   const timer = setTimeout(() => stop(), Math.max(1, Math.min(deadline, now() + 5000) - now()));
   function stop() {
     if (dead) return; dead = true; clearTimeout(timer); clearInterval(heartbeat); socket.destroy();
+    lost.abort();
     rejectHello(unavailable('browser'));
     for (const entry of pending.values()) { clearTimeout(entry.timer); entry.reject(unavailable('browser')); }
     pending.clear();
@@ -323,17 +329,27 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
             if (!pingId) { pingId = token('req'); seen.add(pingId); write(socket, { wire: 1, id: pingId, method: 'ping', params: {} }); }
           } catch { stop(); }
         }, 2000);
-        resolveHello(Object.freeze({ hello, close: stop,
+        const send = (request: Request | Contract<'wire.Cancel'>, limit: number, check: (value: unknown) => boolean): Promise<unknown> => {
+          const maximum = request.method === 'cancel' ? 64 : 32;
+          if (dead || seen.has(request.id) || seen.size >= 65536 || pending.size >= maximum || now() >= limit)
+            return Promise.reject(unavailable('browser'));
+          seen.add(request.id);
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(stop, Math.max(1, limit - now()));
+            pending.set(request.id, { check, resolve, reject, timer: timeout });
+            try { verify(); write(socket, request, 1024 * 1024); } catch { stop(); }
+          });
+        };
+        resolveHello(Object.freeze({ hello, signal: lost.signal, close: stop,
           call(request: Request, limit = now() + duration(request)): Promise<unknown> {
-            if (dead || seen.has(request.id) || seen.size >= 65536 || pending.size >= 32 || now() >= limit ||
-                !(endpoint === 'agent' ? validator('wire.ToolRequest')(request) : validator('wire.ManagementRequest')(request)))
+            if (!(endpoint === 'agent' ? validator('wire.ToolRequest')(request) : validator('wire.ManagementRequest')(request)))
               return Promise.reject(unavailable('browser'));
-            seen.add(request.id);
-            return new Promise((resolve, reject) => {
-              const timeout = setTimeout(stop, Math.max(1, limit - now()));
-              pending.set(request.id, { request, resolve, reject, timer: timeout });
-              try { verify(); write(socket, request, 1024 * 1024); } catch { stop(); }
-            });
+            return send(request, limit, resultValidator(request));
+          },
+          cancel(requestId: string, limit = now() + 2000): Promise<Contract<'wire.CancelResult'>> {
+            if (!validator('browser.RequestId')(requestId) || !seen.has(requestId)) return Promise.reject(unavailable('browser'));
+            return send({ wire: 1, id: token('req'), method: 'cancel', params: { request: requestId } }, limit,
+              value => validator('wire.CancelResult')(value) && value.request === requestId) as Promise<Contract<'wire.CancelResult'>>;
           },
         })); return;
       }
@@ -347,8 +363,8 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
         pingId = undefined; lastPong = now(); return;
       }
       const entry = pending.get(value.id);
-      if (!entry?.request) throw unavailable('browser');
-      if (value.ok && !resultValidator(entry.request)(value.result)) throw unavailable('browser');
+      if (!entry) throw unavailable('browser');
+      if (value.ok && !entry.check(value.result)) throw unavailable('browser');
       pending.delete(value.id); clearTimeout(entry.timer);
       if (value.ok) entry.resolve(value.result); else entry.reject(new BrowserFailure(value.error));
     } catch { stop(); }
