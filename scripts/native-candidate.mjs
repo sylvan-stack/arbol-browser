@@ -17,12 +17,15 @@ async function currentCompilation() {
   const compiled = JSON.parse(await readFile(join(root, 'dist/compile-record.json'), 'utf8'));
   if (inventoryDigest(await sourceInventory()) !== compiled.sourceDigest ||
       inventoryDigest(await inventory(join(root, 'dist/lib'))) !== compiled.libraryDigest ||
-      inventoryDigest(await inventory(join(root, 'dist/native'))) !== compiled.nativeDigest) throw new Error('Native staging requires fresh test-free compilation');
+      inventoryDigest(await inventory(join(root, 'dist/native'))) !== compiled.nativeDigest ||
+      hash(await readFile(join(root,'dist/cli/main.mjs'))) !== compiled.entryDigest ||
+      hash(await readFile(join(root,'dist/host/main.mjs'))) !== compiled.hostDigest) throw new Error('Native staging requires fresh test-free compilation');
   await validateNativeCompilation();
   await validateWatchdogCompilation();
   return compiled;
 }
 async function expectedUnsignedFiles() {
+  const compiled = await currentCompilation();
   const raw = await readFile(join(foundation, 'metadata.json'));
   if (hash(raw) !== '75e592cd773a7b3cdb300af827b4d5971331fe489941cadeddb58e09aaef9bec') throw new Error('Foundation metadata changed');
   const metadata = JSON.parse(raw), files = {};
@@ -32,7 +35,7 @@ async function expectedUnsignedFiles() {
   for (const name of ['native/host-bootstrap', 'runtime/ArbolBrowserHost.app/Contents/MacOS/arbol-browser-host']) files[`Contents/Resources/browser/${name}`] = bootstrap;
   for (const [name,digest] of Object.entries(await inventory(join(root,'dist/lib')))) files[`Contents/Resources/browser/lib/${name}`]=digest;
   for (const [name,digest] of Object.entries(await inventory(join(root,'dist/native')))) files[`Contents/Resources/browser/native/${name}`]=digest;
-  for(const name of ['cli','host']) files[`Contents/Resources/browser/lib/${name}/main.mjs`]=hash(await readFile(join(root,'dist',name,'main.mjs')));
+  for(const name of ['cli','host']) files[`Contents/Resources/browser/lib/${name}/main.mjs`]=name === 'cli' ? compiled.entryDigest : compiled.hostDigest;
   files['Contents/MacOS/arbol-browser-native'] = bootstrap;
   files['Contents/Info.plist'] = hash(infoPlist());
   files['Contents/Resources/publisher-requirement.json'] = hash(JSON.stringify(policy, null, 2) + '\n');
