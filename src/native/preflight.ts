@@ -1,10 +1,10 @@
 /** Main-process only, single attempt native preflight. This is not page authority. */
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
-import { release } from 'node:os';
 import { isMainThread } from 'node:worker_threads';
 import type { Contract } from '../contracts/generated.js';
 import { validator } from '../contracts/schema.js';
+import { assertNativeFeatures } from './features.js';
 import { nativeLimit, pinnedRuntime, stable, refuse, verifyNativeCandidate, type CandidateTrust } from './manifest.js';
 
 export interface CompatibilityAddon {
@@ -30,7 +30,9 @@ export interface NativeCompatibility {
   guard<T>(operation: () => T | Promise<T>): Promise<T>;
   seal(): NativeStatus;
 }
-export function preflightNative(bundle: string, fatal: (reason: string) => void): NativeCompatibility {
+/** Implemented by ABR-7's independently verified child, never by a default stub. */
+export interface ArmedWatchdogPort { assertArmed(trust: CandidateTrust): void }
+export function preflightNative(bundle: string, fatal: (reason: string) => void, watchdog: ArmedWatchdogPort): NativeCompatibility {
   if (attempted) return refuse();
   attempted = true;
   let failed = false;
@@ -40,22 +42,28 @@ export function preflightNative(bundle: string, fatal: (reason: string) => void)
     if (!isMainThread || process.type !== 'browser' || typeof fatal !== 'function') refuse();
     const actual = { electron: process.versions.electron, chromium: process.versions.chrome, node: process.versions.node,
       napi: process.versions.napi, modules: process.versions.modules, platform: process.platform, arch: process.arch,
-      // Darwin 26 is macOS 27; exact product version is checked independently below.
       macOS: process.getSystemVersion?.() };
-    if (!release() || stable(actual) !== stable(pinnedRuntime)) refuse();
+    if (stable(actual) !== stable(pinnedRuntime)) refuse();
     for (const key of ['NODE_OPTIONS', 'NODE_PATH', 'ELECTRON_EXTRA_LAUNCH_ARGS', 'ELECTRON_OVERRIDE_DIST_PATH', 'ELECTRON_RUN_AS_NODE', 'DYLD_INSERT_LIBRARIES', 'DYLD_LIBRARY_PATH'])
       if (process.env[key] !== undefined) refuse();
+    assertNativeFeatures();
     const trust = verifyNativeCandidate(bundle);
+    if (!watchdog || typeof watchdog.assertArmed !== 'function') refuse();
+    watchdog.assertArmed(trust);
     const addon: CompatibilityAddon = createRequire(import.meta.url)(join(trust.bundle, 'Contents/Resources/browser/native/ownership.node')) as CompatibilityAddon;
     const expected = ['getABI', 'install', 'status', 'checkIntegrity', 'seal'];
-    if (Object.getOwnPropertyNames(addon).sort().join(',') !== expected.sort().join(',') || expected.some(key => typeof addon[key as keyof CompatibilityAddon] !== 'function')) refuse();
+    const allowed = [...expected, 'beginBinding', 'finishBinding', 'bindingInfo', 'mark', 'restore', 'retire', 'interactionState'];
+    if (Object.getOwnPropertyNames(addon).some(name => !allowed.includes(name)) || expected.some(key => typeof addon[key as keyof CompatibilityAddon] !== 'function')) refuse();
     const inventory = nativeReply('native.Inventory', addon.getABI());
     if (stable(inventory) !== stable(trust.manifest.nativeABI)) refuse();
+    watchdog.assertArmed(trust);
     const installed = nativeReply('native.Status', addon.install(JSON.stringify(trust.manifest.nativeABI)));
     if (installed.phase !== 'ready' || installed.hooks === 0 || installed.hooks !== installed.appliedHooks) refuse();
     const assertIntegrity = (): NativeStatus => {
       try {
         if (failed) return refuse();
+        assertNativeFeatures();
+        watchdog.assertArmed(trust);
         const value = nativeReply('native.Status', addon.checkIntegrity());
         if (value.phase !== 'ready' || value.hooks !== installed.hooks || value.appliedHooks !== installed.appliedHooks) refuse();
         return value;
