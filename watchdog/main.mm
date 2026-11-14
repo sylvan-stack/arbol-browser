@@ -75,6 +75,57 @@ struct Channel {
     } return lines;
   }
 };
+struct Frame { char kind=0; uint64_t sequence=0; };
+static bool frame(const std::string& line,Frame& result,const std::string& allowed) {
+  if(line.size()<3||line.size()>127||line[1]!=' '||allowed.find(line[0])==std::string::npos) return false;
+  std::string digits=line.substr(2); if(digits.empty()||(digits.size()>1&&digits[0]=='0')||digits.size()>20) return false;
+  uint64_t value=0; for(char ch:digits) { if(ch<'0'||ch>'9'||value>(UINT64_MAX-(ch-'0'))/10) return false; value=value*10+(ch-'0'); }
+  result={line[0],value}; return true;
+}
+struct Deadline {
+  double expires; bool fatal=false,received=false; uint64_t sequence=0;
+  explicit Deadline(double start):expires(start+2500) {}
+  bool accept(const Frame& value,double now) {
+    if(received&&value.sequence<=sequence) return false;
+    received=true; sequence=value.sequence;
+    if(value.kind=='F') { fatal=true; expires=std::min(expires,now+1000); }
+    else if(!fatal) expires=now+2500;
+    return true;
+  }
+  void lost(double now) { fatal=true; expires=std::min(expires,now); }
+};
+[[noreturn]] static void protocolLoop(Context& c,Channel& pair,bool primary,double start) {
+  Channel host(primary?0:6,primary?1:7); Deadline deadline(start);
+  struct Pending { uint64_t sequence; double sent; }; std::deque<Pending> pending;
+  if(primary) host.send("R 1 "+std::to_string(c.main.pid)+"\n");
+  double blockedWrite=0;
+  for(;;) {
+    double now=clockMs();
+    Channel& input=primary?host:pair;
+    for(const std::string& line:input.readLines()) {
+      Frame value;
+      if(!frame(line,value,"HF")||!deadline.accept(value,now)) { deadline.lost(now); break; }
+      if(primary) { if(pending.size()>=16) { deadline.lost(now); break; } pending.push_back({value.sequence,now}); pair.send(line+"\n"); }
+      else pair.send("A "+std::to_string(value.sequence)+"\n");
+    }
+    if(primary) {
+      for(const std::string& line:pair.readLines()) {
+        Frame value;
+        if(!frame(line,value,"A")||pending.empty()||pending.front().sequence!=value.sequence) { deadline.lost(now); break; }
+        pending.pop_front(); host.send(line+"\n");
+      }
+      if(!pending.empty()&&now-pending.front().sent>=1000) deadline.lost(now);
+    }
+    pair.flush(); if(primary) host.flush();
+    bool outputPending=!pair.outgoing.empty()||(primary&&!host.outgoing.empty());
+    if(outputPending) { if(!blockedWrite) blockedWrite=now; else if(now-blockedWrite>=1000) deadline.lost(now); } else blockedWrite=0;
+    if(pair.failed||(primary&&host.failed)||current(primary?c.custody:c.primary)!=1||!lockIdentity(c.owner)||!lockIdentity(c.build)) deadline.lost(now);
+    if(now>=deadline.expires) c.enforce();
+    reap(c.custody);
+    if(c.engineGone()) retainedRefusal(&c); // post-quiescence phase follows
+    usleep(5000);
+  }
+}
 static void pipeDescriptors(int (&out)[2]) {
   int raw[2]; if(pipe(raw)) throw 4;
   out[0]=fcntl(raw[0],F_DUPFD_CLOEXEC,10); out[1]=fcntl(raw[1],F_DUPFD_CLOEXEC,10); close(raw[0]); close(raw[1]);
@@ -109,15 +160,15 @@ static Channel launchCustody(Context& c,const std::string& raw,double deadline) 
 static int runPrimary(Context& c,const std::string& raw,double deadline) {
   Identity self; Info detail{};
   if(getppid()!=c.main.pid||observe(getpid(),self,&detail)!=1||!same(self,c.primary)||detail.unique.parent!=c.main.start||!c.initial()||!c.monitor(self,false)) throw 4;
-  Channel pair=launchCustody(c,raw,deadline); (void)pair;
-  retainedRefusal(&c); // No R until protocol/liveness leaves are installed.
+  Channel pair=launchCustody(c,raw,deadline);
+  if(clockMs()>=deadline) throw 4; protocolLoop(c,pair,true,deadline-1000);
 }
 static int runCustody(Context& c,double deadline) {
   Info detail{};
   if(getppid()!=c.primary.pid||observe(getpid(),c.custody,&detail)!=1||detail.unique.parent!=c.primary.start||!c.initial()||!c.monitor(c.primary,false)||!c.monitor(c.custody,true)||clockMs()>=deadline) throw 4;
   Channel pair(6,7); pair.send("C 1 "+std::to_string(c.custody.pid)+" "+std::to_string(c.custody.start)+"\n");
   while(!pair.outgoing.empty()) { if(clockMs()>=deadline||pair.failed) throw 4; pair.flush(); usleep(1000); }
-  retainedRefusal(&c); // Independent enforcement; never an early custody release.
+  protocolLoop(c,pair,false,deadline-1000);
 }
 
 int main(int argc,const char* argv[]) {
