@@ -1,0 +1,19 @@
+{
+  "component": "arbol-browser",
+  "entry": "bin/arbol-browser",
+  "contract": 1,
+  "dataFormat": 1,
+  "build": [
+    "npm ci --ignore-scripts --no-audit --no-fund",
+    "node node_modules/electron/install.js",
+    "npm run compile",
+    "npm run package:candidate -- --out \"$ARBOL_BUILD_DIR\" --build \"$ARBOL_BUILD_NUMBER\""
+  ],
+  "checks": [
+    {
+      "name": "foundation-gate-unavailable-until-ABR-4",
+      "kind": "unit",
+      "command": "/usr/bin/false"
+    }
+  ]
+}
