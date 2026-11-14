@@ -182,6 +182,13 @@ NAPI_MODULE_INIT() {
   if (![NSThread isMainThread]) { napi_throw_error(env, nullptr, "native_main_thread_only"); return nullptr; }
   napi_add_env_cleanup_hook(env, environmentClosing, nullptr);
   napi_property_descriptor exportsList[] = {
+    {"beginBinding", nullptr, beginBinding, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"finishBinding", nullptr, finishBinding, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"bindingInfo", nullptr, bindingInfo, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"mark", nullptr, mark, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"restore", nullptr, restore, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"retire", nullptr, retire, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"interactionState", nullptr, interactionState, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"seal", nullptr, seal, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"checkIntegrity", nullptr, checkIntegrity, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"install", nullptr, install, nullptr, nullptr, nullptr, napi_default, nullptr},
