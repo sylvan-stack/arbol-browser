@@ -168,10 +168,8 @@ export function createProcessService(options: { selection: BuildSelection; platf
       const deadline = startupDeadline(), contentionDeadline = Math.min(deadline, now() + 10000);
       await within(deadline, () => integration.assertAdmissionAvailable());
       const profile = await within(deadline, () => selectProfile(input.profile, options.platform(), { state, createDefault: true, deadline: contentionDeadline }));
-      const attached = await within(deadline, () => integration.start(profile, 'management', deadline, contentionDeadline).then(result => {
-        if (now() >= deadline) { result.client.close(); throw unavailable('browser'); }
-        return result;
-      }));
+      const attached = await acquireWithin(deadline,
+        () => integration.start(profile, 'management', deadline, contentionDeadline), result => result.client.close());
       try {
         const result = await attached.client.call({ wire: 1, id: token('req'), method: 'open',
           params: input.url === undefined ? {} : { url: input.url } }, Math.min(deadline, now() + 15000)) as Contract<'wire.OpenResult'>;
@@ -205,10 +203,8 @@ export function createProcessService(options: { selection: BuildSelection; platf
           const deadline = startupDeadline(), contentionDeadline = Math.min(deadline, now() + 10000);
           await within(deadline, () => integration.assertAdmissionAvailable());
           const profile = await within(deadline, () => selectProfile(id, options.platform(), { state, createDefault: true, deadline: contentionDeadline }));
-          client = (await within(deadline, () => integration.start(profile, 'agent', deadline, contentionDeadline, label).then(result => {
-            if (now() >= deadline || disconnected) { result.client.close(); throw unavailable('browser'); }
-            return result;
-          }))).client;
+          client = (await acquireWithin(deadline,
+            () => integration.start(profile, 'agent', deadline, contentionDeadline, label), result => result.client.close())).client;
           if (disconnected) { client.close(); throw unavailable('browser'); }
           return client;
         }, io);
