@@ -1,9 +1,12 @@
-import { mkdir } from 'node:fs/promises';
+import { mkdir, opendir } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
-import { profilePaths, directory, assertDirectory, statOrAbsent, syncDirectory, profileUnavailable } from './paths.js';
-import { writeNewFile, readProfile, type ProfileRecord, type ProfileSnapshot } from './records.js';
-import { lockExisting, type RegistryLease } from './locking.js';
+import type { PlatformPort } from '../runtime/platform.js';
+import type { Contract } from '../contracts/generated.js';
+import { BrowserFailure, invalidInput } from '../contracts/errors.js';
+import { profilePaths, directory, assertDirectory, statOrAbsent, syncDirectory, profileUnavailable, profileId, privateFile, stateDirectory, profileMissing } from './paths.js';
+import { writeNewFile, readProfile, newRecord, type ProfileRecord, type ProfileSnapshot } from './records.js';
+import { lockExisting, registryLock, lockDeadline, type RegistryLease } from './locking.js';
 
 /** Internal transaction. No cleanup of uncertain staging directories and no adoption.
  * A failure after rename may have committed creation; only the exact receipt may retry. */
@@ -28,4 +31,77 @@ export async function publishProfile(registry: RegistryLease, record: Readonly<P
   const owner = await lockExisting(published, registry.platform, deadline);
   try { await registry.assert(); await owner.assert(); return published; }
   finally { owner.release(); }
+}
+
+export const MAX_PROFILES = 4096;
+/** Bounded metadata scan, including incomplete destinations as refusals rather than
+ * partial success. Private transaction remnants are preserved and never adopted. */
+export async function managedProfiles(registry: RegistryLease): Promise<ProfileSnapshot[]> {
+  await registry.assert();
+  const records: ProfileSnapshot[] = [];
+  const entries = await opendir(join(registry.state, 'profiles'));
+  let count = 0;
+  for await (const entry of entries) {
+    if (++count > MAX_PROFILES * 2) throw profileUnavailable();
+    if (/^\.(creating|deleting)-[0-9a-f]{32}$/.test(entry.name)) {
+      await directory(join(registry.state, 'profiles', entry.name));
+      continue;
+    }
+    // An unknown entry is uncertain registry state, not a name to omit.
+    try { profileId(entry.name); } catch { throw profileUnavailable(); }
+    const snapshot = await readProfile(profilePaths(entry.name, registry.state));
+    const lock = await statOrAbsent(snapshot.paths.owner);
+    if (!lock) throw profileUnavailable();
+    privateFile(lock);
+    records.push(snapshot);
+    if (records.length > MAX_PROFILES) throw profileUnavailable();
+  }
+  await registry.assert();
+  return records.sort((a, b) => a.record.id.localeCompare(b.record.id, 'en'));
+}
+function requestToken(request: string | undefined): void {
+  if (request !== undefined && !/^create_[A-Za-z0-9_-]{22}$/.test(request)) throw invalidInput();
+}
+async function createManaged(id: string, request: string | undefined, platform: PlatformPort,
+  state: string, allowDefault: boolean): Promise<Contract<'profile.ProfileCreated'>> {
+  profileId(id, !allowDefault); requestToken(request);
+  const deadline = lockDeadline();
+  const paths = profilePaths(id, state);
+  try {
+    // Unsupported existing metadata is read/refused before even registry creation.
+    if (await statOrAbsent(paths.root)) await readProfile(paths);
+    const registry = await registryLock(state, platform, true, deadline);
+    try {
+      const records = await managedProfiles(registry);
+      const existing = records.find(item => item.record.id === id);
+      if (existing) {
+        // Internal default first use may converge, ordinary explicit creation may not.
+        if ((allowDefault && id === 'default') || (request !== undefined && existing.record.creationRequest === request))
+          return { profile: { ...existing.record }, created: false };
+        throw profileUnavailable();
+      }
+      if (records.length >= MAX_PROFILES) throw new BrowserFailure({ code: 'control_refused',
+        message: 'The profile registry is at capacity.', retryable: false,
+        remedy: 'Remove an unused profile explicitly before creating another.' });
+      const created = await publishProfile(registry, newRecord(id, request), deadline);
+      return { profile: { ...created.record }, created: true };
+    } finally { registry.release(); }
+  } catch (error) { if (error instanceof BrowserFailure) throw error; throw profileUnavailable(); }
+}
+export function createProfile(id: string, request: string | undefined, platform: PlatformPort,
+  state = stateDirectory()): Promise<Contract<'profile.ProfileCreated'>> {
+  return createManaged(id, request, platform, state, false);
+}
+/** The process service calls this before owner arbitration. Only open/mcp may set
+ * createDefault; close/list and all additional-profile selections are read-only. */
+export async function selectProfile(id: string, platform: PlatformPort,
+  options: { state?: string; createDefault?: boolean } = {}): Promise<ProfileSnapshot> {
+  profileId(id);
+  const state = options.state ?? stateDirectory(), paths = profilePaths(id, state);
+  try {
+    if (await statOrAbsent(paths.root)) return await readProfile(paths);
+    if (id !== 'default' || !options.createDefault) throw profileMissing();
+    await createManaged(id, undefined, platform, state, true);
+    return await readProfile(paths);
+  } catch (error) { if (error instanceof BrowserFailure) throw error; throw profileUnavailable(); }
 }
