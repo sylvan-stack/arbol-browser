@@ -2,6 +2,7 @@
 // trust or inherited engine arguments. This code never loads an input addon.
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
+#include "../../watchdog/boundary.hpp"
 #include <CommonCrypto/CommonDigest.h>
 #include <mach-o/loader.h>
 #include <mach-o/fat.h>
@@ -108,7 +109,12 @@ int main(int argc, const char* argv[]) {
       NSString* engine = [root stringByAppendingPathComponent:@"runtime/Electron.app/Contents/MacOS/Electron"];
       NSString* entry = [root stringByAppendingPathComponent:@"lib/host/main.mjs"];
       std::string home = "HOME=" + std::string(NSHomeDirectory().fileSystemRepresentation), user = "USER=" + std::string(NSUserName().UTF8String);
-      char* environment[] = {home.data(), user.data(), (char*)"PATH=/usr/bin:/bin", (char*)"TMPDIR=/private/tmp", nullptr};
+      arbol_boundary::Identity original;
+      if(arbol_boundary::observe(getpid(),original)!=1 || original.group!=(uint32_t)getpid() || getsid(0)<=0) return 4;
+      // PID version changes across exec; record stable original identity here and
+      // let preloaded process support capture the running engine's actual version.
+      std::string custody="ARBOL_BROWSER_BOOTSTRAP=1:"+std::to_string(original.pid)+":"+std::to_string(original.start)+":"+std::to_string(original.group)+":"+std::to_string(getsid(0))+":"+std::to_string(original.uid);
+      char* environment[] = {home.data(), user.data(), custody.data(), (char*)"PATH=/usr/bin:/bin", (char*)"TMPDIR=/private/tmp", nullptr};
       char* args[] = {(char*)engine.fileSystemRepresentation, (char*)"--site-per-process", (char*)"--disable-features=MacAccessibilityTextOperation", (char*)entry.fileSystemRepresentation, (char*)"--arbol-host-request", (char*)argv[2], nullptr};
       execve(engine.fileSystemRepresentation, args, environment); return 4;
     } @catch (NSException*) { return 4; }

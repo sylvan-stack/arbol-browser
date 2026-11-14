@@ -88,6 +88,10 @@ struct Context {
   }
   bool initial() const {
     Identity id; std::string path;
+    if(getpid()==main.pid) {
+      std::string expected="1:"+std::to_string(main.pid)+":"+std::to_string(main.start)+":"+std::to_string(main.group)+":"+std::to_string(session)+":"+std::to_string(main.uid);
+      const char* record=getenv("ARBOL_BROWSER_BOOTSTRAP"); if(!record || expected!=record) return false;
+    }
     return main.pid > 1 && main.group == (uint32_t)main.pid && main.uid == geteuid() && canonical(bundle) && bundle.size() > 4 && bundle.substr(bundle.size()-4) == ".app" &&
       observe(main.pid, id) == 1 && same(main, id) && id.group == main.group && getsid(main.pid) == session && executable(id, path) && path == engine() && signature(path, true) &&
       owner.heldMode == LOCK_EX && build.heldMode == LOCK_SH && lockIdentity(owner) && lockIdentity(build) && (owner.device != build.device || owner.inode != build.inode);
