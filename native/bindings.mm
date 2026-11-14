@@ -7,6 +7,7 @@
 namespace arbol_native {
 NSMutableArray<ArbolPagePolicy*>* policies = [NSMutableArray new];
 bool creating = false;
+thread_local unsigned callbackDepth = 0;
 static char policyKey;
 static __weak NSView* creationRoot;
 static __weak NSWindow* creationWindow;
@@ -126,4 +127,58 @@ napi_value finishBinding(napi_env env, napi_callback_info info) {
     return jsonReply(env, bindingObject(policy));
   } catch (const std::exception&) { return bindingFailure(env); } } @catch (NSException*) { return bindingFailure(env); }
 }
+static uint32_t keyNumber(id value, bool positive = false) {
+  if (![value isKindOfClass:[NSNumber class]] || CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID()) throw std::runtime_error("native_key_number");
+  double number = [value doubleValue];
+  if (!std::isfinite(number) || std::floor(number) != number || number < (positive ? 1 : 0) || number > UINT32_MAX) throw std::runtime_error("native_key_number");
+  return static_cast<uint32_t>(number);
+}
+ArbolPagePolicy* keyPolicy(napi_env env, napi_value value) {
+  size_t length = 0;
+  if (napi_get_value_string_utf8(env, value, nullptr, 0, &length) != napi_ok || !length || length > kStructuredLimit) throw std::runtime_error("native_key_bound");
+  std::vector<char> bytes(length + 1); size_t written = 0;
+  if (napi_get_value_string_utf8(env, value, bytes.data(), bytes.size(), &written) != napi_ok || written != length) throw std::runtime_error("native_key_encoding");
+  NSError* error = nil;
+  id key = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:bytes.data() length:length] options:0 error:&error];
+  NSSet* names = [NSSet setWithArray:@[@"id", @"nonce", @"webContentsId", @"revision"]];
+  if (error || ![key isKindOfClass:[NSDictionary class]] || ![[NSSet setWithArray:[key allKeys]] isEqualToSet:names]) throw std::runtime_error("native_key_shape");
+  uint32_t identifier = keyNumber(key[@"id"]), contents = keyNumber(key[@"webContentsId"], true), revision = keyNumber(key[@"revision"]);
+  if (identifier >= policies.count || ![key[@"nonce"] isKindOfClass:[NSString class]]) throw std::runtime_error("native_key_identity");
+  ArbolPagePolicy* policy = policies[identifier];
+  if (!policyLive(policy) || policy.identifier != identifier || policy.webContentsId != contents || policy.revision != revision || ![policy.nonce isEqualToString:key[@"nonce"]])
+    throw std::runtime_error("native_key_stale");
+  return policy;
+}
+template <typename Function> static napi_value keyCall(napi_env env, napi_callback_info info, size_t count, Function operation) {
+  napi_value args[2]; if (!mainCall(env, info, count, args)) return bindingFailure(env);
+  @try { try {
+    if (!integrity() || creating || callbackDepth) throw std::runtime_error("native_policy_unavailable");
+    ArbolPagePolicy* policy = keyPolicy(env, args[0]); CallbackScope scope;
+    operation(policy, args); return jsonReply(env, bindingObject(policy));
+  } catch (const std::exception&) { return bindingFailure(env); } } @catch (NSException*) { return bindingFailure(env); }
+}
+napi_value bindingInfo(napi_env env, napi_callback_info info) {
+  return keyCall(env, info, 1, [](ArbolPagePolicy*, napi_value*) {});
+}
+napi_value mark(napi_env env, napi_callback_info info) {
+  return keyCall(env, info, 2, [env](ArbolPagePolicy* policy, napi_value* args) {
+    bool blocked;
+    if (napi_get_value_bool(env, args[1], &blocked) != napi_ok) throw std::runtime_error("native_block_boolean");
+    advanceRevision(policy); policy.blocked = blocked;
+  });
+}
+napi_value restore(napi_env env, napi_callback_info info) {
+  return keyCall(env, info, 1, [](ArbolPagePolicy* policy, napi_value*) {
+    NSView* view = policy.view; view.hidden = NO;
+    for (NSView* child in view.subviews) child.hidden = NO;
+    [view setNeedsDisplay:YES]; // Presentation only; never native focus or a policy change.
+  });
+}
+napi_value retire(napi_env env, napi_callback_info info) {
+  return keyCall(env, info, 1, [](ArbolPagePolicy* policy, napi_value*) {
+    advanceRevision(policy); policy.blocked = YES; policy.retired = YES;
+    policy.view = nil; policy.window = nil; --liveBindings;
+  });
+}
+
 }
