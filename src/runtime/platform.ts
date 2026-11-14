@@ -5,6 +5,7 @@ import { unavailable } from '../contracts/errors.js';
 
 export interface FileIdentity { readonly device: string; readonly inode: string; readonly uid: number }
 export interface ProcessIdentity { readonly pid: number; readonly uid: number; readonly startId: string }
+export interface GroupProcess extends ProcessIdentity { readonly group: number; readonly parentStartId: string; readonly executable: string }
 export interface HeldLock {
   /** Check the retained descriptor against the published pathname after waits/transactions. */
   assertIdentity(): FileIdentity;
@@ -16,6 +17,9 @@ export interface PlatformPort {
   publishDirectory(source: string, destination: string): void;
   /** Nonblocking: null means contention. The caller enforces its monotonic deadline. */
   tryLock(absolutePath: string): HeldLock | null;
+  trySharedLock(absolutePath: string): HeldLock | null;
+  /** Observation only: cannot prove flush, escaped-helper death or executable trust. */
+  groupCensus(group: number): readonly GroupProcess[];
   /** null means kernel ESRCH only; denied/uncertain observation throws unavailability. */
   processIdentity(pid: number): ProcessIdentity | null;
   /** Connected AF_UNIX stream FD owned by the caller; verifies UID, PID and kernel PID version. */
@@ -24,6 +28,8 @@ export interface PlatformPort {
 interface NativeSupport {
   publishDirectory(source: string, destination: string): void;
   tryLock(path: string): object | null;
+  trySharedLock(path: string): object | null;
+  groupCensus(group: number): GroupProcess[];
   assertLock(handle: object): FileIdentity;
   releaseLock(handle: object): void;
   processIdentity(pid: number): ProcessIdentity | null;
@@ -39,7 +45,7 @@ export function loadPlatform(): PlatformPort {
   let native: NativeSupport;
   try {
     native = createRequire(import.meta.url)(fileURLToPath(new URL('../../native/platform.node', import.meta.url)));
-    for (const name of ['tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory'] as const)
+    for (const name of ['tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus'] as const)
       if (typeof native[name] !== 'function') throw new Error('Missing process support');
   } catch { throw unavailable('profile'); }
   const call = <T>(operation: () => T): T => {
@@ -50,16 +56,17 @@ export function loadPlatform(): PlatformPort {
       if (![source, destination].every(path => isAbsolute(path) && !path.includes('\0'))) throw unavailable('profile');
       call(() => native.publishDirectory(source, destination));
     },
-    tryLock(path: string): HeldLock | null {
+    ...Object.fromEntries((['tryLock', 'trySharedLock'] as const).map(method => [method, (path: string): HeldLock | null => {
       if (!isAbsolute(path) || path.includes('\0')) throw unavailable('profile');
-      const handle = call(() => native.tryLock(path));
+      const handle = call(() => native[method](path));
       if (handle === null) return null;
       let released = false;
       return Object.freeze({
         assertIdentity: () => { if (released) throw unavailable('profile'); return call(() => native.assertLock(handle)); },
         release: () => { if (!released) { released = true; call(() => native.releaseLock(handle)); } },
       });
-    },
+    }])) as Pick<PlatformPort, 'tryLock' | 'trySharedLock'>,
+    groupCensus: (group: number) => call(() => native.groupCensus(group)),
     processIdentity: (pid: number) => call(() => native.processIdentity(pid)),
     peerIdentity: (fd: number) => call(() => native.peerIdentity(fd)),
   });

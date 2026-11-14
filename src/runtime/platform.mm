@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 // Darwin kernel ABI, absent from the public SDK. Refuse unavailable/changed sizes.
 // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/proc_info_private.h
@@ -66,7 +67,7 @@ static bool matches(const HeldLock* lock, struct stat* out) {
     out->st_dev == lock->dev && out->st_ino == lock->ino &&
     path.st_dev == out->st_dev && path.st_ino == out->st_ino;
 }
-static napi_value tryLock(napi_env env, napi_callback_info info) {
+static napi_value acquireLock(napi_env env, napi_callback_info info, int mode) {
   napi_value arg; std::string path;
   if (!argument(env, info, &arg) || !string(env, arg, path)) return fail(env);
   int fd = open(path.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0600);
@@ -75,7 +76,7 @@ static napi_value tryLock(napi_env env, napi_callback_info info) {
   if (fstat(fd, &st) != 0) { close(fd); return fail(env); }
   auto* lock = new HeldLock{fd, path, st.st_dev, st.st_ino};
   if (!matches(lock, &st)) { finalize(env, lock, nullptr); return fail(env); }
-  if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+  if (flock(fd, mode | LOCK_NB) != 0) {
     int error = errno; finalize(env, lock, nullptr);
     if (error == EWOULDBLOCK || error == EAGAIN) { napi_value nil; napi_get_null(env, &nil); return nil; }
     return fail(env);
@@ -87,6 +88,8 @@ static napi_value tryLock(napi_env env, napi_callback_info info) {
   }
   return handle;
 }
+static napi_value tryLock(napi_env env, napi_callback_info info) { return acquireLock(env, info, LOCK_EX); }
+static napi_value trySharedLock(napi_env env, napi_callback_info info) { return acquireLock(env, info, LOCK_SH); }
 static HeldLock* held(napi_env env, napi_callback_info info) {
   napi_value arg; void* data = nullptr;
   if (!argument(env, info, &arg) || napi_get_value_external(env, arg, &data) != napi_ok || !data) return nullptr;
@@ -151,6 +154,34 @@ static napi_value peerIdentity(napi_env env, napi_callback_info info) {
       data.unique.pidVersion != audit_token_to_pidversion(token)) return fail(env);
   return identity(env, pid, data);
 }
+// Closed bounded kernel enumeration. Return only an observation, never a claim
+// that a helper cannot escape the group or that Chromium flushed its storage.
+static napi_value groupCensus(napi_env env, napi_callback_info info) {
+  napi_value arg; int group;
+  if (!argument(env, info, &arg) || !integer(env, arg, &group) || group <= 1) return fail(env);
+  constexpr size_t capacity = 4097;
+  std::vector<pid_t> pids(capacity);
+  int count = proc_listpids(PROC_PGRP_ONLY, group, pids.data(), (int)(pids.size() * sizeof(pid_t)));
+  if (count < 0 || count % sizeof(pid_t) || (size_t)count >= pids.size() * sizeof(pid_t)) return fail(env);
+  napi_value result; if (napi_create_array(env, &result) != napi_ok) return fail(env);
+  uint32_t index = 0;
+  for (int i = 0; i < count / (int)sizeof(pid_t); ++i) {
+    int pid = pids[i]; if (pid <= 0) continue;
+    ProcessInfo before{}, after{};
+    if (processInfo(pid, before) != 1 || before.bsd.pbi_uid != geteuid() ||
+        before.bsd.pbi_pgid != (uint32_t)group) return fail(env);
+    char path[PROC_PIDPATHINFO_MAXSIZE] = {};
+    int length = proc_pidpath(pid, path, sizeof(path));
+    if (length <= 0 || path[0] != '/' || processInfo(pid, after) != 1 ||
+        before.unique.uniqueid != after.unique.uniqueid || after.bsd.pbi_pgid != (uint32_t)group) return fail(env);
+    napi_value item = identity(env, pid, after);
+    if (!property(env, item, "group", number(env, group)) ||
+        !property(env, item, "parentStartId", text(env, std::to_string(after.unique.parentUniqueid))) ||
+        !property(env, item, "executable", text(env, path)) ||
+        napi_set_element(env, result, index++, item) != napi_ok) return fail(env);
+  }
+  return result;
+}
 // Atomic no-replacement publication, never Node rename's replacement semantics.
 // The caller holds registry.lock and syncs all staging contents before this call,
 // then syncs this parent after return. Ancestor validation remains with the caller.
@@ -183,6 +214,8 @@ static napi_value publishDirectory(napi_env env, napi_callback_info info) {
 static napi_value init(napi_env env, napi_value exports) {
   napi_property_descriptor properties[] = {
     {"publishDirectory", nullptr, publishDirectory, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"trySharedLock", nullptr, trySharedLock, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"groupCensus", nullptr, groupCensus, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"tryLock", nullptr, tryLock, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"assertLock", nullptr, assertLock, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"releaseLock", nullptr, releaseLock, nullptr, nullptr, nullptr, napi_default, nullptr},
