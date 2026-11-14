@@ -151,3 +151,118 @@ export async function closeAcquisitionBoundary(context) {
   return { resourcePaths: evidence, productionLifecycleBytes: 'unchanged packaged module',
     completeHostExit: 'not provided: refusal-only authority; no engine started' };
 }
+
+export async function startupAcquisitionBoundary(context) {
+  const { startupLifecycle } = await import('../support/foundation-startup-deadlines.mjs');
+  const { bounded, opaque } = await import('../support/foundation.mjs');
+  const { PassThrough } = await import('node:stream');
+  const f = await fixture(context, 'startup-acquisitions');
+  const { loadPlatform } = await load(f, 'runtime/platform'), platform = loadPlatform();
+  const { readProfile } = await load(f, 'profiles/records');
+  const { profilePaths } = await load(f, 'profiles/paths');
+  const { now, acquireInstance, neverOpenedExit } = await load(f, 'runtime/instance');
+  const { listenTransport, connectRuntime } = await load(f, 'runtime/transport');
+  const { acquireBuildLease } = await load(f, 'runtime/build-lease');
+  const { unavailable } = await load(f, 'contracts/errors');
+  const component = await privateDirectory(join(f.root, 'registry/arbol-browser'));
+  const directory = await privateDirectory(join(component, 'a'));
+  await privateDirectory(join(component, '.uses'));
+  const guard = join(component, '.uses/a'); await writeFile(guard, '', { mode: 0o600 });
+  const selection = { build: 'a', explicit: false, directory, guard };
+  const outcome = promise => promise.then(value => ({ ok: true, value }), error => ({ ok: false, error }));
+  const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
+  async function probe(path, expected) {
+    const child = await worker(f, 'lock-probe', { path });
+    try { assert.equal(child.ready.acquired, expected, 'Independent custody observation disagrees'); }
+    finally { await child.stop(); }
+  }
+  const observations = [];
+  for (const endpoint of ['management', 'agent']) {
+    const modes = ['late', 'post-wait', 'transfer', 'ordinary', 'reject',
+      ...(endpoint === 'agent' ? ['eof', 'input-close', 'input-error'] : [])];
+    for (const mode of modes) {
+      const id = `${endpoint}-${mode}`;
+      assert.equal((await cli(f, ['profiles', 'create', id])).status, 0);
+      const profile = await readProfile(profilePaths(id, f.state));
+      const instance = await acquireInstance(profile, platform, 'a', neverOpenedExit, now() + 2000);
+      assert.ok(instance);
+      const hostBuild = await acquireBuildLease(selection, platform);
+      const lost = deferred(), mcpExit = deferred(), transferred = deferred();
+      let disconnects = 0, executions = 0;
+      const server = await listenTransport(instance.location, instance.record, platform, {
+        authorize() {}, async execute(_connection, request) {
+          ++executions;
+          // A synthetic transport reply only; no tab, page or host is opened.
+          if (request.method === 'open') return { profile: id, instance: instance.record.instance,
+            process: instance.record.pid, alreadyRunning: true };
+          throw unavailable('browser');
+        }, commit() {}, disconnect() { ++disconnects; lost.resolve(); }, cancel() {},
+        fatal() { throw new Error('Unexpected synthetic transport fatal'); },
+      });
+      const seam = await startupLifecycle(f, mode, async (_profile, role, deadline, label) => ({
+        client: await connectRuntime(instance.location, instance.record, role, selection, platform, deadline, label),
+        record: instance.record, alreadyRunning: true,
+      }));
+      const io = { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() };
+      io.stdin.resume();
+      let pending;
+      try {
+        server.openAdmission(); await instance.phase('ready');
+        const before = await snapshot(profile.paths.root);
+        const service = seam.createProcessService({ selection, platform: () => platform, state: f.state,
+          integration: {
+            async assertAdmissionAvailable() { /* explicitly synthetic resource boundary */ },
+            start: seam.start,
+            async mcp(connect) { const client = await connect('Synthetic resource pipeline');
+              transferred.resolve(client); await mcpExit.promise; },
+          } });
+        pending = outcome(endpoint === 'management' ? service.open({ profile: id }) : service.mcp(id, io));
+        if (mode !== 'reject') {
+          await seam.acquired(); assert.equal(disconnects, 0);
+          if (mode === 'late') assert.equal((await bounded(pending, 2000)).ok, false);
+          if (['eof', 'input-close', 'input-error'].includes(mode)) {
+            const event = mode === 'eof' ? 'end' : mode === 'input-close' ? 'close' : 'error';
+            const observed = new Promise(resolve => io.stdin.once(event, resolve));
+            if (mode === 'eof') io.stdin.end();
+            else io.stdin.destroy(mode === 'input-error' ? new Error('Synthetic stdin failure') : undefined);
+            await bounded(observed);
+          }
+          seam.settle();
+        }
+        if (mode === 'ordinary' && endpoint === 'agent') {
+          const client = await bounded(transferred.promise);
+          for (let call = 0; call < 2; ++call) {
+            await assert.rejects(client.call({ wire: 1, id: opaque('req'), method: 'tool',
+              params: { name: 'browser_tabs_list', arguments: {} } }, now() + 1000));
+            assert.equal(client.signal.aborted, false, 'Ordinary transferred connection stopped being usable');
+          }
+          assert.equal(executions, 2); assert.equal(disconnects, 0);
+          mcpExit.resolve();
+        }
+        const result = await bounded(pending, 2000);
+        assert.equal(result.ok, mode === 'ordinary', 'Unexpected lifecycle transfer outcome');
+        if (mode !== 'reject') {
+          await bounded(lost.promise, 500).catch(() => {
+            throw new Error('Operation-owned startup socket remains connected after settlement with strong references alive');
+          });
+        } else assert.equal(disconnects, 0);
+        assert.equal(executions, mode === 'ordinary' ? (endpoint === 'agent' ? 2 : 1) : 0,
+          'Refused startup dispatched an open/tool call');
+        await probe(profile.paths.owner, false); await probe(guard, false);
+        assert.deepEqual(await snapshot(profile.paths.root), before);
+        observations.push({ endpoint, mode, peerDisconnects: disconnects, executions,
+          retainedClientReferences: seam.resources.length, postAcquisitionChecks: seam.clockChecks,
+          hostOwnerAndBuildProtective: true });
+      } finally {
+        mcpExit.resolve(); await seam.cleanup();
+        if (pending) await bounded(pending, 2000).catch(() => {});
+        await server.close(); instance.owner.release(); hostBuild.release();
+        io.stdin.destroy(); io.stdout.destroy(); io.stderr.destroy();
+      }
+      await probe(profile.paths.owner, true); await probe(guard, true);
+    }
+  }
+  return { lifecycleTransfers: observations,
+    syntheticPredicates: 'admission and ProcessIntegration resource pipeline only; no production adapter or native readiness',
+    realOracles: 'actual authenticated peer disconnect, usable client control and independent owner/Build lock contenders' };
+}
