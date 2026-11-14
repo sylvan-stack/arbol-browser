@@ -6,7 +6,7 @@ import type { PlatformPort, GroupProcess } from './platform.js';
 import type { BuildSelection } from './selection.js';
 import { connectRuntime, type RuntimeClient, type Endpoint, type TransportServer, type ConnectionContext } from './transport.js';
 import { runtimeLocation, readRuntime, originalAlive, now, startupDeadline, neverOpenedExit,
-  token, type RuntimeRecord, type PreviousExit } from './instance.js';
+  token, assertTime, type RuntimeRecord, type PreviousExit } from './instance.js';
 import { assertProfile, type ProfileSnapshot } from '../profiles/records.js';
 import { profileUnavailable, statOrAbsent, stateDirectory } from '../profiles/paths.js';
 import { selectProfile } from '../profiles/create.js';
@@ -15,6 +15,18 @@ import type { ProfileRuntimePort } from '../profiles/manage.js';
 import type { ProcessPort, Stdio } from './ports.js';
 import type { HostPreparation } from './host-entry.js';
 import type { ProfileSessions } from '../profiles/session.js';
+
+/** Expiry is refusal only, never evidence that native work was cancelled. */
+async function within<T>(deadline: number, operation: () => Promise<T>): Promise<T> {
+  assertTime(deadline);
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const result = await Promise.race([operation(), new Promise<never>((_resolve, reject) => {
+      timer = globalThis.setTimeout(() => reject(unavailable('browser')), Math.max(1, deadline - now()));
+    })]);
+    assertTime(deadline); return result;
+  } finally { clearTimeout(timer); }
+}
 
 export interface ExitAuthority extends PreviousExit {
   /** Trusted confinement/provenance plus full owned-process census, including
@@ -102,7 +114,7 @@ export async function closeProfile(profile: ProfileSnapshot, selection: BuildSel
 }
 export interface ProcessIntegration {
   assertAdmissionAvailable(): Promise<void>;
-  start(profile: ProfileSnapshot, endpoint: Endpoint, deadline: number, label?: string): Promise<{
+  start(profile: ProfileSnapshot, endpoint: Endpoint, deadline: number, contentionDeadline: number, label?: string): Promise<{
     client: RuntimeClient; record: RuntimeRecord; alreadyRunning: boolean;
   }>;
   /** Later MCP stage supplies protocol/SDK handling. It may connect once after
@@ -116,9 +128,13 @@ export function createProcessService(options: { selection: BuildSelection; platf
     async open(input) {
       const integration = options.integration;
       if (!integration) return preflightPageAdmission();
-      await integration.assertAdmissionAvailable();
-      const deadline = startupDeadline(), profile = await selectProfile(input.profile, options.platform(), { state, createDefault: true });
-      const attached = await integration.start(profile, 'management', deadline);
+      const deadline = startupDeadline(), contentionDeadline = Math.min(deadline, now() + 10000);
+      await within(deadline, () => integration.assertAdmissionAvailable());
+      const profile = await within(deadline, () => selectProfile(input.profile, options.platform(), { state, createDefault: true, deadline: contentionDeadline }));
+      const attached = await within(deadline, () => integration.start(profile, 'management', deadline, contentionDeadline).then(result => {
+        if (now() >= deadline) { result.client.close(); throw unavailable('browser'); }
+        return result;
+      }));
       try {
         const result = await attached.client.call({ wire: 1, id: token('req'), method: 'open',
           params: input.url === undefined ? {} : { url: input.url } }, Math.min(deadline, now() + 15000)) as Contract<'wire.OpenResult'>;
@@ -141,7 +157,6 @@ export function createProcessService(options: { selection: BuildSelection; platf
     async mcp(id, io) {
       const integration = options.integration;
       if (!integration) throw unavailable('browser');
-      await integration.assertAdmissionAvailable();
       let attempted = false, client: RuntimeClient | undefined, disconnected = false;
       const stop = () => { disconnected = true; client?.close(); };
       io.stdin.once('end', stop); io.stdin.once('close', stop); io.stdin.once('error', stop);
@@ -149,8 +164,13 @@ export function createProcessService(options: { selection: BuildSelection; platf
         await integration.mcp(async label => {
           if (attempted || disconnected) throw unavailable('browser');
           attempted = true;
-          const deadline = startupDeadline(), profile = await selectProfile(id, options.platform(), { state, createDefault: true });
-          client = (await integration.start(profile, 'agent', deadline, label)).client;
+          const deadline = startupDeadline(), contentionDeadline = Math.min(deadline, now() + 10000);
+          await within(deadline, () => integration.assertAdmissionAvailable());
+          const profile = await within(deadline, () => selectProfile(id, options.platform(), { state, createDefault: true, deadline: contentionDeadline }));
+          client = (await within(deadline, () => integration.start(profile, 'agent', deadline, contentionDeadline, label).then(result => {
+            if (now() >= deadline || disconnected) { result.client.close(); throw unavailable('browser'); }
+            return result;
+          }))).client;
           if (disconnected) { client.close(); throw unavailable('browser'); }
           return client;
         }, io);

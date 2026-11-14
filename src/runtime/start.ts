@@ -47,7 +47,8 @@ export function unresolvedStartups(): readonly RetainedStartup[] { return [...re
  * a replacement or kill a slow owner. There is no resident launch broker. */
 export function createStarter(options: { selection: BuildSelection; platform: PlatformPort; authority: StartAuthority;
   acquireBuild(): Promise<BuildGuard>; launch?: LaunchPort }) {
-  return async (profile: ProfileSnapshot, endpoint: Endpoint, deadline: number): Promise<{ client: RuntimeClient; record: RuntimeRecord; alreadyRunning: boolean }> => {
+  return async (profile: ProfileSnapshot, endpoint: Endpoint, deadline: number, contentionDeadline = Math.min(deadline, now() + 10000),
+    label = 'Browser client'): Promise<{ client: RuntimeClient; record: RuntimeRecord; alreadyRunning: boolean }> => {
     assertTime(deadline); await assertProfile(profile);
     const location = await runtimeLocation(profile, true);
     if (!location) throw profileUnavailable();
@@ -64,12 +65,12 @@ export function createStarter(options: { selection: BuildSelection; platform: Pl
           if (!observed || observed.instance !== current.instance || !originalAlive(observed, options.platform)) throw profileUnavailable();
           current = observed;
         }
-        const client = await connectRuntime(location, current, endpoint, options.selection, options.platform, deadline);
-        try { await options.authority.assertReady(profile, current); await guard.assert(); }
+        const client = await connectRuntime(location, current, endpoint, options.selection, options.platform, deadline, label);
+        try { await options.authority.assertReady(profile, current); await guard.assert(); assertTime(deadline); }
         catch (error) { client.close(); throw error; }
-        release(); return { client, record: current, alreadyRunning: true };
+        assertTime(deadline); release(); return { client, record: current, alreadyRunning: true };
       }
-      startup = await startupArbitration(location, options.platform, deadline);
+      startup = await startupArbitration(location, options.platform, contentionDeadline);
       await guard.assert(); assertTime(deadline);
       current = await readRuntime(location);
       if (current && originalAlive(current, options.platform)) {
@@ -80,10 +81,10 @@ export function createStarter(options: { selection: BuildSelection; platform: Pl
           if (!observed || observed.instance !== current.instance || !originalAlive(observed, options.platform)) throw profileUnavailable();
           current = observed;
         }
-        const client = await connectRuntime(location, current, endpoint, options.selection, options.platform, deadline);
-        try { await options.authority.assertReady(profile, current); await guard.assert(); }
+        const client = await connectRuntime(location, current, endpoint, options.selection, options.platform, deadline, label);
+        try { await options.authority.assertReady(profile, current); await guard.assert(); assertTime(deadline); }
         catch (error) { client.close(); throw error; }
-        release(); return { client, record: current, alreadyRunning: true };
+        assertTime(deadline); release(); return { client, record: current, alreadyRunning: true };
       }
       await options.authority.assertTrusted(options.selection); assertTime(deadline);
       request = token('req');
@@ -99,10 +100,10 @@ export function createStarter(options: { selection: BuildSelection; platform: Pl
         assertTime(deadline); await guard.assert(); startup.assertIdentity();
         const record = await readRuntime(location);
         if (record && record.phase === 'ready' && originalAlive(record, options.platform)) {
-          const client = await connectRuntime(location, record, endpoint, options.selection, options.platform, deadline);
-          try { await options.authority.assertReady(profile, record); await guard.assert(); }
+          const client = await connectRuntime(location, record, endpoint, options.selection, options.platform, deadline, label);
+          try { await options.authority.assertReady(profile, record); await guard.assert(); assertTime(deadline); }
           catch (error) { client.close(); throw error; }
-          release(); return { client, record, alreadyRunning: false };
+          assertTime(deadline); release(); return { client, record, alreadyRunning: false };
         }
         await setTimeout(Math.min(25, Math.max(1, deadline - now())));
       } while (now() < deadline);

@@ -1,3 +1,4 @@
+import { performance } from 'node:perf_hooks';
 import { mkdir, opendir } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
@@ -12,6 +13,7 @@ import { lockExisting, registryLock, lockDeadline, type RegistryLease } from './
  * A failure after rename may have committed creation; only the exact receipt may retry. */
 export async function publishProfile(registry: RegistryLease, record: Readonly<ProfileRecord>,
   deadline: number): Promise<ProfileSnapshot> {
+  if (performance.now() >= deadline) throw profileUnavailable();
   await registry.assert();
   const paths = profilePaths(record.id, registry.state);
   if (await statOrAbsent(paths.root)) throw profileUnavailable();
@@ -24,6 +26,7 @@ export async function publishProfile(registry: RegistryLease, record: Readonly<P
   for (const name of ['data', 'logs', 'userData']) await syncDirectory(join(staged, name));
   await syncDirectory(staged);
   await registry.assert(); await assertDirectory(staged, stagedIdentity);
+  if (performance.now() >= deadline) throw profileUnavailable();
   registry.platform.publishDirectory(staged, paths.root);
   await syncDirectory(paths.profiles);
   await registry.assert(); await assertDirectory(paths.root, stagedIdentity);
@@ -63,9 +66,8 @@ function requestToken(request: string | undefined): void {
   if (request !== undefined && !/^create_[A-Za-z0-9_-]{22}$/.test(request)) throw invalidInput();
 }
 async function createManaged(id: string, request: string | undefined, platform: PlatformPort,
-  state: string, allowDefault: boolean): Promise<Contract<'profile.ProfileCreated'>> {
+  state: string, allowDefault: boolean, deadline = lockDeadline()): Promise<Contract<'profile.ProfileCreated'>> {
   profileId(id, !allowDefault); requestToken(request);
-  const deadline = lockDeadline();
   const paths = profilePaths(id, state);
   try {
     // Unsupported existing metadata is read/refused before even registry creation.
@@ -95,13 +97,13 @@ export function createProfile(id: string, request: string | undefined, platform:
 /** The process service calls this before owner arbitration. Only open/mcp may set
  * createDefault; close/list and all additional-profile selections are read-only. */
 export async function selectProfile(id: string, platform: PlatformPort,
-  options: { state?: string; createDefault?: boolean } = {}): Promise<ProfileSnapshot> {
+  options: { state?: string; createDefault?: boolean; deadline?: number } = {}): Promise<ProfileSnapshot> {
   profileId(id);
   const state = options.state ?? stateDirectory(), paths = profilePaths(id, state);
   try {
     if (await statOrAbsent(paths.root)) return await readProfile(paths);
     if (id !== 'default' || !options.createDefault) throw profileMissing();
-    await createManaged(id, undefined, platform, state, true);
+    await createManaged(id, undefined, platform, state, true, options.deadline);
     return await readProfile(paths);
   } catch (error) { if (error instanceof BrowserFailure) throw error; throw profileUnavailable(); }
 }
