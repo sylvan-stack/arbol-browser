@@ -5,6 +5,7 @@
 #include <spawn.h>
 #include <deque>
 #include <limits>
+#include <cmath>
 using namespace arbol_boundary;
 static bool keys(NSDictionary* value, NSArray* expected) {
   return [value isKindOfClass:[NSDictionary class]] && [[NSSet setWithArray:value.allKeys] isEqual:[NSSet setWithArray:expected]];
@@ -52,22 +53,82 @@ static Context record(const std::string& raw) {
 // Refusal never advertises R or gives up the only retained descriptions. An
 // already identified family can be enforced; unknown input cannot select PIDs.
 [[noreturn]] static void retainedRefusal(Context* c) {
-  for(;;) { if(c) { (void)c->discoverCustody(); c->enforce(); reap(c->custody); if(c->engineGone() && current(c->custody)==0) _exit(4); } usleep(10000); }
+  for(;;) { if(c) { (void)c->discoverCustody(); c->enforce(); reap(c->custody); if(c->engineGone()) { const Identity& peer=getpid()==c->primary.pid?c->custody:c->primary; if(current(peer)==0) _exit(4); (void)c->retireMonitorPeer(peer); } } usleep(10000); }
 }
-static int runPrimary(Context& c,const std::string&,double) {
+struct Channel {
+  int input,output; std::string incoming,outgoing; bool failed=false;
+  Channel(int in,int out):input(in),output(out) { nonblocking(input); nonblocking(output); }
+  void send(const std::string& line) { if(line.size()>128||outgoing.size()+line.size()>4096) {failed=true;return;} outgoing+=line; }
+  void flush() {
+    while(!outgoing.empty()&&!failed) { ssize_t n=write(output,outgoing.data(),outgoing.size());
+      if(n>0) outgoing.erase(0,(size_t)n); else if(n<0&&errno==EINTR) continue;
+      else if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK)) break; else failed=true; }
+  }
+  std::vector<std::string> readLines() {
+    std::vector<std::string> lines; char bytes[512];
+    for(int batch=0;batch<8&&!failed;++batch) {
+      ssize_t n=read(input,bytes,sizeof(bytes));
+      if(n>0) { for(ssize_t i=0;i<n;++i) { unsigned char ch=bytes[i];
+        if(ch=='\n') { lines.push_back(incoming); incoming.clear(); if(lines.size()>32) failed=true; }
+        else if(ch<32||ch>126||incoming.size()>=127) failed=true; else incoming+=(char)ch; } }
+      else if(n==0) failed=true; else if(errno==EINTR) continue; else if(errno!=EAGAIN&&errno!=EWOULDBLOCK) failed=true; else break;
+    } return lines;
+  }
+};
+static void pipeDescriptors(int (&out)[2]) {
+  int raw[2]; if(pipe(raw)) throw 4;
+  out[0]=fcntl(raw[0],F_DUPFD_CLOEXEC,10); out[1]=fcntl(raw[1],F_DUPFD_CLOEXEC,10); close(raw[0]); close(raw[1]);
+  if(out[0]<0||out[1]<0) throw 4;
+}
+static Channel launchCustody(Context& c,const std::string& raw,double deadline) {
+  int init[2],forward[2],reply[2]; pipeDescriptors(init); pipeDescriptors(forward); pipeDescriptors(reply);
+  int owner=fcntl(3,F_DUPFD_CLOEXEC,10),build=fcntl(4,F_DUPFD_CLOEXEC,10);
+  posix_spawn_file_actions_t actions; posix_spawnattr_t attr;
+  if(owner<0||build<0||posix_spawn_file_actions_init(&actions)||posix_spawnattr_init(&attr)) throw 4;
+  bool ok=!posix_spawn_file_actions_adddup2(&actions,owner,3)&&!posix_spawn_file_actions_adddup2(&actions,build,4)&&
+    !posix_spawn_file_actions_adddup2(&actions,init[0],5)&&!posix_spawn_file_actions_adddup2(&actions,forward[0],6)&&!posix_spawn_file_actions_adddup2(&actions,reply[1],7)&&
+    !posix_spawn_file_actions_addopen(&actions,0,"/dev/null",O_RDONLY,0)&&!posix_spawn_file_actions_addopen(&actions,1,"/dev/null",O_WRONLY,0)&&!posix_spawn_file_actions_addopen(&actions,2,"/dev/null",O_WRONLY,0)&&
+    !posix_spawnattr_setpgroup(&attr,c.main.group)&&!posix_spawnattr_setflags(&attr,POSIX_SPAWN_SETPGROUP|POSIX_SPAWN_CLOEXEC_DEFAULT);
+  std::string helper=c.helper(); char* args[]={helper.data(),(char*)"--custody",nullptr}; char* env[]={(char*)"PATH=/usr/bin:/bin",nullptr}; pid_t pid=0;
+  int result=ok?posix_spawn(&pid,helper.c_str(),&actions,&attr,args,env):EINVAL;
+  posix_spawn_file_actions_destroy(&actions); posix_spawnattr_destroy(&attr);
+  close(owner); close(build); close(init[0]); close(forward[0]); close(reply[1]);
+  if(result) throw 4;
+  // Capture the actual child even if its validation fails: failed-attempt
+  // retirement must not forget a child which already owns duplicate locks.
+  if(observe(pid,c.custody)!=1||!c.monitor(c.custody,true)) throw 4;
+  nonblocking(init[1]); size_t offset=0;
+  while(offset<raw.size()) { if(clockMs()>=deadline) throw 4; ssize_t n=write(init[1],raw.data()+offset,raw.size()-offset);
+    if(n>0) offset+=(size_t)n; else if(n<0&&(errno==EINTR||errno==EAGAIN||errno==EWOULDBLOCK)) usleep(1000); else throw 4; }
+  close(init[1]); Channel pair(reply[0],forward[1]);
+  std::string expected="C 1 "+std::to_string(c.custody.pid)+" "+std::to_string(c.custody.start);
+  for(;;) { if(clockMs()>=deadline||pair.failed||current(c.custody)!=1) throw 4;
+    auto lines=pair.readLines(); if(lines.size()==1&&lines[0]==expected&&c.monitor(c.custody,true)&&c.initial()) return pair;
+    if(!lines.empty()) throw 4; usleep(1000); }
+}
+static int runPrimary(Context& c,const std::string& raw,double deadline) {
   Identity self; Info detail{};
   if(getppid()!=c.main.pid||observe(getpid(),self,&detail)!=1||!same(self,c.primary)||detail.unique.parent!=c.main.start||!c.initial()||!c.monitor(self,false)) throw 4;
-  // Pair startup/protocol is installed by the following atomic leaves. Until
-  // then this executable provides no ready acknowledgement or admission.
-  retainedRefusal(&c);
+  Channel pair=launchCustody(c,raw,deadline); (void)pair;
+  retainedRefusal(&c); // No R until protocol/liveness leaves are installed.
 }
+static int runCustody(Context& c,double deadline) {
+  Info detail{};
+  if(getppid()!=c.primary.pid||observe(getpid(),c.custody,&detail)!=1||detail.unique.parent!=c.primary.start||!c.initial()||!c.monitor(c.primary,false)||!c.monitor(c.custody,true)||clockMs()>=deadline) throw 4;
+  Channel pair(6,7); pair.send("C 1 "+std::to_string(c.custody.pid)+" "+std::to_string(c.custody.start)+"\n");
+  while(!pair.outgoing.empty()) { if(clockMs()>=deadline||pair.failed) throw 4; pair.flush(); usleep(1000); }
+  retainedRefusal(&c); // Independent enforcement; never an early custody release.
+}
+
 int main(int argc,const char* argv[]) {
   signal(SIGPIPE,SIG_IGN); double deadline=clockMs()+1000; Context c; bool parsed=false;
   @autoreleasepool {
     @try { try {
-      if(argc!=2||strcmp(argv[1],"--watchdog")||setpgid(0,0)||getpgrp()!=getpid()) throw 4;
+      if(argc!=2) throw 4;
+      bool primary=!strcmp(argv[1],"--watchdog"),custody=!strcmp(argv[1],"--custody");
+      if((!primary&&!custody)||(primary&&(setpgid(0,0)||getpgrp()!=getpid()))) throw 4;
       std::string raw=startup(deadline); c=record(raw); parsed=true;
-      return runPrimary(c,raw,deadline);
+      return primary?runPrimary(c,raw,deadline):runCustody(c,deadline);
     } catch(...) { retainedRefusal(parsed?&c:nullptr); } } @catch(NSException*) { retainedRefusal(parsed?&c:nullptr); }
   }
 }
