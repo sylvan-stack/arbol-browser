@@ -7,17 +7,21 @@ import { parse } from './parse.js';
 import { publicFailure, type ExitCode } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
 import type { Contract } from '../contracts/generated.js';
-import type { CommandPorts, ProfilePort, Stdio, PackageMetadata } from '../runtime/ports.js';
-import { consumeSelection } from '../runtime/selection.js';
-import { foundationPorts } from '../runtime/bootstrap.js';
+import type { CommandPorts, Stdio, PackageMetadata } from '../runtime/ports.js';
+import { consumeSelection, type BuildSelection } from '../runtime/selection.js';
 
-// Lazy management service: info performs no profile/native load or filesystem read.
-const profilePorts: ProfilePort = Object.freeze({
-  list: async () => (await import('../profiles/manage.js')).createProfileService().list(),
-  create: async (id: string, request?: string) => (await import('../profiles/manage.js')).createProfileService().create(id, request),
-  remove: async (id: string, io: Stdio) => (await import('../profiles/manage.js')).createProfileService().remove(id, io),
-});
-const defaultPorts: CommandPorts = Object.freeze({ process: foundationPorts.process, profiles: profilePorts });
+// All native/profile/runtime work is lazy. info remains metadata only.
+const defaultPorts = Object.freeze({}) as CommandPorts;
+async function productionPorts(selection: BuildSelection): Promise<CommandPorts> {
+  const [{ createProfileService }, { loadPlatform }, { createProcessService, createProfileRuntime }] = await Promise.all([
+    import('../profiles/manage.js'), import('../runtime/platform.js'), import('../runtime/lifecycle.js'),
+  ]);
+  const platform = loadPlatform();
+  return Object.freeze({
+    profiles: createProfileService({ platform: () => platform, runtime: createProfileRuntime(platform, selection) }),
+    process: createProcessService({ selection, platform: () => platform }),
+  });
+}
 
 /** Metadata only: no Electron import, native load, profile read, socket or child. */
 export async function componentInfo(): Promise<Contract<'wire.ComponentInfo'>> {
@@ -33,23 +37,25 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
   const mcp = args[0] === 'mcp';
   try {
     const command = parse(args);
+    let activePorts = ports;
     if (ports === defaultPorts && command.kind !== 'info') {
       const metadata = await componentInfo();
-      consumeSelection(metadata.build, resolve(fileURLToPath(new URL('../../', import.meta.url))));
+      const selection = consumeSelection(metadata.build, resolve(fileURLToPath(new URL('../../', import.meta.url))));
+      activePorts = await productionPorts(selection);
     }
-    if (command.kind === 'mcp') { await ports.process.mcp(command.profile, io); return 0; }
+    if (command.kind === 'mcp') { await activePorts.process.mcp(command.profile, io); return 0; }
     let result: unknown;
     let check: (value: unknown) => boolean;
     switch (command.kind) {
       case 'info': result = await componentInfo(); check = validator('wire.ComponentInfo'); break;
-      case 'open': result = await ports.process.open(command); check = validator('wire.OpenResult'); break;
-      case 'close': result = await ports.process.close(command.profile); check = validator('wire.CloseResult'); break;
-      case 'profiles-list': result = await ports.profiles.list(); check = validator('profile.ProfileList'); break;
+      case 'open': result = await activePorts.process.open(command); check = validator('wire.OpenResult'); break;
+      case 'close': result = await activePorts.process.close(command.profile); check = validator('wire.CloseResult'); break;
+      case 'profiles-list': result = await activePorts.profiles.list(); check = validator('profile.ProfileList'); break;
       case 'profiles-create':
-        result = await ports.profiles.create(command.profile, command.creationRequest);
+        result = await activePorts.profiles.create(command.profile, command.creationRequest);
         check = validator('profile.ProfileCreated'); break;
       case 'profiles-remove':
-        result = await ports.profiles.remove(command.profile, io);
+        result = await activePorts.profiles.remove(command.profile, io);
         check = validator('profile.ProfileRemoved'); break;
     }
     if (!check(result)) throw new Error('Invalid command result');

@@ -1,0 +1,248 @@
+import { setTimeout } from 'node:timers/promises';
+import type { Contract } from '../contracts/generated.js';
+import { unavailable, BrowserFailure } from '../contracts/errors.js';
+import { preflightPageAdmission } from './bootstrap.js';
+import type { PlatformPort, GroupProcess } from './platform.js';
+import type { BuildSelection } from './selection.js';
+import { connectRuntime, type RuntimeClient, type Endpoint, type TransportServer, type ConnectionContext } from './transport.js';
+import { runtimeLocation, readRuntime, originalAlive, now, startupDeadline, neverOpenedExit,
+  token, type RuntimeRecord, type PreviousExit } from './instance.js';
+import { assertProfile, type ProfileSnapshot } from '../profiles/records.js';
+import { profileUnavailable, statOrAbsent, stateDirectory } from '../profiles/paths.js';
+import { selectProfile } from '../profiles/create.js';
+import { ownerLock } from '../profiles/locking.js';
+import type { ProfileRuntimePort } from '../profiles/manage.js';
+import type { ProcessPort, Stdio } from './ports.js';
+import type { HostPreparation } from './host-entry.js';
+import type { ProfileSessions } from '../profiles/session.js';
+
+export interface ExitAuthority extends PreviousExit {
+  /** Trusted confinement/provenance plus full owned-process census, including
+   * escaped/orphaned helpers. A PID/group observation alone cannot satisfy it. */
+  assertCensus(profile: ProfileSnapshot, original: RuntimeRecord, group: readonly GroupProcess[]): Promise<void>;
+  /** Terminate verified original identities only; independently armed native
+   * watchdog, never JavaScript PID-check-then-kill or a timer-as-proof. */
+  force(profile: ProfileSnapshot, original: RuntimeRecord, deadline: number): Promise<void>;
+}
+async function assertNoSockets(profile: ProfileSnapshot): Promise<void> {
+  const location = await runtimeLocation(profile);
+  if (location && (await statOrAbsent(location.agent) || await statOrAbsent(location.management))) throw profileUnavailable();
+}
+export function createProfileRuntime(platform: PlatformPort, selection: BuildSelection,
+  exits: PreviousExit = neverOpenedExit): ProfileRuntimePort {
+  const assertClosed = async (profile: ProfileSnapshot) => {
+    const location = await runtimeLocation(profile), record = location ? await readRuntime(location) : undefined;
+    if (record && originalAlive(record, platform)) throw profileUnavailable();
+    await exits.assertExited(profile, record);
+    if (!record) await assertNoSockets(profile);
+    await assertProfile(profile);
+    if (location && JSON.stringify(record) !== JSON.stringify(await readRuntime(location))) throw profileUnavailable();
+    if (record && originalAlive(record, platform)) throw profileUnavailable();
+  };
+  return Object.freeze({ assertClosed,
+    async running(profile: ProfileSnapshot, ownerAvailable: boolean) {
+      if (ownerAvailable) { await assertClosed(profile); return false; }
+      const location = await runtimeLocation(profile), record = location ? await readRuntime(location) : undefined;
+      if (!location || !record || !originalAlive(record, platform)) throw profileUnavailable();
+      const client = await connectRuntime(location, record, 'management', { ...selection, explicit: false }, platform, now() + 2000, 'Profile inspection');
+      try {
+        await assertProfile(profile);
+        if (JSON.stringify(record) !== JSON.stringify(await readRuntime(location)) || !originalAlive(record, platform)) throw profileUnavailable();
+        return true;
+      } finally { client.close(); }
+    },
+  });
+}
+async function verifiedGone(profile: ProfileSnapshot, original: RuntimeRecord, platform: PlatformPort,
+  exits: ExitAuthority, deadline: number): Promise<boolean> {
+  if (now() >= deadline) throw profileUnavailable();
+  // Observe group even after main death, then require independent containment
+  // authority covering all helpers. PID reuse is never a target for signalling.
+  const group = platform.groupCensus(original.pid);
+  await exits.assertCensus(profile, original, group);
+  if (originalAlive(original, platform) || group.length) return false;
+  await exits.assertExited(profile, original);
+  await assertProfile(profile);
+  if (now() >= deadline) throw profileUnavailable();
+  return !originalAlive(original, platform) && platform.groupCensus(original.pid).length === 0;
+}
+export async function closeProfile(profile: ProfileSnapshot, selection: BuildSelection, platform: PlatformPort,
+  exits: ExitAuthority | undefined): Promise<Contract<'wire.CloseResult'>> {
+  const deadline = now() + 8000, graceful = deadline - 3000;
+  const location = await runtimeLocation(profile), original = location ? await readRuntime(location) : undefined;
+  if (!original) {
+    const owner = await ownerLock(profile, platform, false, deadline);
+    if (!owner) throw profileUnavailable();
+    try {
+      await createProfileRuntime(platform, selection, exits ?? neverOpenedExit).assertClosed(profile);
+      await owner.assert(); return { profile: profile.record.id, closed: false, dataRemoved: false };
+    } finally { owner.release(); }
+  }
+  if (originalAlive(original, platform) && selection.explicit && original.build !== selection.build) throw profileUnavailable();
+  if (!exits) throw unavailable('browser');
+  let client: RuntimeClient | undefined;
+  try {
+    if (originalAlive(original, platform) && original.phase === 'ready' && location) {
+      client = await connectRuntime(location, original, 'management', selection, platform, graceful, 'Explicit close');
+      // This result acknowledges shutdown only. Never forward it as CLI success.
+      await client.call({ wire: 1, id: token('req'), method: 'close', params: {} }, graceful);
+    }
+  } catch { /* Lost acknowledgement may succeed only after complete verified exit. */ }
+  finally { client?.close(); }
+  while (now() < graceful) {
+    if (await verifiedGone(profile, original, platform, exits, deadline)) return { profile: profile.record.id, closed: true, dataRemoved: false };
+    await setTimeout(Math.min(25, Math.max(1, graceful - now())));
+  }
+  if (!await verifiedGone(profile, original, platform, exits, deadline)) await exits.force(profile, original, deadline);
+  while (now() < deadline) {
+    if (await verifiedGone(profile, original, platform, exits, deadline)) return { profile: profile.record.id, closed: true, dataRemoved: false };
+    await setTimeout(Math.min(25, Math.max(1, deadline - now())));
+  }
+  throw profileUnavailable();
+}
+export interface ProcessIntegration {
+  assertAdmissionAvailable(): Promise<void>;
+  start(profile: ProfileSnapshot, endpoint: Endpoint, deadline: number, label?: string): Promise<{
+    client: RuntimeClient; record: RuntimeRecord; alreadyRunning: boolean;
+  }>;
+  /** Later MCP stage supplies protocol/SDK handling. It may connect once after
+   * initialize and must never retry buffered calls across transport loss. */
+  mcp(connect: (label: string) => Promise<RuntimeClient>, io: Stdio): Promise<void>;
+}
+export function createProcessService(options: { selection: BuildSelection; platform: () => PlatformPort;
+  state?: string; integration?: ProcessIntegration; exits?: ExitAuthority }): ProcessPort {
+  const state = options.state ?? stateDirectory();
+  return Object.freeze<ProcessPort>({
+    async open(input) {
+      const integration = options.integration;
+      if (!integration) return preflightPageAdmission();
+      await integration.assertAdmissionAvailable();
+      const deadline = startupDeadline(), profile = await selectProfile(input.profile, options.platform(), { state, createDefault: true });
+      const attached = await integration.start(profile, 'management', deadline);
+      try {
+        const result = await attached.client.call({ wire: 1, id: token('req'), method: 'open',
+          params: input.url === undefined ? {} : { url: input.url } }, Math.min(deadline, now() + 15000)) as Contract<'wire.OpenResult'>;
+        if (result.instance !== attached.record.instance || result.process !== attached.record.pid || result.profile !== profile.record.id)
+          throw unavailable('browser');
+        return { ...result, alreadyRunning: attached.alreadyRunning };
+      } finally { attached.client.close(); }
+    },
+    async close(id) {
+      const platform = options.platform();
+      let profile: ProfileSnapshot;
+      try { profile = await selectProfile(id, platform, { state }); }
+      catch (error) {
+        if (id === 'default' && error instanceof BrowserFailure && error.detail.code === 'profile_not_found')
+          return { profile: id, closed: false, dataRemoved: false };
+        throw error;
+      }
+      return closeProfile(profile, options.selection, platform, options.exits);
+    },
+    async mcp(id, io) {
+      const integration = options.integration;
+      if (!integration) throw unavailable('browser');
+      await integration.assertAdmissionAvailable();
+      let attempted = false, client: RuntimeClient | undefined, disconnected = false;
+      const stop = () => { disconnected = true; client?.close(); };
+      io.stdin.once('end', stop); io.stdin.once('close', stop); io.stdin.once('error', stop);
+      try {
+        await integration.mcp(async label => {
+          if (attempted || disconnected) throw unavailable('browser');
+          attempted = true;
+          const deadline = startupDeadline(), profile = await selectProfile(id, options.platform(), { state, createDefault: true });
+          client = (await integration.start(profile, 'agent', deadline, label)).client;
+          if (disconnected) { client.close(); throw unavailable('browser'); }
+          return client;
+        }, io);
+      } finally {
+        stop(); io.stdin.removeListener('end', stop); io.stdin.removeListener('close', stop); io.stdin.removeListener('error', stop);
+      }
+    },
+  });
+}
+
+export interface HostControlPort {
+  /** Must synchronously invalidate ALL content, grants and admission. */
+  closeAdmission(): void;
+  disconnect(attachment: string): void;
+  /** One concurrent all-tab cleanup, including drain/retire and destroyed proof. */
+  settleDisconnect(attachment: string, deadline: number): Promise<void>;
+  retireAll(deadline: number): Promise<void>;
+  windowCount(): number;
+}
+export interface HostNativeLifetime {
+  /** Must establish real native guard custody through original main/helper exit.
+   * ABR-3 has no FD inheritance/lock handoff implementation or permissive default. */
+  armRetainedLifetime(prepared: HostPreparation): Promise<void>;
+  assertReady(): Promise<void>;
+  /** Stop watchdog renewal synchronously before any possibly blocking cleanup. */
+  quarantine(): void;
+  /** Exit is owned by the independently armed native path, retaining guards.
+   * A bare Electron quit event is neither flush nor complete-exit evidence. */
+  exit(deadline: number): Promise<void>;
+}
+/** One authoritative host; no automatic restart and no saved action/lease state. */
+export function createHostLifecycle(prepared: HostPreparation, sessions: ProfileSessions, transport: TransportServer,
+  control: HostControlPort, native: HostNativeLifetime) {
+  let phase: 'starting' | 'ready' | 'closing' | 'fatal' = 'starting';
+  let closing: Promise<void> | undefined;
+  const pending = new Set<Promise<void>>();
+  function closeAdmission() { control.closeAdmission(); transport.closeAdmission(); }
+  function fatal(): void {
+    if (phase === 'fatal') return;
+    phase = 'fatal';
+    // Independent fatal enforcement comes first, even when control cleanup throws.
+    try { native.quarantine(); } finally {
+      try { control.closeAdmission(); } finally { transport.closeAdmission(); }
+    }
+  }
+  const shutdown = () => {
+    if (closing) return closing;
+    if (phase !== 'ready') { fatal(); return Promise.reject(unavailable('browser')); }
+    phase = 'closing';
+    // Close admission synchronously before the first await or queue operation.
+    try { closeAdmission(); } catch { fatal(); return Promise.reject(unavailable('browser')); }
+    const deadline = now() + 8000;
+    closing = (async () => {
+      const timer = globalThis.setTimeout(() => { try { fatal(); } catch { /* native already armed */ } }, 5000);
+      try {
+        await prepared.instance.phase('closing');
+        await Promise.all([control.retireAll(deadline - 3000), ...pending]);
+        await sessions.flushStorage(); // necessary; explicitly insufficient to mark clean
+        await prepared.instance.owner.assert(); await prepared.buildGuard.assert();
+        await transport.close();
+        await native.exit(deadline);
+        // Never release owner/Build or call completeExit from a window/quit event.
+      } catch (error) { fatal(); throw error; }
+      finally { clearTimeout(timer); }
+    })();
+    return closing;
+  };
+  return Object.freeze({
+    get phase() { return phase; }, fatal,
+    async ready() {
+      try {
+      if (phase !== 'starting' || control.windowCount() < 1) throw unavailable('browser');
+      await native.armRetainedLifetime(prepared); await native.assertReady();
+      await prepared.engine.assertReady(); await prepared.buildGuard.assert();
+      if (phase !== 'starting') throw unavailable('browser');
+      await prepared.instance.phase('ready');
+      if (phase !== 'starting') throw unavailable('browser');
+      phase = 'ready'; transport.openAdmission();
+      } catch (error) { fatal(); throw error; }
+    },
+    assertAdmission() { if (phase !== 'ready') throw unavailable('browser'); },
+    disconnect(context: ConnectionContext) {
+      if (!context.attachment) return;
+      const id = context.attachment.id;
+      try { control.disconnect(id); } catch { fatal(); return; }
+      const deadline = now() + 6000;
+      const timer = globalThis.setTimeout(() => { try { fatal(); } catch { /* native already armed */ } }, 6000);
+      const cleanup = Promise.resolve().then(() => control.settleDisconnect(id, deadline));
+      pending.add(cleanup);
+      void cleanup.catch(() => fatal()).finally(() => { clearTimeout(timer); pending.delete(cleanup); }).catch(() => {});
+    },
+    close: shutdown,
+    lastWindowClosed() { if (control.windowCount() === 0) void shutdown().catch(() => {}); },
+  });
+}
