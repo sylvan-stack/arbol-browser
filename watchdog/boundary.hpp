@@ -79,22 +79,23 @@ inline bool lockIdentity(const Lock& lock) {
     (d.st_mode & 07777) == lock.mode && lock.mode == 0600 && (uint64_t)d.st_dev == lock.device && d.st_ino == lock.inode && d.st_dev == p.st_dev && d.st_ino == p.st_ino;
 }
 struct Context {
-  Identity main, primary, custody; std::string bundle; int session = 0; Lock owner, build; std::map<int, Identity> seen;
+  Identity main, primary, custody; bool authenticated=false; std::string bundle; int session = 0; Lock owner, build; std::map<int, Identity> seen;
   std::string engine() const { return bundle + "/Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron"; }
   std::string helper() const { return bundle + "/Contents/Resources/browser/native/watchdog"; }
   bool enginePath(const std::string& path) const {
     for (const char* suffix : {"", " (Renderer)", " (GPU)", " (Plugin)"}) { std::string name = std::string("Electron Helper") + suffix;
       if (path == bundle + "/Contents/Resources/browser/runtime/Electron.app/Contents/Frameworks/" + name + ".app/Contents/MacOS/" + name) return true; } return false;
   }
-  bool initial() const {
+  bool initial() {
     Identity id; std::string path;
     if(getpid()==main.pid) {
       std::string expected="1:"+std::to_string(main.pid)+":"+std::to_string(main.start)+":"+std::to_string(main.group)+":"+std::to_string(session)+":"+std::to_string(main.uid);
       const char* record=getenv("ARBOL_BROWSER_BOOTSTRAP"); if(!record || expected!=record) return false;
     }
-    return main.pid > 1 && main.group == (uint32_t)main.pid && main.uid == geteuid() && canonical(bundle) && bundle.size() > 4 && bundle.substr(bundle.size()-4) == ".app" &&
+    authenticated = main.pid > 1 && main.group == (uint32_t)main.pid && main.uid == geteuid() && canonical(bundle) && bundle.size() > 4 && bundle.substr(bundle.size()-4) == ".app" &&
       observe(main.pid, id) == 1 && same(main, id) && id.group == main.group && getsid(main.pid) == session && executable(id, path) && path == engine() && signature(path, true) &&
       owner.heldMode == LOCK_EX && build.heldMode == LOCK_SH && lockIdentity(owner) && lockIdentity(build) && (owner.device != build.device || owner.inode != build.inode);
+    return authenticated;
   }
   bool monitor(const Identity& id, bool anchor) const {
     Identity now; std::string path;
@@ -102,6 +103,7 @@ struct Context {
       getsid(id.pid) == session && executable(now, path) && path == helper() && signature(path, false);
   }
   bool discoverCustody() {
+    if(!authenticated) return false;
     if(custody.pid) return current(custody)>=0;
     if(!primary.pid) return false;
     std::vector<pid_t> pids(4097); int bytes=proc_listpids(PROC_PGRP_ONLY,main.group,pids.data(),(int)(pids.size()*sizeof(pid_t)));
@@ -118,6 +120,7 @@ struct Context {
     if(count>1) return false; if(count==1) custody=found; return true;
   }
   bool census(std::vector<Identity>& targets) {
+    if(!authenticated) return false;
     targets.clear(); Identity actual; int alive = observe(main.pid, actual); if (alive < 0) return false;
     if (alive == 1 && actual.start != main.start && actual.group == main.group) {
       // A reused leader PID cannot have been allocated while the old group existed.
@@ -147,6 +150,7 @@ struct Context {
       (executingMain ? (getpid() == main.pid && current(main) == 1) : current(main) == 0);
   }
   void enforce(bool executingMain = false) {
+    if(!authenticated) return;
     std::vector<Identity> targets;
     if (!census(targets)) { targets.clear(); for (const auto& entry : seen) targets.push_back(entry.second); }
     for (const auto& id : targets) if ((!executingMain || !same(id,main)) && id.pid != primary.pid && id.pid != custody.pid) (void)signalExact(id,SIGKILL);
