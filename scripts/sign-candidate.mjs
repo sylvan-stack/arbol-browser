@@ -5,7 +5,7 @@ import { lstat, readFile, readdir, writeFile, realpath } from 'node:fs/promises'
 import { resolve, join, relative, sep } from 'node:path';
 import { createHash } from 'node:crypto';
 import { root, inventoryDigest } from './package-base.mjs';
-import { policy, writeCompatibility, assertStagedSource } from './native-candidate.mjs';
+import { policy, candidateQualification, writeCompatibility, assertStagedSource } from './native-candidate.mjs';
 const identity = 'F1B6782A3BACC18E73FE08CA424C0A81450A982C';
 const args = process.argv.slice(2);
 if (args.length !== 2 || args[0] !== '--candidate') throw new Error('Usage: sign-candidate.mjs --candidate <new-isolated.app>');
@@ -14,7 +14,7 @@ if (!bundle.endsWith('.app') || bundle.startsWith(root + sep) || bundle.startsWi
     await realpath(bundle) !== bundle) throw new Error('Signing requires the isolated real candidate');
 const staged = await assertStagedSource(bundle, true);
 const original = JSON.parse(await readFile(join(bundle, 'Contents/Resources/native-compatibility.json'), 'utf8'));
-if (original.qualification !== `unqualified:ABR-5-static-only;source=${staged.sourceDigest}` || original.publisherTeam !== policy.team || original.bundleIdentifier !== policy.bundleIdentifier)
+if (original.qualification !== `${candidateQualification};source=${staged.sourceDigest}` || original.publisherTeam !== policy.team || original.bundleIdentifier !== policy.bundleIdentifier)
   throw new Error('Not an unqualified native candidate');
 if (await lstat(join(bundle, 'Contents/_CodeSignature')).catch(error => { if (error.code !== 'ENOENT') throw error; })) throw new Error('Outer candidate already signed; retain it and stage a fresh attempt');
 await writeFile(bundle + '.signing-attempt.json', JSON.stringify({ candidate: bundle, qualification: 'unexecuted' }) + '\n', { flag: 'wx', mode: 0o600 });

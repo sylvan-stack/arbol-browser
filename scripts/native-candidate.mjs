@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { root, inventory, inventoryDigest, sourceInventory } from './package-base.mjs';
 import { validateNativeCompilation } from './compile-native.mjs';
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+export const candidateQualification = 'unqualified:ABR-6-static-only';
 export const policy = JSON.parse(await readFile(join(root, 'native/publisher-requirement.json'), 'utf8'));
 const runtime = { electron: '45.3.2', chromium: '156.0.8078.100', node: '24.22.2', napi: '10', modules: '150', platform: 'darwin', arch: 'arm64', macOS: '27.0.1' };
 const foundation = '/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-32-20261114/registry/arbol-browser/1';
@@ -58,7 +59,7 @@ export async function writeCompatibility(bundle) {
     publisherTeam: policy.team, bundleIdentifier: policy.bundleIdentifier,
     featureConfiguration: { sitePerProcess: true, disabledFeatures: ['MacAccessibilityTextOperation'], extraChromiumArguments: [] },
     files, dataEpoch: 1, compatibleReaderKeys: ['candidate-unqualified'], writerKey: 'candidate-unqualified', readableDataEpochs: [1],
-    qualification: `unqualified:ABR-6-static-only;source=${staged.sourceDigest}` };
+    qualification: `${candidateQualification};source=${staged.sourceDigest}` };
   const raw = JSON.stringify(manifest, null, 2) + '\n';
   if (Buffer.byteLength(raw) > 1048576 || Object.keys(files).length > 4096) throw new Error('Native manifest bound exceeded');
   await writeFile(join(bundle, 'Contents/Resources/native-compatibility.json'), raw);
