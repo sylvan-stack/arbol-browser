@@ -1,0 +1,412 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:arbol-browser:native:1",
+  "title": "native-adapter-1.schema.json",
+  "$comment": "Normative definition bundle. Select a named $defs entry; see README.md and the BRW chapters.",
+  "$defs": {
+    "Method": {
+      "type": "object",
+      "properties": {
+        "encoding": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "provider": {
+          "type": "string",
+          "maxLength": 160
+        }
+      },
+      "required": [
+        "encoding",
+        "provider"
+      ],
+      "additionalProperties": false
+    },
+    "Inventory": {
+      "type": "object",
+      "properties": {
+        "abi": {
+          "const": 1
+        },
+        "compiledNapi": {
+          "const": 8
+        },
+        "pointerBytes": {
+          "const": 8
+        },
+        "rangeBytes": {
+          "const": 16
+        },
+        "pointBytes": {
+          "const": 16
+        },
+        "methods": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*#[A-Za-z_][A-Za-z0-9_:]*$"
+          },
+          "additionalProperties": {
+            "oneOf": [
+              {
+                "$ref": "urn:arbol-browser:native:1#/$defs/Method"
+              },
+              {
+                "const": "<absent>"
+              }
+            ]
+          },
+          "maxProperties": 4096
+        }
+      },
+      "required": [
+        "abi",
+        "compiledNapi",
+        "pointerBytes",
+        "rangeBytes",
+        "pointBytes",
+        "methods"
+      ],
+      "additionalProperties": false
+    },
+    "Status": {
+      "type": "object",
+      "properties": {
+        "abi": {
+          "const": 1
+        },
+        "phase": {
+          "type": "string",
+          "enum": [
+            "new",
+            "planning",
+            "ready",
+            "rejected",
+            "poisoned",
+            "closing"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "hooks": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4096
+        },
+        "appliedHooks": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4096
+        },
+        "liveBindings": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "policyObjects": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        }
+      },
+      "required": [
+        "abi",
+        "phase",
+        "reason",
+        "hooks",
+        "appliedHooks",
+        "liveBindings",
+        "policyObjects"
+      ],
+      "additionalProperties": false
+    },
+    "Binding": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "nonce": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "webContentsId": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "blocked": {
+          "type": "boolean"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "retired": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "nonce",
+        "webContentsId",
+        "blocked",
+        "revision",
+        "retired"
+      ],
+      "additionalProperties": false
+    },
+    "Interaction": {
+      "type": "object",
+      "properties": {
+        "buttons": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "wheel": {
+          "type": "boolean"
+        },
+        "momentum": {
+          "type": "boolean"
+        },
+        "htmlSource": {
+          "type": "boolean"
+        },
+        "htmlTarget": {
+          "type": "boolean"
+        },
+        "drops": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "marked": {
+          "type": "boolean"
+        },
+        "pressedButtons": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "busy": {
+          "type": "boolean"
+        },
+        "lastDragOperation": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "buttons",
+        "wheel",
+        "momentum",
+        "htmlSource",
+        "htmlTarget",
+        "drops",
+        "marked",
+        "pressedButtons",
+        "busy"
+      ],
+      "additionalProperties": false
+    },
+    "Runtime": {
+      "type": "object",
+      "properties": {
+        "electron": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "chromium": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "node": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "napi": {
+          "type": "string",
+          "maxLength": 8
+        },
+        "modules": {
+          "type": "string",
+          "maxLength": 8
+        },
+        "platform": {
+          "const": "darwin"
+        },
+        "arch": {
+          "const": "arm64"
+        },
+        "macOS": {
+          "type": "string",
+          "maxLength": 40
+        }
+      },
+      "required": [
+        "electron",
+        "chromium",
+        "node",
+        "napi",
+        "modules",
+        "platform",
+        "arch",
+        "macOS"
+      ],
+      "additionalProperties": false
+    },
+    "BuildCompatibility": {
+      "type": "object",
+      "properties": {
+        "abi": {
+          "const": 1
+        },
+        "runtime": {
+          "$ref": "urn:arbol-browser:native:1#/$defs/Runtime"
+        },
+        "nativeABI": {
+          "$ref": "urn:arbol-browser:native:1#/$defs/Inventory"
+        },
+        "publisherTeam": {
+          "type": "string",
+          "maxLength": 10,
+          "pattern": "^[A-Z0-9]{10}$"
+        },
+        "bundleIdentifier": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "featureConfiguration": {
+          "type": "object",
+          "properties": {
+            "sitePerProcess": {
+              "const": true
+            },
+            "disabledFeatures": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "maxLength": 80
+              },
+              "maxItems": 64,
+              "uniqueItems": true,
+              "contains": {
+                "const": "MacAccessibilityTextOperation"
+              }
+            },
+            "extraChromiumArguments": {
+              "type": "array",
+              "maxItems": 0
+            }
+          },
+          "required": [
+            "sitePerProcess",
+            "disabledFeatures",
+            "extraChromiumArguments"
+          ],
+          "additionalProperties": false
+        },
+        "files": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^Contents/(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"
+          },
+          "additionalProperties": {
+            "type": "string",
+            "maxLength": 64,
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "minProperties": 3,
+          "maxProperties": 4096
+        },
+        "dataEpoch": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "compatibleReaderKeys": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "maxItems": 128,
+          "minItems": 1
+        },
+        "qualification": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "writerKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "readableDataEpochs": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "uniqueItems": true,
+          "minItems": 1,
+          "maxItems": 128
+        }
+      },
+      "required": [
+        "abi",
+        "runtime",
+        "nativeABI",
+        "publisherTeam",
+        "bundleIdentifier",
+        "featureConfiguration",
+        "files",
+        "dataEpoch",
+        "compatibleReaderKeys",
+        "qualification",
+        "writerKey",
+        "readableDataEpochs"
+      ],
+      "additionalProperties": false
+    },
+    "BindingKey": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "nonce": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "webContentsId": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      },
+      "required": [
+        "id",
+        "nonce",
+        "webContentsId",
+        "revision"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

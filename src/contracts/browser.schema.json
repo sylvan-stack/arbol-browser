@@ -1,0 +1,1785 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:arbol-browser:contract:1",
+  "title": "browser-contract-1.schema.json",
+  "$comment": "Normative definition bundle. Select a named $defs entry; see README.md and the BRW chapters.",
+  "$defs": {
+    "InstanceId": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^ins_[A-Za-z0-9_-]{22}$"
+    },
+    "AttachmentId": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^att_[A-Za-z0-9_-]{22}$"
+    },
+    "TabId": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^tab_[A-Za-z0-9_-]{22}$"
+    },
+    "NavigationId": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^nav_[A-Za-z0-9_-]{22}$"
+    },
+    "SnapshotId": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^snap_[A-Za-z0-9_-]{22}$"
+    },
+    "ElementRef": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^ref_[A-Za-z0-9_-]{22}$"
+    },
+    "ActionId": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^act_[A-Za-z0-9_-]{22}$"
+    },
+    "RequestId": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^req_[A-Za-z0-9_-]{22}$"
+    },
+    "RecoveryId": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^rec_[A-Za-z0-9_-]{22}$"
+    },
+    "Generation": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "ProfileId": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z](?:[a-z0-9-]{0,62}[a-z0-9])?$"
+    },
+    "Build": {
+      "type": "string",
+      "maxLength": 16,
+      "pattern": "^[1-9a-f][0-9a-f]{0,15}$"
+    },
+    "Availability": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "unresponsive",
+        "crashed",
+        "unavailable"
+      ]
+    },
+    "Outcome": {
+      "type": "string",
+      "enum": [
+        "not_dispatched",
+        "completed",
+        "outcome_unknown"
+      ]
+    },
+    "Controller": {
+      "type": "string",
+      "enum": [
+        "user",
+        "agent"
+      ]
+    },
+    "Url": {
+      "type": "string",
+      "maxLength": 8192
+    },
+    "SafeUrl": {
+      "type": "string",
+      "maxLength": 8192
+    },
+    "ClientLabel": {
+      "type": "string",
+      "maxLength": 80
+    },
+    "ErrorCode": {
+      "type": "string",
+      "enum": [
+        "invalid_input",
+        "profile_not_found",
+        "profile_unavailable",
+        "browser_unavailable",
+        "tab_not_found",
+        "control_refused",
+        "control_changed",
+        "stale_snapshot",
+        "snapshot_truncated",
+        "navigation_failed",
+        "unsupported",
+        "internal"
+      ]
+    },
+    "BrowserError": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ErrorCode"
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "remedy": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "action": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ActionId"
+        },
+        "dispatchOutcome": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Outcome"
+        },
+        "controller": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Controller"
+        },
+        "controlGeneration": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ],
+      "additionalProperties": false
+    },
+    "ErrorResult": {
+      "type": "object",
+      "properties": {
+        "error": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/BrowserError"
+        }
+      },
+      "required": [
+        "error"
+      ],
+      "additionalProperties": false
+    },
+    "ClientIdentity": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/AttachmentId"
+        },
+        "label": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ClientLabel"
+        }
+      },
+      "required": [
+        "id",
+        "label"
+      ],
+      "additionalProperties": false
+    },
+    "BrowserInfo": {
+      "type": "object",
+      "properties": {
+        "contract": {
+          "const": 1
+        },
+        "profile": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ProfileId"
+        },
+        "instance": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/InstanceId"
+        },
+        "build": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Build"
+        },
+        "client": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ClientIdentity"
+        }
+      },
+      "required": [
+        "contract",
+        "profile",
+        "instance",
+        "build",
+        "client"
+      ],
+      "additionalProperties": false
+    },
+    "PrivateTab": {
+      "type": "object",
+      "properties": {
+        "tab": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+        },
+        "controller": {
+          "const": "user"
+        },
+        "controlGeneration": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+        },
+        "observationSuspended": {
+          "const": true
+        },
+        "inputReady": {
+          "const": false
+        },
+        "pageAvailability": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Availability"
+        }
+      },
+      "required": [
+        "tab",
+        "controller",
+        "controlGeneration",
+        "observationSuspended",
+        "inputReady",
+        "pageAvailability"
+      ],
+      "additionalProperties": false
+    },
+    "ObservedTab": {
+      "type": "object",
+      "properties": {
+        "tab": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+        },
+        "controller": {
+          "const": "agent"
+        },
+        "controlGeneration": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+        },
+        "observationSuspended": {
+          "const": false
+        },
+        "inputReady": {
+          "type": "boolean"
+        },
+        "pageAvailability": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Availability"
+        },
+        "ownsControl": {
+          "type": "boolean"
+        },
+        "controllerLabel": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ClientLabel"
+        },
+        "url": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/SafeUrl"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "navigation": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/NavigationId"
+        }
+      },
+      "required": [
+        "tab",
+        "controller",
+        "controlGeneration",
+        "observationSuspended",
+        "inputReady",
+        "pageAvailability",
+        "ownsControl",
+        "controllerLabel"
+      ],
+      "additionalProperties": false
+    },
+    "SharedTab": {
+      "oneOf": [
+        {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/PrivateTab"
+        },
+        {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ObservedTab"
+        }
+      ]
+    },
+    "TabsResult": {
+      "type": "object",
+      "properties": {
+        "tabs": {
+          "type": "array",
+          "items": {
+            "$ref": "urn:arbol-browser:contract:1#/$defs/SharedTab"
+          },
+          "maxItems": 64
+        }
+      },
+      "required": [
+        "tabs"
+      ],
+      "additionalProperties": false
+    },
+    "Target": {
+      "type": "object",
+      "properties": {
+        "snapshot": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/SnapshotId"
+        },
+        "ref": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ElementRef"
+        }
+      },
+      "required": [
+        "snapshot",
+        "ref"
+      ],
+      "additionalProperties": false
+    },
+    "SnapshotState": {
+      "type": "object",
+      "properties": {
+        "disabled": {
+          "type": "boolean"
+        },
+        "checked": {
+          "type": [
+            "boolean",
+            "string"
+          ],
+          "enum": [
+            true,
+            false,
+            "mixed"
+          ]
+        },
+        "selected": {
+          "type": "boolean"
+        },
+        "expanded": {
+          "type": "boolean"
+        },
+        "focused": {
+          "type": "boolean"
+        },
+        "editable": {
+          "type": "boolean"
+        },
+        "sensitive": {
+          "type": "boolean"
+        },
+        "unavailable": {
+          "type": "boolean"
+        },
+        "valueTruncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "SnapshotNode": {
+      "type": "object",
+      "properties": {
+        "ref": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ElementRef"
+        },
+        "role": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "value": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "state": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/SnapshotState"
+        },
+        "children": {
+          "type": "array",
+          "items": {
+            "$ref": "urn:arbol-browser:contract:1#/$defs/SnapshotNode"
+          },
+          "maxItems": 5000
+        }
+      },
+      "required": [
+        "role"
+      ],
+      "additionalProperties": false
+    },
+    "SnapshotResult": {
+      "type": "object",
+      "properties": {
+        "tab": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+        },
+        "snapshot": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/SnapshotId"
+        },
+        "navigation": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/NavigationId"
+        },
+        "domRevision": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "controlGeneration": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+        },
+        "url": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/SafeUrl"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "tree": {
+          "type": "array",
+          "items": {
+            "$ref": "urn:arbol-browser:contract:1#/$defs/SnapshotNode"
+          },
+          "maxItems": 5000
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "tab",
+        "snapshot",
+        "navigation",
+        "domRevision",
+        "controlGeneration",
+        "url",
+        "title",
+        "tree",
+        "truncated"
+      ],
+      "additionalProperties": false
+    },
+    "ActionResult": {
+      "type": "object",
+      "properties": {
+        "tab": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+        },
+        "action": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ActionId"
+        },
+        "status": {
+          "const": "completed"
+        },
+        "controlGeneration": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+        },
+        "navigation": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/NavigationId"
+        },
+        "domRevision": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "pageAvailability": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Availability"
+        },
+        "inputReady": {
+          "type": "boolean"
+        },
+        "openedTabs": {
+          "type": "array",
+          "items": {
+            "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+          },
+          "maxItems": 10
+        }
+      },
+      "required": [
+        "tab",
+        "action",
+        "status",
+        "controlGeneration",
+        "pageAvailability",
+        "inputReady"
+      ],
+      "additionalProperties": false
+    },
+    "OpenTabResult": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ActionId"
+        },
+        "status": {
+          "const": "completed"
+        },
+        "tab": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ObservedTab"
+        }
+      },
+      "required": [
+        "action",
+        "status",
+        "tab"
+      ],
+      "additionalProperties": false
+    },
+    "CloseTabResult": {
+      "type": "object",
+      "properties": {
+        "tab": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+        },
+        "action": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ActionId"
+        },
+        "status": {
+          "const": "completed"
+        },
+        "closed": {
+          "const": true
+        }
+      },
+      "required": [
+        "tab",
+        "action",
+        "status",
+        "closed"
+      ],
+      "additionalProperties": false
+    },
+    "SettledAction": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ActionId"
+        },
+        "status": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Outcome"
+        }
+      },
+      "required": [
+        "action",
+        "status"
+      ],
+      "additionalProperties": false
+    },
+    "ReleaseResult": {
+      "type": "object",
+      "properties": {
+        "tab": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/PrivateTab"
+        },
+        "action": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ActionId"
+        },
+        "status": {
+          "const": "completed"
+        },
+        "settledAction": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/SettledAction"
+        }
+      },
+      "required": [
+        "tab",
+        "action",
+        "status"
+      ],
+      "additionalProperties": false
+    },
+    "ScreenshotResult": {
+      "type": "object",
+      "properties": {
+        "tab": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+        },
+        "snapshot": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/SnapshotId"
+        },
+        "navigation": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/NavigationId"
+        },
+        "controlGeneration": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+        },
+        "mimeType": {
+          "const": "image/png"
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2048
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2048
+        },
+        "redacted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "tab",
+        "snapshot",
+        "navigation",
+        "controlGeneration",
+        "mimeType",
+        "width",
+        "height",
+        "redacted"
+      ],
+      "additionalProperties": false
+    },
+    "Empty": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "OpenTabInput": {
+      "type": "object",
+      "properties": {
+        "url": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Url"
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "NavigateInput": {
+      "type": "object",
+      "properties": {
+        "tab": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+        },
+        "controlGeneration": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+        },
+        "snapshot": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/SnapshotId"
+        },
+        "url": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Url"
+        }
+      },
+      "required": [
+        "tab",
+        "controlGeneration",
+        "snapshot",
+        "url"
+      ],
+      "additionalProperties": false
+    },
+    "SnapshotInput": {
+      "type": "object",
+      "properties": {
+        "tab": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+        },
+        "controlGeneration": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+        },
+        "root": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Target"
+        },
+        "allowTruncation": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": [
+        "tab",
+        "controlGeneration"
+      ],
+      "additionalProperties": false
+    },
+    "ClickInput": {
+      "type": "object",
+      "properties": {
+        "tab": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+        },
+        "controlGeneration": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+        },
+        "snapshot": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/SnapshotId"
+        },
+        "ref": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ElementRef"
+        }
+      },
+      "required": [
+        "tab",
+        "controlGeneration",
+        "snapshot",
+        "ref"
+      ],
+      "additionalProperties": false
+    },
+    "TypeInput": {
+      "type": "object",
+      "properties": {
+        "tab": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+        },
+        "controlGeneration": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+        },
+        "snapshot": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/SnapshotId"
+        },
+        "ref": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ElementRef"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "replace",
+            "append"
+          ]
+        },
+        "text": {
+          "type": "string",
+          "maxLength": 10000
+        }
+      },
+      "required": [
+        "tab",
+        "controlGeneration",
+        "snapshot",
+        "ref",
+        "mode",
+        "text"
+      ],
+      "additionalProperties": false
+    },
+    "PressKeyInput": {
+      "type": "object",
+      "properties": {
+        "tab": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+        },
+        "controlGeneration": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+        },
+        "snapshot": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/SnapshotId"
+        },
+        "ref": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ElementRef"
+        },
+        "key": {
+          "type": "string",
+          "enum": [
+            "Enter",
+            "Tab",
+            "Shift+Tab",
+            "Escape",
+            "Backspace",
+            "Delete",
+            "ArrowLeft",
+            "ArrowRight",
+            "ArrowUp",
+            "ArrowDown",
+            "Home",
+            "End",
+            "PageUp",
+            "PageDown",
+            "Space",
+            "Meta+A",
+            "Shift+ArrowLeft",
+            "Shift+ArrowRight",
+            "Shift+ArrowUp",
+            "Shift+ArrowDown",
+            "Shift+Home",
+            "Shift+End"
+          ]
+        }
+      },
+      "required": [
+        "tab",
+        "controlGeneration",
+        "snapshot",
+        "ref",
+        "key"
+      ],
+      "additionalProperties": false
+    },
+    "ScrollInput": {
+      "type": "object",
+      "properties": {
+        "tab": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+        },
+        "controlGeneration": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+        },
+        "snapshot": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/SnapshotId"
+        },
+        "ref": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ElementRef"
+        },
+        "deltaX": {
+          "type": "integer",
+          "minimum": -2000,
+          "maximum": 2000
+        },
+        "deltaY": {
+          "type": "integer",
+          "minimum": -2000,
+          "maximum": 2000
+        }
+      },
+      "required": [
+        "tab",
+        "controlGeneration",
+        "snapshot",
+        "ref",
+        "deltaX",
+        "deltaY"
+      ],
+      "additionalProperties": false
+    },
+    "DragInput": {
+      "type": "object",
+      "properties": {
+        "tab": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+        },
+        "controlGeneration": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+        },
+        "snapshot": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/SnapshotId"
+        },
+        "source": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ElementRef"
+        },
+        "destination": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ElementRef"
+        }
+      },
+      "required": [
+        "tab",
+        "controlGeneration",
+        "snapshot",
+        "source",
+        "destination"
+      ],
+      "additionalProperties": false
+    },
+    "ScreenshotInput": {
+      "type": "object",
+      "properties": {
+        "tab": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+        },
+        "controlGeneration": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+        },
+        "snapshot": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/SnapshotId"
+        }
+      },
+      "required": [
+        "tab",
+        "controlGeneration",
+        "snapshot"
+      ],
+      "additionalProperties": false
+    },
+    "CloseTabInput": {
+      "type": "object",
+      "properties": {
+        "tab": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+        },
+        "controlGeneration": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+        }
+      },
+      "required": [
+        "tab",
+        "controlGeneration"
+      ],
+      "additionalProperties": false
+    },
+    "ReleaseInput": {
+      "type": "object",
+      "properties": {
+        "tab": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+        },
+        "controlGeneration": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+        }
+      },
+      "required": [
+        "tab",
+        "controlGeneration"
+      ],
+      "additionalProperties": false
+    },
+    "ShellController": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "user"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "agent"
+            },
+            "client": {
+              "$ref": "urn:arbol-browser:contract:1#/$defs/AttachmentId"
+            },
+            "label": {
+              "$ref": "urn:arbol-browser:contract:1#/$defs/ClientLabel"
+            }
+          },
+          "required": [
+            "kind",
+            "client",
+            "label"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ShellTab": {
+      "type": "object",
+      "properties": {
+        "tab": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+        },
+        "controller": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ShellController"
+        },
+        "generation": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+        },
+        "navigation": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/NavigationId"
+        },
+        "inputReady": {
+          "type": "boolean",
+          "description": "Native user readiness or current agent input readiness; independent of privacy projection."
+        },
+        "handoff": {
+          "type": "string",
+          "enum": [
+            "idle",
+            "taking"
+          ]
+        },
+        "visibleTo": {
+          "type": "array",
+          "items": {
+            "$ref": "urn:arbol-browser:contract:1#/$defs/AttachmentId"
+          },
+          "maxItems": 32
+        },
+        "observationSuspended": {
+          "type": "boolean"
+        },
+        "pageAvailability": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Availability"
+        }
+      },
+      "required": [
+        "tab",
+        "controller",
+        "generation",
+        "inputReady",
+        "handoff",
+        "visibleTo",
+        "observationSuspended",
+        "pageAvailability"
+      ],
+      "additionalProperties": false
+    },
+    "ShellRequest": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "ui": {
+              "const": 1
+            },
+            "id": {
+              "$ref": "urn:arbol-browser:contract:1#/$defs/RequestId"
+            },
+            "method": {
+              "const": "new_tab"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "url": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/Url"
+                }
+              },
+              "required": [],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "ui",
+            "id",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ui": {
+              "const": 1
+            },
+            "id": {
+              "$ref": "urn:arbol-browser:contract:1#/$defs/RequestId"
+            },
+            "method": {
+              "const": "select"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "tab": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+                }
+              },
+              "required": [
+                "tab"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "ui",
+            "id",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ui": {
+              "const": 1
+            },
+            "id": {
+              "$ref": "urn:arbol-browser:contract:1#/$defs/RequestId"
+            },
+            "method": {
+              "const": "share"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "tab": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+                },
+                "controlGeneration": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+                },
+                "client": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/AttachmentId"
+                }
+              },
+              "required": [
+                "tab",
+                "controlGeneration",
+                "client"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "ui",
+            "id",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ui": {
+              "const": 1
+            },
+            "id": {
+              "$ref": "urn:arbol-browser:contract:1#/$defs/RequestId"
+            },
+            "method": {
+              "const": "stop_sharing"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "tab": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+                },
+                "controlGeneration": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+                },
+                "client": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/AttachmentId"
+                }
+              },
+              "required": [
+                "tab",
+                "controlGeneration",
+                "client"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "ui",
+            "id",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ui": {
+              "const": 1
+            },
+            "id": {
+              "$ref": "urn:arbol-browser:contract:1#/$defs/RequestId"
+            },
+            "method": {
+              "const": "take"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "tab": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+                },
+                "controlGeneration": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+                }
+              },
+              "required": [
+                "tab",
+                "controlGeneration"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "ui",
+            "id",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ui": {
+              "const": 1
+            },
+            "id": {
+              "$ref": "urn:arbol-browser:contract:1#/$defs/RequestId"
+            },
+            "method": {
+              "const": "return"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "tab": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+                },
+                "controlGeneration": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+                },
+                "client": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/AttachmentId"
+                }
+              },
+              "required": [
+                "tab",
+                "controlGeneration",
+                "client"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "ui",
+            "id",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ui": {
+              "const": 1
+            },
+            "id": {
+              "$ref": "urn:arbol-browser:contract:1#/$defs/RequestId"
+            },
+            "method": {
+              "const": "recover"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "tab": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+                },
+                "controlGeneration": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+                }
+              },
+              "required": [
+                "tab",
+                "controlGeneration"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "ui",
+            "id",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ui": {
+              "const": 1
+            },
+            "id": {
+              "$ref": "urn:arbol-browser:contract:1#/$defs/RequestId"
+            },
+            "method": {
+              "const": "close_tab"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "tab": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+                },
+                "controlGeneration": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+                }
+              },
+              "required": [
+                "tab",
+                "controlGeneration"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "ui",
+            "id",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ui": {
+              "const": 1
+            },
+            "id": {
+              "$ref": "urn:arbol-browser:contract:1#/$defs/RequestId"
+            },
+            "method": {
+              "const": "user_navigate"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "tab": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+                },
+                "controlGeneration": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+                },
+                "url": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/Url"
+                }
+              },
+              "required": [
+                "tab",
+                "controlGeneration",
+                "url"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "ui",
+            "id",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ui": {
+              "const": 1
+            },
+            "id": {
+              "$ref": "urn:arbol-browser:contract:1#/$defs/RequestId"
+            },
+            "method": {
+              "const": "back"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "tab": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+                },
+                "controlGeneration": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+                }
+              },
+              "required": [
+                "tab",
+                "controlGeneration"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "ui",
+            "id",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ui": {
+              "const": 1
+            },
+            "id": {
+              "$ref": "urn:arbol-browser:contract:1#/$defs/RequestId"
+            },
+            "method": {
+              "const": "forward"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "tab": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+                },
+                "controlGeneration": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+                }
+              },
+              "required": [
+                "tab",
+                "controlGeneration"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "ui",
+            "id",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ui": {
+              "const": 1
+            },
+            "id": {
+              "$ref": "urn:arbol-browser:contract:1#/$defs/RequestId"
+            },
+            "method": {
+              "const": "reload"
+            },
+            "params": {
+              "type": "object",
+              "properties": {
+                "tab": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/TabId"
+                },
+                "controlGeneration": {
+                  "$ref": "urn:arbol-browser:contract:1#/$defs/Generation"
+                }
+              },
+              "required": [
+                "tab",
+                "controlGeneration"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "ui",
+            "id",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ui": {
+              "const": 1
+            },
+            "id": {
+              "$ref": "urn:arbol-browser:contract:1#/$defs/RequestId"
+            },
+            "method": {
+              "const": "close_window"
+            },
+            "params": {
+              "type": "object",
+              "properties": {},
+              "required": [],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "ui",
+            "id",
+            "method",
+            "params"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ShellSuccess": {
+      "type": "object",
+      "properties": {
+        "ui": {
+          "const": 1
+        },
+        "id": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/RequestId"
+        },
+        "ok": {
+          "const": true
+        },
+        "state": {
+          "oneOf": [
+            {
+              "$ref": "urn:arbol-browser:contract:1#/$defs/ShellTab"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "settledAction": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/SettledAction"
+        }
+      },
+      "required": [
+        "ui",
+        "id",
+        "ok",
+        "state"
+      ],
+      "additionalProperties": false
+    },
+    "ShellFailure": {
+      "type": "object",
+      "properties": {
+        "ui": {
+          "const": 1
+        },
+        "id": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/RequestId"
+        },
+        "ok": {
+          "const": false
+        },
+        "error": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/BrowserError"
+        }
+      },
+      "required": [
+        "ui",
+        "id",
+        "ok",
+        "error"
+      ],
+      "additionalProperties": false
+    },
+    "ShellEvent": {
+      "type": "object",
+      "properties": {
+        "ui": {
+          "const": 1
+        },
+        "event": {
+          "const": "state"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "tabs": {
+          "type": "array",
+          "items": {
+            "$ref": "urn:arbol-browser:contract:1#/$defs/ShellTab"
+          },
+          "maxItems": 64
+        },
+        "attachments": {
+          "type": "array",
+          "items": {
+            "$ref": "urn:arbol-browser:contract:1#/$defs/ClientIdentity"
+          },
+          "maxItems": 32
+        }
+      },
+      "required": [
+        "ui",
+        "event",
+        "revision",
+        "tabs",
+        "attachments"
+      ],
+      "additionalProperties": false
+    },
+    "ScreenshotPayload": {
+      "type": "object",
+      "properties": {
+        "metadata": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ScreenshotResult"
+        },
+        "data": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "maxLength": 5592408
+        }
+      },
+      "required": [
+        "metadata",
+        "data"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "x-tools": {
+    "browser_info": {
+      "input": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/Empty"
+      },
+      "success": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/BrowserInfo"
+      },
+      "failure": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ErrorResult"
+      },
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "browser_tabs_list": {
+      "input": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/Empty"
+      },
+      "success": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/TabsResult"
+      },
+      "failure": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ErrorResult"
+      },
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "browser_tab_open": {
+      "input": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/OpenTabInput"
+      },
+      "success": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/OpenTabResult"
+      },
+      "failure": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ErrorResult"
+      },
+      "readOnlyHint": false,
+      "idempotentHint": false
+    },
+    "browser_navigate": {
+      "input": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/NavigateInput"
+      },
+      "success": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ActionResult"
+      },
+      "failure": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ErrorResult"
+      },
+      "readOnlyHint": false,
+      "idempotentHint": false
+    },
+    "browser_snapshot": {
+      "input": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/SnapshotInput"
+      },
+      "success": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/SnapshotResult"
+      },
+      "failure": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ErrorResult"
+      },
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "browser_click": {
+      "input": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ClickInput"
+      },
+      "success": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ActionResult"
+      },
+      "failure": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ErrorResult"
+      },
+      "readOnlyHint": false,
+      "idempotentHint": false
+    },
+    "browser_type": {
+      "input": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/TypeInput"
+      },
+      "success": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ActionResult"
+      },
+      "failure": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ErrorResult"
+      },
+      "readOnlyHint": false,
+      "idempotentHint": false
+    },
+    "browser_press_key": {
+      "input": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/PressKeyInput"
+      },
+      "success": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ActionResult"
+      },
+      "failure": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ErrorResult"
+      },
+      "readOnlyHint": false,
+      "idempotentHint": false
+    },
+    "browser_scroll": {
+      "input": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ScrollInput"
+      },
+      "success": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ActionResult"
+      },
+      "failure": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ErrorResult"
+      },
+      "readOnlyHint": false,
+      "idempotentHint": false
+    },
+    "browser_drag": {
+      "input": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/DragInput"
+      },
+      "success": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ActionResult"
+      },
+      "failure": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ErrorResult"
+      },
+      "readOnlyHint": false,
+      "idempotentHint": false
+    },
+    "browser_screenshot": {
+      "input": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ScreenshotInput"
+      },
+      "success": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ScreenshotResult"
+      },
+      "failure": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ErrorResult"
+      },
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "browser_tab_close": {
+      "input": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/CloseTabInput"
+      },
+      "success": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/CloseTabResult"
+      },
+      "failure": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ErrorResult"
+      },
+      "readOnlyHint": false,
+      "idempotentHint": false
+    },
+    "browser_release": {
+      "input": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ReleaseInput"
+      },
+      "success": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ReleaseResult"
+      },
+      "failure": {
+        "$ref": "urn:arbol-browser:contract:1#/$defs/ErrorResult"
+      },
+      "readOnlyHint": false,
+      "idempotentHint": false
+    }
+  }
+}
