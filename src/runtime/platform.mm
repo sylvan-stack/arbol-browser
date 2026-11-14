@@ -7,6 +7,7 @@
 #include <libproc.h>
 #include <bsm/libbsm.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <unistd.h>
 #include <cerrno>
 #include <climits>
@@ -150,8 +151,38 @@ static napi_value peerIdentity(napi_env env, napi_callback_info info) {
       data.unique.pidVersion != audit_token_to_pidversion(token)) return fail(env);
   return identity(env, pid, data);
 }
+// Atomic no-replacement publication, never Node rename's replacement semantics.
+// The caller holds registry.lock and syncs all staging contents before this call,
+// then syncs this parent after return. Ancestor validation remains with the caller.
+static napi_value publishDirectory(napi_env env, napi_callback_info info) {
+  napi_value args[2]; size_t count = 2; std::string source, destination;
+  if (napi_get_cb_info(env, info, &count, args, nullptr, nullptr) != napi_ok || count != 2 ||
+      !string(env, args[0], source) || !string(env, args[1], destination)) return fail(env);
+  size_t a = source.rfind('/'), b = destination.rfind('/');
+  if (a == 0 || b == 0 || source.substr(0, a) != destination.substr(0, b)) return fail(env);
+  std::string parent = source.substr(0, a), from = source.substr(a + 1), to = destination.substr(b + 1);
+  if (from.empty() || to.empty() || from == "." || from == ".." || to == "." || to == ".." || from == to) return fail(env);
+  int fd = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) return fail(env);
+  struct stat st{}, path{}, staged{}, published{};
+  bool valid = fstat(fd, &st) == 0 && lstat(parent.c_str(), &path) == 0 &&
+    S_ISDIR(st.st_mode) && S_ISDIR(path.st_mode) && st.st_uid == geteuid() &&
+    (st.st_mode & 07777) == 0700 && st.st_dev == path.st_dev && st.st_ino == path.st_ino &&
+    fstatat(fd, from.c_str(), &staged, AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(staged.st_mode) &&
+    staged.st_uid == geteuid() && (staged.st_mode & 07777) == 0700;
+  if (!valid || renameatx_np(fd, from.c_str(), fd, to.c_str(), RENAME_EXCL) != 0) {
+    close(fd); return fail(env);
+  }
+  valid = fstatat(fd, to.c_str(), &published, AT_SYMLINK_NOFOLLOW) == 0 &&
+    S_ISDIR(published.st_mode) && published.st_dev == staged.st_dev && published.st_ino == staged.st_ino &&
+    lstat(parent.c_str(), &path) == 0 && path.st_dev == st.st_dev && path.st_ino == st.st_ino;
+  int result = close(fd);
+  if (!valid || result != 0) return fail(env);
+  napi_value out; napi_get_undefined(env, &out); return out;
+}
 static napi_value init(napi_env env, napi_value exports) {
   napi_property_descriptor properties[] = {
+    {"publishDirectory", nullptr, publishDirectory, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"tryLock", nullptr, tryLock, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"assertLock", nullptr, assertLock, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"releaseLock", nullptr, releaseLock, nullptr, nullptr, nullptr, napi_default, nullptr},

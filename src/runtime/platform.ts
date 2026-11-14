@@ -12,6 +12,8 @@ export interface HeldLock {
   release(): void;
 }
 export interface PlatformPort {
+  /** Same-parent atomic directory publication; refuses every existing destination. */
+  publishDirectory(source: string, destination: string): void;
   /** Nonblocking: null means contention. The caller enforces its monotonic deadline. */
   tryLock(absolutePath: string): HeldLock | null;
   /** null means kernel ESRCH only; denied/uncertain observation throws unavailability. */
@@ -20,6 +22,7 @@ export interface PlatformPort {
   peerIdentity(socketFd: number): ProcessIdentity;
 }
 interface NativeSupport {
+  publishDirectory(source: string, destination: string): void;
   tryLock(path: string): object | null;
   assertLock(handle: object): FileIdentity;
   releaseLock(handle: object): void;
@@ -36,13 +39,17 @@ export function loadPlatform(): PlatformPort {
   let native: NativeSupport;
   try {
     native = createRequire(import.meta.url)(fileURLToPath(new URL('../../native/platform.node', import.meta.url)));
-    for (const name of ['tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity'] as const)
+    for (const name of ['tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory'] as const)
       if (typeof native[name] !== 'function') throw new Error('Missing process support');
   } catch { throw unavailable('profile'); }
   const call = <T>(operation: () => T): T => {
     try { return operation(); } catch { throw unavailable('profile'); }
   };
   return Object.freeze({
+    publishDirectory(source: string, destination: string): void {
+      if (![source, destination].every(path => isAbsolute(path) && !path.includes('\0'))) throw unavailable('profile');
+      call(() => native.publishDirectory(source, destination));
+    },
     tryLock(path: string): HeldLock | null {
       if (!isAbsolute(path) || path.includes('\0')) throw unavailable('profile');
       const handle = call(() => native.tryLock(path));
