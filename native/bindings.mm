@@ -88,7 +88,7 @@ static uint32_t contentsArgument(napi_env env, napi_value value) {
 napi_value beginBinding(napi_env env, napi_callback_info info) {
   napi_value args[2]; if (!mainCall(env, info, 2, args)) return bindingFailure(env);
   @try { try {
-    if (!integrity() || creating) throw std::runtime_error("native_creation_unavailable");
+    if (!integrity() || creating || callbackDepth) throw std::runtime_error("native_creation_unavailable");
     bool buffer = false; void* bytes = nullptr; size_t size = 0;
     if (napi_is_buffer(env, args[0], &buffer) != napi_ok || !buffer || napi_get_buffer_info(env, args[0], &bytes, &size) != napi_ok || size != sizeof(void*))
       throw std::runtime_error("native_window_handle");
@@ -108,7 +108,7 @@ napi_value beginBinding(napi_env env, napi_callback_info info) {
 napi_value finishBinding(napi_env env, napi_callback_info info) {
   if (!mainCall(env, info, 0)) return bindingFailure(env);
   @try { try {
-    if (!integrity() || !creating) throw std::runtime_error("native_creation_unavailable");
+    if (!integrity() || !creating || callbackDepth) throw std::runtime_error("native_creation_unavailable");
     NSWindow* window = creationWindow; NSView* root = creationRoot;
     if (!window || !root || window.contentView != root || root.window != window || ![NSApp.windows containsObject:window]) throw std::runtime_error("native_creation_window_changed");
     NSArray<NSView*>* after = pageViews(root); NSMutableArray<NSView*>* added = [NSMutableArray new];
@@ -124,6 +124,8 @@ napi_value finishBinding(napi_env env, napi_callback_info info) {
     [policies addObject:policy]; ++liveBindings; ++policyObjects;
     objc_setAssociatedObject(view, &policyKey, policy, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     creating = false; creationBefore = nil; creationRoot = nil; creationWindow = nil; creationContents = 0;
+    primeAccessibility(policy);
+    if (!integrity()) throw std::runtime_error("native_creation_integrity");
     return jsonReply(env, bindingObject(policy));
   } catch (const std::exception&) { return bindingFailure(env); } } @catch (NSException*) { return bindingFailure(env); }
 }
