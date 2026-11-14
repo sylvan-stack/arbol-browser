@@ -107,7 +107,7 @@ export async function closeProfile(profile: ProfileSnapshot, selection: BuildSel
   const location = await within(deadline, () => runtimeLocation(profile));
   const original = location ? await within(deadline, () => readRuntime(location)) : undefined;
   if (!original) {
-    const owner = await within(deadline, () => ownerLock(profile, platform, false, deadline));
+    const owner = await acquireWithin(deadline, () => ownerLock(profile, platform, false, deadline), owner => owner?.release());
     if (!owner) throw profileUnavailable();
     try {
       await within(deadline, () => createProfileRuntime(platform, selection, exits ?? neverOpenedExit).assertClosed(profile));
@@ -117,7 +117,7 @@ export async function closeProfile(profile: ProfileSnapshot, selection: BuildSel
   if (originalAlive(original, platform) && selection.explicit && original.build !== selection.build) throw profileUnavailable();
   if (!exits) throw unavailable('browser');
   if (!originalAlive(original, platform)) {
-    const owner = await within(deadline, () => ownerLock(profile, platform, false, deadline));
+    const owner = await acquireWithin(deadline, () => ownerLock(profile, platform, false, deadline), owner => owner?.release());
     if (!owner) throw profileUnavailable();
     try {
       if (await verifiedGone(profile, original, platform, exits, deadline)) {
@@ -131,7 +131,8 @@ export async function closeProfile(profile: ProfileSnapshot, selection: BuildSel
   let client: RuntimeClient | undefined;
   try {
     if (originalAlive(original, platform) && original.phase === 'ready' && location) {
-      client = await within(graceful, () => connectRuntime(location, original, 'management', selection, platform, graceful, 'Explicit close'));
+      client = await acquireWithin(graceful,
+        () => connectRuntime(location, original, 'management', selection, platform, graceful, 'Explicit close'), client => client.close());
       // This result acknowledges shutdown only. Never forward it as CLI success.
       await client.call({ wire: 1, id: token('req'), method: 'close', params: {} }, graceful);
     }
