@@ -24,6 +24,8 @@ function checkedUrl(value: string): string {
 }
 
 export function parse(args: readonly string[]): Command {
+  // Command comes first; leading Build selection belongs to the common launcher.
+  if (!['info', 'open', 'close', 'mcp', 'profiles'].includes(args[0] ?? '')) throw invalidInput();
   const words: string[] = [];
   const options = new Map<string, string | true>();
   for (let i = 0; i < args.length; i++) {
