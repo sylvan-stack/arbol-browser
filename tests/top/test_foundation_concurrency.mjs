@@ -262,7 +262,95 @@ export async function startupAcquisitionBoundary(context) {
       await probe(profile.paths.owner, true); await probe(guard, true);
     }
   }
-  return { lifecycleTransfers: observations,
+  return { lifecycleTransfers: observations, starterTransfers: await starterTransferObservations(context),
     syntheticPredicates: 'admission and ProcessIntegration resource pipeline only; no production adapter or native readiness',
     realOracles: 'actual authenticated peer disconnect, usable client control and independent owner/Build lock contenders' };
+}
+
+async function starterTransferObservations(context) {
+  const { startupStarter } = await import('../support/foundation-startup-deadlines.mjs');
+  const { bounded, opaque } = await import('../support/foundation.mjs');
+  const f = await fixture(context, 'starter-transfers');
+  const { loadPlatform } = await load(f, 'runtime/platform'), platform = loadPlatform();
+  const { readProfile } = await load(f, 'profiles/records');
+  const { profilePaths } = await load(f, 'profiles/paths');
+  const { now, acquireInstance, neverOpenedExit } = await load(f, 'runtime/instance');
+  const { listenTransport } = await load(f, 'runtime/transport');
+  const { acquireBuildLease } = await load(f, 'runtime/build-lease');
+  const component = await privateDirectory(join(f.root, 'registry/arbol-browser'));
+  const directory = await privateDirectory(join(component, 'a'));
+  await privateDirectory(join(component, '.uses'));
+  const guard = join(component, '.uses/a'); await writeFile(guard, '', { mode: 0o600 });
+  const selection = { build: 'a', explicit: false, directory, guard };
+  async function probe(path, expected) {
+    const child = await worker(f, 'lock-probe', { path });
+    try { assert.equal(child.ready.acquired, expected, 'Independent starter custody observation disagrees'); }
+    finally { await child.stop(); }
+  }
+  const observations = [];
+  for (const branch of ['existing', 'arbitrated', 'launched']) {
+    for (const mode of ['readiness', 'final', 'guard-release', 'post-release', 'ordinary']) {
+      const id = `${branch}-${mode}`;
+      assert.equal((await cli(f, ['profiles', 'create', id])).status, 0);
+      const profile = await readProfile(profilePaths(id, f.state));
+      const hostBuild = await acquireBuildLease(selection, platform);
+      let instance, server, seam, disconnects = 0, executions = 0, disconnected;
+      const lost = new Promise(resolve => { disconnected = resolve; });
+      async function publish() {
+        assert.equal(instance, undefined, 'Synthetic launch unexpectedly repeated');
+        instance = await acquireInstance(profile, platform, 'a', neverOpenedExit, now() + 2000);
+        assert.ok(instance);
+        server = await listenTransport(instance.location, instance.record, platform, {
+          authorize() {}, async execute(_connection, request) {
+            ++executions; assert.equal(request.method, 'open');
+            // Only a synthetic resource reply: no browser, page or controller.
+            return { profile: id, instance: instance.record.instance,
+              process: instance.record.pid, alreadyRunning: true };
+          }, commit() {}, disconnect() { ++disconnects; disconnected(); }, cancel() {},
+          fatal() { throw new Error('Unexpected synthetic starter transport fatal'); },
+        });
+        server.openAdmission(); await instance.phase('ready');
+      }
+      try {
+        if (branch === 'existing') await publish();
+        seam = await startupStarter(f, { branch, mode, profile, selection, platform, publish });
+        const before = await snapshot(profile.paths.root);
+        const result = await seam.run().then(value => ({ ok: true, value }), error => ({ ok: false, error }));
+        assert.equal(result.ok, mode === 'ordinary', 'Unexpected starter resource-transfer outcome');
+        assert.equal(seam.resources.length, 1, 'Resource boundary was not reached with an actual client');
+        assert.equal(seam.simulatedLaunches, branch === 'launched' ? 1 : 0);
+        if (mode === 'ordinary') {
+          const client = result.value.client;
+          assert.equal(disconnects, 0);
+          for (let call = 0; call < 2; ++call) {
+            await client.call({ wire: 1, id: opaque('req'), method: 'open', params: {} }, now() + 1000);
+            assert.equal(client.signal.aborted, false, 'Transferred starter client was not usable');
+          }
+          assert.equal(executions, 2); client.close();
+        } else assert.equal(executions, 0, 'Refused starter dispatched application work');
+        await bounded(lost, 500).catch(() => {
+          throw new Error('Operation-owned starter socket remains connected after transfer failure with strong references alive');
+        });
+        await probe(profile.paths.owner, false); await probe(guard, false);
+        assert.deepEqual(await snapshot(profile.paths.root), before);
+        const retained = branch === 'launched' && ['readiness', 'final', 'guard-release'].includes(mode);
+        assert.equal(seam.retainedAttempts, retained ? 1 : 0);
+        observations.push({ branch, mode, actualPeerDisconnects: disconnects, executions,
+          retainedClientReferences: seam.resources.length, postReadinessChecks: seam.clockChecks,
+          hostOwnerAndBuildProtective: true, simulatedUpstreamPredicates: [...seam.predicates],
+          noEngineLaunch: true, syntheticLaunches: seam.simulatedLaunches,
+          failedAttemptAuthorityRefusals: seam.failedAttemptRefusals,
+          retainedAttemptGuardsAtObservation: seam.retainedAttempts,
+          genuineNativeReadinessAndExit: 'unqualified; fixture predicates and teardown are not production evidence' });
+      } finally {
+        // No fixture asserts production exit to release a retained attempt.
+        // Shut down the test transport first; dispose only test-owned handles.
+        if (server) await server.close();
+        instance?.owner.release(); hostBuild.release();
+        await seam?.cleanup();
+      }
+      await probe(profile.paths.owner, true); await probe(guard, true);
+    }
+  }
+  return observations;
 }
