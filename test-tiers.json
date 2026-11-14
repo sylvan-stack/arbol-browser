@@ -1,0 +1,39 @@
+{
+  "format": 1,
+  "component": "arbol-browser",
+  "reviewed": "2026-11-14",
+  "cases": [
+    {
+      "id": "receiptRace", "file": "tests/top/test_foundation_boundary.mjs", "tier": "top", "status": "retained",
+      "reason": "Independent CLI processes can replace/adopt a shared destination or mint duplicate receipt identities during concurrent publication.",
+      "oracle": "Exactly one created result; on-disk record instance, inode/mode/digest inventory and fictional payload survive exact replay and conflicting/unmanaged refusal.",
+      "origins": ["BRW-1.2", "BRW-1.6", "BRW-1.7", "BRW-1.10"]
+    },
+    {
+      "id": "ownershipBoundary", "file": "tests/top/test_foundation_concurrency.mjs", "tier": "top", "status": "retained",
+      "reason": "Confusing a slow live owner, dead main or one released shared Build guard can replace active runtime/data or admit pruning while another process owns protection.",
+      "oracle": "Separate kernel processes retain exclusive/shared flocks; byte/inode inventory and native process identity survive losers; no-engine module starters expire under an externally held startup flock without launching.",
+      "origins": ["BRW-0.4", "BRW-0.6", "BRW-0.9", "BRW-0.14", "BRW-1.7"]
+    },
+    {
+      "id": "preservationBoundary", "file": "tests/top/test_foundation_recovery.mjs", "tier": "top", "status": "retained",
+      "reason": "Refusal may mutate unsupported profile/dirty state, accept piped deletion, fall back/create default or falsely report close/native readiness.",
+      "oracle": "Packaged CLI exit/stdout channels plus complete private state inode/mode/digest inventories before and after each distinct refusal boundary.",
+      "origins": ["BRW-0.3", "BRW-0.7", "BRW-0.11", "BRW-1.1", "BRW-1.3", "BRW-1.8", "BRW-1.9", "BRW-1.10", "BRW-1.12", "BRW-4.11"]
+    },
+    {
+      "id": "transportBoundary", "file": "tests/top/test_foundation_recovery.mjs", "tier": "top", "status": "retained",
+      "reason": "A same-UID socket can dispatch wrong-nonce, wrong-Build or management traffic through an agent connection; malformed frames or cancelled late responses can escape or disconnect unrelated clients.",
+      "oracle": "Actual AF_UNIX native peer UID/PID/start identity, zero unauthorized dispatches, independent surviving peer, suppressed late cancellation commit and bounded silent-peer loss with healthy ping/pong control.",
+      "origins": ["BRW-0.5", "BRW-0.9", "BRW-0.14", "BRW-1.13", "BRW-3.11"]
+    }
+  ],
+  "mid": [], "low": [],
+  "unavailable": [
+    { "id": "native-host-start", "reason": "Production ProcessIntegration, signed EngineAuthority, native readiness and HostNativeLifetime guard custody/watchdog providers absent; two successful CLI starters and LaunchServices host readiness unqualified." },
+    { "id": "complete-close", "reason": "No production complete original-main/helper confinement, force, exit and flush authority. No closed:true or clean engine marker pass." },
+    { "id": "engine-reader-session", "reason": "No qualified signed Build compatibility authority; reader allow-list, dirty upgrade/recovery, actual pre-ready Electron session persistence/isolation and durability crash points unqualified." },
+    { "id": "native-pages-driver-release", "reason": "No production input addon/watchdog/control/tools or signed distribution manifest. Native/page/Driver/account/model/install/update journeys unavailable; broader mid-tier execution not authorized." },
+    { "id": "destructive-tty-platform", "reason": "Negative default and absent controlling-TTY protection only; positive confirmed deletion/replacement, cross-UID peers, complete filesystem attack/race and capacity matrix unqualified." }
+  ]
+}
