@@ -68,7 +68,7 @@ export async function startupStarter(context, { branch, mode, profile, selection
   const { unavailable } = await load(context, 'contracts/errors');
   let deadline, reads = 0, checks = 0, transferring = false, expired = false, releaseFault = false;
   let simulatedLaunches = 0, failedAttemptRefusals = 0;
-  const resources = [], leases = [], predicates = [];
+  const resources = [], leases = [], arbitrations = [], predicates = [];
   const state = {
     now: () => expired ? deadline + 1 : clock.now(),
     assertTime(limit) {
@@ -84,13 +84,17 @@ export async function startupStarter(context, { branch, mode, profile, selection
       }
       return observed;
     },
+    async startupArbitration(...args) {
+      const held = await clock.startupArbitration(...args);
+      arbitrations.push(held); return held;
+    },
     async connectRuntime(...args) {
       const client = await transport.connectRuntime(...args);
       resources.push(client); return client;
     },
   };
   const scoped = await qualifiedModule(context, 'runtime/start', state, {
-    'runtime/instance': [['now', 'now'], ['assertTime', 'assertTime'], ['readRuntime', 'readRuntime']],
+    'runtime/instance': [['now', 'now'], ['assertTime', 'assertTime'], ['readRuntime', 'readRuntime'], ['startupArbitration', 'startupArbitration']],
     'runtime/transport': [['connectRuntime', 'connectRuntime']],
   });
   // These predicates deliberately simulate only the upstream hand-over. They
@@ -127,7 +131,7 @@ export async function startupStarter(context, { branch, mode, profile, selection
       await publish(); return process.pid;
     } },
   });
-  return { resources, leases, predicates,
+  return { resources, leases, arbitrations, predicates,
     get clockChecks() { return checks; },
     get simulatedLaunches() { return simulatedLaunches; },
     get failedAttemptRefusals() { return failedAttemptRefusals; },
@@ -140,6 +144,7 @@ export async function startupStarter(context, { branch, mode, profile, selection
       for (const client of resources) client.close();
       // Call only after fixture transport shutdown. This is test-owned resource
       // teardown, never StartAuthority.resolve or a production exit assertion.
+      for (const held of arbitrations) held.release();
       for (const lease of leases) lease.release();
       scoped.forget();
     },

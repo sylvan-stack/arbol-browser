@@ -294,7 +294,7 @@ async function starterTransferObservations(context) {
       assert.equal((await cli(f, ['profiles', 'create', id])).status, 0);
       const profile = await readProfile(profilePaths(id, f.state));
       const hostBuild = await acquireBuildLease(selection, platform);
-      let instance, server, seam, disconnects = 0, executions = 0, disconnected;
+      let instance, server, seam, arbitrationPath, disconnects = 0, executions = 0, disconnected;
       const lost = new Promise(resolve => { disconnected = resolve; });
       async function publish() {
         assert.equal(instance, undefined, 'Synthetic launch unexpectedly repeated');
@@ -335,12 +335,17 @@ async function starterTransferObservations(context) {
         assert.deepEqual(await snapshot(profile.paths.root), before);
         const retained = branch === 'launched' && ['readiness', 'final', 'guard-release'].includes(mode);
         assert.equal(seam.retainedAttempts, retained ? 1 : 0);
+        const startupRetained = branch === 'launched' && ['readiness', 'final'].includes(mode);
+        if (branch !== 'existing') {
+          arbitrationPath = join(instance.location.leaf, 'startup.lock');
+          await probe(arbitrationPath, !startupRetained);
+        }
         observations.push({ branch, mode, actualPeerDisconnects: disconnects, executions,
           retainedClientReferences: seam.resources.length, postReadinessChecks: seam.clockChecks,
           hostOwnerAndBuildProtective: true, simulatedUpstreamPredicates: [...seam.predicates],
           noEngineLaunch: true, syntheticLaunches: seam.simulatedLaunches,
           failedAttemptAuthorityRefusals: seam.failedAttemptRefusals,
-          retainedAttemptGuardsAtObservation: seam.retainedAttempts,
+          retainedAttemptGuardsAtObservation: seam.retainedAttempts, startupLockRetainedAtObservation: startupRetained,
           genuineNativeReadinessAndExit: 'unqualified; fixture predicates and teardown are not production evidence' });
       } finally {
         // No fixture asserts production exit to release a retained attempt.
@@ -350,6 +355,7 @@ async function starterTransferObservations(context) {
         await seam?.cleanup();
       }
       await probe(profile.paths.owner, true); await probe(guard, true);
+      if (arbitrationPath) await probe(arbitrationPath, true);
     }
   }
   return observations;
