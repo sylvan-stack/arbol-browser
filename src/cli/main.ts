@@ -8,6 +8,7 @@ import { publicFailure, type ExitCode } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
 import type { Contract } from '../contracts/generated.js';
 import type { CommandPorts, ProfilePort, Stdio, PackageMetadata } from '../runtime/ports.js';
+import { consumeSelection } from '../runtime/selection.js';
 import { foundationPorts } from '../runtime/bootstrap.js';
 
 // Lazy management service: info performs no profile/native load or filesystem read.
@@ -32,6 +33,10 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
   const mcp = args[0] === 'mcp';
   try {
     const command = parse(args);
+    if (ports === defaultPorts && command.kind !== 'info') {
+      const metadata = await componentInfo();
+      consumeSelection(metadata.build, resolve(fileURLToPath(new URL('../../', import.meta.url))));
+    }
     if (command.kind === 'mcp') { await ports.process.mcp(command.profile, io); return 0; }
     let result: unknown;
     let check: (value: unknown) => boolean;
