@@ -31,6 +31,7 @@ export interface EngineTransaction {
   /** Does not release ownership; keep owner/build protection until this settles. */
   completeExit(evidence: EngineExitEvidence): Promise<void>;
 }
+const preparedOwners = new WeakSet<OwnerLease>();
 interface StoredMarker { readonly marker: Readonly<EngineMarker>; readonly identity: Identity }
 async function storedMarker(profile: ProfileSnapshot): Promise<StoredMarker | undefined> {
   if (!await statOrAbsent(profile.paths.engine)) return undefined;
@@ -68,6 +69,10 @@ async function replaceMarker(owner: OwnerLease, expected: StoredMarker | undefin
  * No major-version, management-format or lexical-version inference is used. */
 export async function prepareEngine(owner: OwnerLease, authority: EngineAuthority): Promise<EngineTransaction> {
   try {
+    // Consume before the first await. Failed preparation also requires a fresh
+    // ownership transaction; no same-lease retry may race a prior continuation.
+    if (preparedOwners.has(owner)) throw profileUnavailable();
+    preparedOwners.add(owner);
     await owner.assert();
     const profile = owner.profile;
     const previous = await storedMarker(profile);
