@@ -34,8 +34,49 @@ NSDictionary* bindingObject(ArbolPagePolicy* policy) {
   return @{ @"id": @(policy.identifier), @"nonce": policy.nonce, @"webContentsId": @(policy.webContentsId),
     @"revision": @(policy.revision), @"blocked": @(policy.blocked), @"retired": @(policy.retired) };
 }
+// All registry and Objective-C access stays on the main thread. Off-main
+// callbacks examine only the atomic phase before refusing.
+bool policyLive(ArbolPagePolicy* policy) {
+  if (![NSThread isMainThread] || !policy || policy.retired) return false;
+  NSView* view = policy.view; NSWindow* window = policy.window;
+  if (!view || !window || view.window != window || viewPolicy(view) != policy) return false;
+  NSView* ancestor = view;
+  for (unsigned depth = 0; ancestor && depth < 128; ++depth, ancestor = ancestor.superview)
+    if (ancestor == window.contentView) return true;
+  return false;
+}
+void advanceRevision(ArbolPagePolicy* policy) {
+  if (policy.revision == UINT32_MAX) { poison("native_revision_exhausted"); throw std::runtime_error("native_restart_required"); }
+  ++policy.revision;
+}
+static void sealBindings() {
+  if (![NSThread isMainThread]) return; // Atomic non-ready phase already denies all callbacks.
+  creating = false; creationBefore = nil; creationRoot = nil; creationWindow = nil; creationContents = 0;
+  for (ArbolPagePolicy* policy in policies) { policy.blocked = YES; policy.retired = YES; policy.view = nil; policy.window = nil; }
+  liveBindings = 0;
+}
+static bool auditBindings() {
+  if (![NSThread isMainThread]) return false;
+  @try {
+    if (policies.count != policyObjects || policies.count != nextIdentifier || policies.count > 1000000) return false;
+    size_t live = 0;
+    for (NSUInteger index = 0; index < policies.count; ++index) {
+      ArbolPagePolicy* policy = policies[index];
+      if (policy.identifier != index || !policy.webContentsId || !policy.nonce || ![[[NSUUID alloc] initWithUUIDString:policy.nonce].UUIDString.lowercaseString isEqualToString:policy.nonce]) return false;
+      if (policy.retired) { if (!policy.blocked || policy.view || policy.window) return false; }
+      else { if (!policyLive(policy)) return false; ++live; }
+    }
+    return live == liveBindings;
+  } @catch (NSException*) { return false; }
+}
+void initializeBindings() {
+  if (![NSThread isMainThread] || phase.load() != Phase::Planning || bindingAudit || bindingSeal || policies.count) throw std::runtime_error("native_binding_initialization");
+  bindingAudit = auditBindings; bindingSeal = sealBindings;
+}
 static napi_value bindingFailure(napi_env env) {
-  poison("native_binding_failed"); napi_throw_error(env, nullptr, "native_binding_failed"); return nullptr;
+  if ([NSThread isMainThread]) poison("native_binding_failed");
+  else phase.store(Phase::Poisoned, std::memory_order_release);
+  napi_throw_error(env, nullptr, "native_binding_failed"); return nullptr;
 }
 static uint32_t contentsArgument(napi_env env, napi_value value) {
   double number;
