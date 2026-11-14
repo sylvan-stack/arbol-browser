@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import { createConnection } from 'node:net';
 import { createHash, randomBytes } from 'node:crypto';
 import { chmod, lstat, mkdir, readFile, readdir, readlink, realpath, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -71,6 +72,29 @@ export async function dataSentinel(path, text = 'fictional qualification data\n'
 export function refused(result, status, code) {
   assert.equal(result.status, status, result.stderr);
   assert.equal(result.value?.error?.code, code);
+}
+export async function bounded(promise, milliseconds = 2000) {
+  let timer;
+  try { return await Promise.race([promise, new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`Observation exceeded ${milliseconds} ms`)), milliseconds);
+  })]); } finally { clearTimeout(timer); }
+}
+export async function rawConnection(path) {
+  const socket = createConnection(path), frames = [], readers = [];
+  let pending = '';
+  const closed = new Promise(resolve => socket.once('close', resolve));
+  socket.on('error', () => {});
+  socket.on('data', bytes => {
+    pending += bytes;
+    let newline;
+    while ((newline = pending.indexOf('\n')) >= 0) {
+      const value = JSON.parse(pending.slice(0, newline)); pending = pending.slice(newline + 1);
+      if (readers.length) readers.shift()(value); else frames.push(value);
+    }
+  });
+  await bounded(new Promise((resolve, reject) => { socket.once('connect', resolve); socket.once('error', reject); }));
+  return { socket, closed, send(value) { socket.write(`${JSON.stringify(value)}\n`); },
+    next() { return bounded(frames.length ? Promise.resolve(frames.shift()) : new Promise(resolve => readers.push(resolve))); } };
 }
 
 export async function worker(context, task, input) {
