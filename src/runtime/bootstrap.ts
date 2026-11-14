@@ -32,6 +32,7 @@ export interface NativeBoundaryPreparation {
   arm(owner: HeldLock, build: HeldLock): Promise<NativeWatchdog>;
 }
 const preparations = new WeakSet<object>();
+const handovers = new WeakMap<NativeWatchdog, { prepared: NativeBoundaryPreparation; owner: HeldLock; build: HeldLock }>();
 let boundaryAttempted = false;
 /** Initial independent publisher verification precedes process-addon loading.
  * ABR-29 acquires real owner/Build handles using this exact platform instance. */
@@ -45,10 +46,107 @@ export function prepareNativeBoundary(bundle: string): NativeBoundaryPreparation
       if (armAttempted) throw unavailable('browser'); armAttempted = true;
       assertCandidateTrust(trust);
       const custody = platform.prepareWatchdogCustody(owner, build, trust.bundle, trust.snapshotDigest);
-      return startNativeWatchdog(trust, custody);
+      const watchdog = await startNativeWatchdog(trust, custody);
+      handovers.set(watchdog, { prepared, owner, build }); return watchdog;
     } });
   preparations.add(prepared); return prepared;
 }
 export function assertNativeBoundaryPreparation(value: NativeBoundaryPreparation): void {
   if (!preparations.has(value)) throw unavailable('browser');
+}
+
+import { assertNativeWatchdog } from '../native/watchdog.js';
+import { createProfileFatal, type ProfileFatal, type FatalEffects } from '../native/fatal.js';
+import { retireNativeTarget } from '../native/retirement.js';
+import type { NativeCompatibility } from '../native/preflight.js';
+import type { Binding, BindingKey } from '../native/api.js';
+import type { View, WebContentsView } from 'electron';
+import type { HostPreparation } from './host-entry.js';
+import type { HostNativeLifetime } from './lifecycle.js';
+import type { BuildSelection } from './selection.js';
+import { lstat, realpath } from 'node:fs/promises';
+import { performance } from 'node:perf_hooks';
+export interface NativeFailureBoundary {
+  readonly native: NativeCompatibility;
+  readonly fatal: ProfileFatal;
+  readonly watchdog: NativeWatchdog;
+  readonly pageAdmission: false;
+  retire(key: BindingKey, parent: View, view: WebContentsView): Promise<Binding>;
+}
+const installedBoundaries = new WeakSet<object>();
+/** The same concrete armed child covers feature setup and the one addon install.
+ * Variable module URLs keep Electron-only imports out of the Node CLI bundle. */
+export async function installNativeBoundary(prepared: NativeBoundaryPreparation, watchdog: NativeWatchdog,
+  effects: FatalEffects): Promise<NativeFailureBoundary> {
+  assertNativeWatchdog(watchdog);
+  let fatal: ProfileFatal | undefined;
+  try {
+    assertNativeBoundaryPreparation(prepared);
+    if (handovers.get(watchdog)?.prepared !== prepared) return watchdog.terminate();
+    watchdog.assertArmed(prepared.trust);
+    fatal = createProfileFatal(watchdog, effects);
+    const featuresUrl = new URL('../native/features.js', import.meta.url).href;
+    const features = await import(featuresUrl) as typeof import('../native/features.js');
+    fatal.assertHealthy(); features.configureNativeFeatures();
+    const preflightUrl = new URL('../native/preflight.js', import.meta.url).href;
+    const preflight = await import(preflightUrl) as typeof import('../native/preflight.js');
+    fatal.assertHealthy(); watchdog.assertArmed(prepared.trust);
+    const guard = fatal;
+    const native = preflight.preflightNative(prepared.trust.bundle, reason => guard.fail(reason), watchdog);
+    guard.attach(native);
+    const boundary: NativeFailureBoundary = Object.freeze({ native, fatal: guard, watchdog, pageAdmission: false as const,
+      retire: (key: BindingKey, parent: View, view: WebContentsView) => {
+        guard.assertHealthy(); return retireNativeTarget(native, key, parent, view, reason => guard.fail(reason));
+      } });
+    installedBoundaries.add(boundary); return boundary;
+  } catch { if (fatal) return fatal.fail('native_integrity_unavailable'); return watchdog.terminate(); }
+}
+async function assertHeldPath(path: string, held: HeldLock): Promise<void> {
+  const expected = held.assertIdentity(), actual = await lstat(path, { bigint: true });
+  if (await realpath(path) !== path || !actual.isFile() || actual.nlink !== 1n || (actual.mode & 0o7777n) !== 0o600n ||
+      String(actual.dev) !== expected.device || String(actual.ino) !== expected.inode || actual.uid !== BigInt(expected.uid)) throw unavailable('browser');
+  held.assertIdentity();
+}
+/** Native lifetime contribution, not EngineAuthority or complete host admission.
+ * ABR-29 supplies its actual preparation/selection and real app-exit request. */
+export function createNativeLifetime(boundary: NativeFailureBoundary, host: HostPreparation, selection: BuildSelection,
+  requestApplicationExit: () => void): HostNativeLifetime {
+  if (!installedBoundaries.has(boundary) || typeof requestApplicationExit !== 'function') throw unavailable('browser');
+  const ownership = handovers.get(boundary.watchdog);
+  if (!ownership) return boundary.fatal.fail('native_integrity_unavailable');
+  let attached = false, exiting = false;
+  const assertCustody = async () => {
+    boundary.fatal.assertHealthy(); boundary.watchdog.assertArmed(boundary.native.trust);
+    if (!selection.guard || host.instance.record.build !== selection.build) throw unavailable('browser');
+    await host.instance.owner.assert(); await host.buildGuard.assert();
+    await assertHeldPath(host.instance.owner.profile.paths.owner, ownership.owner);
+    await assertHeldPath(selection.guard, ownership.build);
+    boundary.fatal.assertHealthy(); boundary.watchdog.assertArmed(boundary.native.trust);
+  };
+  return Object.freeze({
+    async armRetainedLifetime(current: HostPreparation): Promise<void> {
+      try {
+        if (attached || current !== host) return boundary.fatal.fail('native_integrity_unavailable');
+        await assertCustody(); attached = true;
+      } catch { return boundary.fatal.fail('native_integrity_unavailable'); }
+    },
+    async assertReady(): Promise<void> {
+      try { if (!attached || exiting) return boundary.fatal.fail('native_integrity_unavailable'); await assertCustody(); boundary.native.assertIntegrity(); }
+      catch { return boundary.fatal.fail('native_integrity_unavailable'); }
+    },
+    quarantine(): never { return boundary.fatal.fail('native_boundary_unavailable'); },
+    async exit(deadline: number): Promise<never> {
+      try {
+        if (!attached || exiting || !Number.isFinite(deadline) || performance.now() >= deadline) return boundary.fatal.fail('native_boundary_unavailable');
+        exiting = true; await assertCustody(); boundary.native.seal();
+        // Healthy H/A continues through ordinary shutdown. The timer escalates
+        // failure; no finally stops either monitor or releases original guards.
+        const timer = setTimeout(() => boundary.fatal.fail('native_boundary_unavailable'), Math.max(1, deadline - performance.now()));
+        timer.unref();
+        const returned: unknown = requestApplicationExit();
+        if (returned !== undefined) return boundary.fatal.fail('native_boundary_unavailable');
+        return await new Promise<never>(() => {}); // only actual process exit ends this wait
+      } catch { return boundary.fatal.fail('native_boundary_unavailable'); }
+    },
+  });
 }

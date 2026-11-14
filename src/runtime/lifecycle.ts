@@ -225,8 +225,8 @@ export interface HostControlPort {
   windowCount(): number;
 }
 export interface HostNativeLifetime {
-  /** Must establish real native guard custody through original main/helper exit.
-   * ABR-3 has no FD inheritance/lock handoff implementation or permissive default. */
+  /** Validate the already acknowledged native custody receipt against this exact
+   * preparation; ABR-7 provides the primitive, ABR-29 the actual handle assembly. */
   armRetainedLifetime(prepared: HostPreparation): Promise<void>;
   assertReady(): Promise<void>;
   /** Stop watchdog renewal synchronously before any possibly blocking cleanup. */
@@ -266,6 +266,8 @@ export function createHostLifecycle(prepared: HostPreparation, sessions: Profile
         await prepared.instance.owner.assert(); await prepared.buildGuard.assert();
         await transport.close();
         await native.exit(deadline);
+        // A returning exit port is not verified engine/helper disappearance.
+        throw unavailable('browser');
         // Never release owner/Build or call completeExit from a window/quit event.
       } catch (error) { fatal(); throw error; }
       finally { clearTimeout(timer); }
