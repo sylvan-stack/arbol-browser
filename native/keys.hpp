@@ -26,6 +26,21 @@ ArbolPagePolicy* ownerPolicy(id object);
 bool callbackAllowed(ArbolPagePolicy* policy);
 extern thread_local unsigned callbackDepth;
 struct CallbackScope { CallbackScope() { ++callbackDepth; } ~CallbackScope() { --callbackDepth; } };
+// One stack frame per admitted original native method. Only explicit pinned
+// child edges may use it; it carries no host key or independently reusable token.
+struct OriginalRoute {
+  __strong ArbolPagePolicy* policy;
+  __weak id object;
+  SEL selector;
+  unsigned depth;
+  OriginalRoute* previous;
+  OriginalRoute(ArbolPagePolicy* policy, id object, SEL selector);
+  ~OriginalRoute();
+  OriginalRoute(const OriginalRoute&) = delete;
+  OriginalRoute& operator=(const OriginalRoute&) = delete;
+};
+ArbolPagePolicy* routePolicy(id object, SEL selector);
+bool pointerFocusContinuation(NSWindow* window, NSView* candidate);
 IMP originalFor(id object, SEL selector);
 void stageRoute(const Target& target, IMP implementation);
 void primeAccessibility(ArbolPagePolicy* policy);

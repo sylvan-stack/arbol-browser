@@ -13,17 +13,17 @@ static NSMutableDictionary* interaction(ArbolPagePolicy* policy) {
   }
   return state;
 }
-template <typename Result, typename Function> static Result inputResult(id object, Result denied, Function operation) {
+template <typename Result, typename Function> static Result inputResult(id object, SEL selector, Result denied, Function operation) {
   if (![NSThread isMainThread]) return denied;
   @try { try {
-    ArbolPagePolicy* policy = ownerPolicy(object);
-    if (!callbackAllowed(policy)) return denied;
-    NSMutableDictionary* state = interaction(policy); CallbackScope scope; return operation(state);
+    ArbolPagePolicy* policy = routePolicy(object, selector);
+    if (!policy) return denied;
+    NSMutableDictionary* state = interaction(policy); OriginalRoute scope(policy, object, selector); return operation(state);
   } catch (const std::exception&) { poison("native_interaction_failed"); } } @catch (NSException*) { poison("native_interaction_failed"); }
   return denied;
 }
 static void mouseEvent(id self, SEL selector, NSEvent* event) {
-  inputResult(self, false, [&](NSMutableDictionary* state) {
+  inputResult(self, selector, false, [&](NSMutableDictionary* state) {
     if (![event isKindOfClass:[NSEvent class]]) { state[@"uncertain"] = @YES; return false; }
     uint32_t buttons = [state[@"buttons"] unsignedIntValue];
     switch (event.type) {
@@ -45,7 +45,7 @@ static void mouseEvent(id self, SEL selector, NSEvent* event) {
   });
 }
 static void wheelEvent(id self, SEL selector, NSEvent* event) {
-  inputResult(self, false, [&](NSMutableDictionary* state) {
+  inputResult(self, selector, false, [&](NSMutableDictionary* state) {
     if (![event isKindOfClass:[NSEvent class]] || event.type != NSEventTypeScrollWheel) { state[@"uncertain"] = @YES; return false; }
     constexpr NSUInteger active = NSEventPhaseMayBegin | NSEventPhaseBegan | NSEventPhaseChanged | NSEventPhaseStationary;
     constexpr NSUInteger ended = NSEventPhaseEnded | NSEventPhaseCancelled;
@@ -58,21 +58,21 @@ static void wheelEvent(id self, SEL selector, NSEvent* event) {
   });
 }
 static NSUInteger dragTarget(id self, SEL selector, id sender) {
-  return inputResult(self, NSUInteger{NSDragOperationNone}, [&](NSMutableDictionary* state) {
+  return inputResult(self, selector, NSUInteger{NSDragOperationNone}, [&](NSMutableDictionary* state) {
     if (![sender conformsToProtocol:@protocol(NSDraggingInfo)]) { state[@"uncertain"] = @YES; return NSUInteger{NSDragOperationNone}; }
     state[@"htmlTarget"] = @YES;
     return ((NSUInteger(*)(id, SEL, id))originalFor(self, selector))(self, selector, sender);
   });
 }
 static void dragExited(id self, SEL selector, id sender) {
-  inputResult(self, false, [&](NSMutableDictionary* state) {
+  inputResult(self, selector, false, [&](NSMutableDictionary* state) {
     if (![sender conformsToProtocol:@protocol(NSDraggingInfo)]) { state[@"uncertain"] = @YES; return false; }
     ((void(*)(id, SEL, id))originalFor(self, selector))(self, selector, sender);
     state[@"htmlTarget"] = @NO; return true;
   });
 }
 static BOOL dragDrop(id self, SEL selector, id sender) {
-  return inputResult(self, BOOL{NO}, [&](NSMutableDictionary* state) {
+  return inputResult(self, selector, BOOL{NO}, [&](NSMutableDictionary* state) {
     if (![sender conformsToProtocol:@protocol(NSDraggingInfo)] || ![state[@"htmlTarget"] boolValue]) { state[@"uncertain"] = @YES; return BOOL{NO}; }
     uint64_t drops = [state[@"drops"] unsignedLongLongValue];
     if (drops == maxSafeInteger) throw std::runtime_error("native_drop_count_exhausted");
@@ -96,7 +96,7 @@ static void dragSource(id self, SEL selector, id session, NSPoint point) {
   } catch (const std::exception&) { poison("native_interaction_failed"); } } @catch (NSException*) { poison("native_interaction_failed"); }
 }
 static void dragEnded(id self, SEL selector, id session, NSPoint point, NSUInteger operation) {
-  inputResult(self, false, [&](NSMutableDictionary* state) {
+  inputResult(self, selector, false, [&](NSMutableDictionary* state) {
     if (![state[@"htmlSource"] boolValue] || operation > maxSafeInteger) { state[@"uncertain"] = @YES; return false; }
     ((void(*)(id, SEL, id, NSPoint, NSUInteger))originalFor(self, selector))(self, selector, session, point, operation);
     state[@"htmlSource"] = @NO; state[@"buttons"] = @0; state[@"lastDragOperation"] = @(operation); return true;

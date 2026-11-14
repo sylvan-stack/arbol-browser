@@ -3,6 +3,7 @@
 namespace arbol_native {
 static __weak NSView* expectedResponder;
 static ArbolPagePolicy* expectedPolicy;
+static unsigned expectedDepth;
 static bool pageResponder(NSView* view) {
   for (unsigned depth = 0; view && depth < 128; ++depth, view = view.superview)
     if ([NSStringFromClass(view.class) isEqualToString:@"WebContentsViewCocoa"] || [NSStringFromClass(view.class) isEqualToString:@"RenderWidgetHostViewCocoa"]) return true;
@@ -13,15 +14,15 @@ static bool visibleUser(ArbolPagePolicy* policy) {
     ![policy.view isHiddenOrHasHiddenAncestor] && policy.window.isKeyWindow;
 }
 struct ResponderContinuation {
-  ResponderContinuation(NSView* view, ArbolPagePolicy* policy) { expectedResponder = view; expectedPolicy = policy; }
-  ~ResponderContinuation() { expectedResponder = nil; expectedPolicy = nil; }
+  ResponderContinuation(NSView* view, ArbolPagePolicy* policy) { expectedResponder = view; expectedPolicy = policy; expectedDepth = callbackDepth + 1; }
+  ~ResponderContinuation() { expectedResponder = nil; expectedPolicy = nil; expectedDepth = 0; }
 };
 static BOOL makeResponder(NSWindow* self, SEL selector, id candidate) {
   if (![NSThread isMainThread]) return NO;
   @try { try {
-    if (callbackDepth) return NO;
     if (candidate && ![candidate isKindOfClass:[NSView class]]) return NO;
     NSView* view = candidate;
+    if (callbackDepth && !pointerFocusContinuation(self, view)) return NO;
     if (view && view.window != self) return NO;
     ArbolPagePolicy* policy = view ? viewPolicy(view) : nil;
     if (view && (pageResponder(view) || policy)) {
@@ -46,7 +47,7 @@ static BOOL becomeResponder(NSView* self, SEL selector) {
   @try { try {
     ArbolPagePolicy* policy = viewPolicy(self);
     if (!visibleUser(policy)) return NO;
-    if (callbackDepth && !(callbackDepth == 1 && expectedResponder == self && expectedPolicy == policy)) return NO;
+    if (callbackDepth && !(callbackDepth == expectedDepth && expectedResponder == self && expectedPolicy == policy) && routePolicy(self, selector) != policy) return NO;
     CallbackScope scope;
     return ((BOOL(*)(id, SEL))originalFor(self, selector))(self, selector);
   } catch (const std::exception&) { poison("native_responder_failed"); } } @catch (NSException*) { poison("native_responder_failed"); }

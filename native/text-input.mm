@@ -2,17 +2,17 @@
 #include "edit-selectors.hpp"
 #include <cstring>
 namespace arbol_native {
-template <typename Function> static void textMutation(id object, Function operation) {
+template <typename Function> static void textMutation(id object, SEL selector, Function operation) {
   if (![NSThread isMainThread]) return;
-  @try { try { if (!callbackAllowed(ownerPolicy(object))) return; CallbackScope scope; operation(); }
+  @try { try { ArbolPagePolicy* policy = routePolicy(object, selector); if (!policy) return; OriginalRoute scope(policy, object, selector); operation(); }
     catch (const std::exception&) { poison("native_text_failed"); } }
   @catch (NSException*) { poison("native_text_failed"); }
 }
 static void editObject(id self, SEL selector, id argument) {
-  textMutation(self, [&] { ((void(*)(id, SEL, id))originalFor(self, selector))(self, selector, argument); });
+  textMutation(self, selector, [&] { ((void(*)(id, SEL, id))originalFor(self, selector))(self, selector, argument); });
 }
 static void textFinish(id self, SEL selector) {
-  textMutation(self, [&] { ((void(*)(id, SEL))originalFor(self, selector))(self, selector); });
+  textMutation(self, selector, [&] { ((void(*)(id, SEL))originalFor(self, selector))(self, selector); });
 }
 static bool knownCommand(SEL command) {
   for (const char* name : editingSelectors) if (command == sel_registerName(name)) return true;
@@ -20,13 +20,13 @@ static bool knownCommand(SEL command) {
   return false;
 }
 static void textCommand(id self, SEL selector, SEL command) {
-  textMutation(self, [&] { if (knownCommand(command)) ((void(*)(id, SEL, SEL))originalFor(self, selector))(self, selector, command); });
+  textMutation(self, selector, [&] { if (knownCommand(command)) ((void(*)(id, SEL, SEL))originalFor(self, selector))(self, selector, command); });
 }
 static void textInsert(id self, SEL selector, id text, NSRange replacement) {
-  textMutation(self, [&] { ((void(*)(id, SEL, id, NSRange))originalFor(self, selector))(self, selector, text, replacement); });
+  textMutation(self, selector, [&] { ((void(*)(id, SEL, id, NSRange))originalFor(self, selector))(self, selector, text, replacement); });
 }
 static void textMarked(id self, SEL selector, id text, NSRange selected, NSRange replacement) {
-  textMutation(self, [&] { ((void(*)(id, SEL, id, NSRange, NSRange))originalFor(self, selector))(self, selector, text, selected, replacement); });
+  textMutation(self, selector, [&] { ((void(*)(id, SEL, id, NSRange, NSRange))originalFor(self, selector))(self, selector, text, selected, replacement); });
 }
 void planTextInput() {
   size_t generated = 0;

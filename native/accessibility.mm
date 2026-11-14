@@ -9,8 +9,8 @@ IMP originalFor(id object, SEL selector) {
 void stageRoute(const Target& target, IMP implementation) {
   stageGuard(objc_getClass(target.cls), sel_registerName(target.selector), implementation, target.encoding);
 }
-ArbolPagePolicy* ownerPolicy(id object) {
-  if (![NSThread isMainThread] || phase.load(std::memory_order_acquire) != Phase::Ready || callbackDepth || creating) return nil;
+static ArbolPagePolicy* resolveOwner(id object) {
+  if (![NSThread isMainThread] || phase.load(std::memory_order_acquire) != Phase::Ready || creating) return nil;
   CallbackScope scope; std::set<void*> seen;
   for (unsigned depth = 0; object && depth < 128; ++depth) {
     if (!seen.insert((__bridge void*)object).second) return nil;
@@ -25,6 +25,37 @@ ArbolPagePolicy* ownerPolicy(id object) {
 bool callbackAllowed(ArbolPagePolicy* policy) {
   return [NSThread isMainThread] && phase.load(std::memory_order_acquire) == Phase::Ready && !callbackDepth && !creating &&
     policyLive(policy) && !policy.blocked && ![policy.view isHiddenOrHasHiddenAncestor];
+}
+ArbolPagePolicy* ownerPolicy(id object) {
+  return callbackDepth ? nil : resolveOwner(object);
+}
+static thread_local OriginalRoute* currentRoute = nullptr;
+OriginalRoute::OriginalRoute(ArbolPagePolicy* owner, id receiver, SEL method)
+  : policy(owner), object(receiver), selector(method), depth(++callbackDepth), previous(currentRoute) { currentRoute = this; }
+OriginalRoute::~OriginalRoute() { currentRoute = previous; --callbackDepth; }
+static bool continuationPolicy(ArbolPagePolicy* policy) {
+  return [NSThread isMainThread] && phase.load() == Phase::Ready && !creating && policyLive(policy) && !policy.blocked && ![policy.view isHiddenOrHasHiddenAncestor];
+}
+static bool childEdge(SEL parent, SEL child) {
+  return (parent == @selector(insertText:) && child == @selector(insertText:replacementRange:)) ||
+    (parent == @selector(insertText:replacementRange:) && child == @selector(becomeFirstResponder)) ||
+    (parent == @selector(mouseEvent:) && child == @selector(finishComposingText)) ||
+    (parent == @selector(accessibilityPerformAction:) && child == @selector(accessibilityPerformPress)) ||
+    (parent == @selector(accessibilitySetValue:forAttribute:) &&
+      (child == @selector(setAccessibilityFocused:) || child == @selector(setAccessibilitySelectedTextRange:)));
+}
+ArbolPagePolicy* routePolicy(id object, SEL selector) {
+  if (![NSThread isMainThread]) return nil;
+  if (!callbackDepth) { ArbolPagePolicy* policy = ownerPolicy(object); return callbackAllowed(policy) ? policy : nil; }
+  OriginalRoute* parent = currentRoute;
+  if (!parent || callbackDepth != parent->depth || callbackDepth > 4 || parent->object != object || !childEdge(parent->selector, selector)) return nil;
+  ArbolPagePolicy* policy = parent->policy;
+  return continuationPolicy(policy) && resolveOwner(object) == policy ? policy : nil;
+}
+bool pointerFocusContinuation(NSWindow* window, NSView* candidate) {
+  if (![NSThread isMainThread] || !callbackDepth || !currentRoute || callbackDepth != currentRoute->depth || callbackDepth > 4 ||
+      currentRoute->selector != @selector(mouseEvent:) || currentRoute->object != candidate || candidate.window != window) return false;
+  return continuationPolicy(currentRoute->policy) && viewPolicy(candidate) == currentRoute->policy;
 }
 static id widgetRoots(NSView* widget) {
   ArbolPagePolicy* policy = viewPolicy(widget);
@@ -49,23 +80,23 @@ void primeAccessibility(ArbolPagePolicy* policy) {
   if (!policyLive(policy)) throw std::runtime_error("native_accessibility_binding_missing");
   size_t count = 0; primeView(policy.view, 0, count);
 }
-template <typename Function> static void mutate(id object, Function operation) {
+template <typename Function> static void mutate(id object, SEL selector, Function operation) {
   if (![NSThread isMainThread]) return;
-  @try { try { if (!callbackAllowed(ownerPolicy(object))) return; CallbackScope scope; operation(); }
+  @try { try { ArbolPagePolicy* policy = routePolicy(object, selector); if (!policy) return; OriginalRoute scope(policy, object, selector); operation(); }
     catch (const std::exception&) { poison("native_accessibility_failed"); } }
   @catch (NSException*) { poison("native_accessibility_failed"); }
 }
 static BOOL axActivate(id self, SEL selector) {
   if (![NSThread isMainThread]) return NO;
-  @try { try { if (!callbackAllowed(ownerPolicy(self))) return NO; CallbackScope scope;
+  @try { try { ArbolPagePolicy* policy = routePolicy(self, selector); if (!policy) return NO; OriginalRoute scope(policy, self, selector);
     return ((BOOL(*)(id, SEL))originalFor(self, selector))(self, selector);
   } catch (const std::exception&) { poison("native_accessibility_failed"); } } @catch (NSException*) { poison("native_accessibility_failed"); }
   return NO;
 }
-static void axObject(id self, SEL selector, id value) { mutate(self, [&] { ((void(*)(id, SEL, id))originalFor(self, selector))(self, selector, value); }); }
-static void axObjects(id self, SEL selector, id value, id attribute) { mutate(self, [&] { ((void(*)(id, SEL, id, id))originalFor(self, selector))(self, selector, value, attribute); }); }
-static void axBoolean(id self, SEL selector, BOOL value) { mutate(self, [&] { ((void(*)(id, SEL, BOOL))originalFor(self, selector))(self, selector, value); }); }
-static void axRange(id self, SEL selector, NSRange value) { mutate(self, [&] { ((void(*)(id, SEL, NSRange))originalFor(self, selector))(self, selector, value); }); }
+static void axObject(id self, SEL selector, id value) { mutate(self, selector, [&] { ((void(*)(id, SEL, id))originalFor(self, selector))(self, selector, value); }); }
+static void axObjects(id self, SEL selector, id value, id attribute) { mutate(self, selector, [&] { ((void(*)(id, SEL, id, id))originalFor(self, selector))(self, selector, value, attribute); }); }
+static void axBoolean(id self, SEL selector, BOOL value) { mutate(self, selector, [&] { ((void(*)(id, SEL, BOOL))originalFor(self, selector))(self, selector, value); }); }
+static void axRange(id self, SEL selector, NSRange value) { mutate(self, selector, [&] { ((void(*)(id, SEL, NSRange))originalFor(self, selector))(self, selector, value); }); }
 static id axChildren(id self, SEL) {
   if (![NSThread isMainThread]) return @[];
   @try { try { return widgetRoots(self); } catch (const std::exception&) { poison("native_accessibility_failed"); } } @catch (NSException*) { poison("native_accessibility_failed"); }
