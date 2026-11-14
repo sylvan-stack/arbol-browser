@@ -24,10 +24,16 @@ export async function receiptRace(context) {
   assert.equal(published.creationRequest, request);
   assert.deepEqual(results.map(result => result.value.profile.instance), [published.instance, published.instance]);
   assert.deepEqual((await readdir(join(f.state, 'profiles'))).filter(name => !name.startsWith('.')), ['alternate']);
-  await dataSentinel(join(profile, 'data/retained'));
+  const privateContent = 'fictional browsing cookie=abr28_private_content_do_not_disclose';
+  await dataSentinel(join(profile, 'data/retained'), privateContent);
   const before = await snapshot(profile);
   const replay = await cli(f, args);
   assert.equal(replay.status, 0); assert.equal(replay.value.created, false);
+  const listed = await cli(f, ['profiles', 'list']); assert.equal(listed.status, 0);
+  for (const result of [replay, listed]) {
+    assert.ok(!result.stdout.includes(privateContent), 'Profile metadata disclosed browsing payload');
+    assert.ok(!result.stdout.includes('abr28_private_content_do_not_disclose'));
+  }
   refused(await cli(f, ['profiles', 'create', 'alternate', '--creation-request', opaque('create')]), 4, 'profile_unavailable');
   assert.deepEqual(await snapshot(profile), before, 'Receipt retry/conflict replaced identity or payload');
   // A partially populated destination is not a receipt, even with an exact token.
