@@ -71,31 +71,44 @@ async function verifiedGone(profile: ProfileSnapshot, original: RuntimeRecord, p
   // Observe group even after main death, then require independent containment
   // authority covering all helpers. PID reuse is never a target for signalling.
   const group = platform.groupCensus(original.pid);
-  await exits.assertCensus(profile, original, group);
+  await within(deadline, () => exits.assertCensus(profile, original, group));
   if (originalAlive(original, platform) || group.length) return false;
-  await exits.assertExited(profile, original);
-  await assertProfile(profile);
+  await within(deadline, () => exits.assertExited(profile, original));
+  await within(deadline, () => assertProfile(profile));
   if (now() >= deadline) throw profileUnavailable();
   return !originalAlive(original, platform) && platform.groupCensus(original.pid).length === 0;
 }
 export async function closeProfile(profile: ProfileSnapshot, selection: BuildSelection, platform: PlatformPort,
-  exits: ExitAuthority | undefined): Promise<Contract<'wire.CloseResult'>> {
-  const deadline = now() + 8000, graceful = deadline - 3000;
-  const location = await runtimeLocation(profile), original = location ? await readRuntime(location) : undefined;
+  exits: ExitAuthority | undefined, deadline = now() + 8000): Promise<Contract<'wire.CloseResult'>> {
+  const graceful = deadline - 3000;
+  const location = await within(deadline, () => runtimeLocation(profile));
+  const original = location ? await within(deadline, () => readRuntime(location)) : undefined;
   if (!original) {
-    const owner = await ownerLock(profile, platform, false, deadline);
+    const owner = await within(deadline, () => ownerLock(profile, platform, false, deadline));
     if (!owner) throw profileUnavailable();
     try {
-      await createProfileRuntime(platform, selection, exits ?? neverOpenedExit).assertClosed(profile);
-      await owner.assert(); return { profile: profile.record.id, closed: false, dataRemoved: false };
+      await within(deadline, () => createProfileRuntime(platform, selection, exits ?? neverOpenedExit).assertClosed(profile));
+      await within(deadline, () => owner.assert()); return { profile: profile.record.id, closed: false, dataRemoved: false };
     } finally { owner.release(); }
   }
   if (originalAlive(original, platform) && selection.explicit && original.build !== selection.build) throw profileUnavailable();
   if (!exits) throw unavailable('browser');
+  if (!originalAlive(original, platform)) {
+    const owner = await within(deadline, () => ownerLock(profile, platform, false, deadline));
+    if (!owner) throw profileUnavailable();
+    try {
+      if (await verifiedGone(profile, original, platform, exits, deadline)) {
+        await within(deadline, () => owner.assert());
+        if (!location || JSON.stringify(await within(deadline, () => readRuntime(location))) !== JSON.stringify(original))
+          throw profileUnavailable();
+        return { profile: profile.record.id, closed: false, dataRemoved: false };
+      }
+    } finally { owner.release(); }
+  }
   let client: RuntimeClient | undefined;
   try {
     if (originalAlive(original, platform) && original.phase === 'ready' && location) {
-      client = await connectRuntime(location, original, 'management', selection, platform, graceful, 'Explicit close');
+      client = await within(graceful, () => connectRuntime(location, original, 'management', selection, platform, graceful, 'Explicit close'));
       // This result acknowledges shutdown only. Never forward it as CLI success.
       await client.call({ wire: 1, id: token('req'), method: 'close', params: {} }, graceful);
     }
@@ -105,7 +118,7 @@ export async function closeProfile(profile: ProfileSnapshot, selection: BuildSel
     if (await verifiedGone(profile, original, platform, exits, deadline)) return { profile: profile.record.id, closed: true, dataRemoved: false };
     await setTimeout(Math.min(25, Math.max(1, graceful - now())));
   }
-  if (!await verifiedGone(profile, original, platform, exits, deadline)) await exits.force(profile, original, deadline);
+  if (!await verifiedGone(profile, original, platform, exits, deadline)) await within(deadline, () => exits.force(profile, original, deadline));
   while (now() < deadline) {
     if (await verifiedGone(profile, original, platform, exits, deadline)) return { profile: profile.record.id, closed: true, dataRemoved: false };
     await setTimeout(Math.min(25, Math.max(1, deadline - now())));
@@ -144,15 +157,16 @@ export function createProcessService(options: { selection: BuildSelection; platf
       } finally { attached.client.close(); }
     },
     async close(id) {
+      const deadline = now() + 8000;
       const platform = options.platform();
       let profile: ProfileSnapshot;
-      try { profile = await selectProfile(id, platform, { state }); }
+      try { profile = await within(deadline, () => selectProfile(id, platform, { state })); }
       catch (error) {
         if (id === 'default' && error instanceof BrowserFailure && error.detail.code === 'profile_not_found')
           return { profile: id, closed: false, dataRemoved: false };
         throw error;
       }
-      return closeProfile(profile, options.selection, platform, options.exits);
+      return closeProfile(profile, options.selection, platform, options.exits, deadline);
     },
     async mcp(id, io) {
       const integration = options.integration;
