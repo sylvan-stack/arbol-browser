@@ -5,15 +5,16 @@ import { lstat, readFile, readdir, writeFile, realpath } from 'node:fs/promises'
 import { resolve, join, relative, sep } from 'node:path';
 import { createHash } from 'node:crypto';
 import { root, inventoryDigest } from './package-base.mjs';
-import { policy, writeCompatibility } from './native-candidate.mjs';
+import { policy, writeCompatibility, assertStagedSource } from './native-candidate.mjs';
 const identity = 'F1B6782A3BACC18E73FE08CA424C0A81450A982C';
 const args = process.argv.slice(2);
 if (args.length !== 2 || args[0] !== '--candidate') throw new Error('Usage: sign-candidate.mjs --candidate <new-isolated.app>');
 const bundle = resolve(args[1]);
 if (!bundle.endsWith('.app') || bundle.startsWith(root + sep) || bundle.startsWith('/Users/msix/Artifacts/') ||
     await realpath(bundle) !== bundle) throw new Error('Signing requires the isolated real candidate');
+const staged = await assertStagedSource(bundle, true);
 const original = JSON.parse(await readFile(join(bundle, 'Contents/Resources/native-compatibility.json'), 'utf8'));
-if (!original.qualification.startsWith('unqualified:ABR-5-static-only;source=') || original.publisherTeam !== policy.team || original.bundleIdentifier !== policy.bundleIdentifier)
+if (original.qualification !== `unqualified:ABR-5-static-only;source=${staged.sourceDigest}` || original.publisherTeam !== policy.team || original.bundleIdentifier !== policy.bundleIdentifier)
   throw new Error('Not an unqualified native candidate');
 if (await lstat(join(bundle, 'Contents/_CodeSignature')).catch(error => { if (error.code !== 'ENOENT') throw error; })) throw new Error('Outer candidate already signed; retain it and stage a fresh attempt');
 await writeFile(bundle + '.signing-attempt.json', JSON.stringify({ candidate: bundle, qualification: 'unexecuted' }) + '\n', { flag: 'wx', mode: 0o600 });
@@ -65,6 +66,7 @@ for (const path of [...leaves, ...bundles, join(bundle, 'Contents/MacOS/arbol-br
   if (jitAllowed(path) && entitlements['com.apple.security.cs.allow-jit'] !== true) throw new Error('Electron JIT entitlement absent');
   audit.push({ path: relative(bundle, path) || '.', team: policy.team, hardenedRuntime: true, timestamped: true, entitlements });
 }
+await assertStagedSource(bundle);
 const manifestRaw = await readFile(join(bundle, 'Contents/Resources/native-compatibility.json'));
 await writeFile(bundle + '.signature-audit.json', JSON.stringify({ candidate: bundle, publisher: policy,
   objects: audit, files: Object.keys(manifest.files).length, payloadDigest: inventoryDigest(manifest.files),
