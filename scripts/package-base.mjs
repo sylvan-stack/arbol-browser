@@ -73,7 +73,7 @@ async function stage(args) {
     if (!path.startsWith('node_modules/') || path.includes('..')) throw new Error('Unsafe dependency path');
     await cp(join(root, path), join(out, path), copy);
   }
-  await writeFile(join(out, 'package.json'), JSON.stringify({ name: pkg.name, version: pkg.version, type: 'module', private: true }) + '\n');
+  await writeFile(join(out, 'package.json'), JSON.stringify({ name: pkg.name, version: pkg.version, bin: pkg.bin, type: 'module', private: true }) + '\n');
   await mkdir(join(out, 'bin'));
   await writeFile(join(out, 'bin/arbol-browser'), `#!/bin/sh
 set -eu
