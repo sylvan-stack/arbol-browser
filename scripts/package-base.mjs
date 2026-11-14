@@ -32,7 +32,7 @@ export async function sourceInventory() {
   for (const name of ['package.json', 'package-lock.json', 'arbol-build.json', 'tsconfig.json'])
     entries[name] = hash(await readFile(join(root, name)));
   if (existsSync(join(root, 'entitlements.plist'))) entries['entitlements.plist'] = hash(await readFile(join(root, 'entitlements.plist')));
-  for (const name of ['src', 'scripts', 'native'])
+  for (const name of ['src', 'scripts', 'native', 'watchdog'])
     for (const [path, digest] of Object.entries(await inventory(join(root, name)))) entries[`${name}/${path}`] = digest;
   return Object.fromEntries(Object.entries(entries).sort(([a], [b]) => a.localeCompare(b, 'en')));
 }

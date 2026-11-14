@@ -71,5 +71,5 @@ const manifestRaw = await readFile(join(bundle, 'Contents/Resources/native-compa
 await writeFile(bundle + '.signature-audit.json', JSON.stringify({ candidate: bundle, publisher: policy,
   objects: audit, files: Object.keys(manifest.files).length, payloadDigest: inventoryDigest(manifest.files),
   manifestDigest: createHash('sha256').update(manifestRaw).digest('hex'), qualification: 'unexecuted',
-  unavailable: ['watchdog until ABR-7', 'native runtime/route/full-key/rollback/watchdog qualification until ABR-8', 'complete production host until ABR-29', 'notarization/Gatekeeper/distribution until ABR-25'] }, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+  unavailable: ['native runtime/route/full-key/rollback/two-holder-watchdog/FD-custody qualification until ABR-8', 'complete production host until ABR-29', 'notarization/Gatekeeper/distribution until ABR-25'] }, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
 console.log(JSON.stringify({ candidate: bundle, signedObjects: audit.length, libraryValidationDisabled: false, qualification: 'unexecuted' }));

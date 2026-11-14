@@ -10,9 +10,9 @@ if (!headers || !existsSync(`${headers}/node_api.h`)) throw new Error('Set NODE_
 const output = resolve(root, 'dist/native/platform.node');
 mkdirSync(dirname(output), { recursive: true });
 const result = spawnSync('/usr/bin/xcrun', ['clang++', '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror',
-  '-DNAPI_VERSION=8', '-DNODE_GYP_MODULE_NAME=arbol_browser_platform', '-arch', 'arm64',
+  '-fobjc-arc', '-DNAPI_VERSION=8', '-DNODE_GYP_MODULE_NAME=arbol_browser_platform', '-arch', 'arm64',
   '-mmacosx-version-min=27.0', '-bundle', '-undefined', 'dynamic_lookup', '-I', headers,
-  resolve(root, 'src/runtime/platform.mm'), '-lbsm', '-o', output], { stdio: 'inherit' });
+  resolve(root, 'src/runtime/platform.mm'), '-lbsm', '-framework', 'Foundation', '-framework', 'Security', '-o', output], { stdio: 'inherit' });
 if (result.error || result.status !== 0) throw new Error('Process support compilation failed');
 console.log('Compiled private Darwin process support (Node-API 8); no behavioral checks run');
 
