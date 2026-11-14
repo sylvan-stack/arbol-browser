@@ -26,3 +26,11 @@ complete positive host/session/compatibility/custody/close/removal; ABR-30/16 ow
 real stdio/MCP integration. ABR-8/21/23/25 retain native/application/Driver/release
 qualification. The repaired contribution allocation permits Foundation's bounded
 infrastructure review without claiming any missing downstream behavior.
+
+ABR-32 adds one individually admitted top-tier startup resource-transfer case,
+not a mid-tier suite. Its upstream native trust/readiness and no-engine launch
+are explicit synthetic fixture predicates, never conformance evidence. Actual
+client cleanup and unrelated owner/Build guard preservation are the bounded
+claims; signed production startup, native readiness/exit, helper confinement,
+real stdio MCP and every prior unavailable route retain their downstream owner
+and actual execution requirements. Earlier five-case evidence remains preserved.

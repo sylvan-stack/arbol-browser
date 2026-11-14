@@ -79,6 +79,21 @@
         "BRW-0.14",
         "BRW-1.7"
       ]
+    },
+    {
+      "id": "startupAcquisitionBoundary",
+      "file": "tests/top/test_foundation_concurrency.mjs",
+      "tier": "top",
+      "status": "retained",
+      "reason": "A refused startup or failed connection transfer can retain an actual management connection or agent attachment/capacity in a surviving service. Lifecycle and three starter transfer sites have distinct ownership windows.",
+      "oracle": "Actual authenticated peers disconnect before teardown while clients/process remain strongly alive; ordinary transferred clients remain usable. Independent kernel contenders observe separate host-owner/Build custody. Clock/resource-return faults and explicitly synthetic upstream trust/readiness/no-engine launch isolate transfer code without claiming genuine native host or exit evidence.",
+      "origins": [
+        "BRW-0.4",
+        "BRW-0.5",
+        "BRW-0.7",
+        "BRW-0.14",
+        "BRW-3.11"
+      ]
     }
   ],
   "mid": [],
@@ -106,7 +121,7 @@
     }
   ],
   "qualificationOwners": {
-    "foundation": "ABR-28: complete structural rows and explicit infrastructure contributions only",
+    "foundation": "ABR-32: complete structural rows and bounded infrastructure contributions; ABR-28 exact evidence preserved",
     "native-host-start": "ABR-29/ABR-12",
     "complete-close": "ABR-29/ABR-12",
     "engine-reader-session": "ABR-29/ABR-12",

@@ -1,12 +1,13 @@
 # Tests: arbol-browser
 
 The current [Test Strategy](/Users/msix/Artifacts/mycel/operations/test-strategy.md)
-governs execution. ABR-28 is the revised Foundation final testing Beat. The complete
+governs execution. ABR-32 is the current Foundation final testing Beat. The complete
 inventory and individual admission reasons are in [test-tiers.json](test-tiers.json).
 There were no previous retained cases or low-tier bodies to restore or archive.
 
-The normal unit gate explicitly runs all five retained cases: `receiptRace`,
-`ownershipBoundary`, `preservationBoundary`, `transportBoundary`. They use the
+The normal unit gate explicitly runs all six retained cases: `receiptRace`,
+`ownershipBoundary`, `preservationBoundary`, `transportBoundary`,
+`closeAcquisitionBoundary`, `startupAcquisitionBoundary`. They use the
 actual packaged CLI, compiled libraries, Darwin process addon and embedded Node,
 private disposable state and kernel locks/AF_UNIX sockets. They open no engine or
 page. Test-only workers/dispatchers supply no successful native trust, readiness
@@ -53,3 +54,17 @@ The five earlier unavailable groups remain historical gaps. Full positive
 host/session/compatibility/custody/close/removal is ABR-29/12; packaged MCP is
 ABR-30/16; native/Driver/integration/release evidence retains its actual downstream
 owner and scope. A revised Foundation pass never marks those routes passed.
+
+The startup case imports unchanged packaged lifecycle/starter modules and uses
+actual authenticated RuntimeClients, Unix peers and kernel Build/owner guards.
+Lifecycle resource-return and monotonic-clock seams isolate late/post-wait/final
+transfer refusal, rejected acquisition and actual stream disconnect before client
+assignment. The three starter resource paths use explicitly synthetic upstream
+trust/readiness predicates and a no-engine transport-fixture launch. These
+predicates are testing-only, never production providers or native readiness
+proof. A rejecting failed-attempt authority leaves real guard retention intact
+during observation; fixture teardown after transport shutdown is not verified
+production exit. Strong references/live process exclude garbage collection and
+process death as the cleanup oracle. Ordinary client exchanges demonstrate only
+usable resource transfer, not browser open, page control or stdio MCP. All six
+cases and every helper remain in the complete normal gate/harness digest.
