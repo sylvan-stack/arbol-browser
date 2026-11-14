@@ -1,7 +1,7 @@
 /** Test-free staging only. Ad hoc bootstrap seal is not production signing. No registry, selection, browser launch or gate. */
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { createReadStream } from 'node:fs';
+import { createReadStream, existsSync } from 'node:fs';
 import { cp, lstat, mkdir, readFile, readdir, readlink, writeFile, chmod, rename } from 'node:fs/promises';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -31,7 +31,8 @@ export async function sourceInventory() {
   const entries = {};
   for (const name of ['package.json', 'package-lock.json', 'arbol-build.json', 'tsconfig.json'])
     entries[name] = hash(await readFile(join(root, name)));
-  for (const name of ['src', 'scripts'])
+  if (existsSync(join(root, 'entitlements.plist'))) entries['entitlements.plist'] = hash(await readFile(join(root, 'entitlements.plist')));
+  for (const name of ['src', 'scripts', 'native'])
     for (const [path, digest] of Object.entries(await inventory(join(root, name)))) entries[`${name}/${path}`] = digest;
   return Object.fromEntries(Object.entries(entries).sort(([a], [b]) => a.localeCompare(b, 'en')));
 }
