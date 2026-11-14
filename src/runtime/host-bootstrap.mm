@@ -26,7 +26,8 @@ static bool signature(NSString* path, bool outer, bool jit) {
     NSDictionary* info = (__bridge NSDictionary*)information;
     NSDictionary* entitlements = info[(__bridge NSString*)kSecCodeInfoEntitlementsDict];
     valid = ([info[(__bridge NSString*)kSecCodeInfoFlags] unsignedIntValue] & kSecCodeSignatureRuntime) &&
-      [info[(__bridge NSString*)kSecCodeInfoTeamIdentifier] isEqual:team];
+      [info[(__bridge NSString*)kSecCodeInfoTeamIdentifier] isEqual:team] &&
+      [info[(__bridge NSString*)kSecCodeInfoTimestamp] isKindOfClass:[NSDate class]];
     for (NSString* key in entitlements) if (![key isEqualToString:@"com.apple.security.cs.allow-jit"] || !jit || ![entitlements[key] isEqual:@YES]) valid = false;
   }
   if (information) CFRelease(information);
