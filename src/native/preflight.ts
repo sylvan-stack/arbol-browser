@@ -5,6 +5,7 @@ import { isMainThread } from 'node:worker_threads';
 import type { Contract } from '../contracts/generated.js';
 import { validator } from '../contracts/schema.js';
 import { assertNativeFeatures } from './features.js';
+import { createNativeOwnership, validateOwnershipAddon, type NativeOwnership } from './api.js';
 import { nativeLimit, pinnedRuntime, stable, refuse, verifyNativeCandidate, type CandidateTrust } from './manifest.js';
 
 export interface CompatibilityAddon {
@@ -25,6 +26,7 @@ export function nativeReply<K extends 'native.Inventory' | 'native.Status'>(kind
 export interface NativeCompatibility {
   readonly trust: CandidateTrust;
   readonly pageAdmission: false;
+  readonly ownership: NativeOwnership;
   assertIntegrity(): NativeStatus;
   /** Applies integrity checks both before dispatch and after async settlement. */
   guard<T>(operation: () => T | Promise<T>): Promise<T>;
@@ -50,10 +52,7 @@ export function preflightNative(bundle: string, fatal: (reason: string) => void,
     const trust = verifyNativeCandidate(bundle);
     if (!watchdog || typeof watchdog.assertArmed !== 'function') refuse();
     watchdog.assertArmed(trust);
-    const addon: CompatibilityAddon = createRequire(import.meta.url)(join(trust.bundle, 'Contents/Resources/browser/native/ownership.node')) as CompatibilityAddon;
-    const expected = ['getABI', 'install', 'status', 'checkIntegrity', 'seal'];
-    const allowed = [...expected, 'beginBinding', 'finishBinding', 'bindingInfo', 'mark', 'restore', 'retire', 'interactionState'];
-    if (Object.getOwnPropertyNames(addon).some(name => !allowed.includes(name)) || expected.some(key => typeof addon[key as keyof CompatibilityAddon] !== 'function')) refuse();
+    const addon = validateOwnershipAddon(createRequire(import.meta.url)(join(trust.bundle, 'Contents/Resources/browser/native/ownership.node')));
     const inventory = nativeReply('native.Inventory', addon.getABI());
     if (stable(inventory) !== stable(trust.manifest.nativeABI)) refuse();
     watchdog.assertArmed(trust);
@@ -71,10 +70,11 @@ export function preflightNative(bundle: string, fatal: (reason: string) => void,
     };
     cadence = setInterval(() => { try { assertIntegrity(); } catch { /* fatal port owns quarantine; never publish a reply */ } }, 250);
     cadence.unref();
-    return Object.freeze({ trust, pageAdmission: false as const, assertIntegrity,
+    const ownership = createNativeOwnership(addon, assertIntegrity, fail);
+    return Object.freeze({ trust, pageAdmission: false as const, ownership, assertIntegrity,
       async guard<T>(operation: () => T | Promise<T>): Promise<T> { assertIntegrity(); try { return await operation(); } finally { assertIntegrity(); } },
       seal(): NativeStatus {
-        try { if (cadence) clearInterval(cadence); const value = nativeReply('native.Status', addon.seal()); if (value.phase !== 'closing') refuse(); failed = true; return value; }
+        try { if (cadence) clearInterval(cadence); const value = nativeReply('native.Status', addon.seal()); if (value.phase !== 'closing' || value.liveBindings !== 0 || value.hooks !== installed.hooks || value.appliedHooks !== installed.appliedHooks) refuse(); failed = true; return value; }
         catch { return fail(); }
       } });
   } catch { return fail(); }
