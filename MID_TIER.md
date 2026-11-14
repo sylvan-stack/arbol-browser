@@ -18,3 +18,11 @@ Mid-tier execution requires explicit owner scope. Missing native/GUI evidence is
 unavailable, never an exclusion pass from a failed tool.
 
 No low-tier bodies existed; none were invented or silently re-enabled.
+
+ABR-28 preserves these unavailable groups and the original four cases, and adds
+one top-tier acquisition-cleanup regression with independent kernel/socket
+observations. It does not create or execute a mid-tier suite. ABR-29/12 own
+complete positive host/session/compatibility/custody/close/removal; ABR-30/16 own
+real stdio/MCP integration. ABR-8/21/23/25 retain native/application/Driver/release
+qualification. The repaired contribution allocation permits Foundation's bounded
+infrastructure review without claiming any missing downstream behavior.

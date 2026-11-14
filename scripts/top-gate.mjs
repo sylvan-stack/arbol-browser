@@ -14,6 +14,7 @@ const selected = [
   ['ownershipBoundary', 'tests/top/test_foundation_concurrency.mjs'],
   ['preservationBoundary', 'tests/top/test_foundation_recovery.mjs'],
   ['transportBoundary', 'tests/top/test_foundation_recovery.mjs'],
+  ['closeAcquisitionBoundary', 'tests/top/test_foundation_concurrency.mjs'],
 ];
 const args = process.argv.slice(2), embedded = args.at(-1) === '--embedded';
 if (embedded) args.pop();
@@ -65,7 +66,7 @@ if (!embedded) {
     platform: process.platform, arch: process.arch,
     macOS: execFileSync('/usr/bin/sw_vers', ['-productVersion'], { encoding: 'utf8' }).trim() };
   assert.deepEqual(actualRuntime, metadata.runtime, 'Declared runtime is not the executing runtime');
-  const sourceFiles = [...new Set(['test-tiers.json', 'scripts/top-gate.mjs', 'tests/support/foundation.mjs', ...selected.map(([, file]) => file)])].sort();
+  const sourceFiles = [...new Set(['test-tiers.json', 'scripts/top-gate.mjs', 'tests/support/foundation.mjs', 'tests/support/foundation-deadlines.mjs', ...selected.map(([, file]) => file)])].sort();
   const harness = Object.fromEntries(await Promise.all(sourceFiles.map(async file => [file, hash(await readFile(join(repository, file)))])));
   const result = { format: 1, candidate, output, build: metadata.component.build,
     startedAt: new Date().toISOString(), sourceDigest: metadata.sourceDigest,
