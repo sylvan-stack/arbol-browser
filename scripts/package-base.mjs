@@ -1,4 +1,5 @@
-/** Test-free staging only. No registry, selection, signing, browser launch or gate. */
+/** Test-free staging only. Ad hoc bootstrap seal is not production signing. No registry, selection, browser launch or gate. */
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { cp, lstat, mkdir, readFile, readdir, readlink, writeFile, chmod, rename } from 'node:fs/promises';
@@ -52,7 +53,8 @@ async function stage(args) {
   if (inventoryDigest(sources) !== record.sourceDigest ||
       inventoryDigest(await inventory(join(root, 'dist/lib'))) !== record.libraryDigest ||
       inventoryDigest(await inventory(join(root, 'dist/native'))) !== record.nativeDigest ||
-      hash(await readFile(join(root, 'dist/cli/main.mjs'))) !== record.entryDigest)
+      hash(await readFile(join(root, 'dist/cli/main.mjs'))) !== record.entryDigest ||
+      hash(await readFile(join(root, 'dist/host/main.mjs'))) !== record.hostDigest)
     throw new Error('Sources or compiled payload changed; recompile before packaging');
   const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
   const electron = JSON.parse(await readFile(join(root, 'node_modules/electron/package.json'), 'utf8'));
@@ -62,9 +64,27 @@ async function stage(args) {
   const copy = { recursive: true, force: false, errorOnExist: true, verbatimSymlinks: true };
   await cp(join(root, 'dist/lib'), join(out, 'lib'), copy);
   await cp(join(root, 'dist/cli/main.mjs'), join(out, 'lib/cli/main.mjs'), copy);
+  await cp(join(root, 'dist/host'), join(out, 'lib/host'), copy);
   await cp(join(root, 'dist/native'), join(out, 'native'), copy);
   await mkdir(join(out, 'runtime'));
   await cp(join(root, 'node_modules/electron/dist/Electron.app'), join(out, 'runtime/Electron.app'), copy);
+  const host = join(out, 'runtime/ArbolBrowserHost.app');
+  await mkdir(join(host, 'Contents/MacOS'), { recursive: true });
+  await cp(join(root, 'dist/native/host-bootstrap'), join(host, 'Contents/MacOS/arbol-browser-host'), copy);
+  await writeFile(join(host, 'Contents/Info.plist'), `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>com.sylvan-stack.arbol-browser.host</string>
+<key>CFBundleName</key><string>Arbol Browser</string>
+<key>CFBundleExecutable</key><string>arbol-browser-host</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleVersion</key><string>1</string>
+<key>LSMultipleInstancesProhibited</key><false/>
+<key>LSMinimumSystemVersion</key><string>27.0</string>
+</dict></plist>
+`);
+  const seal = spawnSync('/usr/bin/codesign', ['--force', '--sign', '-', '--options', 'runtime', host], { stdio: 'inherit' });
+  if (seal.error || seal.status !== 0) throw new Error('Candidate bootstrap seal failed');
   for (const name of ['LICENSE', 'LICENSES.chromium.html'])
     await cp(join(root, 'node_modules/electron/dist', name), join(out, 'runtime', name), copy);
   const lock = JSON.parse(await readFile(join(root, 'package-lock.json'), 'utf8'));

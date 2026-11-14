@@ -15,3 +15,14 @@ const result = spawnSync('/usr/bin/xcrun', ['clang++', '-std=c++17', '-O2', '-Wa
   resolve(root, 'src/runtime/platform.mm'), '-lbsm', '-o', output], { stdio: 'inherit' });
 if (result.error || result.status !== 0) throw new Error('Process support compilation failed');
 console.log('Compiled private Darwin process support (Node-API 8); no behavioral checks run');
+
+for (const [source, name, frameworks] of [
+  ['host-launch.mm', 'host-launch', ['AppKit']],
+  ['host-bootstrap.mm', 'host-bootstrap', ['Foundation', 'Security']],
+]) {
+  const executable = spawnSync('/usr/bin/xcrun', ['clang++', '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror',
+    '-fobjc-arc', '-arch', 'arm64', '-mmacosx-version-min=27.0', resolve(root, 'src/runtime', source),
+    ...frameworks.flatMap(name => ['-framework', name]), '-o', resolve(root, 'dist/native', name)], { stdio: 'inherit' });
+  if (executable.error || executable.status !== 0) throw new Error('Host support compilation failed');
+}
+console.log('Compiled one-shot LaunchServices support and isolated native app bootstrap; no engine launched');

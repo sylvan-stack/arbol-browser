@@ -32,10 +32,14 @@ run(['scripts/compile-platform.mjs']);
 await build({ entryPoints: [join(root, 'src/cli/main.ts')], outfile: join(root, 'dist/cli/main.mjs'),
   bundle: true, platform: 'node', format: 'esm', target: 'node24.22.2',
   banner: { js: "import { createRequire as bundledCreateRequire } from 'node:module'; const require = bundledCreateRequire(import.meta.url);" } });
+await build({ entryPoints: [join(root, 'src/runtime/host-entry.ts')], outfile: join(root, 'dist/host/main.mjs'),
+  bundle: true, platform: 'node', format: 'esm', target: 'node24.22.2', external: ['electron'],
+  banner: { js: "import { createRequire as bundledCreateRequire } from 'node:module'; const require = bundledCreateRequire(import.meta.url);" } });
 if (inventoryDigest(await sourceInventory()) !== inventoryDigest(sources)) throw new Error('Source changed during compilation');
 const record = { sourceDigest: inventoryDigest(sources), sources,
   libraryDigest: inventoryDigest(await inventory(join(root, 'dist/lib'))),
   nativeDigest: inventoryDigest(await inventory(join(root, 'dist/native'))),
+  hostDigest: createHash('sha256').update(await readFile(join(root, 'dist/host/main.mjs'))).digest('hex'),
   entryDigest: createHash('sha256').update(await readFile(join(root, 'dist/cli/main.mjs'))).digest('hex') };
 await writeFile(join(root, 'dist/compile-record.json'), JSON.stringify(record, null, 2) + '\n');
 console.log(`Compiled candidate sources ${record.sourceDigest}; qualification remains unexecuted`);
