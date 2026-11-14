@@ -1,0 +1,164 @@
+// Private process support only (BRW-0.14, BRW-1.7, BRW-3.11), not native input ABI.
+#include <node_api.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <libproc.h>
+#include <bsm/libbsm.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cerrno>
+#include <climits>
+#include <cmath>
+#include <cstdint>
+#include <string>
+
+// Darwin kernel ABI, absent from the public SDK. Refuse unavailable/changed sizes.
+// https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/proc_info_private.h
+struct UniqueInfo {
+  uint8_t uuid[16]; uint64_t uniqueid, parentUniqueid;
+  int32_t pidVersion, originalParentVersion; uint64_t reserved2, reserved3;
+};
+static_assert(sizeof(UniqueInfo) == 56);
+struct ProcessInfo { proc_bsdinfo bsd; UniqueInfo unique; };
+static constexpr int kBsdWithUniqueId = 18;
+struct HeldLock { int fd; std::string path; dev_t dev; ino_t ino; };
+
+static napi_value fail(napi_env env) {
+  napi_throw_error(env, "platform_unavailable", "Private OS support unavailable."); return nullptr;
+}
+static napi_value text(napi_env env, const std::string& value) {
+  napi_value out; if (napi_create_string_utf8(env, value.c_str(), value.size(), &out) != napi_ok) return fail(env);
+  return out;
+}
+static napi_value number(napi_env env, uint32_t value) {
+  napi_value out; if (napi_create_uint32(env, value, &out) != napi_ok) return fail(env); return out;
+}
+static bool property(napi_env env, napi_value object, const char* name, napi_value value) {
+  return value && napi_set_named_property(env, object, name, value) == napi_ok;
+}
+static bool integer(napi_env env, napi_value value, int* out) {
+  double n; if (napi_get_value_double(env, value, &n) != napi_ok || !std::isfinite(n) || n < 0 || n > INT_MAX || n != (int)n) return false;
+  *out = (int)n; return true;
+}
+static bool string(napi_env env, napi_value value, std::string& out) {
+  size_t length = 0, written = 0;
+  if (napi_get_value_string_utf8(env, value, nullptr, 0, &length) != napi_ok || !length || length >= PATH_MAX) return false;
+  out.resize(length + 1);
+  if (napi_get_value_string_utf8(env, value, out.data(), out.size(), &written) != napi_ok || written != length) return false;
+  out.resize(length); return out[0] == '/' && out.find('\0') == std::string::npos;
+}
+static bool argument(napi_env env, napi_callback_info info, napi_value* value) {
+  size_t n = 1; return napi_get_cb_info(env, info, &n, value, nullptr, nullptr) == napi_ok && n == 1;
+}
+static void finalize(napi_env, void* data, void*) {
+  auto* lock = static_cast<HeldLock*>(data);
+  if (lock->fd >= 0) close(lock->fd);
+  delete lock;
+}
+static bool matches(const HeldLock* lock, struct stat* out) {
+  struct stat path;
+  return lock->fd >= 0 && fstat(lock->fd, out) == 0 && lstat(lock->path.c_str(), &path) == 0 &&
+    S_ISREG(out->st_mode) && S_ISREG(path.st_mode) && out->st_uid == geteuid() &&
+    (out->st_mode & 07777) == 0600 && out->st_nlink == 1 && path.st_nlink == 1 &&
+    out->st_dev == lock->dev && out->st_ino == lock->ino &&
+    path.st_dev == out->st_dev && path.st_ino == out->st_ino;
+}
+static napi_value tryLock(napi_env env, napi_callback_info info) {
+  napi_value arg; std::string path;
+  if (!argument(env, info, &arg) || !string(env, arg, path)) return fail(env);
+  int fd = open(path.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0600);
+  if (fd < 0) return fail(env);
+  struct stat st;
+  if (fstat(fd, &st) != 0) { close(fd); return fail(env); }
+  auto* lock = new HeldLock{fd, path, st.st_dev, st.st_ino};
+  if (!matches(lock, &st)) { finalize(env, lock, nullptr); return fail(env); }
+  if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+    int error = errno; finalize(env, lock, nullptr);
+    if (error == EWOULDBLOCK || error == EAGAIN) { napi_value nil; napi_get_null(env, &nil); return nil; }
+    return fail(env);
+  }
+  if (!matches(lock, &st)) { finalize(env, lock, nullptr); return fail(env); }
+  napi_value handle;
+  if (napi_create_external(env, lock, finalize, nullptr, &handle) != napi_ok) {
+    finalize(env, lock, nullptr); return fail(env);
+  }
+  return handle;
+}
+static HeldLock* held(napi_env env, napi_callback_info info) {
+  napi_value arg; void* data = nullptr;
+  if (!argument(env, info, &arg) || napi_get_value_external(env, arg, &data) != napi_ok || !data) return nullptr;
+  return static_cast<HeldLock*>(data);
+}
+static napi_value assertLock(napi_env env, napi_callback_info info) {
+  auto* lock = held(env, info); struct stat st;
+  if (!lock || !matches(lock, &st)) return fail(env);
+  napi_value object; if (napi_create_object(env, &object) != napi_ok) return fail(env);
+  if (!property(env, object, "device", text(env, std::to_string(st.st_dev))) ||
+      !property(env, object, "inode", text(env, std::to_string(st.st_ino))) ||
+      !property(env, object, "uid", number(env, st.st_uid))) return fail(env);
+  return object;
+}
+static napi_value releaseLock(napi_env env, napi_callback_info info) {
+  auto* lock = held(env, info); if (!lock) return fail(env);
+  if (lock->fd >= 0) {
+    int fd = lock->fd; lock->fd = -1;
+    // close releases flock; never unlink the shared lock inode, or retry close.
+    if (close(fd) != 0) return fail(env);
+  }
+  napi_value out; napi_get_undefined(env, &out); return out;
+}
+static int processInfo(int pid, ProcessInfo& info) {
+  errno = 0;
+  int size = proc_pidinfo(pid, kBsdWithUniqueId, 0, &info, sizeof(info));
+  if (size == 0 && errno == ESRCH) return 0;
+  if (size != sizeof(info) || info.bsd.pbi_pid != (uint32_t)pid || !info.unique.uniqueid) return -1;
+  return 1;
+}
+static napi_value identity(napi_env env, int pid, const ProcessInfo& info) {
+  napi_value object; if (napi_create_object(env, &object) != napi_ok) return fail(env);
+  if (!property(env, object, "pid", number(env, pid)) ||
+      !property(env, object, "uid", number(env, info.bsd.pbi_uid)) ||
+      !property(env, object, "startId", text(env, std::to_string(info.unique.uniqueid)))) return fail(env);
+  return object;
+}
+static napi_value processIdentity(napi_env env, napi_callback_info info) {
+  napi_value arg; int pid; ProcessInfo data{};
+  if (!argument(env, info, &arg) || !integer(env, arg, &pid) || pid <= 0) return fail(env);
+  int status = processInfo(pid, data);
+  if (status < 0) return fail(env);
+  if (!status) { napi_value nil; napi_get_null(env, &nil); return nil; }
+  return identity(env, pid, data);
+}
+static napi_value peerIdentity(napi_env env, napi_callback_info info) {
+  napi_value arg; int fd, socketType; uid_t uid; gid_t gid; pid_t pid; audit_token_t token{};
+  if (!argument(env, info, &arg) || !integer(env, arg, &fd)) return fail(env);
+  socklen_t n = sizeof(socketType);
+  sockaddr_un address{}; socklen_t addressSize = sizeof(address);
+  if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &socketType, &n) != 0 || socketType != SOCK_STREAM ||
+      getpeername(fd, (sockaddr*)&address, &addressSize) != 0 || address.sun_family != AF_UNIX ||
+      getpeereid(fd, &uid, &gid) != 0 || uid != geteuid()) return fail(env);
+  n = sizeof(pid);
+  if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &n) != 0 || n != sizeof(pid) || pid <= 0) return fail(env);
+  n = sizeof(token);
+  if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERTOKEN, &token, &n) != 0 || n != sizeof(token) ||
+      audit_token_to_pid(token) != pid || audit_token_to_euid(token) != uid) return fail(env);
+  ProcessInfo data{};
+  // The socket audit-token's PID version prevents a recycled peer PID being adopted.
+  if (processInfo(pid, data) != 1 || data.bsd.pbi_uid != uid ||
+      data.unique.pidVersion != audit_token_to_pidversion(token)) return fail(env);
+  return identity(env, pid, data);
+}
+static napi_value init(napi_env env, napi_value exports) {
+  napi_property_descriptor properties[] = {
+    {"tryLock", nullptr, tryLock, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"assertLock", nullptr, assertLock, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"releaseLock", nullptr, releaseLock, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"processIdentity", nullptr, processIdentity, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"peerIdentity", nullptr, peerIdentity, nullptr, nullptr, nullptr, napi_default, nullptr},
+  };
+  if (napi_define_properties(env, exports, sizeof(properties) / sizeof(properties[0]), properties) != napi_ok) return fail(env);
+  return exports;
+}
+NAPI_MODULE(NODE_GYP_MODULE_NAME, init)
