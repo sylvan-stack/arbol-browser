@@ -1,0 +1,490 @@
+{
+  "abi": 1,
+  "compiledNapi": 8,
+  "methods": {
+    "BrowserAccessibilityCocoa#accessibilityCustomActions": {
+      "encoding": "@16@0:8",
+      "provider": "Electron Framework"
+    },
+    "BrowserAccessibilityCocoa#accessibilityPerformAction:": {
+      "encoding": "v24@0:8@16",
+      "provider": "Electron Framework"
+    },
+    "BrowserAccessibilityCocoa#accessibilityPerformDecrement": {
+      "encoding": "B16@0:8",
+      "provider": "Electron Framework"
+    },
+    "BrowserAccessibilityCocoa#accessibilityPerformIncrement": {
+      "encoding": "B16@0:8",
+      "provider": "Electron Framework"
+    },
+    "BrowserAccessibilityCocoa#accessibilityPerformPress": {
+      "encoding": "B16@0:8",
+      "provider": "Electron Framework"
+    },
+    "BrowserAccessibilityCocoa#accessibilityPerformShowMenu": {
+      "encoding": "B16@0:8",
+      "provider": "Electron Framework"
+    },
+    "BrowserAccessibilityCocoa#accessibilitySetValue:forAttribute:": {
+      "encoding": "v32@0:8@16@24",
+      "provider": "Electron Framework"
+    },
+    "BrowserAccessibilityCocoa#setAccessibilityFocused:": {
+      "encoding": "v20@0:8B16",
+      "provider": "Electron Framework"
+    },
+    "BrowserAccessibilityCocoa#setAccessibilitySelectedText:": {
+      "encoding": "v24@0:8@16",
+      "provider": "Electron Framework"
+    },
+    "BrowserAccessibilityCocoa#setAccessibilitySelectedTextRange:": {
+      "encoding": "v32@0:8{_NSRange=QQ}16",
+      "provider": "Electron Framework"
+    },
+    "BrowserAccessibilityCocoa#setAccessibilityValue:": {
+      "encoding": "v24@0:8@16",
+      "provider": "Electron Framework"
+    },
+    "BrowserAccessibilityCocoa#setSelectedTextMarkerRange:": "<absent>",
+    "NSWindow#makeFirstResponder:": {
+      "encoding": "B24@0:8@16",
+      "provider": "AppKit"
+    },
+    "RenderWidgetHostViewCocoa#accessibilityChildren": {
+      "encoding": "@16@0:8",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#alignCenter:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#alignJustified:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#alignLeft:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#alignRight:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#becomeFirstResponder": {
+      "encoding": "B16@0:8",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#copy:": {
+      "encoding": "v24@0:8@16",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#cut:": {
+      "encoding": "v24@0:8@16",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#delete:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#deleteBackward:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#deleteBackwardByDecomposingPreviousCharacter:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#deleteForward:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#deleteToBeginningOfLine:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#deleteToBeginningOfParagraph:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#deleteToEndOfLine:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#deleteToEndOfParagraph:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#deleteToMark:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#deleteWordBackward:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#deleteWordForward:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#doCommandBySelector:": {
+      "encoding": "v24@0:8:16",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#finishComposingText": {
+      "encoding": "v16@0:8",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#ignoreSpelling:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#indent:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#insertBacktab:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#insertLineBreak:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#insertNewline:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#insertNewlineIgnoringFieldEditor:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#insertParagraphSeparator:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#insertTab:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#insertTabIgnoringFieldEditor:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#insertText:": {
+      "encoding": "v24@0:8@16",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#insertText:replacementRange:": {
+      "encoding": "v40@0:8@16{_NSRange=QQ}24",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#makeTextWritingDirectionLeftToRight:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#makeTextWritingDirectionNatural:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#makeTextWritingDirectionRightToLeft:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#mouseEvent:": {
+      "encoding": "v24@0:8@16",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveBackward:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveBackwardAndModifySelection:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveDown:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveDownAndModifySelection:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveForward:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveForwardAndModifySelection:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveLeft:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveLeftAndModifySelection:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveParagraphBackwardAndModifySelection:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveParagraphForwardAndModifySelection:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveRight:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveRightAndModifySelection:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveToBeginningOfDocument:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveToBeginningOfDocumentAndModifySelection:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveToBeginningOfLine:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveToBeginningOfLineAndModifySelection:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveToBeginningOfParagraph:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveToBeginningOfParagraphAndModifySelection:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveToBeginningOfSentence:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveToBeginningOfSentenceAndModifySelection:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveToEndOfDocument:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveToEndOfDocumentAndModifySelection:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveToEndOfLine:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveToEndOfLineAndModifySelection:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveToEndOfParagraph:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveToEndOfParagraphAndModifySelection:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveToEndOfSentence:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveToEndOfSentenceAndModifySelection:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveUp:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveUpAndModifySelection:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveWordBackward:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveWordBackwardAndModifySelection:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveWordForward:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveWordForwardAndModifySelection:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveWordLeft:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveWordLeftAndModifySelection:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveWordRight:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#moveWordRightAndModifySelection:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#outdent:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#pageDown:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#pageDownAndModifySelection:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#pageUp:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#pageUpAndModifySelection:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#paste:": {
+      "encoding": "v24@0:8@16",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#pasteAndMatchStyle:": {
+      "encoding": "v24@0:8@16",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#redo:": {
+      "encoding": "v24@0:8@16",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#scrollWheel:": {
+      "encoding": "v24@0:8@16",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#selectAll:": {
+      "encoding": "v24@0:8@16",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#selectLine:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#selectParagraph:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#selectSentence:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#selectToMark:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#selectWord:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#setMark:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#setMarkedText:selectedRange:replacementRange:": {
+      "encoding": "v56@0:8@16{_NSRange=QQ}24{_NSRange=QQ}40",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#showGuessPanel:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#subscript:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#superscript:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#swapWithMark:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#transpose:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#underline:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#undo:": {
+      "encoding": "v24@0:8@16",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#unmarkText": {
+      "encoding": "v16@0:8",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#unscript:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#yank:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "RenderWidgetHostViewCocoa#yankAndSelect:": {
+      "encoding": "v@:@",
+      "provider": "Electron Framework"
+    },
+    "WebContentsViewCocoa#draggingEntered:": {
+      "encoding": "Q24@0:8@16",
+      "provider": "Electron Framework"
+    },
+    "WebContentsViewCocoa#draggingExited:": {
+      "encoding": "v24@0:8@16",
+      "provider": "Electron Framework"
+    },
+    "WebContentsViewCocoa#draggingSession:endedAtPoint:operation:": {
+      "encoding": "v48@0:8@16{CGPoint=dd}24Q40",
+      "provider": "Electron Framework"
+    },
+    "WebContentsViewCocoa#draggingSession:willBeginAtPoint:": {
+      "encoding": "v40@0:8@16{CGPoint=dd}24",
+      "provider": "Electron Framework"
+    },
+    "WebContentsViewCocoa#draggingUpdated:": {
+      "encoding": "Q24@0:8@16",
+      "provider": "Electron Framework"
+    },
+    "WebContentsViewCocoa#performDragOperation:": {
+      "encoding": "B24@0:8@16",
+      "provider": "Electron Framework"
+    }
+  },
+  "pointBytes": 16,
+  "pointerBytes": 8,
+  "rangeBytes": 16
+}
