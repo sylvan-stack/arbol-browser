@@ -1,4 +1,4 @@
-#import "inventory.hpp"
+#import "keys.hpp"
 #include <dlfcn.h>
 #include <limits.h>
 #include <cstdlib>
@@ -84,36 +84,6 @@ NSDictionary* statusObject() {
     @"hooks": @(hooks.size()), @"appliedHooks": @(applied), @"liveBindings": @(liveBindings), @"policyObjects": @(policyObjects)};
 }
 
-// Conservative first-stage guards intentionally deny all page routes. ABR-6
-// supplies ownership-aware bodies; this stage exposes no binding/admission API.
-static void denyObject(id, SEL, id) {}
-static void denySelector(id, SEL, SEL) {}
-static void denyVoid(id, SEL) {}
-static BOOL denyBool(id, SEL) { return NO; }
-static BOOL denyBoolObject(id, SEL, id) { return NO; }
-static id denyGetter(id, SEL) { return nil; }
-static NSUInteger denyOperation(id, SEL, id) { return 0; }
-static void denyObjects(id, SEL, id, id) {}
-static void denyBoolean(id, SEL, BOOL) {}
-static void denyRange(id, SEL, NSRange) {}
-static void denyObjectRange(id, SEL, id, NSRange) {}
-static void denyMarked(id, SEL, id, NSRange, NSRange) {}
-static void denyPoint(id, SEL, id, NSPoint) {}
-static void denyDragEnd(id, SEL, id, NSPoint, NSUInteger) {}
-static IMP conservativeGuard(const char* encoding) {
-  struct Shape { const char* encoding; IMP guard; };
-  const Shape shapes[] = {
-    {"v@:@", (IMP)denyObject}, {"v24@0:8@16", (IMP)denyObject}, {"v24@0:8:16", (IMP)denySelector},
-    {"v16@0:8", (IMP)denyVoid}, {"B16@0:8", (IMP)denyBool}, {"B24@0:8@16", (IMP)denyBoolObject},
-    {"@16@0:8", (IMP)denyGetter}, {"Q24@0:8@16", (IMP)denyOperation}, {"v32@0:8@16@24", (IMP)denyObjects},
-    {"v20@0:8B16", (IMP)denyBoolean}, {"v32@0:8{_NSRange=QQ}16", (IMP)denyRange},
-    {"v40@0:8@16{_NSRange=QQ}24", (IMP)denyObjectRange},
-    {"v56@0:8@16{_NSRange=QQ}24{_NSRange=QQ}40", (IMP)denyMarked},
-    {"v40@0:8@16{CGPoint=dd}24", (IMP)denyPoint}, {"v48@0:8@16{CGPoint=dd}24Q40", (IMP)denyDragEnd},
-  };
-  for (const auto& shape : shapes) if (!strcmp(shape.encoding, encoding)) return shape.guard;
-  throw std::runtime_error("unqualified_method_encoding");
-}
 void stageGuard(Class cls, SEL selector, IMP guard, const char* encoding) {
   if (phase.load() != Phase::Planning || !cls || !guard || !encoding || hooks.size() >= kMaxTargets) throw std::runtime_error("invalid_hook_plan");
   for (const auto& hook : hooks) if (hook.cls == cls && hook.selector == selector) throw std::runtime_error("duplicate_hook_plan");
@@ -127,11 +97,20 @@ static bool originalIntact(const Hook& hook) {
   return method && method_getImplementation(method) == hook.before && !strcmp(method_getTypeEncoding(method), hook.encoding.c_str()) &&
     [providerOf(hook.before) isEqualToString:@(hook.provider.c_str())];
 }
+void planAccessibility();
+void planTextInput();
+void planResponder();
+void planInteraction();
 static void planOwnershipGuards() {
-  for (const auto& target : targets) {
-    if (!strcmp(target.encoding, "<absent>")) continue;
-    stageGuard(objc_getClass(target.cls), sel_registerName(target.selector), conservativeGuard(target.encoding), target.encoding);
+  initializeBindings();
+  planAccessibility(); planTextInput(); planResponder(); planInteraction();
+  size_t required = 0;
+  for (const auto& target : targets) if (strcmp(target.encoding, "<absent>")) {
+    ++required; bool planned = false;
+    for (const auto& hook : hooks) if (hook.cls == objc_getClass(target.cls) && hook.selector == sel_registerName(target.selector)) planned = true;
+    if (!planned) throw std::runtime_error("native_route_not_planned");
   }
+  if (hooks.size() != required) throw std::runtime_error("native_route_coverage_mismatch");
 }
 static napi_value install(napi_env env, napi_callback_info info) {
   napi_value argument;
