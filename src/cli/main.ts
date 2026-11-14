@@ -7,8 +7,16 @@ import { parse } from './parse.js';
 import { publicFailure, type ExitCode } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
 import type { Contract } from '../contracts/generated.js';
-import type { CommandPorts, Stdio, PackageMetadata } from '../runtime/ports.js';
+import type { CommandPorts, ProfilePort, Stdio, PackageMetadata } from '../runtime/ports.js';
 import { foundationPorts } from '../runtime/bootstrap.js';
+
+// Lazy management service: info performs no profile/native load or filesystem read.
+const profilePorts: ProfilePort = Object.freeze({
+  list: async () => (await import('../profiles/manage.js')).createProfileService().list(),
+  create: async (id: string, request?: string) => (await import('../profiles/manage.js')).createProfileService().create(id, request),
+  remove: async (id: string, io: Stdio) => (await import('../profiles/manage.js')).createProfileService().remove(id, io),
+});
+const defaultPorts: CommandPorts = Object.freeze({ process: foundationPorts.process, profiles: profilePorts });
 
 /** Metadata only: no Electron import, native load, profile read, socket or child. */
 export async function componentInfo(): Promise<Contract<'wire.ComponentInfo'>> {
@@ -18,7 +26,7 @@ export async function componentInfo(): Promise<Contract<'wire.ComponentInfo'>> {
   return info;
 }
 
-export async function runCli(args: readonly string[], ports: CommandPorts = foundationPorts,
+export async function runCli(args: readonly string[], ports: CommandPorts = defaultPorts,
   io: Stdio = process): Promise<ExitCode> {
   // On the MCP path stdout is reserved exclusively for the MCP transport, including failures.
   const mcp = args[0] === 'mcp';
