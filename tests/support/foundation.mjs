@@ -155,13 +155,15 @@ if (process.argv[2] === '--worker') {
       const profile = await readProfile(profilePaths(input.profile, input.state));
       held = await acquireInstance(profile, platform, input.build, neverOpenedExit, now() + 2000);
       assert.ok(held); ready = { pid: process.pid, record: held.record, runtime: held.location.leaf };
+    } else if (task === 'lock-probe') {
+      held = platform.tryLock(input.path); ready = { pid: process.pid, acquired: Boolean(held) };
     } else if (task === 'lease') {
       held = await acquireBuildLease(input.selection, platform); ready = { pid: process.pid };
     } else throw new Error('Unknown worker');
     const release = new Promise(resolve => commands.once('line', resolve));
     console.log(JSON.stringify(ready));
     await release;
-    if (task === 'owner') held.owner.release(); else held.release();
+    if (task === 'owner') held.owner.release(); else held?.release();
     commands.close(); process.stdin.destroy();
   }
 }
