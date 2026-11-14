@@ -28,6 +28,29 @@ async function within<T>(deadline: number, operation: () => Promise<T>): Promise
   } finally { clearTimeout(timer); }
 }
 
+/** Own an acquisition until the bounded wait has accepted its result. Expiry
+ * abandons the wait, never the obligation to dispose an operation-owned value. */
+async function acquireWithin<T>(deadline: number, operation: () => Promise<T>, dispose: (value: T) => void): Promise<T> {
+  let accepting = true;
+  let acquired: { value: T } | undefined;
+  try {
+    const result = await within(deadline, async () => {
+      const value = await operation();
+      if (!accepting || now() >= deadline) { dispose(value); throw unavailable('browser'); }
+      acquired = { value };
+      return value;
+    });
+    assertTime(deadline);
+    // The caller takes responsibility immediately after this successful wait.
+    accepting = false; acquired = undefined;
+    return result;
+  } catch (error) {
+    accepting = false;
+    if (acquired) { const { value } = acquired; acquired = undefined; dispose(value); }
+    throw error;
+  }
+}
+
 export interface ExitAuthority extends PreviousExit {
   /** Trusted confinement/provenance plus full owned-process census, including
    * escaped/orphaned helpers. A PID/group observation alone cannot satisfy it. */
