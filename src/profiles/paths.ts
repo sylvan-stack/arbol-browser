@@ -54,21 +54,27 @@ export async function assertDirectory(path: string, expected: Identity): Promise
 /** Never chmod/adopt an existing destination. Each created directory is separately checked. */
 export async function ensureDirectory(path: string, privateMode = true): Promise<Identity> {
   const before = await statOrAbsent(path);
+  let created = false;
   if (!before) {
     await directory(dirname(path), false);
-    try { await mkdir(path, { mode: 0o700 }); } catch (error) {
+    try { await mkdir(path, { mode: 0o700 }); created = true; } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     }
   }
-  return directory(path, privateMode);
+  const result = await directory(path, privateMode);
+  if (created) {
+    await syncDirectory(path, privateMode);
+    await syncDirectory(dirname(path), false);
+  }
+  return result;
 }
-export async function syncDirectory(path: string): Promise<void> {
-  const expected = await directory(path);
+export async function syncDirectory(path: string, privateMode = true): Promise<void> {
+  const expected = await directory(path, privateMode);
   const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY);
   try {
     if (!sameIdentity(identity(await handle.stat()), expected)) throw profileUnavailable();
     await handle.sync();
-    await assertDirectory(path, expected);
+    if (!sameIdentity(await directory(path, privateMode), expected)) throw profileUnavailable();
   } finally { await handle.close(); }
 }
 export interface ProfilePaths {
