@@ -94,6 +94,36 @@ struct Deadline {
   }
   void lost(double now) { fatal=true; expires=std::min(expires,now); }
 };
+[[noreturn]] static void retirePair(Context& c,Channel& pair,bool primary) {
+  // External R/H/A/F authority is already dead. T/K/P cannot be reached before
+  // this independent original-main/engine disappearance proof.
+  const Identity peer=primary?c.custody:c.primary; uint64_t token=1; double requested=clockMs();
+  pair.send(std::string(primary?"T ":"P ")+std::to_string(token)+"\n");
+  for(;;) {
+    reap(peer);
+    if(!c.engineGone()||!lockIdentity(c.owner)||!lockIdentity(c.build)) { usleep(10000); continue; }
+    int state=current(peer); if(!state) _exit(0);
+    for(const auto& line:pair.readLines()) {
+      Frame f; if(frame(line,f,"A")) continue; // pending pre-quiescence receipt, never authority
+      if(!frame(line,f,"TKP")) continue;
+      if(primary&&f.kind=='P') { token=f.sequence; requested=clockMs(); pair.outgoing.clear(); pair.send("T "+std::to_string(token)+"\n"); }
+      else if(!primary&&f.kind=='T') {
+        token=f.sequence; requested=clockMs(); pair.outgoing.clear(); pair.send("K "+std::to_string(token)+"\n");
+        // Keep actual descriptions until the last send is complete. An old A
+        // or bare live PID cannot substitute for the fresh current T.
+        while(!pair.outgoing.empty()&&!pair.failed&&clockMs()-requested<1000) { pair.flush(); usleep(1000); }
+        if(pair.outgoing.empty()&&!pair.failed&&c.engineGone()) _exit(0);
+      }
+      // K acknowledges consent only; primary still waits/reaps actual death.
+    }
+    pair.flush();
+    if(clockMs()-requested>=1000) {
+      (void)c.retireMonitorPeer(peer); reap(peer);
+      if(c.engineGone()&&current(peer)==0) _exit(0);
+    }
+    usleep(5000);
+  }
+}
 [[noreturn]] static void protocolLoop(Context& c,Channel& pair,bool primary,double start) {
   Channel host(primary?0:6,primary?1:7); Deadline deadline(start);
   struct Pending { uint64_t sequence; double sent; }; std::deque<Pending> pending;
@@ -119,10 +149,12 @@ struct Deadline {
     pair.flush(); if(primary) host.flush();
     bool outputPending=!pair.outgoing.empty()||(primary&&!host.outgoing.empty());
     if(outputPending) { if(!blockedWrite) blockedWrite=now; else if(now-blockedWrite>=1000) deadline.lost(now); } else blockedWrite=0;
-    if(pair.failed||(primary&&host.failed)||current(primary?c.custody:c.primary)!=1||!lockIdentity(c.owner)||!lockIdentity(c.build)) deadline.lost(now);
+    std::vector<Identity> observed;
+    Identity peerNow; const Identity& peer=primary?c.custody:c.primary;
+    if(pair.failed||(primary&&host.failed)||observe(peer.pid,peerNow)!=1||!same(peer,peerNow)||peerNow.group!=(primary?c.main.group:(uint32_t)c.primary.pid)||!c.census(observed)||!lockIdentity(c.owner)||!lockIdentity(c.build)) deadline.lost(now);
     if(now>=deadline.expires) c.enforce();
     reap(c.custody);
-    if(c.engineGone()) retainedRefusal(&c); // post-quiescence phase follows
+    if(c.engineGone()) retirePair(c,pair,primary);
     usleep(5000);
   }
 }
