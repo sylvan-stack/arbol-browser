@@ -34,7 +34,8 @@ export function preflightNative(bundle: string, fatal: (reason: string) => void)
   if (attempted) return refuse();
   attempted = true;
   let failed = false;
-  const fail = (): never => { failed = true; fatal('native_integrity_unavailable'); return refuse(); };
+  let cadence: ReturnType<typeof setInterval> | undefined;
+  const fail = (): never => { const first = !failed; failed = true; if (cadence) clearInterval(cadence); if (first) fatal('native_integrity_unavailable'); return refuse(); };
   try {
     if (!isMainThread || process.type !== 'browser' || typeof fatal !== 'function') refuse();
     const actual = { electron: process.versions.electron, chromium: process.versions.chrome, node: process.versions.node,
@@ -60,10 +61,12 @@ export function preflightNative(bundle: string, fatal: (reason: string) => void)
         return value;
       } catch { return fail(); }
     };
+    cadence = setInterval(() => { try { assertIntegrity(); } catch { /* fatal port owns quarantine; never publish a reply */ } }, 250);
+    cadence.unref();
     return Object.freeze({ trust, pageAdmission: false as const, assertIntegrity,
-      async guard<T>(operation: () => T | Promise<T>): Promise<T> { assertIntegrity(); const result = await operation(); assertIntegrity(); return result; },
+      async guard<T>(operation: () => T | Promise<T>): Promise<T> { assertIntegrity(); try { return await operation(); } finally { assertIntegrity(); } },
       seal(): NativeStatus {
-        try { failed = true; const value = nativeReply('native.Status', addon.seal()); if (value.phase !== 'closing') refuse(); return value; }
+        try { if (cadence) clearInterval(cadence); failed = true; const value = nativeReply('native.Status', addon.seal()); if (value.phase !== 'closing') refuse(); return value; }
         catch { return fail(); }
       } });
   } catch { return fail(); }

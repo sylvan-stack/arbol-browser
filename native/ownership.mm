@@ -177,6 +177,11 @@ static napi_value install(napi_env env, napi_callback_info info) {
     poison("native_install_exception"); napi_throw_error(env, nullptr, "native_install_failed"); return nullptr;
   }
 }
+static napi_value checkIntegrity(napi_env env, napi_callback_info info) {
+  if (!mainCall(env, info, 0)) return nullptr;
+  if (!integrity()) { napi_throw_error(env, nullptr, "native_integrity_failed"); return nullptr; }
+  return jsonReply(env, statusObject());
+}
 static napi_value getABI(napi_env env, napi_callback_info info) { if (!mainCall(env, info, 0)) return nullptr; return jsonReply(env, liveInventory()); }
 static napi_value status(napi_env env, napi_callback_info info) { if (!mainCall(env, info, 0)) return nullptr; return jsonReply(env, statusObject()); }
 static void environmentClosing(void*) { phase.store(Phase::Closing, std::memory_order_release); if (bindingSeal) bindingSeal(); }
@@ -186,6 +191,7 @@ NAPI_MODULE_INIT() {
   if (![NSThread isMainThread]) { napi_throw_error(env, nullptr, "native_main_thread_only"); return nullptr; }
   napi_add_env_cleanup_hook(env, environmentClosing, nullptr);
   napi_property_descriptor exportsList[] = {
+    {"checkIntegrity", nullptr, checkIntegrity, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"install", nullptr, install, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"getABI", nullptr, getABI, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"status", nullptr, status, nullptr, nullptr, nullptr, napi_default, nullptr},
