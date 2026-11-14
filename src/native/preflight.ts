@@ -66,7 +66,7 @@ export function preflightNative(bundle: string, fatal: (reason: string) => void)
     return Object.freeze({ trust, pageAdmission: false as const, assertIntegrity,
       async guard<T>(operation: () => T | Promise<T>): Promise<T> { assertIntegrity(); try { return await operation(); } finally { assertIntegrity(); } },
       seal(): NativeStatus {
-        try { if (cadence) clearInterval(cadence); failed = true; const value = nativeReply('native.Status', addon.seal()); if (value.phase !== 'closing') refuse(); return value; }
+        try { if (cadence) clearInterval(cadence); const value = nativeReply('native.Status', addon.seal()); if (value.phase !== 'closing') refuse(); failed = true; return value; }
         catch { return fail(); }
       } });
   } catch { return fail(); }
