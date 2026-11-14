@@ -135,8 +135,8 @@ static void planOwnershipGuards() {
 }
 static napi_value install(napi_env env, napi_callback_info info) {
   napi_value argument;
-  if (!mainCall(env, info, 1, &argument)) { phase.store(Phase::Poisoned); return nullptr; }
-  if (phase.load() != Phase::New) { napi_throw_error(env, nullptr, "native_install_not_repeatable"); return nullptr; }
+  if (!mainCall(env, info, 1, &argument)) { if (phase.load() != Phase::Closing) phase.store(Phase::Poisoned); return nullptr; }
+  if (phase.load() != Phase::New) { poison("native_install_not_repeatable"); napi_throw_error(env, nullptr, "native_install_not_repeatable"); return nullptr; }
   phase.store(Phase::Planning, std::memory_order_release);
   @try {
     try {
@@ -177,6 +177,18 @@ static napi_value install(napi_env env, napi_callback_info info) {
     poison("native_install_exception"); napi_throw_error(env, nullptr, "native_install_failed"); return nullptr;
   }
 }
+extern bool closingIntegrity();
+static napi_value seal(napi_env env, napi_callback_info info) {
+  if (!mainCall(env, info, 0)) return nullptr;
+  // Publish exclusion first. Reentrant callbacks see closing even if teardown
+  // or audit throws. No path transitions this process back to ready.
+  phase.exchange(Phase::Closing, std::memory_order_acq_rel);
+  @try {
+    if (bindingSeal) bindingSeal();
+    if (!closingIntegrity()) { napi_throw_error(env, nullptr, "native_seal_unconfirmed"); return nullptr; }
+    return jsonReply(env, statusObject());
+  } @catch (NSException*) { napi_throw_error(env, nullptr, "native_seal_unconfirmed"); return nullptr; }
+}
 static napi_value checkIntegrity(napi_env env, napi_callback_info info) {
   if (!mainCall(env, info, 0)) return nullptr;
   if (!integrity()) { napi_throw_error(env, nullptr, "native_integrity_failed"); return nullptr; }
@@ -191,6 +203,7 @@ NAPI_MODULE_INIT() {
   if (![NSThread isMainThread]) { napi_throw_error(env, nullptr, "native_main_thread_only"); return nullptr; }
   napi_add_env_cleanup_hook(env, environmentClosing, nullptr);
   napi_property_descriptor exportsList[] = {
+    {"seal", nullptr, seal, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"checkIntegrity", nullptr, checkIntegrity, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"install", nullptr, install, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"getABI", nullptr, getABI, nullptr, nullptr, nullptr, napi_default, nullptr},

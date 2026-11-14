@@ -20,4 +20,15 @@ bool integrity() {
   if ((!bindingAudit && (liveBindings || policyObjects)) || (bindingAudit && !bindingAudit())) { poison("native_binding_integrity_changed"); return false; }
   return phase.load(std::memory_order_acquire) == Phase::Ready;
 }
+bool closingIntegrity() {
+  if (phase.load(std::memory_order_acquire) != Phase::Closing || liveBindings != 0) return false;
+  // Tombstones and callable guards remain resident. A missing guard cannot be
+  // reported as successful exclusion; ABR-7's watchdog owns uncertain teardown.
+  for (const auto& hook : hooks) {
+    Method method = class_getInstanceMethod(hook.cls, hook.selector);
+    if (!method || method_getImplementation(method) != hook.guard || strcmp(method_getTypeEncoding(method), hook.encoding.c_str())) return false;
+  }
+  return !bindingAudit || bindingAudit();
+}
+
 }
