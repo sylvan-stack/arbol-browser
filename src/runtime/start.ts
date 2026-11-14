@@ -66,9 +66,11 @@ export function createStarter(options: { selection: BuildSelection; platform: Pl
           current = observed;
         }
         const client = await connectRuntime(location, current, endpoint, options.selection, options.platform, deadline, label);
-        try { await options.authority.assertReady(profile, current); await guard.assert(); assertTime(deadline); }
-        catch (error) { client.close(); throw error; }
-        assertTime(deadline); release(); return { client, record: current, alreadyRunning: true };
+        try {
+          await options.authority.assertReady(profile, current); await guard.assert(); assertTime(deadline);
+          assertTime(deadline); release(); assertTime(deadline);
+          return { client, record: current, alreadyRunning: true };
+        } catch (error) { client.close(); throw error; }
       }
       startup = await startupArbitration(location, options.platform, contentionDeadline);
       await guard.assert(); assertTime(deadline);
@@ -82,9 +84,11 @@ export function createStarter(options: { selection: BuildSelection; platform: Pl
           current = observed;
         }
         const client = await connectRuntime(location, current, endpoint, options.selection, options.platform, deadline, label);
-        try { await options.authority.assertReady(profile, current); await guard.assert(); assertTime(deadline); }
-        catch (error) { client.close(); throw error; }
-        assertTime(deadline); release(); return { client, record: current, alreadyRunning: true };
+        try {
+          await options.authority.assertReady(profile, current); await guard.assert(); assertTime(deadline);
+          assertTime(deadline); release(); assertTime(deadline);
+          return { client, record: current, alreadyRunning: true };
+        } catch (error) { client.close(); throw error; }
       }
       await options.authority.assertTrusted(options.selection); assertTime(deadline);
       request = token('req');
@@ -101,9 +105,11 @@ export function createStarter(options: { selection: BuildSelection; platform: Pl
         const record = await readRuntime(location);
         if (record && record.phase === 'ready' && originalAlive(record, options.platform)) {
           const client = await connectRuntime(location, record, endpoint, options.selection, options.platform, deadline, label);
-          try { await options.authority.assertReady(profile, record); await guard.assert(); assertTime(deadline); }
-          catch (error) { client.close(); throw error; }
-          assertTime(deadline); release(); return { client, record, alreadyRunning: false };
+          try {
+            await options.authority.assertReady(profile, record); await guard.assert(); assertTime(deadline);
+            assertTime(deadline); release(); assertTime(deadline);
+            return { client, record, alreadyRunning: false };
+          } catch (error) { client.close(); throw error; }
         }
         await setTimeout(Math.min(25, Math.max(1, deadline - now())));
       } while (now() < deadline);
