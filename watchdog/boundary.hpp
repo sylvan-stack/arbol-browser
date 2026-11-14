@@ -97,6 +97,22 @@ struct Context {
     return id.pid > 1 && observe(id.pid, now) == 1 && same(id, now) && now.uid == main.uid && now.group == (anchor ? main.group : (uint32_t)id.pid) &&
       getsid(id.pid) == session && executable(now, path) && path == helper() && signature(path, false);
   }
+  bool discoverCustody() {
+    if(custody.pid) return current(custody)>=0;
+    if(!primary.pid) return false;
+    std::vector<pid_t> pids(4097); int bytes=proc_listpids(PROC_PGRP_ONLY,main.group,pids.data(),(int)(pids.size()*sizeof(pid_t)));
+    if(bytes<0 || bytes%sizeof(pid_t) || (size_t)bytes>=pids.size()*sizeof(pid_t)) return false;
+    Identity found; unsigned count=0;
+    for(int i=0;i<bytes/(int)sizeof(pid_t);++i) {
+      if(pids[i]<=0) continue; Identity id; Info info{}; std::string path;
+      int state=observe(pids[i],id,&info); if(!state) continue; if(state<0) return false;
+      if(executable(id,path) && path==helper()) {
+        if((info.unique.parent!=primary.start && info.unique.originalParentVersion!=primary.version) || !monitor(id,true)) return false;
+        found=id; ++count;
+      }
+    }
+    if(count>1) return false; if(count==1) custody=found; return true;
+  }
   bool census(std::vector<Identity>& targets) {
     targets.clear(); Identity actual; int alive = observe(main.pid, actual); if (alive < 0) return false;
     if (alive == 1 && actual.start != main.start && actual.group == main.group) {
@@ -113,7 +129,8 @@ struct Context {
       std::string path;
       if (pid == main.pid) { if (!same(id, main) || !executable(id,path) || path != engine()) return false; }
       else if (!executable(id,path) || !enginePath(path) || (info.unique.parent != main.start && info.unique.originalParentVersion != main.version)) return false;
-      if (!signature(path,true)) return false; seen[pid] = id; targets.push_back(id);
+      auto known=seen.find(pid);
+      if ((known==seen.end() || !same(known->second,id)) && !signature(path,true)) return false; seen[pid] = id; targets.push_back(id);
     }
     int mainState = current(main); if (mainState < 0) return false;
     if (mainState == 1 && std::none_of(targets.begin(),targets.end(),[&](const Identity& id){return same(id,main);})) return false;

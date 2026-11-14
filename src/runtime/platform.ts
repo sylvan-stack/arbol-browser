@@ -17,6 +17,7 @@ export interface WatchdogCustody {
   record(primaryPid: number): string;
   bind(): void;
   assert(): void;
+  terminate(): never;
 }
 const custodyReceipts = new WeakSet<object>();
 export function assertWatchdogCustody(value: WatchdogCustody): void {
@@ -43,6 +44,7 @@ interface NativeSupport {
   watchdogRecord(handle: object, pid: number): string;
   watchdogBind(handle: object): void;
   watchdogAssert(handle: object): void;
+  terminateProfileNow(handle: object): never;
 
   publishDirectory(source: string, destination: string): void;
   tryLock(path: string): object | null;
@@ -63,7 +65,7 @@ export function loadPlatform(): PlatformPort {
   let native: NativeSupport;
   try {
     native = createRequire(import.meta.url)(fileURLToPath(new URL('../../native/platform.node', import.meta.url)));
-    for (const name of ['tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'watchdogRecord', 'watchdogBind', 'watchdogAssert'] as const)
+    for (const name of ['tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'watchdogRecord', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
       if (typeof native[name] !== 'function') throw new Error('Missing process support');
   } catch { throw unavailable('profile'); }
   const call = <T>(operation: () => T): T => {
@@ -80,7 +82,8 @@ export function loadPlatform(): PlatformPort {
       if (descriptors.length !== 2 || descriptors.some(fd => !Number.isInteger(fd) || fd < 3) || descriptors[0] === descriptors[1]) throw unavailable('browser');
       const receipt: WatchdogCustody = Object.freeze({ descriptors: Object.freeze(descriptors),
         record: (pid: number) => call(() => native.watchdogRecord(handle, pid)),
-        bind: () => call(() => native.watchdogBind(handle)), assert: () => call(() => native.watchdogAssert(handle)) });
+        bind: () => call(() => native.watchdogBind(handle)), assert: () => call(() => native.watchdogAssert(handle)),
+        terminate: (): never => { native.terminateProfileNow(handle); throw unavailable('browser'); } });
       custodyReceipts.add(receipt); return receipt;
     },
     publishDirectory(source: string, destination: string): void {

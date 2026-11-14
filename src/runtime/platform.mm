@@ -293,8 +293,29 @@ static napi_value watchdogAssert(napi_env env,napi_callback_info info) {
   napi_value out; napi_get_undefined(env,&out); return out;
 }
 
+// No application/native-input cleanup is entered here. Both native lock
+// descriptions remain retained for the lifetime of this nonreturning path.
+static napi_value terminateProfileNow(napi_env env,napi_callback_info info) {
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg);
+  if(!c || getpid()!=c->context.main.pid || arbol_boundary::current(c->context.main)!=1) return fail(env);
+  for(;;) {
+    (void)c->context.discoverCustody();
+    c->context.enforce(true);
+    arbol_boundary::reap(c->context.primary); arbol_boundary::reap(c->context.custody);
+    if(c->context.engineGone(true)) {
+      bool a=c->context.retireMonitorPeer(c->context.primary,true);
+      bool b=!c->context.custody.pid ? arbol_boundary::current(c->context.primary)==0 : c->context.retireMonitorPeer(c->context.custody,true);
+      arbol_boundary::reap(c->context.primary); arbol_boundary::reap(c->context.custody);
+      if(a && b && c->context.engineGone(true) && arbol_boundary::current(c->context.primary)==0 && arbol_boundary::current(c->context.custody)==0)
+        (void)arbol_boundary::signalExact(c->context.main,SIGKILL);
+    }
+    // Uncertainty is retained fatal custody, never permission to return/unlock.
+    usleep(10000);
+  }
+}
 static napi_value init(napi_env env, napi_value exports) {
   napi_property_descriptor properties[] = {
+    {"terminateProfileNow",nullptr,terminateProfileNow,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"prepareWatchdogCustody",nullptr,prepareWatchdogCustody,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"custodyDescriptors",nullptr,custodyDescriptors,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"watchdogRecord",nullptr,watchdogRecord,nullptr,nullptr,nullptr,napi_default,nullptr},
