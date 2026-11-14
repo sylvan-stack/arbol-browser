@@ -11,9 +11,9 @@
   ],
   "checks": [
     {
-      "name": "foundation-gate-unavailable-until-ABR-4",
+      "name": "foundation-top-tier",
       "kind": "unit",
-      "command": "/usr/bin/false"
+      "command": "node scripts/top-gate.mjs --candidate \"$ARBOL_BUILD_DIR\" --out \"$ARBOL_BUILD_DIR/../.qualification-$ARBOL_BUILD_NUMBER\""
     }
   ]
 }
