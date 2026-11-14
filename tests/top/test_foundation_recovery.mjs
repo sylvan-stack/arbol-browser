@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import { writeFile, readFile } from 'node:fs/promises';
-import { assert, fixture, cli, load, snapshot, dataSentinel, refused, opaque, bounded, rawConnection, delay } from '../support/foundation.mjs';
+import { assert, fixture, cli, load, snapshot, dataSentinel, refused, opaque, bounded, rawConnection, delay, privateDirectory } from '../support/foundation.mjs';
 
 export async function preservationBoundary(context) {
   const f = await fixture(context, 'preservation');
@@ -50,7 +50,10 @@ export async function preservationBoundary(context) {
 }
 
 export async function transportBoundary(context) {
-  const f = await fixture(context, 'transport');
+  const base = await fixture(context, 'transport');
+  const home = await privateDirectory(join(base.home, 'long-data-path-'.repeat(6), 'retained-profile-home-'.repeat(5)));
+  await privateDirectory(join(home, 'Library/Application Support/Arbol'));
+  const f = { ...base, home, state: join(home, 'Library/Application Support/Arbol/browser') };
   assert.equal((await cli(f, ['profiles', 'create', 'transport'])).status, 0);
   const { loadPlatform } = await load(f, 'runtime/platform'), platform = loadPlatform();
   const { readProfile } = await load(f, 'profiles/records');
@@ -77,6 +80,9 @@ export async function transportBoundary(context) {
   try {
     server.openAdmission(); await instance.phase('ready');
     const record = instance.record, location = instance.location;
+    assert.ok(Buffer.byteLength(p.paths.root, 'utf8') > 103, 'Fixture must exceed Darwin socket path capacity');
+    assert.ok([location.agent, location.management].every(path => Buffer.byteLength(path, 'utf8') + 1 <= 104));
+    assert.equal(location.hash, (await import('node:crypto')).createHash('sha256').update(p.paths.root, 'utf8').digest('hex'));
     const selection = { build: 'b', explicit: false, directory: context.candidate, guard: '' };
     const positive = await connectRuntime(location, record, 'agent', selection, platform, now() + 2000);
     clients.push(positive);
