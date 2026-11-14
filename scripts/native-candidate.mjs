@@ -10,7 +10,7 @@ export const policy = JSON.parse(await readFile(join(root, 'native/publisher-req
 const runtime = { electron: '45.3.2', chromium: '156.0.8078.100', node: '24.22.2', napi: '10', modules: '150', platform: 'darwin', arch: 'arm64', macOS: '27.0.1' };
 const foundation = '/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-32-20261114/registry/arbol-browser/1';
 const canonical = value => JSON.stringify(Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b, 'en'))));
-function infoPlist() { return `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>${policy.bundleIdentifier}</string><key>CFBundleName</key><string>Arbol Browser Native Candidate</string><key>CFBundleExecutable</key><string>arbol-browser-native</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleVersion</key><string>5</string><key>LSMinimumSystemVersion</key><string>27.0.1</string></dict></plist>\n`; }
+function infoPlist() { return `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>${policy.bundleIdentifier}</string><key>CFBundleName</key><string>Arbol Browser Native Candidate</string><key>CFBundleExecutable</key><string>arbol-browser-native</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleVersion</key><string>6</string><key>LSMinimumSystemVersion</key><string>27.0.1</string></dict></plist>\n`; }
 async function currentCompilation() {
   const compiled = JSON.parse(await readFile(join(root, 'dist/compile-record.json'), 'utf8'));
   if (inventoryDigest(await sourceInventory()) !== compiled.sourceDigest ||
@@ -58,7 +58,7 @@ export async function writeCompatibility(bundle) {
     publisherTeam: policy.team, bundleIdentifier: policy.bundleIdentifier,
     featureConfiguration: { sitePerProcess: true, disabledFeatures: ['MacAccessibilityTextOperation'], extraChromiumArguments: [] },
     files, dataEpoch: 1, compatibleReaderKeys: ['candidate-unqualified'], writerKey: 'candidate-unqualified', readableDataEpochs: [1],
-    qualification: `unqualified:ABR-5-static-only;source=${staged.sourceDigest}` };
+    qualification: `unqualified:ABR-6-static-only;source=${staged.sourceDigest}` };
   const raw = JSON.stringify(manifest, null, 2) + '\n';
   if (Buffer.byteLength(raw) > 1048576 || Object.keys(files).length > 4096) throw new Error('Native manifest bound exceeded');
   await writeFile(join(bundle, 'Contents/Resources/native-compatibility.json'), raw);

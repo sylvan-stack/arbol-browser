@@ -18,8 +18,8 @@ async function nativeSources() { return Object.fromEntries(Object.entries(await 
 async function declaredExports() {
   const text = await readFile(join(root, 'native/ownership.mm'), 'utf8');
   const exports_ = [...text.matchAll(/\{"([A-Za-z]+)", nullptr, [A-Za-z]+,/g)].map(match => match[1]).sort();
-  const required = ['getABI', 'install', 'status', 'checkIntegrity', 'seal'];
-  const allowed = [...required, 'beginBinding', 'finishBinding', 'bindingInfo', 'mark', 'restore', 'retire', 'interactionState'];
+  const required = ['getABI', 'install', 'status', 'checkIntegrity', 'seal', 'beginBinding', 'finishBinding', 'bindingInfo', 'mark', 'restore', 'retire', 'interactionState'];
+  const allowed = required;
   if (required.some(name => !exports_.includes(name)) || exports_.some(name => !allowed.includes(name)) || new Set(exports_).size !== exports_.length)
     throw new Error('Unexpected production native export declaration');
   return exports_;
@@ -56,7 +56,7 @@ export async function compileNative(headers) {
   await mkdir(join(root, 'dist/native'), { recursive: true });
   run('/usr/bin/xcrun', ['clang++', '-std=c++17', '-O2', '-fobjc-arc', '-fblocks', '-fvisibility=hidden', '-Wall', '-Wextra', '-Werror',
     '-DNAPI_VERSION=8', '-arch', 'arm64', '-mmacosx-version-min=27.0', '-isysroot', sdk, '-bundle', '-undefined', 'dynamic_lookup',
-    '-I', headers, 'native/ownership.mm', 'native/integrity.mm', '-framework', 'Cocoa', '-o', output]);
+    '-I', headers, 'native/ownership.mm', 'native/integrity.mm', 'native/bindings.mm', 'native/accessibility.mm', 'native/text-input.mm', 'native/responder.mm', 'native/interaction.mm', '-framework', 'Cocoa', '-o', output]);
   const symbols = run('/usr/bin/nm', ['-gU', output]);
   if (!symbols.includes('_napi_register_module_v1') || !symbols.includes('_node_api_module_get_api_version_v1') || run('/usr/bin/lipo', ['-archs', output]) !== 'arm64') throw new Error('Native registration/architecture mismatch');
   await assertHeaders();
