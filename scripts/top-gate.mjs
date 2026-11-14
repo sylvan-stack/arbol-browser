@@ -33,6 +33,10 @@ if (!embedded) {
   if (result.error) console.error(result.error.message);
   process.exitCode = result.status === 0 ? 0 : 1;
 } else {
+  try {
+  // Electron's ASAR filesystem view must not replace physical archive bytes in
+  // the package inventory. The embedded runtime exposes this documented flag.
+  process.noAsar = true;
   const inventory = JSON.parse(await readFile(join(repository, 'test-tiers.json'), 'utf8'));
   assert.deepEqual(inventory.cases.map(item => [item.id, item.file]), selected);
   assert.ok(inventory.cases.every(item => item.tier === 'top' && item.status === 'retained'));
@@ -53,7 +57,9 @@ if (!embedded) {
     }
   }
   for (const name of ['bin', 'lib', 'native', 'runtime', 'node_modules', 'package.json'].sort()) await walk(join(candidate, name));
-  assert.deepEqual(payload, metadata.files, 'Actual package differs from recorded immutable payload');
+  const mismatches = [...new Set([...Object.keys(payload), ...Object.keys(metadata.files)])]
+    .filter(name => payload[name] !== metadata.files[name]);
+  assert.equal(mismatches.length, 0, `Physical package differs at ${mismatches.slice(0, 8).join(', ')}`);
   const actualRuntime = { electron: process.versions.electron, chromium: process.versions.chrome,
     node: process.versions.node, napi: process.versions.napi, modules: process.versions.modules,
     platform: process.platform, arch: process.arch,
@@ -89,4 +95,11 @@ if (!embedded) {
   result.passed = result.cases.length === selected.length && result.cases.every(item => item.status === 'passed');
   await writeFile(join(output, 'result.json'), JSON.stringify(result, null, 2) + '\n', { mode: 0o600 });
   process.exitCode = result.passed ? 0 : 1;
+  } catch (error) {
+    let partial = { format: 1, candidate, output, selection: selected.map(([id]) => id), cases: [] };
+    try { partial = JSON.parse(await readFile(join(output, 'result.json'), 'utf8')); } catch { /* preflight selected no cases */ }
+    await writeFile(join(output, 'result.json'), JSON.stringify({ ...partial, passed: false,
+      gateError: String(error.stack ?? error), finishedAt: new Date().toISOString() }, null, 2) + '\n', { mode: 0o600 });
+    console.error(`GATE FAILED: ${error.message}`); process.exitCode = 1;
+  }
 }
