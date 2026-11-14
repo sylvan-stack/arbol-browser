@@ -1,5 +1,8 @@
 // Private process support only (BRW-0.14, BRW-1.7, BRW-3.11), not native input ABI.
+#import <Foundation/Foundation.h>
 #include <node_api.h>
+#include "../../watchdog/boundary.hpp"
+#include <set>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -25,7 +28,8 @@ struct UniqueInfo {
 static_assert(sizeof(UniqueInfo) == 56);
 struct ProcessInfo { proc_bsdinfo bsd; UniqueInfo unique; };
 static constexpr int kBsdWithUniqueId = 18;
-struct HeldLock { int fd; std::string path; dev_t dev; ino_t ino; };
+struct HeldLock { int fd; std::string path; dev_t dev; ino_t ino; int mode; };
+static std::set<HeldLock*> liveLocks;
 
 static napi_value fail(napi_env env) {
   napi_throw_error(env, "platform_unavailable", "Private OS support unavailable."); return nullptr;
@@ -56,6 +60,7 @@ static bool argument(napi_env env, napi_callback_info info, napi_value* value) {
 }
 static void finalize(napi_env, void* data, void*) {
   auto* lock = static_cast<HeldLock*>(data);
+  liveLocks.erase(lock);
   if (lock->fd >= 0) close(lock->fd);
   delete lock;
 }
@@ -74,11 +79,11 @@ static napi_value acquireLock(napi_env env, napi_callback_info info, int mode) {
   if (fd < 0) return fail(env);
   struct stat st;
   if (fstat(fd, &st) != 0) { close(fd); return fail(env); }
-  auto* lock = new HeldLock{fd, path, st.st_dev, st.st_ino};
+  auto* lock = new HeldLock{fd, path, st.st_dev, st.st_ino, mode};
   if (!matches(lock, &st)) { finalize(env, lock, nullptr); return fail(env); }
   if (flock(fd, mode | LOCK_NB) != 0) {
     int error = errno; finalize(env, lock, nullptr);
-    if (error == EWOULDBLOCK || error == EAGAIN) { napi_value nil; napi_get_null(env, &nil); return nil; }
+    if (error == EWOULDBLOCK || error == EAGAIN) { napi_value nullValue; napi_get_null(env, &nullValue); return nullValue; }
     return fail(env);
   }
   if (!matches(lock, &st)) { finalize(env, lock, nullptr); return fail(env); }
@@ -86,6 +91,7 @@ static napi_value acquireLock(napi_env env, napi_callback_info info, int mode) {
   if (napi_create_external(env, lock, finalize, nullptr, &handle) != napi_ok) {
     finalize(env, lock, nullptr); return fail(env);
   }
+  liveLocks.insert(lock);
   return handle;
 }
 static napi_value tryLock(napi_env env, napi_callback_info info) { return acquireLock(env, info, LOCK_EX); }
@@ -93,7 +99,8 @@ static napi_value trySharedLock(napi_env env, napi_callback_info info) { return 
 static HeldLock* held(napi_env env, napi_callback_info info) {
   napi_value arg; void* data = nullptr;
   if (!argument(env, info, &arg) || napi_get_value_external(env, arg, &data) != napi_ok || !data) return nullptr;
-  return static_cast<HeldLock*>(data);
+  auto* lock = static_cast<HeldLock*>(data);
+  return liveLocks.count(lock) ? lock : nullptr;
 }
 static napi_value assertLock(napi_env env, napi_callback_info info) {
   auto* lock = held(env, info); struct stat st;
@@ -132,7 +139,7 @@ static napi_value processIdentity(napi_env env, napi_callback_info info) {
   if (!argument(env, info, &arg) || !integer(env, arg, &pid) || pid <= 0) return fail(env);
   int status = processInfo(pid, data);
   if (status < 0) return fail(env);
-  if (!status) { napi_value nil; napi_get_null(env, &nil); return nil; }
+  if (!status) { napi_value nullValue; napi_get_null(env, &nullValue); return nullValue; }
   return identity(env, pid, data);
 }
 static napi_value peerIdentity(napi_env env, napi_callback_info info) {
@@ -211,8 +218,88 @@ static napi_value publishDirectory(napi_env env, napi_callback_info info) {
   if (!valid || result != 0) return fail(env);
   napi_value out; napi_get_undefined(env, &out); return out;
 }
+
+// Process-lifetime native custody is intentionally not garbage-collected. Once
+// created it has no unlock/disarm export; retained originals survive JS failure.
+struct Custody { arbol_boundary::Context context; std::string digest; bool bound = false; };
+static std::set<Custody*> nativeCustodies;
+static bool custodyAttempted = false;
+static Custody* custodyArgument(napi_env env, napi_value value) {
+  void* data = nullptr; if (napi_get_value_external(env,value,&data) != napi_ok) return nullptr;
+  auto* c = static_cast<Custody*>(data); return nativeCustodies.count(c) ? c : nullptr;
+}
+static arbol_boundary::Lock duplicateHeld(HeldLock* held) {
+  struct stat st{}; if (!held || !liveLocks.count(held) || !matches(held,&st)) return {};
+  int fd = fcntl(held->fd,F_DUPFD_CLOEXEC,10); if (fd < 0) return {};
+  return {fd,held->path,(uint64_t)st.st_dev,st.st_ino,st.st_uid,0600,held->mode};
+}
+static napi_value prepareWatchdogCustody(napi_env env, napi_callback_info info) {
+  napi_value args[4]; size_t n = 4; std::string bundle; char digest[65]{}; size_t length = 0; void *a = nullptr, *b = nullptr;
+  if (custodyAttempted) return fail(env); custodyAttempted = true;
+  if (napi_get_cb_info(env,info,&n,args,nullptr,nullptr) != napi_ok || n != 4 ||
+      napi_get_value_external(env,args[0],&a) != napi_ok || napi_get_value_external(env,args[1],&b) != napi_ok ||
+      !liveLocks.count(static_cast<HeldLock*>(a)) || !liveLocks.count(static_cast<HeldLock*>(b)) ||
+      !string(env,args[2],bundle) || napi_get_value_string_utf8(env,args[3],digest,sizeof(digest),&length) != napi_ok || length != 64) return fail(env);
+  for (size_t i=0;i<64;++i) if (!((digest[i]>='0' && digest[i]<='9') || (digest[i]>='a' && digest[i]<='f'))) return fail(env);
+  auto* c = new Custody; c->context.bundle=bundle; c->digest=digest;
+  c->context.owner=duplicateHeld(static_cast<HeldLock*>(a)); c->context.build=duplicateHeld(static_cast<HeldLock*>(b));
+  c->context.session=getsid(0);
+  bool valid=arbol_boundary::observe(getpid(),c->context.main)==1 && c->context.initial();
+  if (!valid) { if(c->context.owner.fd>=0) close(c->context.owner.fd); if(c->context.build.fd>=0) close(c->context.build.fd); delete c; return fail(env); }
+  nativeCustodies.insert(c); napi_value out;
+  if(napi_create_external(env,c,nullptr,nullptr,&out)!=napi_ok) return fail(env); return out;
+}
+static NSDictionary* processRecord(const arbol_boundary::Identity& id, int session=0) {
+  NSMutableDictionary* result=[@{@"pid":@(id.pid),@"startId":[NSString stringWithUTF8String:std::to_string(id.start).c_str()],@"pidVersion":@(id.version),@"uid":@(id.uid),@"group":@(id.group)} mutableCopy];
+  if(session) result[@"session"]=@(session); return result;
+}
+static NSDictionary* lockRecord(const arbol_boundary::Lock& lock) {
+  return @{@"path":[NSString stringWithUTF8String:lock.path.c_str()],@"device":[NSString stringWithUTF8String:std::to_string(lock.device).c_str()],@"inode":[NSString stringWithUTF8String:std::to_string(lock.inode).c_str()],@"uid":@(lock.uid),@"mode":@(lock.mode),@"heldMode":@(lock.heldMode)};
+}
+static napi_value custodyDescriptors(napi_env env,napi_callback_info info) {
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg); if(!c) return fail(env);
+  napi_value out; if(napi_create_array_with_length(env,2,&out)!=napi_ok || napi_set_element(env,out,0,number(env,c->context.owner.fd))!=napi_ok || napi_set_element(env,out,1,number(env,c->context.build.fd))!=napi_ok) return fail(env); return out;
+}
+static napi_value watchdogRecord(napi_env env,napi_callback_info info) {
+  napi_value args[2]; size_t n=2; int pid; arbol_boundary::Info detail{}; arbol_boundary::Identity child; std::string path;
+  if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok || n!=2 || !integer(env,args[1],&pid)) return fail(env);
+  auto* c=custodyArgument(env,args[0]); if(!c || c->context.primary.pid || c->bound || arbol_boundary::observe(pid,child,&detail)!=1 ||
+    child.uid!=geteuid() || detail.unique.parent!=c->context.main.start || !arbol_boundary::executable(child,path) || path!=c->context.helper() || !arbol_boundary::signature(path,false)) return fail(env);
+  c->context.primary=child; c->context.primary.group=(uint32_t)pid;
+  @autoreleasepool {
+    NSDictionary* record=@{@"format":@1,@"candidateSnapshotDigest":[NSString stringWithUTF8String:c->digest.c_str()],@"bundle":[NSString stringWithUTF8String:c->context.bundle.c_str()],@"main":processRecord(c->context.main,c->context.session),@"primary":processRecord(c->context.primary),@"locks":@{@"owner":lockRecord(c->context.owner),@"build":lockRecord(c->context.build)}};
+    NSData* data=[NSJSONSerialization dataWithJSONObject:record options:0 error:nil];
+    if(!data || data.length>16384) return fail(env); return text(env,std::string((const char*)data.bytes,data.length));
+  }
+}
+static napi_value watchdogBind(napi_env env,napi_callback_info info) {
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg);
+  if(!c || c->bound || !c->context.monitor(c->context.primary,false)) return fail(env);
+  std::vector<pid_t> pids(4097); int bytes=proc_listpids(PROC_PGRP_ONLY,c->context.main.group,pids.data(),(int)(pids.size()*sizeof(pid_t))); int found=0;
+  if(bytes<0 || bytes%sizeof(pid_t) || (size_t)bytes>=pids.size()*sizeof(pid_t)) return fail(env);
+  for(int i=0;i<bytes/(int)sizeof(pid_t);++i) { arbol_boundary::Identity id; arbol_boundary::Info detail{}; std::string path;
+    if(pids[i]<=0) continue; if(arbol_boundary::observe(pids[i],id,&detail)!=1) return fail(env);
+    if(arbol_boundary::executable(id,path) && path==c->context.helper()) {
+      if(detail.unique.parent!=c->context.primary.start || !c->context.monitor(id,true)) return fail(env); c->context.custody=id; ++found;
+    }
+  }
+  std::vector<arbol_boundary::Identity> engines;
+  if(found!=1 || !c->context.census(engines) || !arbol_boundary::lockIdentity(c->context.owner) || !arbol_boundary::lockIdentity(c->context.build)) return fail(env);
+  c->bound=true; napi_value out; napi_get_undefined(env,&out); return out;
+}
+static napi_value watchdogAssert(napi_env env,napi_callback_info info) {
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg);
+  if(!c || !c->bound || arbol_boundary::current(c->context.main)!=1 || arbol_boundary::current(c->context.primary)!=1 || arbol_boundary::current(c->context.custody)!=1 || !arbol_boundary::lockIdentity(c->context.owner) || !arbol_boundary::lockIdentity(c->context.build)) return fail(env);
+  napi_value out; napi_get_undefined(env,&out); return out;
+}
+
 static napi_value init(napi_env env, napi_value exports) {
   napi_property_descriptor properties[] = {
+    {"prepareWatchdogCustody",nullptr,prepareWatchdogCustody,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"custodyDescriptors",nullptr,custodyDescriptors,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"watchdogRecord",nullptr,watchdogRecord,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"watchdogBind",nullptr,watchdogBind,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"watchdogAssert",nullptr,watchdogAssert,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"publishDirectory", nullptr, publishDirectory, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"trySharedLock", nullptr, trySharedLock, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"groupCensus", nullptr, groupCensus, nullptr, nullptr, nullptr, napi_default, nullptr},
