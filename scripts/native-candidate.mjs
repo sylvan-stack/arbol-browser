@@ -5,19 +5,21 @@ import { join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { root, inventory, inventoryDigest, sourceInventory } from './package-base.mjs';
 import { validateNativeCompilation } from './compile-native.mjs';
+import { validateWatchdogCompilation } from './compile-watchdog.mjs';
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
-export const candidateQualification = 'unqualified:ABR-6-static-only';
+export const candidateQualification = 'unqualified:ABR-7-static-only';
 export const policy = JSON.parse(await readFile(join(root, 'native/publisher-requirement.json'), 'utf8'));
 const runtime = { electron: '45.3.2', chromium: '156.0.8078.100', node: '24.22.2', napi: '10', modules: '150', platform: 'darwin', arch: 'arm64', macOS: '27.0.1' };
 const foundation = '/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-32-20261114/registry/arbol-browser/1';
 const canonical = value => JSON.stringify(Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b, 'en'))));
-function infoPlist() { return `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>${policy.bundleIdentifier}</string><key>CFBundleName</key><string>Arbol Browser Native Candidate</string><key>CFBundleExecutable</key><string>arbol-browser-native</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleVersion</key><string>6</string><key>LSMinimumSystemVersion</key><string>27.0.1</string></dict></plist>\n`; }
+function infoPlist() { return `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>${policy.bundleIdentifier}</string><key>CFBundleName</key><string>Arbol Browser Native Candidate</string><key>CFBundleExecutable</key><string>arbol-browser-native</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleVersion</key><string>7</string><key>LSMinimumSystemVersion</key><string>27.0.1</string></dict></plist>\n`; }
 async function currentCompilation() {
   const compiled = JSON.parse(await readFile(join(root, 'dist/compile-record.json'), 'utf8'));
   if (inventoryDigest(await sourceInventory()) !== compiled.sourceDigest ||
       inventoryDigest(await inventory(join(root, 'dist/lib'))) !== compiled.libraryDigest ||
       inventoryDigest(await inventory(join(root, 'dist/native'))) !== compiled.nativeDigest) throw new Error('Native staging requires fresh test-free compilation');
   await validateNativeCompilation();
+  await validateWatchdogCompilation();
   return compiled;
 }
 async function expectedUnsignedFiles() {
@@ -28,8 +30,9 @@ async function expectedUnsignedFiles() {
   files['Contents/Resources/browser/metadata.json'] = hash(raw);
   const bootstrap = hash(await readFile(join(root, 'dist/native/host-bootstrap')));
   for (const name of ['native/host-bootstrap', 'runtime/ArbolBrowserHost.app/Contents/MacOS/arbol-browser-host']) files[`Contents/Resources/browser/${name}`] = bootstrap;
-  for (const [name, digest] of Object.entries(await inventory(join(root, 'dist/lib/native')))) files[`Contents/Resources/browser/lib/native/${name}`] = digest;
-  for (const name of ['ownership.node', 'ownership-compile.json']) files[`Contents/Resources/browser/native/${name}`] = hash(await readFile(join(root, 'dist/native', name)));
+  for (const [name,digest] of Object.entries(await inventory(join(root,'dist/lib')))) files[`Contents/Resources/browser/lib/${name}`]=digest;
+  for (const [name,digest] of Object.entries(await inventory(join(root,'dist/native')))) files[`Contents/Resources/browser/native/${name}`]=digest;
+  for(const name of ['cli','host']) files[`Contents/Resources/browser/lib/${name}/main.mjs`]=hash(await readFile(join(root,'dist',name,'main.mjs')));
   files['Contents/MacOS/arbol-browser-native'] = bootstrap;
   files['Contents/Info.plist'] = hash(infoPlist());
   files['Contents/Resources/publisher-requirement.json'] = hash(JSON.stringify(policy, null, 2) + '\n');
@@ -40,9 +43,10 @@ async function expectedUnsignedFiles() {
 export async function assertStagedSource(bundle, unsigned = false) {
   const staged = JSON.parse(await readFile(join(bundle, 'Contents/Resources/native-staging.json'), 'utf8'));
   const compiled = await currentCompilation();
-  if (Object.keys(staged).sort().join(',') !== 'compileRecordDigest,files,format,nativeCompilationDigest,sourceDigest' || staged.format !== 1 ||
+  if (Object.keys(staged).sort().join(',') !== 'compileRecordDigest,files,format,nativeCompilationDigest,sourceDigest,watchdogCompilationDigest' || staged.format !== 1 ||
       staged.sourceDigest !== compiled.sourceDigest || staged.compileRecordDigest !== hash(await readFile(join(root, 'dist/compile-record.json'))) ||
       staged.nativeCompilationDigest !== hash(await readFile(join(root, 'dist/native/ownership-compile.json'))) ||
+      staged.watchdogCompilationDigest !== hash(await readFile(join(root,'dist/native/watchdog-compile.json'))) ||
       canonical(staged.files) !== canonical(await expectedUnsignedFiles())) throw new Error('Staged source identity differs; retain candidate and stage a new one');
   if (unsigned) {
     const actual = await inventory(bundle);
@@ -81,8 +85,9 @@ export async function stageNativeCandidate(out) {
   await mkdir(payload, { recursive: true });
   const copy = { recursive: true, force: false, errorOnExist: true, verbatimSymlinks: true };
   for (const name of [...roots, 'metadata.json']) await cp(join(foundation, name), join(payload, name), copy);
-  await cp(join(root, 'dist/lib/native'), join(payload, 'lib/native'), copy);
-  for (const name of ['ownership.node', 'ownership-compile.json']) await cp(join(root, 'dist/native', name), join(payload, 'native', name), copy);
+  await cp(join(root,'dist/lib'),join(payload,'lib'),{recursive:true,force:true});
+  await cp(join(root,'dist/native'),join(payload,'native'),{recursive:true,force:true});
+  for(const name of ['cli','host']) await cp(join(root,'dist',name,'main.mjs'),join(payload,'lib',name,'main.mjs'),{force:true});
   // Replace only these explicitly new bootstrap bytes. No Foundation evidence is
   // promoted to evidence for this newly signed candidate.
   for (const destination of ['native/host-bootstrap', 'runtime/ArbolBrowserHost.app/Contents/MacOS/arbol-browser-host'])
@@ -93,13 +98,14 @@ export async function stageNativeCandidate(out) {
   await writeFile(join(bundle, 'Contents/Info.plist'), infoPlist());
   const staged = { format: 1, sourceDigest: compiled.sourceDigest,
     compileRecordDigest: hash(await readFile(join(root, 'dist/compile-record.json'))),
-    nativeCompilationDigest: hash(await readFile(join(root, 'dist/native/ownership-compile.json'))), files: await expectedUnsignedFiles() };
+    nativeCompilationDigest: hash(await readFile(join(root, 'dist/native/ownership-compile.json'))),
+    watchdogCompilationDigest: hash(await readFile(join(root,'dist/native/watchdog-compile.json'))), files: await expectedUnsignedFiles() };
   await writeFile(join(bundle, 'Contents/Resources/native-staging.json'), JSON.stringify(staged, null, 2) + '\n', { flag: 'wx' });
   await assertStagedSource(bundle, true);
   const manifest = await writeCompatibility(bundle);
   console.log(JSON.stringify({ candidate: bundle, foundation, sourceDigest: compiled.sourceDigest,
     manifestDigest: hash(await readFile(join(bundle, 'Contents/Resources/native-compatibility.json'))), files: Object.keys(manifest.files).length,
-    admission: 'blocked', watchdog: 'not-yet-implemented; ABR-7 stages its real signed helper', qualification: 'unexecuted' }));
+    admission: 'blocked', watchdog: 'two native custody modes; runtime unqualified', qualification: 'unexecuted' }));
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   if (process.argv.length !== 4 || process.argv[2] !== '--out') throw new Error('Usage: native-candidate.mjs --out <new-isolated.app>');
