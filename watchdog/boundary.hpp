@@ -7,6 +7,7 @@
 #include <bsm/libbsm.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/proc.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -80,12 +81,16 @@ inline bool lockIdentity(const Lock& lock) {
     (d.st_mode & 07777) == lock.mode && lock.mode == 0600 && (uint64_t)d.st_dev == lock.device && d.st_ino == lock.inode && d.st_dev == p.st_dev && d.st_ino == p.st_ino;
 }
 struct Context {
-  Identity main, primary, custody; bool authenticated=false; std::string bundle, digest; int session = 0; Lock owner, build; std::map<int, Identity> seen;
+  Identity main, primary, custody; bool authenticated=false, cleanupOnly=false, primaryOutside=false; std::string bundle, digest; int session = 0; Lock owner, build; std::map<int, Identity> seen;
   std::string engine() const { return bundle + "/Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron"; }
   std::string helper() const { return bundle + "/Contents/Resources/browser/native/watchdog"; }
   bool enginePath(const std::string& path) const {
     for (const char* suffix : {"", " (Renderer)", " (GPU)", " (Plugin)"}) { std::string name = std::string("Electron Helper") + suffix;
       if (path == bundle + "/Contents/Resources/browser/runtime/Electron.app/Contents/Frameworks/" + name + ".app/Contents/MacOS/" + name) return true; } return false;
+  }
+  bool foundation() const {
+    return main.pid>1&&main.group==(uint32_t)main.pid&&main.uid==geteuid()&&canonical(bundle)&&bundle.size()>4&&bundle.substr(bundle.size()-4)==".app"&&
+      owner.heldMode==LOCK_EX&&build.heldMode==LOCK_SH&&lockIdentity(owner)&&lockIdentity(build)&&(owner.device!=build.device||owner.inode!=build.inode);
   }
   bool initial() {
     Identity id; std::string path;
@@ -93,28 +98,73 @@ struct Context {
       std::string expected="1:"+std::to_string(main.pid)+":"+std::to_string(main.start)+":"+std::to_string(main.group)+":"+std::to_string(session)+":"+std::to_string(main.uid);
       const char* record=getenv("ARBOL_BROWSER_BOOTSTRAP"); if(!record || expected!=record) return false;
     }
-    authenticated = main.pid > 1 && main.group == (uint32_t)main.pid && main.uid == geteuid() && canonical(bundle) && bundle.size() > 4 && bundle.substr(bundle.size()-4) == ".app" &&
-      observe(main.pid, id) == 1 && same(main, id) && id.group == main.group && getsid(main.pid) == session && executable(id, path) && path == engine() && signature(path, true) &&
-      owner.heldMode == LOCK_EX && build.heldMode == LOCK_SH && lockIdentity(owner) && lockIdentity(build) && (owner.device != build.device || owner.inode != build.inode);
-    return authenticated;
+    bool valid=foundation()&&observe(main.pid,id)==1&&same(main,id)&&id.group==main.group&&getsid(main.pid)==session&&executable(id,path)&&path==engine()&&signature(path,true);
+    if(valid) authenticated=true; // later death never erases previously proven custody
+    return valid&&!cleanupOnly;
+  }
+  // Captured before any setpgid: the still-inherited membership reserves the
+  // original group even when its leader/producer has already died. This grants
+  // cleanup only; readiness additionally requires the live original engine.
+  bool authenticateBirth(const Identity& self,const Info& birth,int birthSession,const Identity& producer,bool primaryMode) {
+    if(!foundation()||self.uid!=main.uid||self.group!=main.group||birthSession!=session||getsid(0)!=session||getpgrp()!=(int)main.group||
+      birth.unique.originalParentVersion!=producer.version||producer.uid!=main.uid||producer.group!=main.group) return false;
+    if(primaryMode) { if(!same(producer,main)) return false; primary=self; }
+    else primary=producer,custody=self;
+    std::string path; Identity actual;
+    if(observe(self.pid,actual)!=1||!same(self,actual)||actual.group!=main.group||!executable(self,path)||path!=helper()||!signature(path,false)) return false;
+    Info producerInfo{}; Identity producerNow; int parentState=observe(producer.pid,producerNow,&producerInfo);
+    if(parentState<0||(parentState==1&&producerNow.start==producer.start&&!same(producer,producerNow))) return false;
+    // A kernel zombie may already have no task/image. Its exact identity plus
+    // stable original-parent version grants cleanup, never live readiness.
+    if(parentState==1&&same(producer,producerNow)&&producerInfo.bsd.pbi_status!=SZOMB) {
+      if(birth.unique.parent!=producer.start||!executable(producer,path)||path!=(primaryMode?engine():helper())||!signature(path,primaryMode)) return false;
+    }
+    authenticated=true; cleanupOnly=true; return true;
   }
   bool monitor(const Identity& id, bool anchor) const {
     Identity now; std::string path;
     return id.pid > 1 && observe(id.pid, now) == 1 && same(id, now) && now.uid == main.uid && now.group == (anchor ? main.group : (uint32_t)id.pid) &&
       getsid(id.pid) == session && executable(now, path) && path == helper() && signature(path, false);
   }
+  bool primaryMonitor() {
+    Identity now;
+    if(observe(primary.pid,now)!=1||!same(primary,now)) return false;
+    if(now.group==main.group) return !primaryOutside&&monitor(primary,true);
+    // The closed signed primary can leave only after C. Peer liveness is
+    // checked separately; a dead anchor must not block post-quiescence retirement.
+    if(now.group!=(uint32_t)primary.pid||!monitor(primary,false)) return false;
+    primaryOutside=true; return true;
+  }
+  bool discoverPrimary() {
+    if(primary.pid) return current(primary)>=0;
+    std::vector<pid_t> pids(16385); int bytes=proc_listpids(PROC_ALL_PIDS,0,pids.data(),(int)(pids.size()*sizeof(pid_t)));
+    if(bytes<0||bytes%sizeof(pid_t)||(size_t)bytes>=pids.size()*sizeof(pid_t)) return false;
+    Identity found; unsigned count=0;
+    for(int i=0;i<bytes/(int)sizeof(pid_t);++i) {
+      if(pids[i]<=0) continue; Identity id; Info info{}; std::string path;
+      int state=observe(pids[i],id,&info); if(!state) continue; if(state<0) return false;
+      if(id.uid!=main.uid||info.unique.parent!=main.start||info.unique.originalParentVersion!=main.version) continue;
+      if(executable(id,path)&&path==helper()) {
+        if(getsid(id.pid)!=session||(id.group!=main.group&&id.group!=(uint32_t)id.pid)||!signature(path,false)) return false;
+        found=id; ++count;
+      }
+    }
+    if(count>1) return false; if(count==1) primary=found; return true;
+  }
   bool discoverCustody() {
-    if(!authenticated) return false;
+    if(!authenticated||!discoverPrimary()) return false;
     if(custody.pid) return current(custody)>=0;
-    if(!primary.pid) return false;
+    if(!primary.pid) return true;
     std::vector<pid_t> pids(4097); int bytes=proc_listpids(PROC_PGRP_ONLY,main.group,pids.data(),(int)(pids.size()*sizeof(pid_t)));
     if(bytes<0 || bytes%sizeof(pid_t) || (size_t)bytes>=pids.size()*sizeof(pid_t)) return false;
     Identity found; unsigned count=0;
     for(int i=0;i<bytes/(int)sizeof(pid_t);++i) {
       if(pids[i]<=0) continue; Identity id; Info info{}; std::string path;
       int state=observe(pids[i],id,&info); if(!state) continue; if(state<0) return false;
+      if(same(id,primary)) { if(primaryOutside||!monitor(primary,true)) return false; continue; }
       if(executable(id,path) && path==helper()) {
-        if((info.unique.parent!=primary.start && info.unique.originalParentVersion!=primary.version) || !monitor(id,true)) return false;
+        int producerState=current(primary);
+        if(producerState<0||info.unique.originalParentVersion!=primary.version||(producerState==1&&info.unique.parent!=primary.start)||!monitor(id,true)) return false;
         found=id; ++count;
       }
     }
@@ -133,7 +183,8 @@ struct Context {
     for (int i = 0; i < bytes/(int)sizeof(pid_t); ++i) {
       int pid = pids[i]; if (pid <= 0) continue; Identity id; Info info{}; int state = observe(pid, id, &info); if (!state) continue;
       if (state < 0 || id.uid != main.uid || id.group != main.group) return false;
-      if (pid == custody.pid && same(id, custody)) continue;
+      if (pid==primary.pid&&same(id,primary)) { if(!primaryMonitor()) return false; continue; }
+      if (pid==custody.pid&&same(id,custody)) { if(!monitor(custody,true)) return false; continue; }
       std::string path;
       if (pid == main.pid) { if (!same(id, main) || !executable(id,path) || path != engine()) return false; }
       else if (!executable(id,path) || !enginePath(path) || (info.unique.parent != main.start && info.unique.originalParentVersion != main.version)) return false;
@@ -159,7 +210,7 @@ struct Context {
   }
   bool retireMonitorPeer(const Identity& peer, bool executingMain = false) {
     if (!engineGone(executingMain) || (!same(peer,primary) && !same(peer,custody))) return false;
-    int n = current(peer); if (!n) return true; if (n < 0 || !monitor(peer,same(peer,custody))) return false;
+    int n = current(peer); if (!n) return true; if (n < 0 || !(same(peer,custody)?monitor(peer,true):primaryMonitor())) return false;
     (void)signalExact(peer,SIGKILL); return current(peer) == 0;
   }
 };

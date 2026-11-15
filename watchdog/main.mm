@@ -55,6 +55,7 @@ static Context record(const std::string& raw,bool primary,Identity& producer) {
 // Refusal never advertises R or gives up the only retained descriptions. An
 // already identified family can be enforced; unknown input cannot select PIDs.
 [[noreturn]] static void retainedRefusal(Context* c) {
+  struct stat a{},b{}; if(!c&&(fstat(3,&a)||fstat(4,&b)||!S_ISREG(a.st_mode)||!S_ISREG(b.st_mode))) _exit(4);
   for(;;) { if(c) { (void)c->discoverCustody(); c->enforce(); reap(c->custody); if(c->engineGone()) { const Identity& peer=getpid()==c->primary.pid?c->custody:c->primary; if(current(peer)==0) _exit(4); (void)c->retireMonitorPeer(peer); } } usleep(10000); }
 }
 struct Channel {
@@ -185,34 +186,62 @@ static Channel launchCustody(Context& c,double deadline) {
   Channel pair(reply[0],forward[1]);
   std::string expected="C 1 "+std::to_string(c.custody.pid)+" "+std::to_string(c.custody.start);
   for(;;) { if(clockMs()>=deadline||pair.failed||current(c.custody)!=1) throw 4;
-    auto lines=pair.readLines(); if(lines.size()==1&&lines[0]==expected&&c.monitor(c.custody,true)&&c.initial()) return pair;
+    auto lines=pair.readLines(); if(lines.size()==1&&lines[0]==expected&&c.monitor(c.custody,true)&&c.monitor(c.primary,true)&&c.initial()) return pair;
     if(!lines.empty()) throw 4; usleep(1000); }
 }
+static bool liveStart(Context& c,double deadline) {
+  return clockMs()<deadline&&c.initial()&&lockIdentity(c.owner)&&lockIdentity(c.build);
+}
 static int runPrimary(Context& c,double deadline) {
-  Identity self; Info detail{};
-  if(observe(getpid(),self)!=1) throw 4; c.primary=self;
-  if(getppid()!=c.main.pid||observe(getpid(),self,&detail)!=1||!same(self,c.primary)||detail.unique.parent!=c.main.start||!c.initial()||!c.monitor(self,false)) throw 4;
-  Channel pair=launchCustody(c,deadline);
-  if(clockMs()>=deadline) throw 4; protocolLoop(c,pair,true,deadline-1000);
+  // authenticateBirth deliberately granted cleanup only. Live original-main
+  // proof is needed before any child handover or external readiness.
+  c.cleanupOnly=false;
+  if(!liveStart(c,deadline)||!c.monitor(c.primary,true)) { c.cleanupOnly=true; throw 4; }
+  Channel pair=launchCustody(c,deadline); // primary still anchors the old group
+  if(!liveStart(c,deadline)||!c.monitor(c.primary,true)||!c.monitor(c.custody,true)) { c.cleanupOnly=true; throw 4; }
+  // C acknowledged actual descriptors/provenance in this continuously held
+  // group. It now has a real second anchor; only this transition leaves it.
+  if(setpgid(0,0)||getpgrp()!=getpid()||!c.monitor(c.primary,false)||!c.monitor(c.custody,true)) throw 4;
+  c.primaryOutside=true; pair.send("G 1\n");
+  for(;;) {
+    if(!liveStart(c,deadline)||pair.failed||!c.primaryMonitor()||!c.monitor(c.custody,true)) throw 4;
+    pair.flush(); auto lines=pair.readLines();
+    if(lines.size()==1&&lines[0]=="J 1"&&pair.outgoing.empty()) break;
+    if(!lines.empty()) throw 4; usleep(1000);
+  }
+  if(!liveStart(c,deadline)||!c.primaryMonitor()||!c.monitor(c.custody,true)) throw 4;
+  protocolLoop(c,pair,true,deadline-1000);
 }
 static int runCustody(Context& c,double deadline) {
-  Info detail{};
-  if(getppid()!=c.primary.pid||observe(getpid(),c.custody,&detail)!=1||detail.unique.parent!=c.primary.start||!c.initial()||!c.monitor(c.primary,false)||!c.monitor(c.custody,true)||clockMs()>=deadline) throw 4;
+  c.cleanupOnly=false;
+  if(!liveStart(c,deadline)||!c.monitor(c.primary,true)||!c.monitor(c.custody,true)) { c.cleanupOnly=true; throw 4; }
   Channel pair(6,7); pair.send("C 1 "+std::to_string(c.custody.pid)+" "+std::to_string(c.custody.start)+"\n");
-  while(!pair.outgoing.empty()) { if(clockMs()>=deadline||pair.failed) throw 4; pair.flush(); usleep(1000); }
+  while(!pair.outgoing.empty()) { if(!liveStart(c,deadline)||pair.failed||!c.primaryMonitor()) throw 4; pair.flush(); usleep(1000); }
+  // A producer death before G is cleanup-only, whether or not C was consumed.
+  // Our actual inherited membership/OFDs do not depend on a parent's callback.
+  for(;;) {
+    if(!liveStart(c,deadline)||pair.failed||current(c.primary)!=1||!c.monitor(c.custody,true)) throw 4;
+    auto lines=pair.readLines();
+    if(lines.size()==1&&lines[0]=="G 1"&&c.monitor(c.primary,false)) { c.primaryOutside=true; break; }
+    if(!lines.empty()) throw 4; usleep(1000);
+  }
+  if(!liveStart(c,deadline)||!c.primaryMonitor()) throw 4;
+  pair.send("J 1\n");
+  while(!pair.outgoing.empty()) { if(!liveStart(c,deadline)||pair.failed||!c.primaryMonitor()) throw 4; pair.flush(); usleep(1000); }
   protocolLoop(c,pair,false,deadline-1000);
 }
 
 int main(int argc,const char* argv[]) {
   signal(SIGPIPE,SIG_IGN); double deadline=clockMs()+1000; Context c; bool parsed=false;
+  Identity birth; Info birthInfo{}; int birthSession=getsid(0); bool birthValid=observe(getpid(),birth,&birthInfo)==1;
   @autoreleasepool {
     @try { try {
       if(argc!=2) throw 4;
       bool primary=!strcmp(argv[1],"--watchdog"),custody=!strcmp(argv[1],"--custody");
-      if((!primary&&!custody)||(primary&&(setpgid(0,0)||getpgrp()!=getpid()))) throw 4;
+      if((!primary&&!custody)||!birthValid) throw 4;
       Identity producer; std::string raw=startup(deadline); c=record(raw,primary,producer); parsed=true;
-      if(primary&&!same(producer,c.main)) throw 4;
+      if(!c.authenticateBirth(birth,birthInfo,birthSession,producer,primary)) throw 4;
       return primary?runPrimary(c,deadline):runCustody(c,deadline);
-    } catch(...) { retainedRefusal(parsed?&c:nullptr); } } @catch(NSException*) { retainedRefusal(parsed?&c:nullptr); }
+    } catch(...) { c.cleanupOnly=true; retainedRefusal(parsed?&c:nullptr); } } @catch(NSException*) { c.cleanupOnly=true; retainedRefusal(parsed?&c:nullptr); }
   }
 }
