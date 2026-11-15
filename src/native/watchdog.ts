@@ -5,8 +5,8 @@ import { performance } from 'node:perf_hooks';
 import { isMainThread } from 'node:worker_threads';
 import { assertCandidateTrust, refuse, type CandidateTrust } from './manifest.js';
 import { assertWatchdogCustody, type WatchdogCustody } from '../runtime/platform.js';
-import type { ArmedWatchdogPort } from './preflight.js';
-export interface NativeWatchdog extends ArmedWatchdogPort {
+export interface NativeWatchdog {
+  assertArmed(trust: CandidateTrust): void;
   readonly custody: WatchdogCustody;
   readonly fatal: boolean;
   quarantine(): void;

@@ -23,41 +23,56 @@ export const foundationPorts: CommandPorts = Object.freeze({
 });
 
 // Explicit production primitives only. Ordinary entry above still refuses pages.
-import { verifyNativeCandidate, assertCandidateTrust, type CandidateTrust } from '../native/manifest.js';
-import { loadPlatform, type HeldLock, type PlatformPort } from './platform.js';
-import { startNativeWatchdog, type NativeWatchdog } from '../native/watchdog.js';
+import type { CandidateTrust } from '../native/manifest.js';
+import type { HeldLock, PlatformPort } from './platform.js';
+import type { NativeWatchdog } from '../native/watchdog.js';
 export interface NativeBoundaryPreparation {
   readonly trust: CandidateTrust;
   readonly platform: PlatformPort;
   arm(owner: HeldLock, build: HeldLock): Promise<NativeWatchdog>;
 }
+interface NativeServices {
+  readonly manifest: typeof import('../native/manifest.js');
+  readonly platform: typeof import('./platform.js');
+  readonly watchdog: typeof import('../native/watchdog.js');
+}
 const preparations = new WeakSet<object>();
+const preparationServices = new WeakMap<NativeBoundaryPreparation, NativeServices>();
 const handovers = new WeakMap<NativeWatchdog, { prepared: NativeBoundaryPreparation; owner: HeldLock; build: HeldLock }>();
 let boundaryAttempted = false;
 /** Initial independent publisher verification precedes process-addon loading.
- * ABR-29 acquires real owner/Build handles using this exact platform instance. */
-export function prepareNativeBoundary(bundle: string): NativeBoundaryPreparation {
+ * ABR-29 must await preparation, then acquire real owner/Build handles using
+ * this exact platform instance. Both bundled host and physical bootstrap resolve
+ * to the same physical lib/native and lib/runtime graph; no second cache/brand. */
+export async function prepareNativeBoundary(bundle: string): Promise<NativeBoundaryPreparation> {
   if (boundaryAttempted || process.type !== 'browser') throw unavailable('browser');
   boundaryAttempted = true;
-  const trust = verifyNativeCandidate(bundle), platform = loadPlatform();
+  const manifestUrl = new URL('../native/manifest.js', import.meta.url).href;
+  const manifest = await import(manifestUrl) as typeof import('../native/manifest.js');
+  const trust = manifest.verifyNativeCandidate(bundle);
+  const platformUrl = new URL('../runtime/platform.js', import.meta.url).href;
+  const platformModule = await import(platformUrl) as typeof import('./platform.js');
+  manifest.assertCandidateTrust(trust);
+  const platform = platformModule.loadPlatform();
+  const watchdogUrl = new URL('../native/watchdog.js', import.meta.url).href;
+  const watchdogModule = await import(watchdogUrl) as typeof import('../native/watchdog.js');
+  const services: NativeServices = Object.freeze({ manifest, platform: platformModule, watchdog: watchdogModule });
   let armAttempted = false;
   const prepared: NativeBoundaryPreparation = Object.freeze({ trust, platform,
     async arm(owner: HeldLock, build: HeldLock): Promise<NativeWatchdog> {
       if (armAttempted) throw unavailable('browser'); armAttempted = true;
-      assertCandidateTrust(trust);
+      services.manifest.assertCandidateTrust(trust);
       const custody = platform.prepareWatchdogCustody(owner, build, trust.bundle, trust.snapshotDigest);
-      const watchdog = await startNativeWatchdog(trust, custody);
+      const watchdog = await services.watchdog.startNativeWatchdog(trust, custody);
       handovers.set(watchdog, { prepared, owner, build }); return watchdog;
     } });
-  preparations.add(prepared); return prepared;
+  preparationServices.set(prepared, services); preparations.add(prepared); return prepared;
 }
 export function assertNativeBoundaryPreparation(value: NativeBoundaryPreparation): void {
   if (!preparations.has(value)) throw unavailable('browser');
 }
 
-import { assertNativeWatchdog } from '../native/watchdog.js';
-import { createProfileFatal, type ProfileFatal, type FatalEffects } from '../native/fatal.js';
-import { retireNativeTarget } from '../native/retirement.js';
+import type { ProfileFatal, FatalEffects } from '../native/fatal.js';
 import type { NativeCompatibility } from '../native/preflight.js';
 import type { Binding, BindingKey } from '../native/api.js';
 import type { View, WebContentsView } from 'electron';
@@ -78,25 +93,33 @@ const installedBoundaries = new WeakSet<object>();
  * Variable module URLs keep Electron-only imports out of the Node CLI bundle. */
 export async function installNativeBoundary(prepared: NativeBoundaryPreparation, watchdog: NativeWatchdog,
   effects: FatalEffects): Promise<NativeFailureBoundary> {
-  assertNativeWatchdog(watchdog);
+  assertNativeBoundaryPreparation(prepared);
+  const services = preparationServices.get(prepared);
+  if (!services) throw unavailable('browser');
+  services.watchdog.assertNativeWatchdog(watchdog);
   let fatal: ProfileFatal | undefined;
   try {
     assertNativeBoundaryPreparation(prepared);
     if (handovers.get(watchdog)?.prepared !== prepared) return watchdog.terminate();
     watchdog.assertArmed(prepared.trust);
-    fatal = createProfileFatal(watchdog, effects);
+    const fatalUrl = new URL('../native/fatal.js', import.meta.url).href;
+    const fatalModule = await import(fatalUrl) as typeof import('../native/fatal.js');
+    fatal = fatalModule.createProfileFatal(watchdog, effects);
     const featuresUrl = new URL('../native/features.js', import.meta.url).href;
     const features = await import(featuresUrl) as typeof import('../native/features.js');
     fatal.assertHealthy(); features.configureNativeFeatures();
     const preflightUrl = new URL('../native/preflight.js', import.meta.url).href;
     const preflight = await import(preflightUrl) as typeof import('../native/preflight.js');
     fatal.assertHealthy(); watchdog.assertArmed(prepared.trust);
+    const retirementUrl = new URL('../native/retirement.js', import.meta.url).href;
+    const retirement = await import(retirementUrl) as typeof import('../native/retirement.js');
     const guard = fatal;
+    guard.assertHealthy(); watchdog.assertArmed(prepared.trust);
     const native = preflight.preflightNative(prepared.trust.bundle, reason => guard.fail(reason), watchdog);
     guard.attach(native);
     const boundary: NativeFailureBoundary = Object.freeze({ native, fatal: guard, watchdog, pageAdmission: false as const,
       retire: (key: BindingKey, parent: View, view: WebContentsView) => {
-        guard.assertHealthy(); return retireNativeTarget(native, key, parent, view, reason => guard.fail(reason));
+        guard.assertHealthy(); return retirement.retireNativeTarget(native, key, parent, view, reason => guard.fail(reason));
       } });
     installedBoundaries.add(boundary); return boundary;
   } catch { if (fatal) return fatal.fail('native_integrity_unavailable'); return watchdog.terminate(); }

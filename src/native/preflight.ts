@@ -7,6 +7,7 @@ import { validator } from '../contracts/schema.js';
 import { assertNativeFeatures } from './features.js';
 import { createNativeOwnership, validateOwnershipAddon, type NativeOwnership } from './api.js';
 import { nativeLimit, pinnedRuntime, stable, refuse, verifyNativeCandidate, type CandidateTrust } from './manifest.js';
+import { assertNativeWatchdog, type NativeWatchdog } from './watchdog.js';
 
 export interface CompatibilityAddon {
   getABI(): string;
@@ -32,15 +33,14 @@ export interface NativeCompatibility {
   guard<T>(operation: () => T | Promise<T>): Promise<T>;
   seal(): NativeStatus;
 }
-/** Implemented by ABR-7's independently verified child, never by a default stub. */
-export interface ArmedWatchdogPort { assertArmed(trust: CandidateTrust): void }
-export function preflightNative(bundle: string, fatal: (reason: string) => void, watchdog: ArmedWatchdogPort): NativeCompatibility {
+export function preflightNative(bundle: string, fatal: (reason: string) => void, watchdog: NativeWatchdog): NativeCompatibility {
   if (attempted) return refuse();
   attempted = true;
   let failed = false;
   let cadence: ReturnType<typeof setInterval> | undefined;
   const fail = (): never => { const first = !failed; failed = true; if (cadence) clearInterval(cadence); if (first) fatal('native_integrity_unavailable'); return refuse(); };
   try {
+    assertNativeWatchdog(watchdog);
     if (!isMainThread || process.type !== 'browser' || typeof fatal !== 'function') refuse();
     const actual = { electron: process.versions.electron, chromium: process.versions.chrome, node: process.versions.node,
       napi: process.versions.napi, modules: process.versions.modules, platform: process.platform, arch: process.arch,
@@ -50,11 +50,12 @@ export function preflightNative(bundle: string, fatal: (reason: string) => void,
       if (process.env[key] !== undefined) refuse();
     assertNativeFeatures();
     const trust = verifyNativeCandidate(bundle);
-    if (!watchdog || typeof watchdog.assertArmed !== 'function') refuse();
+    assertNativeWatchdog(watchdog);
     watchdog.assertArmed(trust);
     const addon = validateOwnershipAddon(createRequire(import.meta.url)(join(trust.bundle, 'Contents/Resources/browser/native/ownership.node')));
     const inventory = nativeReply('native.Inventory', addon.getABI());
     if (stable(inventory) !== stable(trust.manifest.nativeABI)) refuse();
+    assertNativeWatchdog(watchdog);
     watchdog.assertArmed(trust);
     const installed = nativeReply('native.Status', addon.install(JSON.stringify(trust.manifest.nativeABI)));
     if (installed.phase !== 'ready' || installed.hooks === 0 || installed.hooks !== installed.appliedHooks) refuse();
