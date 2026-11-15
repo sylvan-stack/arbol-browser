@@ -39,7 +39,12 @@ export async function startNativeWatchdog(trust: CandidateTrust, custody: Watchd
     if (!terminating) { terminating = true; custody.terminate(); }
     return refuse();
   }
+  function expired(now: number): boolean {
+    const first = pending.values().next().value;
+    return now - lastAck >= 1000 || (first !== undefined && now - first >= 1000);
+  }
   function send(kind: 'H' | 'F'): void {
+    if (phase !== 'starting' && expired(performance.now())) lose();
     if (!child.stdin || child.stdin.destroyed || sequence >= 0xffffffffffffffffn || pending.size >= 8) lose();
     const next = ++sequence; pending.set(next, performance.now());
     try { child.stdin!.write(`${kind} ${next}\n`, 'ascii', error => { if (error) lose(); }); } catch { lose(); }
@@ -47,7 +52,7 @@ export async function startNativeWatchdog(trust: CandidateTrust, custody: Watchd
   const api: NativeWatchdog = Object.freeze({ custody,
     get fatal() { return phase === 'fatal'; },
     assertArmed(value: CandidateTrust): void {
-      if (value !== trust || phase !== 'armed' || performance.now() - lastAck >= 1000) lose();
+      if (value !== trust || phase !== 'armed' || expired(performance.now())) lose();
       try { custody.assert(); } catch { lose(); }
     },
     quarantine(): void {
@@ -65,6 +70,7 @@ export async function startNativeWatchdog(trust: CandidateTrust, custody: Watchd
     try { if (!child.pid || performance.now() - launch >= 1000) lose(); custody.capture(child.pid!); } catch { lose(); }
   });
   child.stdout.on('data', (chunk: Buffer) => {
+    if (phase !== 'starting' && expired(performance.now())) lose();
     if (!Buffer.isBuffer(chunk) || chunk.some(byte => byte !== 10 && (byte < 32 || byte > 126))) lose();
     buffer += chunk.toString('ascii'); if (buffer.length > 4096) lose();
     for (;;) {
@@ -80,15 +86,16 @@ export async function startNativeWatchdog(trust: CandidateTrust, custody: Watchd
       } else {
         const match = /^A (0|[1-9][0-9]{0,19})$/.exec(line); if (!match) lose();
         const value = BigInt(match![1]!); if (value > 0xffffffffffffffffn || pending.keys().next().value !== value) lose();
-        pending.delete(value); lastAck = performance.now();
+        const now = performance.now(), issued = pending.get(value);
+        if (issued === undefined || now - issued >= 1000 || expired(now)) lose();
+        pending.delete(value); lastAck = now;
       }
     }
   });
   readiness = setTimeout(() => lose(), Math.max(1, 1000 - (performance.now() - launch))); readiness.unref();
   const liveness = setInterval(() => {
     if (phase !== 'starting') {
-      const first = pending.values().next().value;
-      if (performance.now() - lastAck >= 1000 || (first !== undefined && performance.now() - first >= 1000)) lose();
+      if (expired(performance.now())) lose();
       try { custody.assert(); } catch { lose(); }
     }
   }, 25);

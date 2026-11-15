@@ -62,8 +62,8 @@ struct Channel {
   int input,output; std::string incoming,outgoing; bool failed=false;
   Channel(int in,int out):input(in),output(out) { nonblocking(input); nonblocking(output); }
   void send(const std::string& line) { if(line.size()>128||outgoing.size()+line.size()>4096) {failed=true;return;} outgoing+=line; }
-  void flush() {
-    while(!outgoing.empty()&&!failed) { ssize_t n=write(output,outgoing.data(),outgoing.size());
+  void flush(double expires=0) {
+    while(!outgoing.empty()&&!failed) { if(expires&&clockMs()>=expires) { failed=true; return; } ssize_t n=write(output,outgoing.data(),outgoing.size());
       if(n>0) outgoing.erase(0,(size_t)n); else if(n<0&&errno==EINTR) continue;
       else if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK)) break; else failed=true; }
   }
@@ -86,16 +86,18 @@ static bool frame(const std::string& line,Frame& result,const std::string& allow
   result={line[0],value}; return true;
 }
 struct Deadline {
-  double expires; bool fatal=false,received=false; uint64_t sequence=0;
+  double expires; bool fatal=false,received=false,elapsed=false; uint64_t sequence=0;
   explicit Deadline(double start):expires(start+2500) {}
+  bool expired(double now) { if(now>=expires) fatal=elapsed=true; return elapsed; }
   bool accept(const Frame& value,double now) {
+    if(expired(now)) return false;
     if(received&&value.sequence<=sequence) return false;
     received=true; sequence=value.sequence;
     if(value.kind=='F') { fatal=true; expires=std::min(expires,now+1000); }
     else if(!fatal) expires=now+2500;
     return true;
   }
-  void lost(double now) { fatal=true; expires=std::min(expires,now); }
+  void lost(double now) { fatal=elapsed=true; expires=std::min(expires,now); }
 };
 [[noreturn]] static void retirePair(Context& c,Channel& pair,bool primary) {
   // External R/H/A/F authority is already dead. T/K/P cannot be reached before
@@ -131,36 +133,51 @@ struct Deadline {
   Channel host(primary?0:6,primary?1:7); Deadline deadline(start);
   struct Pending { uint64_t sequence; double sent; }; std::deque<Pending> pending;
   if(primary) host.send("R 1 "+std::to_string(c.main.pid)+"\n");
-  double blockedWrite=0;
+  double blockedWrite=0,responseExpires=0;
   for(;;) {
     double now=clockMs();
+    // Latch before touching traffic. Late H or a queued A cannot revive an
+    // already expired window, even when this executor itself was delayed.
+    if(primary&&!pending.empty()&&now-pending.front().sent>=1000) deadline.lost(now);
+    (void)deadline.expired(now);
     Channel& input=primary?host:pair;
-    for(const std::string& line:input.readLines()) {
-      Frame value;
+    if(!deadline.elapsed) for(const std::string& line:input.readLines()) {
+      now=clockMs(); Frame value;
+      if(primary&&!pending.empty()&&now-pending.front().sent>=1000) { deadline.lost(now); break; }
       if(!frame(line,value,"HF")||!deadline.accept(value,now)) { deadline.lost(now); break; }
       if(primary) { if(pending.size()>=16) { deadline.lost(now); break; } pending.push_back({value.sequence,now}); pair.send(line+"\n"); }
       else pair.send("A "+std::to_string(value.sequence)+"\n");
     }
-    if(primary) {
+    if(primary&&!deadline.expired(clockMs())) {
       for(const std::string& line:pair.readLines()) {
-        Frame value;
-        if(!frame(line,value,"A")||pending.empty()||pending.front().sequence!=value.sequence) { deadline.lost(now); break; }
+        now=clockMs(); Frame value;
+        if(deadline.expired(now)||!frame(line,value,"A")||pending.empty()||pending.front().sequence!=value.sequence||now-pending.front().sent>=1000) { deadline.lost(now); break; }
+        double issuedDeadline=pending.front().sent+1000;
+        responseExpires=responseExpires?std::min(responseExpires,issuedDeadline):issuedDeadline;
         pending.pop_front(); host.send(line+"\n");
       }
-      if(!pending.empty()&&now-pending.front().sent>=1000) deadline.lost(now);
     }
-    pair.flush(); if(primary) host.flush();
+    now=clockMs();
+    if(primary&&((!pending.empty()&&now-pending.front().sent>=1000)||(responseExpires&&now>=responseExpires))) deadline.lost(now);
+    if(!deadline.expired(now)) {
+      pair.flush(deadline.expires);
+      now=clockMs(); if(responseExpires&&now>=responseExpires) deadline.lost(now);
+      if(primary&&!deadline.expired(now)) host.flush(responseExpires?std::min(deadline.expires,responseExpires):deadline.expires);
+    }
+    if(host.outgoing.empty()) responseExpires=0;
+    now=clockMs();
     bool outputPending=!pair.outgoing.empty()||(primary&&!host.outgoing.empty());
     if(outputPending) { if(!blockedWrite) blockedWrite=now; else if(now-blockedWrite>=1000) deadline.lost(now); } else blockedWrite=0;
     std::vector<Identity> observed;
     Identity peerNow; const Identity& peer=primary?c.custody:c.primary;
-    if(pair.failed||(primary&&host.failed)||observe(peer.pid,peerNow)!=1||!same(peer,peerNow)||peerNow.group!=(primary?c.main.group:(uint32_t)c.primary.pid)||!c.census(observed)||!lockIdentity(c.owner)||!lockIdentity(c.build)) deadline.lost(now);
-    if(now>=deadline.expires) c.enforce();
+    if(pair.failed||(primary&&host.failed)||observe(peer.pid,peerNow)!=1||!same(peer,peerNow)||peerNow.group!=(primary?c.main.group:(uint32_t)c.primary.pid)||!c.census(observed)||!lockIdentity(c.owner)||!lockIdentity(c.build)) deadline.lost(clockMs());
+    if(deadline.expired(clockMs())) c.enforce();
     reap(c.custody);
     if(c.engineGone()) retirePair(c,pair,primary);
     usleep(5000);
   }
 }
+
 static void pipeDescriptors(int (&out)[2]) {
   int raw[2]; if(pipe(raw)) throw 4;
   out[0]=fcntl(raw[0],F_DUPFD_CLOEXEC,10); out[1]=fcntl(raw[1],F_DUPFD_CLOEXEC,10); close(raw[0]); close(raw[1]);
