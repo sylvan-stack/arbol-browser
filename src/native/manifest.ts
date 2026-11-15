@@ -1,10 +1,15 @@
 /** The publisher anchor is source policy, never derived from a running package. */
-import { constants, lstatSync, openSync, fstatSync, readFileSync, closeSync, readdirSync, readlinkSync, realpathSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { join, dirname, resolve, sep, relative } from 'node:path';
 import type { Contract } from '../contracts/generated.js';
 import { validator } from '../contracts/schema.js';
+
+// Trust covers physical signed bytes, including ASAR archives, on every check.
+// This mandatory Electron builtin leaves the process-wide filesystem view alone.
+const { constants, lstatSync, openSync, fstatSync, readFileSync, closeSync, readdirSync, readlinkSync, realpathSync } =
+  createRequire(import.meta.url)('original-fs') as typeof import('node:fs');
 
 export const publisher = Object.freeze({ team: '7V372XL59S', bundleIdentifier: 'com.sylvan-stack.arbol-browser.native-candidate',
   requirement: 'anchor apple generic and certificate leaf[subject.OU] = "7V372XL59S" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists' });
