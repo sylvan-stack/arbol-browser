@@ -2,7 +2,6 @@
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
-import { Writable, type Readable } from 'node:stream';
 import { isMainThread } from 'node:worker_threads';
 import { assertCandidateTrust, refuse, type CandidateTrust } from './manifest.js';
 import { assertWatchdogCustody, type WatchdogCustody } from '../runtime/platform.js';
@@ -29,7 +28,7 @@ export async function startNativeWatchdog(trust: CandidateTrust, custody: Watchd
   let readiness: ReturnType<typeof setTimeout> | undefined;
   const pending = new Map<bigint, number>();
   const child = spawn(helper, ['--watchdog'], { shell: false, detached: false,
-    stdio: ['pipe', 'pipe', 'ignore', custody.descriptors[0], custody.descriptors[1], 'pipe'], env: { PATH: '/usr/bin:/bin' } });
+    stdio: ['pipe', 'pipe', 'ignore', custody.descriptors[0], custody.descriptors[1], custody.startupDescriptor], env: { PATH: '/usr/bin:/bin' } });
   let readyResolve: (value: NativeWatchdog) => void, readyReject: (error: Error) => void;
   const ready = new Promise<NativeWatchdog>((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
   function lose(): never {
@@ -59,12 +58,11 @@ export async function startNativeWatchdog(trust: CandidateTrust, custody: Watchd
     terminate(): never { return lose(); },
   });
   actualWatchdogs.add(api);
-  const request = (child.stdio as (Readable | Writable | null | undefined)[])[5];
-  if (!(request instanceof Writable) || !child.stdin || !child.stdout) return lose();
-  request.on('error', () => lose()); child.stdin.on('error', () => lose()); child.stdout.on('error', () => lose());
+  if (!child.stdin || !child.stdout) return lose();
+  child.stdin.on('error', () => lose()); child.stdout.on('error', () => lose());
   child.once('error', () => lose()); child.once('exit', () => lose()); child.stdout.once('end', () => lose());
   child.once('spawn', () => {
-    try { if (!child.pid || performance.now() - launch >= 1000) lose(); request.end(custody.record(child.pid!)); } catch { lose(); }
+    try { if (!child.pid || performance.now() - launch >= 1000) lose(); custody.capture(child.pid!); } catch { lose(); }
   });
   child.stdout.on('data', (chunk: Buffer) => {
     if (!Buffer.isBuffer(chunk) || chunk.some(byte => byte !== 10 && (byte < 32 || byte > 126))) lose();

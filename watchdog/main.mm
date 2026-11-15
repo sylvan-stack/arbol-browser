@@ -33,6 +33,8 @@ static bool lockRecord(NSDictionary* value,int fd,Lock& lock) {
 }
 static void nonblocking(int fd) { int f=fcntl(fd,F_GETFL); if(f<0||fcntl(fd,F_SETFL,f|O_NONBLOCK)<0||fcntl(fd,F_SETFD,FD_CLOEXEC)<0) throw 4; }
 static std::string startup(double deadline) {
+  struct stat metadata{}; int flags=fcntl(5,F_GETFL);
+  if(flags<0||(flags&O_ACCMODE)!=O_RDONLY||fstat(5,&metadata)||!S_ISREG(metadata.st_mode)||metadata.st_uid!=geteuid()||(metadata.st_mode&07777)!=0600||metadata.st_nlink!=0||metadata.st_size<1||metadata.st_size>16384) throw 4;
   nonblocking(5); std::string raw; char bytes[4096];
   for(;;) {
     if(clockMs()>=deadline) throw 4;
@@ -43,12 +45,12 @@ static std::string startup(double deadline) {
     else { pollfd p{5,POLLIN,0}; (void)poll(&p,1,5); }
   }
 }
-static Context record(const std::string& raw) {
+static Context record(const std::string& raw,bool primary,Identity& producer) {
   NSData* bytes=[NSData dataWithBytes:raw.data() length:raw.size()];
   NSDictionary* value=[NSJSONSerialization JSONObjectWithData:bytes options:0 error:nil]; Context c;
-  if(!keys(value,@[@"format",@"candidateSnapshotDigest",@"bundle",@"main",@"primary",@"locks"])||![value[@"format"] isEqual:@1]||![value[@"bundle"] isKindOfClass:[NSString class]]||![value[@"candidateSnapshotDigest"] isKindOfClass:[NSString class]]||[value[@"candidateSnapshotDigest"] length]!=64||!keys(value[@"locks"],@[@"owner",@"build"])||!identityRecord(value[@"main"],c.main,&c.session)||!identityRecord(value[@"primary"],c.primary)||!lockRecord(value[@"locks"][@"owner"],3,c.owner)||!lockRecord(value[@"locks"][@"build"],4,c.build)) throw 4;
+  if(!keys(value,@[@"format",@"mode",@"producerRole",@"producer",@"candidateSnapshotDigest",@"bundle",@"main",@"locks"])||![value[@"format"] isEqual:@2]||![value[@"mode"] isEqual:primary?@"primary":@"custody"]||![value[@"producerRole"] isEqual:primary?@"main":@"primary"]||![value[@"bundle"] isKindOfClass:[NSString class]]||![value[@"candidateSnapshotDigest"] isKindOfClass:[NSString class]]||[value[@"candidateSnapshotDigest"] length]!=64||!keys(value[@"locks"],@[@"owner",@"build"])||!identityRecord(value[@"main"],c.main,&c.session)||!identityRecord(value[@"producer"],producer)||!lockRecord(value[@"locks"][@"owner"],3,c.owner)||!lockRecord(value[@"locks"][@"build"],4,c.build)) throw 4;
   std::string digest=[value[@"candidateSnapshotDigest"] UTF8String]; for(char ch:digest) if(!((ch>='0'&&ch<='9')||(ch>='a'&&ch<='f'))) throw 4;
-  c.bundle=[value[@"bundle"] UTF8String]; return c;
+  c.bundle=[value[@"bundle"] UTF8String]; c.digest=digest; if(!primary) c.primary=producer; return c;
 }
 // Refusal never advertises R or gives up the only retained descriptions. An
 // already identified family can be enforced; unknown input cannot select PIDs.
@@ -163,36 +165,34 @@ static void pipeDescriptors(int (&out)[2]) {
   out[0]=fcntl(raw[0],F_DUPFD_CLOEXEC,10); out[1]=fcntl(raw[1],F_DUPFD_CLOEXEC,10); close(raw[0]); close(raw[1]);
   if(out[0]<0||out[1]<0) throw 4;
 }
-static Channel launchCustody(Context& c,const std::string& raw,double deadline) {
-  int init[2],forward[2],reply[2]; pipeDescriptors(init); pipeDescriptors(forward); pipeDescriptors(reply);
+static Channel launchCustody(Context& c,double deadline) {
+  int init= capsuleDescriptor(capsuleBytes(c,false)),forward[2],reply[2]; if(init<0) throw 4; pipeDescriptors(forward); pipeDescriptors(reply);
   int owner=fcntl(3,F_DUPFD_CLOEXEC,10),build=fcntl(4,F_DUPFD_CLOEXEC,10);
   posix_spawn_file_actions_t actions; posix_spawnattr_t attr;
   if(owner<0||build<0||posix_spawn_file_actions_init(&actions)||posix_spawnattr_init(&attr)) throw 4;
   bool ok=!posix_spawn_file_actions_adddup2(&actions,owner,3)&&!posix_spawn_file_actions_adddup2(&actions,build,4)&&
-    !posix_spawn_file_actions_adddup2(&actions,init[0],5)&&!posix_spawn_file_actions_adddup2(&actions,forward[0],6)&&!posix_spawn_file_actions_adddup2(&actions,reply[1],7)&&
+    !posix_spawn_file_actions_adddup2(&actions,init,5)&&!posix_spawn_file_actions_adddup2(&actions,forward[0],6)&&!posix_spawn_file_actions_adddup2(&actions,reply[1],7)&&
     !posix_spawn_file_actions_addopen(&actions,0,"/dev/null",O_RDONLY,0)&&!posix_spawn_file_actions_addopen(&actions,1,"/dev/null",O_WRONLY,0)&&!posix_spawn_file_actions_addopen(&actions,2,"/dev/null",O_WRONLY,0)&&
     !posix_spawnattr_setpgroup(&attr,c.main.group)&&!posix_spawnattr_setflags(&attr,POSIX_SPAWN_SETPGROUP|POSIX_SPAWN_CLOEXEC_DEFAULT);
   std::string helper=c.helper(); char* args[]={helper.data(),(char*)"--custody",nullptr}; char* env[]={(char*)"PATH=/usr/bin:/bin",nullptr}; pid_t pid=0;
   int result=ok?posix_spawn(&pid,helper.c_str(),&actions,&attr,args,env):EINVAL;
   posix_spawn_file_actions_destroy(&actions); posix_spawnattr_destroy(&attr);
-  close(owner); close(build); close(init[0]); close(forward[0]); close(reply[1]);
+  close(owner); close(build); close(init); close(forward[0]); close(reply[1]);
   if(result) throw 4;
   // Capture the actual child even if its validation fails: failed-attempt
   // retirement must not forget a child which already owns duplicate locks.
   if(observe(pid,c.custody)!=1||!c.monitor(c.custody,true)) throw 4;
-  nonblocking(init[1]); size_t offset=0;
-  while(offset<raw.size()) { if(clockMs()>=deadline) throw 4; ssize_t n=write(init[1],raw.data()+offset,raw.size()-offset);
-    if(n>0) offset+=(size_t)n; else if(n<0&&(errno==EINTR||errno==EAGAIN||errno==EWOULDBLOCK)) usleep(1000); else throw 4; }
-  close(init[1]); Channel pair(reply[0],forward[1]);
+  Channel pair(reply[0],forward[1]);
   std::string expected="C 1 "+std::to_string(c.custody.pid)+" "+std::to_string(c.custody.start);
   for(;;) { if(clockMs()>=deadline||pair.failed||current(c.custody)!=1) throw 4;
     auto lines=pair.readLines(); if(lines.size()==1&&lines[0]==expected&&c.monitor(c.custody,true)&&c.initial()) return pair;
     if(!lines.empty()) throw 4; usleep(1000); }
 }
-static int runPrimary(Context& c,const std::string& raw,double deadline) {
+static int runPrimary(Context& c,double deadline) {
   Identity self; Info detail{};
+  if(observe(getpid(),self)!=1) throw 4; c.primary=self;
   if(getppid()!=c.main.pid||observe(getpid(),self,&detail)!=1||!same(self,c.primary)||detail.unique.parent!=c.main.start||!c.initial()||!c.monitor(self,false)) throw 4;
-  Channel pair=launchCustody(c,raw,deadline);
+  Channel pair=launchCustody(c,deadline);
   if(clockMs()>=deadline) throw 4; protocolLoop(c,pair,true,deadline-1000);
 }
 static int runCustody(Context& c,double deadline) {
@@ -210,8 +210,9 @@ int main(int argc,const char* argv[]) {
       if(argc!=2) throw 4;
       bool primary=!strcmp(argv[1],"--watchdog"),custody=!strcmp(argv[1],"--custody");
       if((!primary&&!custody)||(primary&&(setpgid(0,0)||getpgrp()!=getpid()))) throw 4;
-      std::string raw=startup(deadline); c=record(raw); parsed=true;
-      return primary?runPrimary(c,raw,deadline):runCustody(c,deadline);
+      Identity producer; std::string raw=startup(deadline); c=record(raw,primary,producer); parsed=true;
+      if(primary&&!same(producer,c.main)) throw 4;
+      return primary?runPrimary(c,deadline):runCustody(c,deadline);
     } catch(...) { retainedRefusal(parsed?&c:nullptr); } } @catch(NSException*) { retainedRefusal(parsed?&c:nullptr); }
   }
 }

@@ -1,5 +1,6 @@
 #pragma once
 // Pinned private Darwin identity/termination support. Signals are not exit proof.
+#import <Foundation/Foundation.h>
 #include <Security/Security.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <libproc.h>
@@ -79,7 +80,7 @@ inline bool lockIdentity(const Lock& lock) {
     (d.st_mode & 07777) == lock.mode && lock.mode == 0600 && (uint64_t)d.st_dev == lock.device && d.st_ino == lock.inode && d.st_dev == p.st_dev && d.st_ino == p.st_ino;
 }
 struct Context {
-  Identity main, primary, custody; bool authenticated=false; std::string bundle; int session = 0; Lock owner, build; std::map<int, Identity> seen;
+  Identity main, primary, custody; bool authenticated=false; std::string bundle, digest; int session = 0; Lock owner, build; std::map<int, Identity> seen;
   std::string engine() const { return bundle + "/Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron"; }
   std::string helper() const { return bundle + "/Contents/Resources/browser/native/watchdog"; }
   bool enginePath(const std::string& path) const {
@@ -162,5 +163,38 @@ struct Context {
     (void)signalExact(peer,SIGKILL); return current(peer) == 0;
   }
 };
+inline NSDictionary* capsuleIdentity(const Identity& id,int session=0) {
+  NSMutableDictionary* value=[@{@"pid":@(id.pid),@"startId":[NSString stringWithUTF8String:std::to_string(id.start).c_str()],@"pidVersion":@(id.version),@"uid":@(id.uid),@"group":@(id.group)} mutableCopy];
+  if(session) value[@"session"]=@(session); return value;
+}
+inline NSDictionary* capsuleLock(const Lock& lock) {
+  return @{@"path":[NSString stringWithUTF8String:lock.path.c_str()],@"device":[NSString stringWithUTF8String:std::to_string(lock.device).c_str()],@"inode":[NSString stringWithUTF8String:std::to_string(lock.inode).c_str()],@"uid":@(lock.uid),@"mode":@(lock.mode),@"heldMode":@(lock.heldMode)};
+}
+inline std::string capsuleBytes(const Context& c,bool primary) {
+  @autoreleasepool { @try {
+    NSDictionary* value=@{@"format":@2,@"mode":primary?@"primary":@"custody",@"producerRole":primary?@"main":@"primary",@"producer":capsuleIdentity(primary?c.main:c.primary),
+      @"candidateSnapshotDigest":[NSString stringWithUTF8String:c.digest.c_str()],@"bundle":[NSString stringWithUTF8String:c.bundle.c_str()],@"main":capsuleIdentity(c.main,c.session),@"locks":@{@"owner":capsuleLock(c.owner),@"build":capsuleLock(c.build)}};
+    NSData* data=[NSJSONSerialization dataWithJSONObject:value options:0 error:nil];
+    if(!data||!data.length||data.length>16384) return {}; return std::string((const char*)data.bytes,data.length);
+  } @catch(NSException*) { return {}; } }
+}
+// Complete immutable read-only anonymous input before spawn. No writable alias
+// or asynchronous producer message survives this transaction.
+inline int capsuleDescriptor(const std::string& bytes) {
+  if(bytes.empty()||bytes.size()>16384) return -1;
+  char name[]="/private/tmp/arbol-watchdog-start-XXXXXX"; int writer=mkstemp(name),reader=-1,result=-1;
+  if(writer<0) return -1;
+  bool ok=!fcntl(writer,F_SETFD,FD_CLOEXEC)&&!fchmod(writer,0600); size_t at=0;
+  while(ok&&at<bytes.size()) { ssize_t n=write(writer,bytes.data()+at,bytes.size()-at); if(n>0) at+=(size_t)n; else if(n<0&&errno==EINTR) continue; else ok=false; }
+  struct stat a{},b{},path{};
+  if(ok) reader=open(name,O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
+  ok=ok&&reader>=0&&!fstat(writer,&a)&&!fstat(reader,&b)&&!lstat(name,&path)&&S_ISREG(a.st_mode)&&S_ISREG(b.st_mode)&&
+    a.st_dev==b.st_dev&&a.st_ino==b.st_ino&&path.st_dev==a.st_dev&&path.st_ino==a.st_ino&&a.st_uid==geteuid()&&(a.st_mode&07777)==0600&&a.st_nlink==1&&b.st_size==(off_t)bytes.size();
+  if(ok) ok=!unlink(name)&&!fstat(reader,&b)&&b.st_nlink==0;
+  else (void)unlink(name);
+  if(close(writer)) ok=false; // every writable description is closed before export
+  if(ok) result=fcntl(reader,F_DUPFD_CLOEXEC,10);
+  if(reader>=0) close(reader); return result;
+}
 inline void reap(const Identity& id) { if (id.pid > 1) (void)waitpid(id.pid,nullptr,WNOHANG); }
 }

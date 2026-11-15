@@ -14,7 +14,8 @@ export interface HeldLock {
 }
 export interface WatchdogCustody {
   readonly descriptors: readonly [number, number];
-  record(primaryPid: number): string;
+  readonly startupDescriptor: number;
+  capture(primaryPid: number): void;
   bind(): void;
   assert(): void;
   terminate(): never;
@@ -40,8 +41,8 @@ export interface PlatformPort {
 }
 interface NativeSupport {
   prepareWatchdogCustody(owner: object, build: object, bundle: string, digest: string): object;
-  custodyDescriptors(handle: object): [number, number];
-  watchdogRecord(handle: object, pid: number): string;
+  custodyDescriptors(handle: object): [number, number, number];
+  captureWatchdog(handle: object, pid: number): void;
   watchdogBind(handle: object): void;
   watchdogAssert(handle: object): void;
   terminateProfileNow(handle: object): never;
@@ -65,7 +66,7 @@ export function loadPlatform(): PlatformPort {
   let native: NativeSupport;
   try {
     native = createRequire(import.meta.url)(fileURLToPath(new URL('../../native/platform.node', import.meta.url)));
-    for (const name of ['tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'watchdogRecord', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
+    for (const name of ['tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
       if (typeof native[name] !== 'function') throw new Error('Missing process support');
   } catch { throw unavailable('profile'); }
   const call = <T>(operation: () => T): T => {
@@ -79,9 +80,9 @@ export function loadPlatform(): PlatformPort {
       owner.assertIdentity(); build.assertIdentity();
       const handle = call(() => native.prepareWatchdogCustody(a, b, bundle, digest));
       const descriptors = call(() => native.custodyDescriptors(handle));
-      if (descriptors.length !== 2 || descriptors.some(fd => !Number.isInteger(fd) || fd < 3) || descriptors[0] === descriptors[1]) throw unavailable('browser');
-      const receipt: WatchdogCustody = Object.freeze({ descriptors: Object.freeze(descriptors),
-        record: (pid: number) => call(() => native.watchdogRecord(handle, pid)),
+      if (descriptors.length !== 3 || descriptors.some(fd => !Number.isInteger(fd) || fd < 3) || new Set(descriptors).size !== 3) throw unavailable('browser');
+      const receipt: WatchdogCustody = Object.freeze({ descriptors: Object.freeze([descriptors[0], descriptors[1]] as const), startupDescriptor: descriptors[2],
+        capture: (pid: number) => call(() => native.captureWatchdog(handle, pid)),
         bind: () => call(() => native.watchdogBind(handle)), assert: () => call(() => native.watchdogAssert(handle)),
         terminate: (): never => { native.terminateProfileNow(handle); throw unavailable('browser'); } });
       custodyReceipts.add(receipt); return receipt;
