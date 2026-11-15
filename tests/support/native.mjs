@@ -2,8 +2,8 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { createReadStream } from 'node:fs';
-import { mkdir, readFile, writeFile, realpath, readdir, readlink, lstat } from 'node:fs/promises';
+import { createReadStream, constants } from 'node:fs';
+import { mkdir, readFile, writeFile, realpath, readdir, readlink, lstat, cp, appendFile } from 'node:fs/promises';
 import { join, resolve, sep, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 const root = resolve(fileURLToPath(new URL('../../', import.meta.url)));
@@ -14,6 +14,47 @@ export const nativeConsumer = Object.freeze({
 const hash = value => createHash('sha256').update(value).digest('hex');
 const run = (file, args) => execFileSync(file, args, { encoding: 'utf8', timeout: 30000,
   env: { PATH: '/usr/bin:/bin', HOME: process.env.HOME }, maxBuffer: 1024 * 1024 });
+async function physicalInventory(directory) {
+  const actual = {};
+  async function walk(path) {
+    for (const name of (await readdir(path)).sort()) {
+      const child = join(path, name), st = await lstat(child), key = relative(directory, child);
+      if (st.isSymbolicLink()) actual[key] = hash(`symlink\0${await readlink(child)}`);
+      else if (st.isDirectory()) await walk(child);
+      else {
+        assert.ok(st.isFile());
+        const digest = createHash('sha256'); for await (const bytes of createReadStream(child)) digest.update(bytes);
+        actual[key] = digest.digest('hex');
+      }
+    }
+  }
+  await walk(directory); return actual;
+}
+const trustVariants = new WeakSet(); // Fixture provenance only; never a product capability.
+export async function prepareNativeTrustVariant(fixtures, destination) {
+  const consumer = await verifiedConsumer(), candidate = resolve(destination);
+  assert.ok(candidate.startsWith(fixtures.directory + sep) && candidate.endsWith('.app'));
+  const baseBytes = await readFile(consumer.bundle.inventory.path);
+  assert.equal(hash(baseBytes), consumer.bundle.inventory.sha256);
+  const original = JSON.parse(baseBytes).files;
+  await cp(consumer.candidate, candidate, { recursive: true, dereference: false, verbatimSymlinks: true,
+    force: false, errorOnExist: true, mode: constants.COPYFILE_FICLONE });
+  assert.deepEqual(await physicalInventory(candidate), original, 'Trust copy does not match immutable baseline');
+  run('/usr/bin/codesign', ['--verify', '--strict', '--deep', '-R', '=anchor apple generic and certificate leaf[subject.OU] = "7V372XL59S" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists', candidate]);
+  const resource = 'Contents/Resources/browser/metadata.json';
+  await appendFile(join(candidate, resource), '\n'); // One inert sealed resource, no signature/code edit or re-signing.
+  const files = await physicalInventory(candidate);
+  const differences = [...new Set([...Object.keys(original), ...Object.keys(files)])].filter(key => original[key] !== files[key]);
+  assert.deepEqual(differences, [resource]);
+  const record = { format: 1, scope: 'disposable sealed-resource variant; never exact accepted consumer',
+    candidate, baseCandidate: consumer.candidate, baseConsumerManifest: nativeConsumer,
+    changedResource: { path: resource, before: original[resource], after: files[resource] }, files, preCorruptionSignatureVerified: true,
+    signatureBytes: 'all copied signature and executable file bytes match the immutable baseline; no signing operation' };
+  const path = candidate + '.variant.json', bytes = JSON.stringify(record, null, 2) + '\n';
+  await writeFile(path, bytes, { mode: 0o600, flag: 'wx' });
+  const variant = Object.freeze({ ...record, manifest: { path, sha256: hash(bytes) } });
+  trustVariants.add(variant); return variant;
+}
 export async function verifiedConsumer() {
   const bytes = await readFile(nativeConsumer.manifest);
   assert.equal(hash(bytes), nativeConsumer.digest, 'Immutable consumer manifest drift');
@@ -31,20 +72,7 @@ export async function verifiedConsumer() {
     assert.equal(hash(await readFile(join(sourceReview.frozenDist, file))), digest, 'Frozen compiled source drift');
   const inventoryBytes = await readFile(value.bundle.inventory.path);
   assert.equal(hash(inventoryBytes), value.bundle.inventory.sha256);
-  const expected = JSON.parse(inventoryBytes).files, actual = {};
-  async function physical(path) {
-    for (const name of (await readdir(path)).sort()) {
-      const child = join(path, name), st = await lstat(child), key = relative(value.candidate, child);
-      if (st.isSymbolicLink()) actual[key] = hash(`symlink\0${await readlink(child)}`);
-      else if (st.isDirectory()) await physical(child);
-      else {
-        assert.ok(st.isFile());
-        const digest = createHash('sha256'); for await (const bytes of createReadStream(child)) digest.update(bytes);
-        actual[key] = digest.digest('hex');
-      }
-    }
-  }
-  await physical(value.candidate); assert.deepEqual(actual, expected, 'Complete physical native consumer drift');
+  assert.deepEqual(await physicalInventory(value.candidate), JSON.parse(inventoryBytes).files, 'Complete physical native consumer drift');
   return Object.freeze(value);
 }
 export async function prepareNativeFixtures(output, { callbacks = false } = {}) {
@@ -88,6 +116,7 @@ export async function prepareNativeFixtures(output, { callbacks = false } = {}) 
   const record = { format: 1, consumerManifest: nativeConsumer, candidate: consumer.candidate, sourceInputs: inputs,
     compiler, compilerVersion: run(compiler, ['--version']), sdk, callback,
     binaries: Object.fromEntries(await Promise.all(['native-launch', 'native-observer'].map(async file => [file, hash(await readFile(join(destination, file)))]))),
+    harnessRuntime: { node: process.versions.node, arch: process.arch, platform: process.platform },
     sourceCommit: run('/usr/bin/git', ['-C', root, 'rev-parse', 'HEAD']).trim(), qualification: 'fixtures-only; no native gate or production readiness claim' };
   await writeFile(join(destination, 'fixture-manifest.json'), JSON.stringify(record, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
   return Object.freeze({ directory: destination, consumer, record });
@@ -96,11 +125,18 @@ export function observeNative(fixtures, kind, value) {
   assert.ok(['process', 'group', 'contend', 'custody'].includes(kind));
   return JSON.parse(run(join(fixtures.directory, 'native-observer'), [kind, String(value)]));
 }
-export async function launchNativeFixture(fixtures, { mode = 'boundary', callback = fixtures.record.callback?.path, output }) {
+export async function launchNativeFixture(fixtures, { mode = 'boundary', callback = fixtures.record.callback?.path, output, variant = undefined }) {
   assert.ok(['boundary', 'callbacks'].includes(mode)); assert.ok(mode !== 'callbacks' || callback);
   const consumer = await verifiedConsumer(); assert.equal(consumer.candidate, fixtures.consumer.candidate);
   for (const [file, digest] of Object.entries(fixtures.record.binaries))
     assert.equal(hash(await readFile(join(fixtures.directory, file))), digest, 'Prepared observer/launcher binary drift');
+  if (variant) {
+    assert.ok(trustVariants.has(variant), 'Unprepared fixture variant');
+    assert.equal(variant.baseCandidate, consumer.candidate);
+    assert.equal(hash(await readFile(variant.manifest.path)), variant.manifest.sha256);
+    assert.equal(await realpath(variant.candidate), variant.candidate);
+    assert.deepEqual(await physicalInventory(variant.candidate), variant.files, 'Declared disposable variant drift');
+  }
   const directory = resolve(output); assert.ok(directory.startsWith(fixtures.directory + sep));
   for (const [file, expected] of Object.entries(fixtures.record.sourceInputs))
     assert.equal(hash(await readFile(join(root, 'tests/support', file))), expected, 'Prepared fixture source drift');
@@ -108,7 +144,7 @@ export async function launchNativeFixture(fixtures, { mode = 'boundary', callbac
   const home = join(directory, 'home'); await mkdir(home, { mode: 0o700 });
   for (const name of ['app-data', 'session-data']) await mkdir(join(home, name), { mode: 0o700 });
   if (callback) { assert.equal(callback, fixtures.record.callback?.path); assert.equal(hash(await readFile(callback)), fixtures.record.callback.signedDigest); }
-  const config = { format: 1, mode, bundle: fixtures.consumer.candidate, output: directory, home,
+  const config = { format: 1, mode, bundle: variant?.candidate ?? fixtures.consumer.candidate, output: directory, home, trustProbe: Boolean(variant),
     owner: join(directory, 'owner.lock'), build: join(directory, 'build.lock'), callback };
   const request = join(directory, 'request.json');
   await writeFile(request, JSON.stringify(config) + '\n', { mode: 0o600, flag: 'wx' });
@@ -165,7 +201,8 @@ export async function launchNativeFixture(fixtures, { mode = 'boundary', callbac
     current.status === 'uncertain' || (current.status === 'alive' && current.startId === original.startId)))) {
     await new Promise(accept => setTimeout(accept, 100)); final = sample();
   }
-  const record = { format: 1, mode, candidate: config.bundle, consumerManifest: nativeConsumer, pid: child.pid,
+  const record = { format: 1, mode, candidate: config.bundle, consumerManifest: nativeConsumer, derivation: variant ?? null,
+    consumerRole: variant ? 'immutable baseline only; executing copy is explicitly derived' : 'exact executing consumer', pid: child.pid,
     elapsedMs: performance.now() - started, ...outcome, timedOut, stdout, stderr, observations,
     qualification: 'fixture feasibility only; no complete gate/native qualification result' };
   await writeFile(join(directory, 'launch-result.json'), JSON.stringify(record, null, 2) + '\n', { mode: 0o600, flag: 'wx' });

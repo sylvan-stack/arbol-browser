@@ -1,16 +1,22 @@
 // External trusted qualification entry; never packaged as the production host.
-import { app, BaseWindow, WebContentsView } from 'electron';
+import { app, BaseWindow, WebContentsView, webContents } from 'electron';
 import { createRequire } from 'node:module';
 import assert from 'node:assert/strict';
 import { readFile, writeFile, realpath, lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 const events = [];
-let config, boundary, prepared, watchdog;
+let config, boundary, prepared, watchdog, bootstrap, preparationBefore;
 async function event(stage, values = {}) {
   const value = { stage, elapsedMs: performance.now(), ...values }; events.push(value);
   process.stdout.write(JSON.stringify(value) + '\n');
   if (config) await writeFile(join(config.output, 'entry-events.json'), JSON.stringify(events, null, 2) + '\n', { mode: 0o600 });
+}
+function admissionObservation() {
+  const report = process.report.getReport();
+  assert.ok(Array.isArray(report.sharedObjects) && report.sharedObjects.every(path => typeof path === 'string'));
+  return { nativeImages: report.sharedObjects.filter(path => /\/(?:platform|ownership)\.node$/.test(path)),
+    windows: BaseWindow.getAllWindows().map(value => value.id), webContents: webContents.getAllWebContents().map(value => value.id), appReady: app.isReady() };
 }
 try {
   const path = process.env.ARBOL_BROWSER_QUALIFICATION_REQUEST;
@@ -32,7 +38,9 @@ try {
   }
   await event('archive-witness', { noAsar: process.noAsar ?? false, witness });
   const bootstrapURL = pathToFileURL(join(config.bundle, 'Contents/Resources/browser/lib/runtime/bootstrap.js')).href;
-  const bootstrap = await import(bootstrapURL);
+  bootstrap = await import(bootstrapURL);
+  preparationBefore = admissionObservation();
+  await event('preparation-observation', { before: preparationBefore });
   prepared = await bootstrap.prepareNativeBoundary(config.bundle);
   bootstrap.assertNativeBoundaryPreparation(prepared);
   let counterfeitRefused = false;
@@ -50,7 +58,7 @@ try {
     hidePages() { void event('pages-hidden'); },
   });
   assert.equal(boundary.pageAdmission, false);
-  await event('installed', { status: boundary.native.assertIntegrity(), appReady: app.isReady() });
+  await event('installed', { status: boundary.native.assertIntegrity(), admission: admissionObservation(), appReady: app.isReady() });
   if (config.mode === 'callbacks') {
     assert.ok(config.callback && await realpath(config.callback) === config.callback);
     const bridge = createRequire(import.meta.url)(config.callback);
@@ -122,8 +130,22 @@ try {
   await new Promise(accept => setTimeout(accept, 350)); // external kernel/lock observation interval
   boundary.native.seal(); await event('sealed'); app.exit(0);
   }
-} catch (error) {
-  await event('unavailable', { error: String(error.stack ?? error) });
+ } catch (error) {
+  if (!prepared && config) {
+    const locks = {};
+    for (const name of ['owner', 'build']) {
+      try { const stat = await lstat(config[name]); locks[name] = { exists: true, device: String(stat.dev), inode: String(stat.ino) }; }
+      catch (failure) { locks[name] = failure.code === 'ENOENT' ? { exists: false } : { unavailable: String(failure) }; }
+    }
+    let retry;
+    if (config.trustProbe && bootstrap) {
+      try { await bootstrap.prepareNativeBoundary(config.bundle); retry = { refused: false }; }
+      catch (failure) { retry = { refused: true, error: String(failure) }; }
+    }
+    let after; try { after = admissionObservation(); } catch (failure) { after = { unavailable: String(failure) }; }
+    await event('trust-refusal-observation', { before: preparationBefore, after, locks, retry });
+  }
+  await event('unavailable' , { error: String(error.stack ?? error) });
   if (watchdog) watchdog.terminate(); // real native retained-custody loss path
   app.exit(70);
 }
