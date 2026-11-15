@@ -1,6 +1,6 @@
 // Testing-only fixture orchestration; no active inventoried cases or readiness provider.
 import assert from 'node:assert/strict';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createReadStream, lstatSync } from 'node:fs';
 import { mkdir, readFile, writeFile, realpath, readdir, readlink, lstat } from 'node:fs/promises';
@@ -47,7 +47,7 @@ export async function verifiedConsumer() {
   await physical(value.candidate); assert.deepEqual(actual, expected, 'Complete physical native consumer drift');
   return Object.freeze(value);
 }
-export async function prepareNativeFixtures(output) {
+export async function prepareNativeFixtures(output, { callbacks = false } = {}) {
   const destination = resolve(output);
   assert.ok(!destination.startsWith(root + sep) && !destination.startsWith('/Users/msix/Artifacts/'));
   const consumer = await verifiedConsumer();
@@ -57,13 +57,36 @@ export async function prepareNativeFixtures(output) {
   const compiler = run('/usr/bin/xcrun', ['--find', 'clang++']).trim();
   const sdk = run('/usr/bin/xcrun', ['--show-sdk-path']).trim();
   const sources = ['native-launch.mm', 'native-observer.mm', 'native-entry.mjs', 'native.mjs'];
+  if (callbacks) sources.push('native-callbacks.mm');
   const inputs = {};
   for (const file of sources) inputs[file] = hash(await readFile(join(root, 'tests/support', file)));
   for (const file of ['native-launch', 'native-observer']) run(compiler, ['-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror',
     '-fobjc-arc', '-arch', 'arm64', '-isysroot', sdk, '-mmacosx-version-min=27.0', join(root, 'tests/support', file + '.mm'),
     '-framework', 'Foundation', '-o', join(destination, file)]);
+  let callback;
+  if (callbacks) {
+    const headers = '/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-5-20261114/inputs/node_headers/include/node';
+    const { nativeCompilerPolicy } = await import('../../scripts/compile-native.mjs');
+    for (const [file, digest] of Object.entries(nativeCompilerPolicy.headerHashes))
+      assert.equal(hash(await readFile(join(headers, file))), digest, 'Pinned callback header drift');
+    const path = join(destination, 'native-callbacks.node');
+    const arguments_ = ['-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror', '-fobjc-arc', '-fblocks', '-fvisibility=hidden',
+      '-DNAPI_VERSION=8', '-arch', 'arm64', '-isysroot', sdk, '-mmacosx-version-min=27.0', '-bundle', '-undefined', 'dynamic_lookup',
+      '-I', headers, join(root, 'tests/support/native-callbacks.mm'), '-framework', 'Cocoa', '-o', path];
+    run(compiler, arguments_); const unsignedDigest = hash(await readFile(path));
+    run('/usr/bin/codesign', ['--force', '--sign', 'F1B6782A3BACC18E73FE08CA424C0A81450A982C', '--options', 'runtime', '--timestamp', path]);
+    run('/usr/bin/codesign', ['--verify', '--strict', '-R', '=anchor apple generic and certificate leaf[subject.OU] = "7V372XL59S" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists', path]);
+    const details = spawnSync('/usr/bin/codesign', ['-dvvv', path], { encoding: 'utf8', timeout: 30000 });
+    const entitlements = spawnSync('/usr/bin/codesign', ['-d', '--entitlements', ':-', path], { encoding: 'utf8', timeout: 30000 });
+    assert.equal(details.status, 0); assert.ok(details.stderr.includes('TeamIdentifier=7V372XL59S') && details.stderr.includes('runtime)') && details.stderr.includes('Timestamp='));
+    assert.equal(entitlements.status, 0); assert.ok(!/com\.apple\.security\./.test(entitlements.stdout + entitlements.stderr));
+    callback = { path, unsignedDigest, signedDigest: hash(await readFile(path)), compilerArguments: arguments_, headers, headerHashes: nativeCompilerPolicy.headerHashes, details: details.stderr, entitlements: entitlements.stdout + entitlements.stderr,
+      policySources: Object.fromEntries(await Promise.all(['scripts/compile-native.mjs', 'scripts/package-base.mjs'].map(async file => [file, hash(await readFile(join(root, file)))]))) };
+  }
+  for (const [file, digest] of Object.entries(inputs)) assert.equal(hash(await readFile(join(root, 'tests/support', file))), digest, 'Fixture source drift during compilation');
+  if (callback) for (const [file, digest] of Object.entries(callback.headerHashes)) assert.equal(hash(await readFile(join(callback.headers, file))), digest, 'Callback header drift during compilation');
   const record = { format: 1, consumerManifest: nativeConsumer, candidate: consumer.candidate, sourceInputs: inputs,
-    compiler, compilerVersion: run(compiler, ['--version']), sdk,
+    compiler, compilerVersion: run(compiler, ['--version']), sdk, callback,
     binaries: Object.fromEntries(await Promise.all(['native-launch', 'native-observer'].map(async file => [file, hash(await readFile(join(destination, file)))]))),
     sourceCommit: run('/usr/bin/git', ['-C', root, 'rev-parse', 'HEAD']).trim(), qualification: 'fixtures-only; no native gate or production readiness claim' };
   await writeFile(join(destination, 'fixture-manifest.json'), JSON.stringify(record, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
@@ -73,15 +96,18 @@ export function observeNative(fixtures, kind, value) {
   assert.ok(['process', 'group', 'contend'].includes(kind));
   return JSON.parse(run(join(fixtures.directory, 'native-observer'), [kind, String(value)]));
 }
-export async function launchNativeFixture(fixtures, { mode = 'boundary', callback = undefined, output }) {
+export async function launchNativeFixture(fixtures, { mode = 'boundary', callback = fixtures.record.callback?.path, output }) {
   assert.ok(['boundary', 'callbacks'].includes(mode)); assert.ok(mode !== 'callbacks' || callback);
   const consumer = await verifiedConsumer(); assert.equal(consumer.candidate, fixtures.consumer.candidate);
+  for (const [file, digest] of Object.entries(fixtures.record.binaries))
+    assert.equal(hash(await readFile(join(fixtures.directory, file))), digest, 'Prepared observer/launcher binary drift');
   const directory = resolve(output); assert.ok(directory.startsWith(fixtures.directory + sep));
   for (const [file, expected] of Object.entries(fixtures.record.sourceInputs))
     assert.equal(hash(await readFile(join(root, 'tests/support', file))), expected, 'Prepared fixture source drift');
   await mkdir(directory, { mode: 0o700 });
   const home = join(directory, 'home'); await mkdir(home, { mode: 0o700 });
   for (const name of ['app-data', 'session-data']) await mkdir(join(home, name), { mode: 0o700 });
+  if (callback) { assert.equal(callback, fixtures.record.callback?.path); assert.equal(hash(await readFile(callback)), fixtures.record.callback.signedDigest); }
   const config = { format: 1, mode, bundle: fixtures.consumer.candidate, output: directory, home,
     owner: join(directory, 'owner.lock'), build: join(directory, 'build.lock'), callback };
   const request = join(directory, 'request.json');

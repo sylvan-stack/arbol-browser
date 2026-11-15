@@ -1,5 +1,5 @@
 // External trusted qualification entry; never packaged as the production host.
-import { app } from 'electron';
+import { app, BaseWindow, WebContentsView } from 'electron';
 import { createRequire } from 'node:module';
 import assert from 'node:assert/strict';
 import { readFile, writeFile, realpath, lstat } from 'node:fs/promises';
@@ -45,15 +45,60 @@ try {
   watchdog = await prepared.arm(owner, build); watchdog.assertArmed(prepared.trust);
   await event('armed', { descriptors: watchdog.custody.descriptors, startupDescriptor: watchdog.custody.startupDescriptor, appReady: app.isReady() });
   boundary = await bootstrap.installNativeBoundary(prepared, watchdog, {
-    closeAdmission() { events.push({ stage: 'admission-closed' }); },
-    invalidate() { events.push({ stage: 'authority-invalidated' }); },
-    hidePages() { events.push({ stage: 'pages-hidden' }); },
+    closeAdmission() { void event('admission-closed'); },
+    invalidate() { void event('authority-invalidated'); },
+    hidePages() { void event('pages-hidden'); },
   });
   assert.equal(boundary.pageAdmission, false);
   await event('installed', { status: boundary.native.assertIntegrity(), appReady: app.isReady() });
-  if (config.mode === 'callbacks') throw new Error('callback_fixture_not_prepared'); // later booked leaf
+  if (config.mode === 'callbacks') {
+    assert.ok(config.callback && await realpath(config.callback) === config.callback);
+    const bridge = createRequire(import.meta.url)(config.callback);
+    assert.deepEqual(Object.getOwnPropertyNames(bridge).sort(), ['block', 'capture', 'descriptor', 'invoke', 'state']);
+    await event('callback-loaded', { path: config.callback,
+      capsule: JSON.parse(bridge.descriptor(watchdog.custody.startupDescriptor)),
+      owner: JSON.parse(bridge.descriptor(watchdog.custody.descriptors[0])),
+      build: JSON.parse(bridge.descriptor(watchdog.custody.descriptors[1])) });
+    // Resolve this entry before ready; callback setup then uses the real app event.
+    app.whenReady().then(async () => {
+      void event('callback-ready');
+      app.setAccessibilitySupportEnabled(true);
+      void event('callback-accessibility-enabled');
+      const window = new BaseWindow({ width: 640, height: 360, show: false });
+      void event('callback-window-created');
+      const view = new WebContentsView({ webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } });
+      void event('callback-view-created');
+      const key = value => ({ id: value.id, nonce: value.nonce, webContentsId: value.webContentsId, revision: value.revision });
+      let binding = boundary.native.ownership.bind(window.getNativeWindowHandle(), view.webContents.id, () => window.contentView.addChildView(view));
+      void event('callback-bound', { binding });
+      view.setBounds({ x: 0, y: 0, width: 640, height: 360 });
+      binding = boundary.native.ownership.mark(key(binding), false);
+      void event('callback-user-enabled', { binding });
+      const html = '<!doctype html><button aria-label="Native fixture button" onclick="this.textContent=Number(this.textContent)+1">0</button><input id="field" aria-label="Native fixture field" value="abc"><script>globalThis.events=[];field.addEventListener("input",e=>events.push({type:e.type,trusted:e.isTrusted}));field.focus();</script>';
+      await view.webContents.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
+      window.showInactive(); view.webContents.focus();
+      await new Promise(accept => setTimeout(accept, 350));
+      const cached = JSON.parse(bridge.capture(window.getNativeWindowHandle()));
+      await event('callback-view', { binding, cached, state: JSON.parse(bridge.state(cached.token)), appReady: app.isReady() });
+      const focus = JSON.parse(bridge.invoke(cached.token, 'focus'));
+      await event('callback-focus-observation', { focus, state: JSON.parse(bridge.state(cached.token)) });
+      const before = await view.webContents.executeJavaScript('({text:field.value,events:[...events]})');
+      const invocation = JSON.parse(bridge.invoke(cached.token, 'text'));
+      await new Promise(accept => setTimeout(accept, 150));
+      const after = await view.webContents.executeJavaScript('({text:field.value,events:[...events]})');
+      await event('callback-positive-observation', { before, invocation, after, state: JSON.parse(bridge.state(cached.token)) });
+      const originalContents = view.webContents;
+      const retired = await boundary.retire(key(binding), window.contentView, view);
+      await event('callback-retired-observation', { retired, destroyed: originalContents.isDestroyed(), state: JSON.parse(bridge.state(cached.token)) });
+      window.close(); boundary.native.seal(); await event('sealed'); app.exit(0);
+    }).catch(async error => {
+      await event('callback-unavailable', { error: String(error.stack ?? error) });
+      watchdog.terminate();
+    });
+  } else {
   await new Promise(accept => setTimeout(accept, 350)); // external kernel/lock observation interval
   boundary.native.seal(); await event('sealed'); app.exit(0);
+  }
 } catch (error) {
   await event('unavailable', { error: String(error.stack ?? error) });
   if (watchdog) watchdog.terminate(); // real native retained-custody loss path
