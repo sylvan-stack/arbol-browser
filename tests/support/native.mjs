@@ -93,7 +93,7 @@ export async function prepareNativeFixtures(output, { callbacks = false } = {}) 
   return Object.freeze({ directory: destination, consumer, record });
 }
 export function observeNative(fixtures, kind, value) {
-  assert.ok(['process', 'group', 'contend'].includes(kind));
+  assert.ok(['process', 'group', 'contend', 'custody'].includes(kind));
   return JSON.parse(run(join(fixtures.directory, 'native-observer'), [kind, String(value)]));
 }
 export async function launchNativeFixture(fixtures, { mode = 'boundary', callback = fixtures.record.callback?.path, output }) {
@@ -138,7 +138,15 @@ export async function launchNativeFixture(fixtures, { mode = 'boundary', callbac
       const current = [...tracked.values()].map(original => ({ original, current: observeNative(fixtures, 'process', original.pid) }));
       const locks = {};
       for (const name of ['owner', 'build']) try { if (lstatSync(config[name]).isFile()) locks[name] = observeNative(fixtures, 'contend', config[name]); } catch { /* absence grants no custody evidence */ }
-      const value = { elapsedMs: performance.now() - started, identity, group, current, locks }; observations.push(value); return value;
+      let ordered;
+      const published = stdout.split('\n').flatMap(line => { try { const value = JSON.parse(line); return value.stage === 'locks' ? [value] : []; } catch { return []; } }).at(-1);
+      const originals = [...tracked.values()].filter(value => value.executable.startsWith(config.bundle + sep));
+      if (published && originals.length) {
+        const anchor = originals.find(value => value.executable === join(config.bundle, 'Contents/Resources/browser/native/watchdog') && value.group === child.pid && value.parent !== child.pid) ?? null;
+        ordered = observeNative(fixtures, 'custody', JSON.stringify({ format: 1, group: child.pid, anchor, processes: originals,
+          locks: { owner: { path: config.owner, ...published.owner }, build: { path: config.build, ...published.build } } }));
+      }
+      const value = { elapsedMs: performance.now() - started, identity, group, current, locks, ordered }; observations.push(value); return value;
     } catch (error) { const value = { elapsedMs: performance.now() - started, unavailable: String(error) }; observations.push(value); return value; }
   }
   const timer = setInterval(sample, 100);
