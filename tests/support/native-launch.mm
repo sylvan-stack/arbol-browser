@@ -28,6 +28,10 @@ int main(int argc,const char* argv[]) {
     std::string original="ARBOL_BROWSER_BOOTSTRAP=1:"+std::to_string(getpid())+":"+std::to_string(info.unique.start)+":"+std::to_string(getpgrp())+":"+std::to_string(getsid(0))+":"+std::to_string(geteuid());
     char* args[]={engine.data(),const_cast<char*>(argv[2]),nullptr};
     char* environment[]={homeEnv.data(),requestEnv.data(),original.data(),(char*)"PATH=/usr/bin:/bin",(char*)"TMPDIR=/private/tmp",(char*)"LANG=en_US.UTF-8",nullptr};
+    NSDictionary* identity=@{ @"stage":@"launcher",@"pid":@(getpid()),@"startId":[NSString stringWithFormat:@"%llu",info.unique.start],
+      @"pidVersion":@(info.unique.version),@"group":@(getpgrp()),@"session":@(getsid(0)),@"uid":@(geteuid()) };
+    NSData* identityBytes=[NSJSONSerialization dataWithJSONObject:identity options:NSJSONWritingSortedKeys error:nil];
+    if(!identityBytes||fwrite(identityBytes.bytes,1,identityBytes.length,stdout)!=identityBytes.length||fputc('\n',stdout)==EOF||fflush(stdout)) return 70;
     // This external fixture supplies no production bootstrap or host-start proof.
     execve(engine.c_str(),args,environment); return 69;
   }

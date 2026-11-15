@@ -2,14 +2,14 @@
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { lstatSync } from 'node:fs';
-import { mkdir, readFile, writeFile, realpath } from 'node:fs/promises';
-import { join, resolve, sep } from 'node:path';
+import { createReadStream, lstatSync } from 'node:fs';
+import { mkdir, readFile, writeFile, realpath, readdir, readlink, lstat } from 'node:fs/promises';
+import { join, resolve, sep, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 const root = resolve(fileURLToPath(new URL('../../', import.meta.url)));
 export const nativeConsumer = Object.freeze({
-  manifest: '/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-7-20261114/consumer-manifest.json',
-  digest: '2e030da404d4eef479a6e197be90dd4730c14e1d4c8b1f4c4171ddb422bb7307',
+  manifest: '/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-42-20261115/consumer-manifest.json',
+  digest: 'cb041c3918bba14ccd5ea299cbd0b6c4159e3d97b169138c96ed70397f57601f',
 });
 const hash = value => createHash('sha256').update(value).digest('hex');
 const run = (file, args) => execFileSync(file, args, { encoding: 'utf8', timeout: 30000,
@@ -21,6 +21,30 @@ export async function verifiedConsumer() {
   assert.equal(await realpath(value.candidate), value.candidate);
   assert.equal(value.pageAdmission, false);
   assert.equal(hash(await readFile(value.manifest.path)), value.manifest.sha256);
+  const sourceReview = JSON.parse(await readFile(value.sourceReviewManifest.path));
+  assert.equal(hash(await readFile(value.sourceReviewManifest.path)), value.sourceReviewManifest.sha256);
+  const sourceRecord = JSON.parse(await readFile(join(sourceReview.frozenSource, '../source-before.json')));
+  assert.equal(hash(await readFile(join(sourceReview.frozenSource, '../source-before.json'))), sourceReview.records['source-checkpoint-35c9560/source-before.json']);
+  for (const [file, digest] of Object.entries(sourceRecord.sources))
+    assert.equal(hash(await readFile(join(sourceReview.frozenSource, file))), digest, 'Frozen accepted source drift');
+  for (const [file, digest] of Object.entries(sourceReview.compiledInventory))
+    assert.equal(hash(await readFile(join(sourceReview.frozenDist, file))), digest, 'Frozen compiled source drift');
+  const inventoryBytes = await readFile(value.bundle.inventory.path);
+  assert.equal(hash(inventoryBytes), value.bundle.inventory.sha256);
+  const expected = JSON.parse(inventoryBytes).files, actual = {};
+  async function physical(path) {
+    for (const name of (await readdir(path)).sort()) {
+      const child = join(path, name), st = await lstat(child), key = relative(value.candidate, child);
+      if (st.isSymbolicLink()) actual[key] = hash(`symlink\0${await readlink(child)}`);
+      else if (st.isDirectory()) await physical(child);
+      else {
+        assert.ok(st.isFile());
+        const digest = createHash('sha256'); for await (const bytes of createReadStream(child)) digest.update(bytes);
+        actual[key] = digest.digest('hex');
+      }
+    }
+  }
+  await physical(value.candidate); assert.deepEqual(actual, expected, 'Complete physical native consumer drift');
   return Object.freeze(value);
 }
 export async function prepareNativeFixtures(output) {
@@ -51,6 +75,7 @@ export function observeNative(fixtures, kind, value) {
 }
 export async function launchNativeFixture(fixtures, { mode = 'boundary', callback = undefined, output }) {
   assert.ok(['boundary', 'callbacks'].includes(mode)); assert.ok(mode !== 'callbacks' || callback);
+  const consumer = await verifiedConsumer(); assert.equal(consumer.candidate, fixtures.consumer.candidate);
   const directory = resolve(output); assert.ok(directory.startsWith(fixtures.directory + sep));
   for (const [file, expected] of Object.entries(fixtures.record.sourceInputs))
     assert.equal(hash(await readFile(join(root, 'tests/support', file))), expected, 'Prepared fixture source drift');
@@ -73,13 +98,15 @@ export async function launchNativeFixture(fixtures, { mode = 'boundary', callbac
     try {
       const identity = observeNative(fixtures, 'process', child.pid), group = observeNative(fixtures, 'group', child.pid);
       for (const member of group.members) if (member.status === 'alive') {
-        tracked.set(`${member.pid}:${member.startId}:${member.pidVersion}`, member);
+        const key = `${member.pid}:${member.startId}:${member.pidVersion}`;
+        if (!tracked.has(key)) tracked.set(key, member);
         // Custody remains in the original group; its actual parent identifies
         // the outside primary without trusting a fixture-supplied ready receipt.
         if (member.executable === join(config.bundle, 'Contents/Resources/browser/native/watchdog')) {
           const parent = observeNative(fixtures, 'process', member.parent);
           if (parent.status === 'alive' && parent.executable === member.executable && parent.startId === member.parentStartId)
-            tracked.set(`${parent.pid}:${parent.startId}:${parent.pidVersion}`, parent);
+            if (!tracked.has(`${parent.pid}:${parent.startId}:${parent.pidVersion}`))
+              tracked.set(`${parent.pid}:${parent.startId}:${parent.pidVersion}`, parent);
         }
       }
       const current = [...tracked.values()].map(original => ({ original, current: observeNative(fixtures, 'process', original.pid) }));
