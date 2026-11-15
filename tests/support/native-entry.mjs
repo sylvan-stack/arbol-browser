@@ -54,7 +54,7 @@ try {
   if (config.mode === 'callbacks') {
     assert.ok(config.callback && await realpath(config.callback) === config.callback);
     const bridge = createRequire(import.meta.url)(config.callback);
-    assert.deepEqual(Object.getOwnPropertyNames(bridge).sort(), ['block', 'capture', 'descriptor', 'invoke', 'state']);
+    assert.deepEqual(Object.getOwnPropertyNames(bridge).sort(), ['block', 'capture', 'descriptor', 'invoke', 'releaseClients', 'state']);
     await event('callback-loaded', { path: config.callback,
       capsule: JSON.parse(bridge.descriptor(watchdog.custody.startupDescriptor)),
       owner: JSON.parse(bridge.descriptor(watchdog.custody.descriptors[0])),
@@ -64,9 +64,9 @@ try {
       void event('callback-ready');
       app.setAccessibilitySupportEnabled(true);
       void event('callback-accessibility-enabled');
-      const window = new BaseWindow({ width: 640, height: 360, show: false });
+      let window = new BaseWindow({ width: 640, height: 360, show: false });
       void event('callback-window-created');
-      const view = new WebContentsView({ webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } });
+      let view = new WebContentsView({ webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } });
       void event('callback-view-created');
       const key = value => ({ id: value.id, nonce: value.nonce, webContentsId: value.webContentsId, revision: value.revision });
       let binding = boundary.native.ownership.bind(window.getNativeWindowHandle(), view.webContents.id, () => window.contentView.addChildView(view));
@@ -74,7 +74,7 @@ try {
       view.setBounds({ x: 0, y: 0, width: 640, height: 360 });
       binding = boundary.native.ownership.mark(key(binding), false);
       void event('callback-user-enabled', { binding });
-      const html = '<!doctype html><button aria-label="Native fixture button" onclick="this.textContent=Number(this.textContent)+1">0</button><input id="field" aria-label="Native fixture field" value="abc"><script>globalThis.events=[];field.addEventListener("input",e=>events.push({type:e.type,trusted:e.isTrusted}));field.focus();</script>';
+      const html = '<!doctype html><button id="button" aria-label="Native fixture button" onclick="this.textContent=Number(this.textContent)+1">0</button><input id="field" aria-label="Native fixture field" value="abc"><script>globalThis.events=[];field.addEventListener("input",e=>events.push({type:e.type,trusted:e.isTrusted}));button.addEventListener("click",e=>events.push({type:e.type,trusted:e.isTrusted}));field.focus();</script>';
       await view.webContents.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
       window.showInactive(); view.webContents.focus();
       await new Promise(accept => setTimeout(accept, 350));
@@ -87,10 +87,33 @@ try {
       await new Promise(accept => setTimeout(accept, 150));
       const after = await view.webContents.executeJavaScript('({text:field.value,events:[...events]})');
       await event('callback-positive-observation', { before, invocation, after, state: JSON.parse(bridge.state(cached.token)) });
-      const originalContents = view.webContents;
+      const pressBefore = await view.webContents.executeJavaScript('({button:button.textContent,events:[...events]})');
+      const press = JSON.parse(bridge.invoke(cached.token, 'press'));
+      await new Promise(accept => setTimeout(accept, 150));
+      const pressAfter = await view.webContents.executeJavaScript('({button:button.textContent,events:[...events]})');
+      await event('callback-ax-positive-observation', { before: pressBefore, invocation: press, after: pressAfter });
+      const resigned = JSON.parse(bridge.invoke(cached.token, 'resignFocus'));
+      await event('callback-focus-released', { resigned, state: JSON.parse(bridge.state(cached.token)) });
+      if (!resigned.returned) throw new Error('fixture_native_focus_release_unavailable');
+      let originalContents = view.webContents;
       const retired = await boundary.retire(key(binding), window.contentView, view);
       await event('callback-retired-observation', { retired, destroyed: originalContents.isDestroyed(), state: JSON.parse(bridge.state(cached.token)) });
-      window.close(); boundary.native.seal(); await event('sealed'); app.exit(0);
+      view = null; originalContents = null;
+      await new Promise(accept => setTimeout(accept, 100));
+      await event('callback-js-references-released', { state: JSON.parse(bridge.state(cached.token)) });
+      const released = JSON.parse(bridge.releaseClients(cached.token));
+      await event('callback-ax-clients-released', { released, state: JSON.parse(bridge.state(cached.token)) });
+      const weakDeadline = performance.now() + 2000;
+      do {
+        await new Promise(accept => setTimeout(accept, 250));
+        const state = JSON.parse(bridge.state(cached.token));
+        await event('callback-weak-observation', { state });
+        if (!state.weakRootAlive && !state.weakWidgetAlive) break;
+      } while (performance.now() < weakDeadline);
+      await event('callback-window-close-requested');
+      window.close(); window = null;
+      await event('callback-window-closed');
+      boundary.native.seal(); await event('sealed'); app.exit(0);
     }).catch(async error => {
       await event('callback-unavailable', { error: String(error.stack ?? error) });
       watchdog.terminate();

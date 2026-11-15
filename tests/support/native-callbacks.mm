@@ -78,6 +78,13 @@ static napi_value state(napi_env env,napi_callback_info info) {
   return reply(env,@{@"weakRootAlive":@(root!=nil),@"weakWidgetAlive":@(widget!=nil),@"attached":@(root&&root.superview!=nil),
     @"firstResponder":@(widget&&widget.window.firstResponder==widget),@"cachedButton":@(row.button!=nil),@"cachedHandler":@(row.action!=nil)});
 }
+// Drop only clients retained by this testing fixture; weak page witnesses remain.
+static napi_value releaseClients(napi_env env,napi_callback_info info) {
+  napi_value value;if(!args(env,info,1,&value)) return nullptr;NSString* token=string(env,value);
+  if(!token||!routes[token]) return fail(env,"fixture_unknown_token");
+  QualificationRoutes* row=routes[token];row.button=nil;row.field=nil;row.action=nil;
+  return reply(env,@{@"token":token,@"fixtureClientsReleased":@YES});
+}
 static napi_value invoke(napi_env env,napi_callback_info info) {
   napi_value values[2];if(!args(env,info,2,values)) return nullptr;QualificationRoutes* row=routes[string(env,values[0])];NSString* route=string(env,values[1]);
   if(!row||!route) return fail(env,"fixture_unknown_token_or_route");
@@ -94,6 +101,7 @@ static napi_value invoke(napi_env env,napi_callback_info info) {
       else if([route isEqualToString:@"directDelete"]) ((void(*)(id,SEL,id))objc_msgSend)(widget,@selector(deleteBackward:),nil);
       else if([route isEqualToString:@"selectAll"]) ((void(*)(id,SEL,id))objc_msgSend)(widget,@selector(selectAll:),nil);
       else if([route isEqualToString:@"focus"]) result=[widget.window makeFirstResponder:widget];
+      else if([route isEqualToString:@"resignFocus"]) result=[widget.window makeFirstResponder:nil];
       else return fail(env,"fixture_unknown_route");
     }
     return reply(env,@{@"route":route,@"returned":@(result)});
@@ -121,6 +129,6 @@ NAPI_MODULE_INIT() {
   napi_property_descriptor exportsList[]={
     {"capture",nullptr,capture,nullptr,nullptr,nullptr,napi_default,nullptr},{"state",nullptr,state,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"invoke",nullptr,invoke,nullptr,nullptr,nullptr,napi_default,nullptr},{"descriptor",nullptr,descriptor,nullptr,nullptr,nullptr,napi_default,nullptr},
-    {"block",nullptr,block,nullptr,nullptr,nullptr,napi_default,nullptr}};
+    {"block",nullptr,block,nullptr,nullptr,nullptr,napi_default,nullptr},{"releaseClients",nullptr,releaseClients,nullptr,nullptr,nullptr,napi_default,nullptr}};
   if(napi_define_properties(env,exports,sizeof(exportsList)/sizeof(exportsList[0]),exportsList)!=napi_ok) return nullptr;return exports;
 }

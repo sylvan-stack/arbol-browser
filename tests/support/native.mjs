@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { createReadStream, lstatSync } from 'node:fs';
+import { createReadStream } from 'node:fs';
 import { mkdir, readFile, writeFile, realpath, readdir, readlink, lstat } from 'node:fs/promises';
 import { join, resolve, sep, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -135,10 +135,7 @@ export async function launchNativeFixture(fixtures, { mode = 'boundary', callbac
               tracked.set(`${parent.pid}:${parent.startId}:${parent.pidVersion}`, parent);
         }
       }
-      const current = [...tracked.values()].map(original => ({ original, current: observeNative(fixtures, 'process', original.pid) }));
-      const locks = {};
-      for (const name of ['owner', 'build']) try { if (lstatSync(config[name]).isFile()) locks[name] = observeNative(fixtures, 'contend', config[name]); } catch { /* absence grants no custody evidence */ }
-      let ordered;
+      let current, locks = {}, ordered;
       const published = stdout.split('\n').flatMap(line => { try { const value = JSON.parse(line); return value.stage === 'locks' ? [value] : []; } catch { return []; } }).at(-1);
       const originals = [...tracked.values()].filter(value => value.executable.startsWith(config.bundle + sep));
       if (published && originals.length) {
@@ -146,6 +143,14 @@ export async function launchNativeFixture(fixtures, { mode = 'boundary', callbac
         ordered = observeNative(fixtures, 'custody', JSON.stringify({ format: 1, group: child.pid, anchor, processes: originals,
           locks: { owner: { path: config.owner, ...published.owner }, build: { path: config.build, ...published.build } } }));
       }
+      if (ordered?.order) {
+        current = ordered.order.find(point => point.stage === 'before-close')?.processes ?? [];
+        locks = ordered.locks ?? {};
+      } else {
+        current = originals.map(original => ({ original, current: observeNative(fixtures, 'process', original.pid) }));
+      }
+      // The combined observer supplies post-reads/locks; do not add sequential
+      // process/contender subprocesses that obscure ordering and burden startup.
       const value = { elapsedMs: performance.now() - started, identity, group, current, locks, ordered }; observations.push(value); return value;
     } catch (error) { const value = { elapsedMs: performance.now() - started, unavailable: String(error) }; observations.push(value); return value; }
   }
