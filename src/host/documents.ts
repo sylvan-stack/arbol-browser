@@ -48,7 +48,9 @@ export interface DocumentEvent {
 export class PresentationSuperseded extends Error {}
 export function presentationCategory(page: PageSurface): string {
   const host = page.window;
-  return `${host.selected() === page}:${page.view.getVisible()}:${host.window.isVisible() && !host.window.isMinimized()}`;
+  const selected = host.selected() === page, visible = page.view.getVisible();
+  if (!selected && visible) return 'invalid';
+  return selected && visible && host.window.isVisible() && !host.window.isMinimized() ? 'presented' : 'hidden';
 }
 interface EpochState { valid: boolean; ready: boolean; availability: Contract<'browser.Availability'> }
 interface Job { active: boolean; controller: AbortController }

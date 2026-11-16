@@ -90,7 +90,11 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
   let placementDepth = 0, placementVersion = 0;
   const pendingPresentation = new Set<PageSurface>(), categories = new Map<PageSurface, string>();
   const observers = new Set<{ fence: (pages: readonly PageSurface[]) => void; changed: (pages: readonly PageSurface[]) => void }>();
-  const category = (page: PageSurface) => `${selected === page}:${page.view.getVisible()}:${window.isVisible() && !window.isMinimized()}`;
+  const category = (page: PageSurface) => {
+    const active = selected === page, visible = page.view.getVisible();
+    if (!active && visible) return 'invalid';
+    return active && visible && window.isVisible() && !window.isMinimized() ? 'presented' : 'hidden';
+  };
   const synchronous = (work: () => void) => {
     const result: unknown = work(); if (result !== undefined) return boundary.fatal.fail('native_retirement_unavailable');
   };
@@ -172,7 +176,7 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
         },
         restorePresentation() {
           // restore unhides native subviews. It is never a background probe.
-          if (retired || selected !== page || !view.getVisible() || !window.isVisible()) throw unavailable('browser');
+          if (retired || selected !== page || !view.getVisible() || !window.isVisible() || window.isMinimized()) throw unavailable('browser');
           current = boundary.native.ownership.restore(bindingKey(current));
         },
         present(active: boolean) {

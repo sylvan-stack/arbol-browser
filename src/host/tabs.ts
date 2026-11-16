@@ -72,6 +72,7 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
   interface PendingRetirement { generation: number; promise: Promise<void>; ready: Promise<void>; start(): void }
   const retirements = new WeakMap<TabTarget, PendingRetirement>();
   const registered = new WeakSet<TabTarget>();
+  const registrationAttempted = new WeakSet<TabTarget>();
   const windowClosures = new WeakMap<WindowHost, Promise<void>>();
   interface PopupBudget { count: number; client: string; active: boolean; scope?: AgentOpenScope }
   const actions = new Map<TabTarget, { generation: number; budget: PopupBudget }>();
@@ -106,7 +107,8 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
           void page.retire().then(() => {
             window.guardRetirementTransition(() => {
               tabs.delete(target.id); closing.delete(target); registered.delete(target);
-              lifecycle.removed(target); lifecycle.changed();
+              if (registrationAttempted.has(target)) lifecycle.removed(target);
+              lifecycle.changed();
             });
             resolve();
           }, reject);
@@ -121,11 +123,14 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
       if (originalRetirement) assertPageRetirement(page, originalRetirement);
       else page.setNativeBlocked(true);
       if (selection.get(window) === target) {
-        const next = [...tabs.values()].find(tab => tab.page.window === window && !closing.has(tab) && !tab.page.retirement());
+        const next = [...tabs.values()].find(tab => registered.has(tab) && tab.page.window === window && !closing.has(tab) && !tab.page.retirement());
         if (!windowClosures.has(window) && next) window.select(next.page, () => { selection.set(window, next); });
         else window.clearSelection(page, () => { if (selection.get(window) === target) selection.delete(window); });
       }
-      return lifecycle.invalidate(target);
+      // A native placement can lose before the first lifecycle registration.
+      // Such a private blocked tentative has no grants/jobs/authority to revoke.
+      // Its authentic physical retirement still uses this same once-only path.
+      if (registrationAttempted.has(target)) return lifecycle.invalidate(target);
     });
     prepared(); return record;
   }
@@ -176,6 +181,7 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
     tabs.set(target.id, target);
     try {
       const register = () => {
+        registrationAttempted.add(target);
         lifecycle.register(target, initial); registered.add(target);
         if (budget?.scope) {
           const result: unknown = budget.scope.registered(target, opener);
