@@ -289,6 +289,51 @@ async function observeFailureCustody(fixtures, directory, pid, waitForStage, mon
   return observeWithSentinel(fixtures, directory, request, monitorScenario);
 }
 
+async function observeSupportedHelperExit(fixtures, directory, pid, waitForStage) {
+  const record = { scope: 'independent kernel process and original lock observations', samples: [], passed: false };
+  try {
+    const published = await waitForStage('locks');
+    const ready = await waitForStage('helper-exit-observer-waiting');
+    const family = observeNative(fixtures, 'group', pid).members;
+    const helper = join(fixtures.consumer.candidate, 'Contents/Resources/browser/native/watchdog');
+    const anchor = family.find(member => member.status === 'alive' && member.executable === helper && member.parent !== pid);
+    assert.ok(anchor);
+    const primary = observeNative(fixtures, 'process', anchor.parent);
+    const main = family.find(member => member.pid === pid), renderer = family.find(member => member.pid === ready.renderer);
+    assert.equal(primary.executable, helper); assert.equal(primary.group, primary.pid);
+    assert.equal(renderer?.executable, join(fixtures.consumer.candidate,
+      'Contents/Resources/browser/runtime/Electron.app/Contents/Frameworks/Electron Helper (Renderer).app/Contents/MacOS/Electron Helper (Renderer)'));
+    record.originals = { main, primary, custody: anchor, renderer };
+    const locks = { owner: { path: join(directory, 'owner.lock'), ...published.owner }, build: { path: join(directory, 'build.lock'), ...published.build } };
+    const request = { format: 1, group: pid, anchor, processes: [main, primary, anchor, renderer], locks };
+    const sample = () => observeNative(fixtures, 'custody', JSON.stringify(request));
+    record.baseline = sample();
+    await publishReadyMarker(join(directory, 'helper-exit-observer-ready'));
+    record.requested = await waitForStage('helper-exit-requested');
+    const deadline = performance.now() + 10000;
+    for (;;) {
+      const current = observeNative(fixtures, 'process', renderer.pid);
+      record.samples.push({ at: performance.now(), renderer: current });
+      if (current.status === 'gone') break;
+      assert.ok(performance.now() < deadline, 'Original renderer did not disappear after supported close');
+      await new Promise(accept => setTimeout(accept, 50));
+    }
+    record.afterExit = sample();
+    await publishReadyMarker(join(directory, 'helper-exit-observed'));
+    record.live = await waitForStage('helper-exit-live');
+    // Keep the signed census and protocol active beyond another full watchdog interval.
+    await new Promise(accept => setTimeout(accept, 2300));
+    record.continued = sample();
+    record.protocol = (await readFile(join(directory, 'failure.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+    record.passed = true;
+  } catch (error) { record.error = String(error.stack ?? error); }
+  finally {
+    await writeFile(join(directory, 'helper-exit-observation.json'), JSON.stringify(record, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+    await publishReadyMarker(join(directory, 'helper-exit-release'));
+  }
+  return record;
+}
+
 async function observeWithSentinel(fixtures, directory, custody, mode) {
   const profile = join(directory, 'sentinel');
   await mkdir(profile, { mode: 0o700 });
@@ -351,7 +396,7 @@ async function observeWithMarker(fixtures, directory, command, request, markerNa
 export async function launchNativeFixture(fixtures, {
   mode = 'boundary', callback = fixtures.record.callback?.path, output, variant, poisonScenario, bindingScenario, retirementScenario, startupScenario, failureScenario, monitorScenario,
 }) {
-  const callbackModes = ['callbacks', 'resolver-control', 'install-poison', 'binding-lifetime', 'cached-routes', 'concurrent-responder', 'retirement', 'startup-custody', 'failure-custody', 'monitor-loss'];
+  const callbackModes = ['callbacks', 'resolver-control', 'install-poison', 'binding-lifetime', 'cached-routes', 'concurrent-responder', 'retirement', 'startup-custody', 'failure-custody', 'monitor-loss', 'helper-exit'];
   assert.ok(['boundary', 'frozen-trust', 'frozen-trust-restored', 'provider-mismatch', ...callbackModes].includes(mode));
   assert.ok(callback || !callbackModes.includes(mode));
   assert.equal(mode === 'install-poison', installPoisonScenarios.has(poisonScenario));
@@ -457,6 +502,7 @@ export async function launchNativeFixture(fixtures, {
     .catch(error => ({ unavailable: String(error.message ?? error) })) : undefined;
   const failureCustody = ['failure-custody', 'monitor-loss'].includes(mode) ? observeFailureCustody(fixtures, directory, child.pid, waitForStage, monitorScenario)
     .catch(error => ({ unavailable: String(error.message ?? error) })) : undefined;
+  const helperExit = mode === 'helper-exit' ? observeSupportedHelperExit(fixtures, directory, child.pid, waitForStage) : undefined;
   // Timeout teardown is explicitly not production enforcement evidence.
   const deadline = setTimeout(() => {
     timedOut = true;
@@ -488,7 +534,7 @@ export async function launchNativeFixture(fixtures, {
     consumerRole: variant ? 'immutable baseline only; executing copy is explicitly derived' : 'exact executing consumer', pid: child.pid,
     elapsedMs: performance.now() - started, ...outcome, timedOut, stdout, stderr, observations,
     frozenTrust: await trustProbe, startupSlots: mode === 'startup-custody' ? startupSlots : undefined, startupBirths: births,
-    failureCustody: await failureCustody,
+    failureCustody: await failureCustody, helperExit: await helperExit,
     scope: 'one private fixture launch' };
   await writeFile(join(directory, 'launch-result.json'), JSON.stringify(record, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
   return record;

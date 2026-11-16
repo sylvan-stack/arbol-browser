@@ -792,6 +792,35 @@ export async function nativeHelperExitBoundary({ output }) {
     const census = await runCensusWitness(join(fixtures.directory, 'census'));
     result.scenarios.push({ id: 'kernel-helper-exit-controls', status: 'passed', record: join(fixtures.directory, 'census/census-record.json'),
       inputs: census.inputs, binary: census.binary });
+    const runtime = join(fixtures.directory, 'supported-exit');
+    const launch = await launchNativeFixture(fixtures, { mode: 'helper-exit', output: runtime });
+    result.scenarios.push({ id: 'signed-supported-helper-exit', status: 'failed', record: join(runtime, 'helper-exit-observation.json'),
+      launch: join(runtime, 'launch-result.json') });
+    assert.equal(launch.timedOut, false);
+    const witness = launch.helperExit;
+    assert.equal(witness.passed, true, witness.error);
+    assert.equal(witness.requested.destroyed, true);
+    assert.equal(witness.requested.mechanism, 'WebContents.close without beforeunload');
+    assert.equal(witness.samples.at(-1).renderer.status, 'gone');
+    for (const [name, snapshot] of Object.entries({ baseline: witness.baseline, afterExit: witness.afterExit, continued: witness.continued })) {
+      assert.equal(snapshot.unavailable, undefined);
+      for (const lock of ['owner', 'build']) {
+        assert.equal(snapshot.locks[lock].acquired, false);
+        for (const stage of ['before-' + lock, 'after-' + lock]) {
+          const rows = snapshot.order.find(row => row.stage === stage).processes;
+          for (const row of rows) {
+            if (row.original.pid === witness.originals.renderer.pid && name !== 'baseline') assert.equal(row.current.status, 'gone');
+            else { assert.equal(row.identityMatches, true); assert.equal(row.current.stopped, false); }
+          }
+        }
+      }
+    }
+    assert.match(witness.live.acknowledgement, /^A [1-9][0-9]*\n$/);
+    const liveSequence = BigInt(witness.live.acknowledgement.slice(2));
+    const acks = witness.protocol.filter(row => row.stage === 'primary-frame' && /^A /.test(row.frame));
+    assert.ok(acks.some(row => BigInt(row.frame.slice(2)) > liveSequence), 'A later signed acknowledgement must follow the independently witnessed disappearance');
+    for (const ack of acks) assert.ok(witness.protocol.some(row => row.stage === 'host-frame' && row.frame === ack.frame.replace(/^A /, 'H ')));
+    result.scenarios.at(-1).status = 'passed';
     result.status = 'passed';
   } catch (error) { failure = error; result.error = String(error.stack ?? error); }
   await writeFile(join(destination, 'case-result.json'), JSON.stringify(result, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
