@@ -56,6 +56,8 @@ function tabId(exhausted: () => never): string {
 export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
   const tabs = new Map<string, TabTarget>(), closing = new Set<TabTarget>();
   const selection = new Map<WindowHost, TabTarget>();
+  const retirements = new WeakMap<TabTarget, { generation: number; promise: Promise<void> }>();
+  const windowClosures = new WeakMap<WindowHost, Promise<void>>();
   interface PopupBudget { count: number; client: string; active: boolean }
   const actions = new Map<TabTarget, { generation: number; budget: PopupBudget }>();
   const finishBudget = (budget: PopupBudget) => {
@@ -64,28 +66,45 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
   };
   const assertTarget = (target: TabTarget) => {
     lifecycle.assertAdmission(); assertPageSurface(target.page);
-    if (tabs.get(target.id) !== target || closing.has(target)) throw refused('tab_not_found');
+    if (tabs.get(target.id) !== target || closing.has(target) || windowClosures.has(target.page.window)) throw refused('tab_not_found');
   };
   const state = (target: TabTarget) => { assertTarget(target); return lifecycle.state(target); };
   const generation = (target: TabTarget, expected: number) => {
     const value = state(target); if (value.generation !== expected) throw refused('control_changed'); return value;
   };
-  async function retire(target: TabTarget) {
-    assertTarget(target); closing.add(target); actions.delete(target);
-    lifecycle.invalidate(target); // close visibility and queued/content delivery before native teardown
-    await target.page.retire();
-    tabs.delete(target.id); lifecycle.removed(target);
-    const window = target.page.window;
-    if (selection.get(window) === target) {
-      selection.delete(window);
-      const next = [...tabs.values()].find(tab => tab.page.window === window && !closing.has(tab));
-      if (next) { selection.set(window, next); window.select(next.page); }
-    }
-    lifecycle.changed();
+  function retire(target: TabTarget): Promise<void> {
+    const pending = retirements.get(target);
+    if (pending) return pending.promise;
+    if (tabs.get(target.id) !== target) throw refused('tab_not_found');
+    // A failed initial register still needs its actually bound target retired.
+    let currentGeneration = 1;
+    try { currentGeneration = lifecycle.state(target).generation; } catch { /* cleanup retains native exclusion */ }
+    let resolve!: () => void, reject!: (reason: unknown) => void;
+    const promise = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
+    retirements.set(target, { generation: currentGeneration, promise });
+    closing.add(target); actions.delete(target);
+    // Both guards exist before invalidate/removed/changed can synchronously re-enter.
+    let invalidationError: unknown;
+    try { lifecycle.invalidate(target); } catch (error) { invalidationError = error; }
+    const complete = () => {
+      tabs.delete(target.id); closing.delete(target);
+      const window = target.page.window;
+      if (selection.get(window) === target) {
+        selection.delete(window);
+        const next = [...tabs.values()].find(tab => tab.page.window === window && !closing.has(tab));
+        if (!windowClosures.has(window) && next) { selection.set(window, next); window.select(next.page); }
+      }
+      lifecycle.removed(target); lifecycle.changed();
+      if (invalidationError !== undefined) throw invalidationError;
+    };
+    try { void target.page.retire().then(() => { try { complete(); resolve(); } catch (error) { reject(error); } }, reject); }
+    catch (error) { reject(error); }
+    return promise;
   }
   async function open(window: WindowHost, url: string, creator?: Contract<'browser.ClientIdentity'>,
     inherited?: TabState, inheritedBudget?: PopupBudget, background = false): Promise<TabTarget> {
     lifecycle.assertAdmission(); assertWindowHost(window); url = userURL(url);
+    if (windowClosures.has(window)) throw refused('control_refused', 'This browser window is closing.');
     if (tabs.size >= 64) throw refused('control_refused', 'Close an existing tab before opening another.');
     if (creator && !lifecycle.connected(creator.id)) throw refused('control_refused');
     const budget = creator ? inheritedBudget ?? { count: 0, client: creator.id, active: true } : undefined;
@@ -136,7 +155,7 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
     return open(opener.page.window, url, { id: action.budget.client, label: before.controller.label }, before, action.budget);
   }
   const registry: TabRegistry = Object.freeze({
-    all: () => [...tabs.values()].filter(target => !closing.has(target)),
+    all: () => [...tabs.values()].filter(target => !closing.has(target) && !windowClosures.has(target.page.window)),
     get(id: string) { const target = tabs.get(id); if (!target) throw refused('tab_not_found'); assertTarget(target); return target; },
     state,
     openUser: (window: WindowHost, url = 'about:blank') => open(window, url),
@@ -146,9 +165,11 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
       selection.set(window, target); window.select(target.page); return target;
     },
     selected: (window: WindowHost) => selection.get(window),
-    async closeUser(window: WindowHost, id: string, expected: number) {
-      const target = registry.get(id); if (target.page.window !== window) throw refused('tab_not_found');
-      generation(target, expected); await retire(target);
+    closeUser(window: WindowHost, id: string, expected: number) {
+      const target = tabs.get(id); if (!target || target.page.window !== window) throw refused('tab_not_found');
+      const pending = retirements.get(target);
+      if (pending) { if (pending.generation !== expected) throw refused('control_changed'); return pending.promise; }
+      generation(target, expected); return retire(target);
     },
     async closeAgent(client: string, id: string, expected: number) {
       const target = registry.get(id), current = state(target);
@@ -157,10 +178,17 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
       if (current.controller.kind !== 'agent' || current.controller.client !== client) throw refused('control_refused');
       await retire(target);
     },
-    async closeWindow(window: WindowHost) {
+    closeWindow(window: WindowHost) {
+      const pending = windowClosures.get(window); if (pending) return pending;
       assertWindowHost(window);
-      await Promise.all([...tabs.values()].filter(target => target.page.window === window).map(retire));
-      selection.delete(window); await window.close();
+      let resolve!: () => void, reject!: (reason: unknown) => void;
+      const promise = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
+      windowClosures.set(window, promise); // precedes every invalidation/native callback
+      try {
+        const pendingTabs = [...tabs.values()].filter(target => target.page.window === window).map(retire);
+        void Promise.all(pendingTabs).then(() => { selection.delete(window); return window.close(); }).then(resolve, reject);
+      } catch (error) { reject(error); }
+      return promise;
     },
     beginPopupAction(target: TabTarget, expected: number) {
       const current = generation(target, expected);
