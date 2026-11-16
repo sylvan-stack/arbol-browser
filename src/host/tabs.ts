@@ -111,7 +111,7 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
         if (!windowClosures.has(window) && next) { window.select(next.page); selection.set(window, next); }
         else window.clearSelection(target.page);
       }
-      lifecycle.invalidate(target);
+      return lifecycle.invalidate(target);
     });
     prepared(); return record;
   }
