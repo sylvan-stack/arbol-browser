@@ -1,4 +1,4 @@
-import { webContents, webFrameMain, type WebFrameMain } from 'electron';
+import { webContents, webFrameMain, type WebFrameMain, type WebContents } from 'electron';
 import { randomBytes } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import type { Contract } from '../contracts/generated.js';
@@ -44,13 +44,15 @@ export interface DocumentEvent {
   readonly kind: 'changed' | 'ready' | 'closed' | 'suspect';
   readonly receipt?: HostDocument;
 }
+/** Ordinary selection can supersede a presentation job without a renderer fault. */
+export class PresentationSuperseded extends Error {}
 interface EpochState { valid: boolean; ready: boolean; availability: Contract<'browser.Availability'> }
 interface Job { active: boolean; controller: AbortController }
 interface Ticket {
   issued: IssuedNavigation; original: HostDocument; execution: ActionExecution; candidate?: HostDocument; commits: number; starts: number;
 }
 interface PageRecord {
-  target: TabTarget; page: PageSurface; use: object; channel: object; closed: boolean;
+  target: TabTarget; page: PageSurface; contents: WebContents; use: object; channel: object; closed: boolean;
   current?: HostDocument; state?: EpochState; barrier?: Job; load?: Job; ticket?: Ticket;
   committed: boolean; mainDOM: boolean; lastSafeURL: string; startHTTPS: boolean; redirects: number;
   fault?: DocumentFault; stopped?: Readonly<{ page: PageSurface; renderer: HostDocument['renderer']; reason: string }>;
@@ -68,7 +70,7 @@ function sameFrame(a: PhysicalFrame, b: PhysicalFrame): boolean {
  * identity; the wrapper itself and a URL are insufficient lifetime evidence. */
 export function physicalFrames(page: PageSurface): readonly PhysicalFrame[] {
   const contents = page.view.webContents;
-  if (page.retirement() || contents.isDestroyed() || contents.isCrashed()) throw staleSnapshot();
+  if (page.retirement() || !contents || contents.isDestroyed() || contents.isCrashed()) throw staleSnapshot();
   const main = contents.mainFrame, frames = main.framesInSubtree;
   if (!frames.length || !frames.includes(main)) throw staleSnapshot();
   return Object.freeze(frames.map(handle => {
@@ -117,7 +119,7 @@ export class HostDocuments implements DocumentAuthority {
     return !record.closed && this.records.get(record.target) === record && record.target.page === record.page;
   }
   private alive(record: PageRecord): boolean {
-    return this.isOriginal(record) && !record.page.retirement() && !record.page.view.webContents.isDestroyed();
+    return this.isOriginal(record) && !record.page.retirement() && !record.contents.isDestroyed();
   }
   private poisonEpoch(record: PageRecord): readonly Job[] {
     // Reentrant AbortSignal listeners are notified only after authority closes.
@@ -160,7 +162,7 @@ export class HostDocuments implements DocumentAuthority {
     if (previous?.page === target.page && !previous.closed) return;
     if (previous) this.close(target, previous.page);
     const page = target.page, contents = page.view.webContents;
-    const record: PageRecord = { target, page, use: Object.freeze({}), channel: this.preparation!.channel(page), closed: false,
+    const record: PageRecord = { target, page, contents, use: Object.freeze({}), channel: this.preparation!.channel(page), closed: false,
       committed: false, mainDOM: false, lastSafeURL: previous?.lastSafeURL ?? 'about:blank', startHTTPS: false, redirects: 0, listeners: [] };
     this.records.set(target, record);
     const on = <K extends string>(name: K, receive: (...args: any[]) => void) => {
@@ -275,9 +277,10 @@ export class HostDocuments implements DocumentAuthority {
       job.active = false; delete record.barrier;
       record.state!.ready = true; record.state!.availability = 'ready';
       this.emit(record, 'ready'); // actual ownership adapter performs the checked native policy publication
-    }, () => {
+    }, error => {
       const current = job.active && record.barrier === job && this.alive(record) && record.current === receipt;
       job.active = false; if (record.barrier === job) delete record.barrier;
+      if (error instanceof PresentationSuperseded) { if (current) this.schedule(record); return; }
       if (current) {
         try { this.authority().expected(record.target, generation); } catch { return; }
         this.failPage(record.target, record.page, 'unavailable', 'readiness_failed');
@@ -312,7 +315,7 @@ export class HostDocuments implements DocumentAuthority {
         context.signal.addEventListener('abort', abort, { once: true });
       });
       void complete.catch(() => {});
-      const contents = record.page.view.webContents;
+      const contents = record.contents;
       guard();
       if (address === 'back' || address === 'forward') {
         const history = contents.navigationHistory;
@@ -417,6 +420,21 @@ export class HostDocuments implements DocumentAuthority {
   assertFault(target: TabTarget, fault: DocumentFault): void {
     const record = this.faults.get(fault);
     if (!record || record.target !== target || record.page !== fault.page || record.fault !== fault || !this.isOriginal(record)) throw staleSnapshot();
+  }
+  target(receipt: HostDocument): TabTarget {
+    const value = this.receipts.get(receipt); if (!value) throw staleSnapshot();
+    this.assertCurrent(value.record.target, receipt); return value.record.target;
+  }
+  channelLost(page: PageSurface, channel: object): void {
+    for (const record of this.records.values()) if (record.page === page && record.channel === channel && this.alive(record))
+      this.failPage(record.target, page, 'unavailable', 'debugger_detached');
+  }
+  presentationChanged(page: PageSurface): void {
+    for (const record of this.records.values()) if (record.page === page && this.alive(record) && !record.fault) {
+      // The actual WindowHost placement producer calls before shell state can
+      // advertise readiness. A protected navigation keeps only its own slot.
+      this.suspend(record, Boolean(record.ticket)); this.schedule(record);
+    }
   }
   failure(target: TabTarget): DocumentFault | undefined { return this.records.get(target)?.fault; }
   lastSafeURL(target: TabTarget): string { const record = this.records.get(target); if (!record) throw staleSnapshot(); return record.lastSafeURL; }
