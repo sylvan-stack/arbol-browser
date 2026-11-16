@@ -84,7 +84,7 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
     lifecycle.changed();
   }
   async function open(window: WindowHost, url: string, creator?: Contract<'browser.ClientIdentity'>,
-    inherited?: TabState, inheritedBudget?: PopupBudget): Promise<TabTarget> {
+    inherited?: TabState, inheritedBudget?: PopupBudget, background = false): Promise<TabTarget> {
     lifecycle.assertAdmission(); assertWindowHost(window); url = userURL(url);
     if (tabs.size >= 64) throw refused('control_refused', 'Close an existing tab before opening another.');
     if (creator && !lifecycle.connected(creator.id)) throw refused('control_refused');
@@ -115,7 +115,7 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
       await lifecycle.prepare(target, url);
       assertTarget(target);
       if (creator && (!lifecycle.connected(creator.id) || state(target).controller.kind !== 'agent')) throw refused('control_changed');
-      if (!creator) { selection.set(window, target); window.select(target.page); }
+      if (!background && (!creator || !selection.has(window))) { selection.set(window, target); window.select(target.page); }
       lifecycle.changed(); return target;
     } catch (error) {
       // No failed open may retain an unreported lease. Retirement failures remain profile-fatal.
@@ -128,7 +128,8 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
   async function popup(opener: TabTarget, url: string) {
     const before = state(opener); userURL(url);
     if (before.handoff !== 'idle') throw refused('control_refused');
-    if (before.controller.kind === 'user') return open(opener.page.window, url);
+    // Popup creation does not silently change the shell's selected tab.
+    if (before.controller.kind === 'user') return open(opener.page.window, url, undefined, undefined, undefined, true);
     const action = actions.get(opener);
     if (!action || action.generation !== before.generation || action.budget.client !== before.controller.client ||
         !action.budget.active || action.budget.count >= 10 || !lifecycle.connected(action.budget.client)) throw refused('control_refused');
