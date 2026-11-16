@@ -2,7 +2,7 @@ import { createServer, createConnection, type Socket, type Server } from 'node:n
 import { chmod } from 'node:fs/promises';
 import type { Contract, ContractTypes } from '../contracts/generated.js';
 import { validator, bundles } from '../contracts/schema.js';
-import { BrowserFailure, unavailable, publicFailure } from '../contracts/errors.js';
+import { BrowserFailure, unavailable, publicFailure, type BrowserError } from '../contracts/errors.js';
 import { ownerUid, profileUnavailable } from '../profiles/paths.js';
 import type { PlatformPort, ProcessIdentity } from './platform.js';
 import { assertSocket, now, token, originalAlive, sameProcess, recordProcess,
@@ -28,6 +28,16 @@ export interface DispatchPort {
    * An acknowledgement of lookup never claims cancellation succeeded. */
   cancel(context: ConnectionContext, requestId: string): void;
   fatal(): void;
+}
+export type ControlFrameKind = 'hello' | 'ping' | 'pong' | 'cancel';
+/** Actual production host port; never substituted with the infrastructure port.
+ * Its queue is the one real mutation queue. All final guards are synchronous. */
+export interface ProtectedDispatchPort extends Omit<DispatchPort, 'commit'> {
+  enroll(context: ConnectionContext): void;
+  guardControl(context: ConnectionContext, kind: ControlFrameKind, bytes: Uint8Array): void;
+  commitResponse(context: ConnectionContext, request: Request, success: boolean, bytes: Uint8Array): void;
+  redactedFailure(context: ConnectionContext, request: Request, error: unknown): BrowserError;
+  forget(context: ConnectionContext, request: Request): void;
 }
 export function capacityFailure(): BrowserFailure {
   return new BrowserFailure({ code: 'control_refused', message: 'Browser capacity is exhausted.',
@@ -72,8 +82,13 @@ function frames(socket: Socket, maximum: number, receive: (value: unknown) => vo
 }
 function write(socket: Socket, value: unknown, maximum = 8 * 1024 * 1024): void {
   const bytes = Buffer.from(JSON.stringify(value) + '\n', 'utf8');
+  writeFrame(socket, bytes, maximum);
+}
+function writeFrame(socket: Socket, bytes: Buffer, maximum = 8 * 1024 * 1024, guard?: () => void): void {
   if (bytes.length - 1 > maximum || socket.destroyed || socket.writableLength + bytes.length > 8 * 1024 * 1024)
     throw unavailable('browser');
+  if (guard) { const result: unknown = guard(); if (result !== undefined) throw unavailable('browser'); }
+  // No serialization, provider callback or await after this exact-byte guard.
   socket.write(bytes);
 }
 function resultValidator(request: Request): (value: unknown) => boolean {
@@ -139,8 +154,22 @@ class Scheduler {
   }
 }
 export interface TransportServer { openAdmission(): void; closeAdmission(): void; close(): Promise<void> }
-export async function listenTransport(location: RuntimeLocation, record: RuntimeRecord, platform: PlatformPort,
+/** Explicit injected infrastructure compatibility. This supplies no production
+ * page authority. Existing Foundation callers keep their success-only commit. */
+export function listenTransport(location: RuntimeLocation, record: RuntimeRecord, platform: PlatformPort,
   dispatch: DispatchPort): Promise<TransportServer> {
+  if ('enroll' in dispatch || 'commitResponse' in dispatch) throw unavailable('browser');
+  return listenServer(location, record, platform, dispatch);
+}
+/** Production assembly must choose this entry, with every real protected port. */
+export function listenProtectedTransport(location: RuntimeLocation, record: RuntimeRecord, platform: PlatformPort,
+  dispatch: ProtectedDispatchPort): Promise<TransportServer> {
+  for (const method of ['enroll', 'guardControl', 'commitResponse', 'redactedFailure', 'forget', 'authorize', 'execute', 'disconnect', 'cancel', 'fatal'] as const)
+    if (typeof dispatch[method] !== 'function') throw unavailable('browser');
+  return listenServer(location, record, platform, dispatch, dispatch);
+}
+async function listenServer(location: RuntimeLocation, record: RuntimeRecord, platform: PlatformPort,
+  dispatch: DispatchPort | ProtectedDispatchPort, protectedPort?: ProtectedDispatchPort): Promise<TransportServer> {
   let admission = false, sealed = false, agents = 0, management = 0;
   const connections = new Set<() => void>(), servers: Server[] = [], scheduler = new Scheduler();
   const fatal = () => { try { dispatch.fatal(); } catch { /* admission stays sealed; independent native fatal path remains armed */ } };
@@ -155,17 +184,36 @@ export async function listenTransport(location: RuntimeLocation, record: Runtime
       if (dead) return; dead = true; connections.delete(stop);
       clearTimeout(helloTimer); clearInterval(heartbeat);
       try {
-      connection.abort(); for (const controller of active.values()) controller.abort();
-      if (context) {
-        if (endpoint === 'agent') --agents; else --management;
-        try { dispatch.disconnect(context); } catch { fatal(); }
+      if (protectedPort) {
+        // Revoke grants, queued and issued authority before any abort handler
+        // can reenter. Also rolls back a partially failed enrollment/Hello once.
+        if (context) { if (endpoint === 'agent') --agents; else --management;
+          try { const returned: unknown = protectedPort.disconnect(context); if (returned !== undefined) fatal(); } catch { fatal(); } }
+        connection.abort(); for (const controller of active.values()) controller.abort();
+      } else {
+        connection.abort(); for (const controller of active.values()) controller.abort();
+        if (context) { if (endpoint === 'agent') --agents; else --management;
+          try { dispatch.disconnect(context); } catch { fatal(); } }
       }
       } finally { socket.destroy(); }
     };
     connections.add(stop);
     try { if (!admission || connections.size > 64) throw capacityFailure(); identity = peer(socket, platform); }
     catch { stop(); return; }
-    function response(id: string, value: unknown) { write(socket, { wire: 1, id, ok: true, result: value }); }
+    function control(value: unknown, kind: ControlFrameKind): void {
+      if (!protectedPort) { write(socket, value); return; }
+      if (!context) throw unavailable('browser');
+      const captured = context, bytes = Buffer.from(JSON.stringify(value) + '\n', 'utf8');
+      writeFrame(socket, bytes, 8 * 1024 * 1024, () => { checkPeer(); return protectedPort.guardControl(captured, kind, bytes); });
+    }
+    function response(id: string, value: unknown, kind: 'pong' | 'cancel') { control({ wire: 1, id, ok: true, result: value }, kind); }
+    function failure(captured: ConnectionContext, request: Request, error: unknown): void {
+      if (!protectedPort) { write(socket, { wire: 1, id: request.id, ok: false, error: publicFailure(error).detail }); return; }
+      const detail = protectedPort.redactedFailure(captured, request, error);
+      if (!validator('browser.BrowserError')(detail)) throw unavailable('browser');
+      const bytes = Buffer.from(JSON.stringify({ wire: 1, id: request.id, ok: false, error: detail }) + '\n', 'utf8');
+      writeFrame(socket, bytes, 8 * 1024 * 1024, () => { checkPeer(); return protectedPort.commitResponse(captured, request, false, bytes); });
+    }
     function checkPeer() { if (!sameProcess(identity, peer(socket, platform))) throw unavailable('browser'); }
     helloTimer = setTimeout(stop, 5000);
     frames(socket, 1024 * 1024, value => {
@@ -182,17 +230,21 @@ export async function listenTransport(location: RuntimeLocation, record: Runtime
           const attachment = endpoint === 'agent' ? Object.freeze({ id: token('att'), label: sanitizedLabel(p.label) }) : undefined;
           context = Object.freeze({ endpoint, peer: identity, signal: connection.signal, ...(attachment ? { attachment } : {}) });
           if (endpoint === 'agent') ++agents; else ++management;
+          if (protectedPort) {
+            const enrolled: unknown = protectedPort.enroll(context);
+            if (enrolled !== undefined) throw unavailable('browser');
+          }
           const reply: Contract<'wire.HelloResult'> = { wire: 1, id: value.id, ok: true,
             result: { instance: record.instance, nonce: record.nonce, profile: record.profile,
               profileInstance: record.profileInstance, build: record.build, contract: 1, ...(attachment ? { attachment } : {}) } };
           if (!validator('wire.HelloResult')(reply)) throw unavailable('browser');
-          write(socket, reply); clearTimeout(helloTimer);
+          control(reply, 'hello'); clearTimeout(helloTimer);
           heartbeat = setInterval(() => {
             try {
               if (now() - lastPong >= 6000) { stop(); return; }
               if (!pingId) {
                 if (seen.size >= 65536) { stop(); return; }
-                pingId = token('req'); seen.add(pingId); write(socket, { wire: 1, id: pingId, method: 'ping', params: {} }); }
+                pingId = token('req'); seen.add(pingId); control({ wire: 1, id: pingId, method: 'ping', params: {} }, 'ping'); }
             } catch { stop(); }
           }, 2000);
           return;
@@ -208,15 +260,18 @@ export async function listenTransport(location: RuntimeLocation, record: Runtime
         const request = value as Request | Contract<'wire.Ping'> | Contract<'wire.Cancel'>;
         if (seen.has(request.id) || seen.size >= 65536) throw unavailable('browser');
         seen.add(request.id);
-        if (request.method === 'ping') { response(request.id, {}); return; }
+        if (request.method === 'ping') { response(request.id, {}, 'pong'); return; }
         if (request.method === 'cancel') {
           const target = active.get(request.params.request);
-          if (target) { dispatch.cancel(context, request.params.request); target.abort(); }
-          response(request.id, { request: request.params.request, found: Boolean(target) }); return;
+          if (target) {
+            const returned: unknown = dispatch.cancel(context, request.params.request);
+            if (protectedPort && returned !== undefined) throw unavailable('browser'); target.abort();
+          }
+          response(request.id, { request: request.params.request, found: Boolean(target) }, 'cancel'); return;
         }
         if (!admission) throw unavailable('browser');
         if (active.size >= 32) {
-          write(socket, { wire: 1, id: request.id, ok: false, error: capacityFailure().detail }); return;
+          failure(context, request, capacityFailure()); return;
         }
         const deadline = now() + duration(request), controller = new AbortController(), captured = context;
         const abort = () => controller.abort();
@@ -225,24 +280,39 @@ export async function listenTransport(location: RuntimeLocation, record: Runtime
         // A timeout closes transport/admission and delegates actual drain/retire;
         // it never emits a synthetic successful cancellation or action outcome.
         const timer = setTimeout(() => {
-          try { dispatch.cancel(captured, request.id); } catch { fatal(); }
+          try { const returned: unknown = dispatch.cancel(captured, request.id); if (protectedPort && returned !== undefined) fatal(); } catch { fatal(); }
           controller.abort(); stop();
         }, Math.max(1, deadline - now()));
         void (async () => {
+          let committed = false;
           try {
-            dispatch.authorize(captured, request);
-            const result = await scheduler.run(request, controller.signal, () => dispatch.execute(captured, request, deadline, controller.signal));
+            const authorized: unknown = dispatch.authorize(captured, request);
+            if (protectedPort && authorized !== undefined) throw unavailable('browser');
+            const result = await (protectedPort ? dispatch.execute(captured, request, deadline, controller.signal)
+              : scheduler.run(request, controller.signal, () => dispatch.execute(captured, request, deadline, controller.signal)));
             if (dead || controller.signal.aborted || now() >= deadline) return;
             if (!resultValidator(request)(result)) throw unavailable('browser');
-            checkPeer(); dispatch.commit(captured, request); response(request.id, result);
+            if (protectedPort) {
+              const bytes = Buffer.from(JSON.stringify({ wire: 1, id: request.id, ok: true, result }) + '\n', 'utf8');
+              writeFrame(socket, bytes, 8 * 1024 * 1024, () => {
+                checkPeer(); const returned: unknown = protectedPort.commitResponse(captured, request, true, bytes);
+                if (returned !== undefined) throw unavailable('browser'); committed = true;
+              });
+            } else {
+              checkPeer(); (dispatch as DispatchPort).commit(captured, request);
+              write(socket, { wire: 1, id: request.id, ok: true, result });
+            }
           } catch (error) {
+            // A write after final commitment may have reached the OS. Do not
+            // manufacture another result; disconnect means uncertain delivery.
+            if (protectedPort && committed) { stop(); return; }
             if (!dead && !controller.signal.aborted) {
-              // Provider errors are public redacted BrowserFailure only.
-              try { write(socket, { wire: 1, id: request.id, ok: false, error: publicFailure(error).detail }); }
+              try { failure(captured, request, error); }
               catch { stop(); }
             }
           } finally {
             clearTimeout(timer); active.delete(request.id); connection.signal.removeEventListener('abort', abort);
+            if (protectedPort) { try { protectedPort.forget(captured, request); } catch { fatal(); stop(); } }
           }
         })();
       } catch { stop(); }
