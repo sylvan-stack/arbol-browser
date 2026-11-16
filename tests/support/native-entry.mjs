@@ -7,10 +7,16 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 const events = [];
 let config, boundary, prepared, watchdog, bootstrap, preparationBefore;
+let eventWrite = Promise.resolve();
 async function event(stage, values = {}) {
   const value = { stage, elapsedMs: performance.now(), ...values }; events.push(value);
   process.stdout.write(JSON.stringify(value) + '\n');
-  if (config) await writeFile(join(config.output, 'entry-events.json'), JSON.stringify(events, null, 2) + '\n', { mode: 0o600 });
+  if (config) {
+    const path = join(config.output, 'entry-events.json');
+    const snapshot = JSON.stringify(events, null, 2) + '\n';
+    eventWrite = eventWrite.then(() => writeFile(path, snapshot, { mode: 0o600 }));
+    await eventWrite;
+  }
 }
 function admissionObservation() {
   const report = process.report.getReport();
@@ -67,6 +73,10 @@ try {
       capsule: JSON.parse(bridge.descriptor(watchdog.custody.startupDescriptor)),
       owner: JSON.parse(bridge.descriptor(watchdog.custody.descriptors[0])),
       build: JSON.parse(bridge.descriptor(watchdog.custody.descriptors[1])) });
+    // This fixture owns the exit request after observing retirement. Keep the
+    // usual last-window notification, but do not let it race the final record.
+    let allWindowsClosed = 0;
+    app.on('window-all-closed', () => { allWindowsClosed++; });
     // Resolve this entry before ready; callback setup then uses the real app event.
     app.whenReady().then(async () => {
       void event('callback-ready');
@@ -82,7 +92,19 @@ try {
       view.setBounds({ x: 0, y: 0, width: 640, height: 360 });
       binding = boundary.native.ownership.mark(key(binding), false);
       void event('callback-user-enabled', { binding });
-      const html = '<!doctype html><button id="button" aria-label="Native fixture button" onclick="this.textContent=Number(this.textContent)+1">0</button><input id="field" aria-label="Native fixture field" value="abc"><script>globalThis.events=[];field.addEventListener("input",e=>events.push({type:e.type,trusted:e.isTrusted}));button.addEventListener("click",e=>events.push({type:e.type,trusted:e.isTrusted}));field.focus();</script>';
+      const html = `<!doctype html>
+        <button id="button" aria-label="Native fixture button" onclick="this.textContent=Number(this.textContent)+1">0</button>
+        <input id="field" aria-label="Native fixture field" value="abc">
+        <script>
+          globalThis.events = [];
+          for (const type of ['input', 'compositionstart', 'compositionupdate', 'compositionend']) {
+            field.addEventListener(type, event => events.push({
+              type: event.type, trusted: event.isTrusted, data: event.data, inputType: event.inputType,
+            }));
+          }
+          button.addEventListener('click', event => events.push({ type: event.type, trusted: event.isTrusted }));
+          field.focus();
+        </script>`;
       await view.webContents.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
       window.showInactive(); view.webContents.focus();
       await new Promise(accept => setTimeout(accept, 350));
@@ -100,6 +122,29 @@ try {
       await new Promise(accept => setTimeout(accept, 150));
       const pressAfter = await view.webContents.executeJavaScript('({button:button.textContent,events:[...events]})');
       await event('callback-ax-positive-observation', { before: pressBefore, invocation: press, after: pressAfter });
+
+      const fieldState = () => view.webContents.executeJavaScript(
+        '({text:field.value, selection:[field.selectionStart,field.selectionEnd], events:[...events]})');
+      for (const routes of [['selectAll'], ['delete'], ['directDelete'], ['mark', 'unmark']]) {
+        await view.webContents.executeJavaScript("field.value='edit'; field.focus(); field.setSelectionRange(4,4); events.length=0");
+        for (const route of routes) {
+          const before = await fieldState();
+          let invocation;
+          try { invocation = JSON.parse(bridge.invoke(cached.token, route)); }
+          catch (error) { invocation = { route, unavailable: String(error.message ?? error) }; }
+          await new Promise(accept => setTimeout(accept, 150));
+          await event('callback-edit-observation', { route, before, invocation, after: await fieldState() });
+        }
+      }
+      // A short normal callback verifies synchronous execution without
+      // exceeding the watchdog heartbeat deadline or injecting a fault.
+      const began = performance.now();
+      const returned = JSON.parse(bridge.block(40));
+      const elapsedMs = performance.now() - began;
+      watchdog.assertArmed(prepared.trust);
+      assert.equal(returned.returnedAfterMs, 40);
+      assert.ok(elapsedMs >= 40);
+      await event('callback-bounded-main-thread-observation', { returned, observedMs: elapsedMs });
       const resigned = JSON.parse(bridge.invoke(cached.token, 'resignFocus'));
       await event('callback-focus-released', { resigned, state: JSON.parse(bridge.state(cached.token)) });
       if (!resigned.returned) throw new Error('fixture_native_focus_release_unavailable');
@@ -120,7 +165,7 @@ try {
       } while (performance.now() < weakDeadline);
       await event('callback-window-close-requested');
       window.close(); window = null;
-      await event('callback-window-closed');
+      await event('callback-window-closed', { allWindowsClosed, remainingWindows: BaseWindow.getAllWindows().length });
       boundary.native.seal(); await event('sealed'); app.exit(0);
     }).catch(async error => {
       await event('callback-unavailable', { error: String(error.stack ?? error) });
