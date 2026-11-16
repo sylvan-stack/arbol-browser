@@ -1,10 +1,10 @@
-// Native qualification bodies remain standalone until independent admission.
+// Scoped native qualification of the pinned signed consumer.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { readFile, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { bindingScenarios, launchNativeFixture, nativeConsumer, prepareNativeFixtures } from '../support/native.mjs';
+import { createNativeOutput, bindingScenarios, launchNativeFixture, nativeConsumer, prepareNativeFixtures } from '../support/native.mjs';
 
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const refusal = { error: 'native_binding_failed' };
@@ -107,13 +107,11 @@ function assertBindingScenario(id, report) {
 }
 
 export async function nativeBindingLifetime({ output }) {
-  const destination = resolve(output);
-  assert.ok(destination.startsWith('/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-8-20261115/'));
-  await mkdir(destination, { mode: 0o700 });
+  const destination = await createNativeOutput(output);
   const bodyPath = fileURLToPath(import.meta.url), sourceBodyDigest = digest(await readFile(bodyPath));
   const fixtures = await prepareNativeFixtures(join(destination, 'fixtures'), { callbacks: true });
   const result = { format: 1, case: 'nativeBindingLifetime', status: 'incomplete', sourceBodyDigest, nativeConsumer,
-    gateAdmission: 'pending independent actual-body review', scenarios: [],
+    scope: 'pinned-consumer native observations', scenarios: [],
     unavailable: ['binding identifier/revision/lifetime exhaustion has no bounded trigger on the signed ABI'] };
   const errors = [];
   for (const id of bindingScenarios) {
@@ -155,8 +153,8 @@ const cachedRoutes = Object.freeze({
   unmark: 'RenderWidgetHostViewCocoa#unmarkText',
 });
 
-function assertRouteMatrix(matrix, blocked) {
-  assert.deepEqual(matrix.map(({ route }) => route), Object.keys(cachedRoutes));
+function assertRouteMatrix(matrix, blocked, routes = Object.keys(cachedRoutes)) {
+  assert.deepEqual(matrix.map(({ route }) => route), routes);
   for (const { route, before, dispatched, after } of matrix) {
     assert.deepEqual(dispatched, { returned: { route, returned: route !== 'press' || !blocked } });
     if (route !== 'unmark') assert.deepEqual(before, { button: 0, text: 'edit', selection: [4, 4], events: [] });
@@ -200,12 +198,10 @@ function assertRouteMatrix(matrix, blocked) {
 }
 
 export async function nativeCachedRouteBoundary({ output }) {
-  const destination = resolve(output);
-  assert.ok(destination.startsWith('/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-8-20261115/'));
-  await mkdir(destination, { mode: 0o700 });
+  const destination = await createNativeOutput(output);
   const bodyPath = fileURLToPath(import.meta.url), sourceBodyDigest = digest(await readFile(bodyPath));
   const result = { format: 1, case: 'nativeCachedRouteBoundary', status: 'incomplete', sourceBodyDigest, nativeConsumer,
-    gateAdmission: 'pending independent actual-body review', representatives: cachedRoutes,
+    scope: 'pinned-consumer native observations', representatives: cachedRoutes,
     complementaryRoutes: {
       'cached custom action handler': 'no positive handler exposed by the controlled renderer',
       'AX action forwarding, attribute value, focus and selected text/range': 'separate from cached press and setAccessibilityValue:',
@@ -233,8 +229,38 @@ export async function nativeCachedRouteBoundary({ output }) {
     assert.equal(report.originalState.windowKey, true);
     assert.equal(report.focus.returned?.returned, true);
     assert.equal(report.resigned.returned?.returned, true);
-    for (const phase of ['user', 'resumed', 'replacementPositive']) assertRouteMatrix(report[phase], false);
-    for (const phase of ['blocked', 'afterNavigation']) assertRouteMatrix(report[phase], true);
+    for (const phase of ['user', 'resumed']) assertRouteMatrix(report[phase], false);
+    assertRouteMatrix(report.blocked, true, Object.keys(cachedRoutes).slice(0, -1));
+    for (const phase of ['user', 'blocked', 'resumed']) {
+      for (const { route, responder } of report[phase]) {
+        if (route !== 'press' && route !== 'axValue') {
+          assert.equal(responder.windowKey, true);
+          assert.equal(responder.firstResponder, true, phase + ' ' + route);
+        }
+      }
+    }
+    assertRouteMatrix(report.afterNavigation, true, ['press', 'axValue']);
+    assertRouteMatrix(report.replacementPositive, false, ['press', 'axValue']);
+    for (const [index, { responder }] of report.afterNavigation.entries()) {
+      assert.equal(responder.firstResponder, report.replacementPositive[index].responder.firstResponder);
+      assert.equal(responder.windowKey, report.replacementPositive[index].responder.windowKey);
+    }
+    const { prime, primed, beforeUnmark, deniedUnmark, afterUnmark, allowedUnmark, cleared } = report.liveUnmark;
+    assert.deepEqual(prime, { returned: { route: 'mark', returned: true } });
+    for (const sample of [primed, beforeUnmark, afterUnmark, cleared]) {
+      assert.equal(sample.responder.firstResponder, true);
+      assert.equal(sample.responder.windowKey, true);
+    }
+    for (const sample of [primed, beforeUnmark, afterUnmark]) assert.equal(sample.native.marked, true);
+    assert.equal(primed.dom.text, 'editM');
+    assert.ok(primed.dom.events.some(event => event.type === 'compositionstart' && event.trusted));
+    assert.ok(!primed.dom.events.some(event => event.type === 'compositionend'));
+    assert.deepEqual(beforeUnmark.dom, primed.dom);
+    assert.deepEqual(deniedUnmark, { returned: { route: 'unmark', returned: true } });
+    assert.deepEqual(afterUnmark.dom, beforeUnmark.dom);
+    assert.deepEqual(allowedUnmark, deniedUnmark);
+    assert.equal(cleared.native.marked, false);
+    assert.ok(cleared.dom.events.some(event => event.type === 'compositionend' && event.data === 'M'));
     assert.deepEqual(report.beforeContexts, report.afterContexts);
     assert.deepEqual(report.contexts.map(context => context.context), ['unknown', 'off-main', 'reentrant']);
     const image = join(fixtures.consumer.candidate, 'Contents/Resources/browser/native/ownership.node');
@@ -257,9 +283,11 @@ export async function nativeCachedRouteBoundary({ output }) {
     assert.deepEqual(report.blockedBinding, { ...report.initialUser, revision: 2, blocked: true });
     assert.deepEqual(report.restored, report.blockedBinding);
     assert.deepEqual(report.resumedBinding, { ...report.blockedBinding, revision: 3, blocked: false });
-    assert.deepEqual(report.navigationBlocked, { ...report.resumedBinding, revision: 4, blocked: true });
+    assert.deepEqual(report.compositionBlocked, { ...report.resumedBinding, revision: 4, blocked: true });
+    assert.deepEqual(report.compositionUser, { ...report.compositionBlocked, revision: 5, blocked: false });
+    assert.deepEqual(report.navigationBlocked, { ...report.compositionUser, revision: 6, blocked: true });
     assert.deepEqual(report.replacementBlocked, report.navigationBlocked);
-    assert.deepEqual(report.replacementUser, { ...report.replacementBlocked, revision: 5, blocked: false });
+    assert.deepEqual(report.replacementUser, { ...report.replacementBlocked, revision: 7, blocked: false });
     assert.equal(report.status.phase, 'ready');
     assert.equal(report.status.liveBindings, 1);
     result.status = 'passed';
@@ -335,6 +363,9 @@ function assertConcurrentResponder(report) {
   assert.deepEqual(report.ax.unknown.press, { error: 'fixture_missing_button' });
   assert.deepEqual(report.ax.unknown.after, report.ax.unknown.before);
   assert.equal(report.refocus.returned, true);
+  assert.equal(report.agentFocus.returned, false);
+  assert.equal(report.userAfterAgent.firstResponder, true);
+  assert.equal(report.agentAfterFocus.firstResponder, false);
   assert.equal(report.unknownFocus.returned, false);
   assert.equal(report.userAfterUnknown.windowKey, true);
   assert.equal(report.userAfterUnknown.firstResponder, true);
@@ -377,12 +408,10 @@ function assertConcurrentResponder(report) {
 }
 
 export async function nativeConcurrentResponder({ output }) {
-  const destination = resolve(output);
-  assert.ok(destination.startsWith('/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-8-20261115/'));
-  await mkdir(destination, { mode: 0o700 });
+  const destination = await createNativeOutput(output);
   const bodyPath = fileURLToPath(import.meta.url), sourceBodyDigest = digest(await readFile(bodyPath));
   const result = { format: 1, case: 'nativeConcurrentResponder', status: 'incomplete', sourceBodyDigest, nativeConsumer,
-    gateAdmission: 'pending independent actual-body review',
+    scope: 'pinned-consumer native observations',
     limits: ['Window-local AppKit events exercise the native dispatcher without physical input.',
       'Interaction state is a snapshot. Controller and generation changes, Take/Return and operation settlement are outside this case.',
       'The destination callback uses fictional NSDraggingInfo and a unique pasteboard. Physical OS source drag and trackpad momentum are unobserved.'] };

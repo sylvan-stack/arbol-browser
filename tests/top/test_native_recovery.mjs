@@ -1,22 +1,22 @@
-// Native qualification bodies remain standalone until independent admission.
+// Scoped native qualification of the pinned signed consumer.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { readFile, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { failureScenarios, launchNativeFixture, monitorScenarios, nativeConsumer, prepareNativeFixtures, retirementScenarios, startupScenarios } from '../support/native.mjs';
+import { createNativeOutput, failureScenarios, launchNativeFixture, monitorScenarios, nativeConsumer, prepareNativeFixtures, requireNativeLaunch, retirementScenarios, startupScenarios } from '../support/native.mjs';
 
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const jsonLines = text => text.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
 const fatalStages = ['admission-closed', 'authority-invalidated', 'pages-hidden'];
 
 function assertRetirement(scenario, records) {
-  assert.ok(records.every(record => record.scenario === scenario));
+  assert.ok(records.every(record => record.scenario === scenario || record.stage === 'native-detach-in-call'));
   const stages = ['positive', 'before-remove'];
   if (scenario === 'success') stages.push('after-remove', 'close-called', 'destroyed', 'returned');
   if (scenario === 'detach-throws') stages.push(...fatalStages);
   if (scenario === 'destroy-missing') stages.push('after-remove', 'close-called', ...fatalStages);
-  if (scenario === 'native-detach-blocked') stages.push('native-block-enter');
+  if (scenario === 'native-detach-blocked') stages.push('native-block-enter', 'native-detach-in-call');
   assert.deepEqual(records.map(record => record.stage), stages);
   const rows = Object.fromEntries(records.map(record => [record.stage, record]));
   const positive = rows.positive;
@@ -91,12 +91,10 @@ function assertRetirement(scenario, records) {
 }
 
 export async function nativeRetirementBoundary({ output }) {
-  const destination = resolve(output);
-  assert.ok(destination.startsWith('/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-8-20261115/'));
-  await mkdir(destination, { mode: 0o700 });
+  const destination = await createNativeOutput(output);
   const bodyPath = fileURLToPath(import.meta.url), sourceBodyDigest = digest(await readFile(bodyPath));
   const result = { format: 1, case: 'nativeRetirementBoundary', status: 'incomplete', sourceBodyDigest, nativeConsumer,
-    gateAdmission: 'pending independent actual-body review', scenarios: [],
+    scope: 'pinned-consumer native observations', scenarios: [],
     limits: ['The test intercepts detach and close on disposable Electron objects.',
       'Native blocking acts inside the fixture detach call. The observed signal and process identities do not identify its issuer or certify complete helper custody.',
       'Full host lifecycle transitions are downstream.'] };
@@ -123,7 +121,22 @@ export async function nativeRetirementBoundary({ output }) {
         const original = final.current?.find(row => row.original.pid === launch.pid);
         assert.equal(original?.original.executable, join(launch.candidate, 'Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron'));
         assert.equal(original.current.status, 'gone');
-        assertRetirement(scenario, jsonLines(await readFile(entry.record, 'utf8')));
+        requireNativeLaunch(launch, events);
+        const records = jsonLines(await readFile(entry.record, 'utf8'));
+        assertRetirement(scenario, records);
+        if (scenario === 'native-detach-blocked') {
+          const marker = records.find(record => record.stage === 'native-detach-in-call');
+          assert.equal(marker.pid, launch.pid);
+          const during = launch.observations.find(({ ordered }) => ordered && !ordered.unavailable &&
+            ['owner', 'build'].every(name => !ordered.locks[name].acquired && ['before', 'after'].every(phase => {
+              const point = ordered.order.find(row => row.stage === phase + '-' + name);
+              return BigInt(point.nanos) > BigInt(marker.nanos) &&
+                point.processes.some(row => row.original.pid === marker.pid && row.identityMatches);
+            })));
+          assert.ok(during, 'Both locks must contend while the original main is in the native detach block');
+          assert.ok(BigInt(final.ordered.order.find(row => row.stage === 'before-close').nanos) > BigInt(marker.nanos));
+          assertOriginalsGoneOnAcquisition(launch, final.ordered.expected.processes);
+        }
         entry.status = 'passed';
       } catch (error) { failure ??= error; entry.error = String(error.stack ?? error); }
     }
@@ -136,6 +149,8 @@ export async function nativeRetirementBoundary({ output }) {
 }
 
 function assertStartupDescriptors(launch, events) {
+  assert.equal(launch.code, 0);
+  assert.equal(launch.signal, null);
   const started = events.find(event => event.stage === 'startup-descriptors');
   assert.ok(started, 'The signed process did not publish its real startup descriptors');
   assert.ok(events.some(event => event.stage === 'installed' && event.status.phase === 'ready'));
@@ -262,6 +277,28 @@ function assertStartupIdentityRefusal(launch, events) {
   assert.ok(!events.some(event => event.stage === 'armed' || event.stage === 'installed'));
   assert.ok(launch.observations.some(sample => sample.locks.owner?.acquired === false && sample.locks.build?.acquired === false));
   assert.ok(!launch.observations.some(sample => sample.current?.some(row => row.original.executable.endsWith('/native/watchdog'))));
+  const witness = launch.startupBirths;
+  assert.equal(witness?.forkFence, true, witness?.unavailable);
+  assert.equal(witness.main.pid, launch.pid);
+  assert.equal(witness.main.startId, actual.startId);
+  assert.deepEqual(witness.after, { pid: launch.pid, status: 'gone' });
+}
+
+function assertOriginalsGoneOnAcquisition(launch, captured) {
+  const final = launch.observations.at(-1).ordered;
+  assert.ok(final && !final.unavailable, 'No ordered final exact-inode observations');
+  for (const name of ['owner', 'build']) {
+    assert.equal(final.locks[name].acquired, true);
+    for (const phase of ['before', 'after']) {
+      const rows = final.order.find(row => row.stage === phase + '-' + name).processes;
+      for (const original of captured) {
+        const match = rows.find(row => ['pid', 'startId', 'pidVersion', 'uid', 'session', 'executable']
+          .every(key => row.original[key] === original[key]));
+        assert.ok(match, 'Final sample omitted original ' + original.pid);
+        assert.equal(match.current.status, 'gone');
+      }
+    }
+  }
 }
 
 function assertReadinessDelivery(launch, events, records, delayed) {
@@ -285,12 +322,20 @@ function assertReadinessDelivery(launch, events, records, delayed) {
   assert.ok(delivery.delivered - spawn.spawnReturned >= 1050, 'R was not delayed beyond the startup deadline');
   assert.equal(launch.signal, 'SIGKILL');
   assert.ok(!events.some(event => event.stage === 'armed' || event.stage === 'installed'));
-  const primary = launch.observations.flatMap(sample => sample.current ?? []).find(row =>
-    row.identityMatches && row.original.pid === spawn.primary && row.original.executable === spawn.executable);
-  assert.ok(primary, 'No external kernel observation of the actual primary');
-  const final = launch.observations.at(-1);
-  assert.equal(final.current.find(row => row.original.pid === launch.pid).current.status, 'gone');
-  assert.equal(final.current.find(row => row.original.pid === spawn.primary).current.status, 'gone');
+  const starting = launch.observations.find(({ ordered }) => ordered && !ordered.unavailable &&
+    ['owner', 'build'].every(name => !ordered.locks[name].acquired &&
+      ['before', 'after'].every(phase => {
+        const rows = ordered.order.find(row => row.stage === phase + '-' + name).processes;
+        const main = rows.find(row => row.identityMatches && row.current.pid === launch.pid)?.current;
+        const primary = rows.find(row => row.identityMatches && row.current.pid === spawn.primary)?.current;
+        const custody = rows.find(row => row.identityMatches && row.current.parent === primary?.pid)?.current;
+        return main?.executed && primary?.executable === spawn.executable && custody?.executable === spawn.executable &&
+          primary.parent === main.pid && primary.parentStartId === main.startId && primary.originalParentVersion === main.pidVersion &&
+          custody.parentStartId === primary.startId && custody.originalParentVersion === primary.pidVersion &&
+          primary.group === primary.pid && custody.group === main.group && primary.session === main.session && custody.session === main.session;
+      })));
+  assert.ok(starting, 'The observer missed both exact startup monitors while both locks contended');
+  assertOriginalsGoneOnAcquisition(launch, starting.ordered.expected.processes);
 }
 
 function assertStartupBirthFault(launch, events, scenario) {
@@ -342,20 +387,14 @@ function assertStartupBirthFault(launch, events, scenario) {
   }
   assert.equal(launch.signal, 'SIGKILL');
   assert.ok(!events.some(event => event.stage === 'armed' || event.stage === 'installed'));
-  const final = launch.observations.at(-1);
-  for (const pid of [launch.pid, ...Object.values(births.first).map(identity => identity.pid)])
-    assert.equal(final.current.find(row => row.original.pid === pid).current.status, 'gone');
-  assert.equal(final.locks.owner.acquired, true);
-  assert.equal(final.locks.build.acquired, true);
+  assertOriginalsGoneOnAcquisition(launch, [births.main, ...Object.values(births.first)]);
 }
 
 export async function nativeStartupCustodyBoundary({ output }) {
-  const destination = resolve(output);
-  assert.ok(destination.startsWith('/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-8-20261115/'));
-  await mkdir(destination, { mode: 0o700 });
+  const destination = await createNativeOutput(output);
   const bodyPath = fileURLToPath(import.meta.url), sourceBodyDigest = digest(await readFile(bodyPath));
   const result = { format: 1, case: 'nativeStartupCustodyBoundary', status: 'incomplete', sourceBodyDigest, nativeConsumer,
-    gateAdmission: 'pending independent actual-body review', scenarios: [],
+    scope: 'pinned-consumer native observations', scenarios: [],
     limits: ['The original main is held in its process group across the measured startup handoff until custody is observed.',
       'Private transfer phases are inferred from the exact signed startup sequence and the observed pipe queue lengths.',
       'The fixture records identified originals and lock contention. Its census is sampled.'] };
@@ -386,7 +425,7 @@ export async function nativeStartupCustodyBoundary({ output }) {
             assert.equal(trace[0].primary, launch.startupBirths.first.primary.pid);
           }
         }
-        entry.status = 'observed';
+        entry.status = 'passed';
       } catch (error) { failure ??= error; entry.error = String(error.stack ?? error); }
     }
     if (!failure) result.status = 'passed';
@@ -399,9 +438,22 @@ export async function nativeStartupCustodyBoundary({ output }) {
 
 function assertFailureCustody(launch, fault, { requireFinalHolderSample = true } = {}) {
   const trace = launch.failureCustody;
-  assert.ok(trace?.complete, trace?.unavailable ?? 'No complete independent custody observation');
+  assert.equal(trace?.failure, undefined, trace?.failure);
+  for (const sample of [...(trace?.observations ?? []), trace?.last, trace?.terminal].filter(Boolean)) {
+    for (const name of ['owner', 'build']) {
+      if (!sample.locks?.[name]?.acquired) continue;
+      const pre = sample.order.find(row => row.stage === 'before-' + name).processes;
+      const post = sample.order.find(row => row.stage === 'after-' + name).processes;
+      assert.ok(!pre.some(row => row.identityMatches && post.some(after => after.identityMatches &&
+        after.original.pid === row.original.pid)), 'Original survived a successful acquisition of ' + name);
+    }
+  }
+  requireMonitorWitness(trace?.capturedOriginalsRetired, trace?.unavailable ?? 'No independent captured-originals trace');
   assert.deepEqual(trace.unexpected, [], 'A process joined the original group after the initial census');
   const identity = trace.observations[0].expected.processes;
+  assert.deepEqual(trace.forkFence.watched, identity);
+  assert.ok(BigInt(trace.forkFence.armedAtNanos) < BigInt(fault.nanos));
+  assert.ok(BigInt(trace.forkFence.verifiedThroughNanos) >= BigInt(trace.terminal.heldThroughNanos));
   const monitors = identity.filter(member => member.executable.endsWith('/native/watchdog'));
   const main = identity.find(member => member.pid === launch.pid);
   const engines = identity.filter(member => member !== main && !monitors.includes(member));
@@ -415,24 +467,36 @@ function assertFailureCustody(launch, fault, { requireFinalHolderSample = true }
   for (const sample of trace.observations) {
     const finalRows = rows(sample, 'before-close');
     if (!mainGone && gone(finalRows, main)) mainGone = BigInt(sample.order.find(item => item.stage === 'before-close').nanos);
-    const bracketed = ['owner', 'build'].map(lock => {
+    const bracketed = ['owner', 'build'].flatMap(lock => {
       const before = rows(sample, `before-${lock}`), after = rows(sample, `after-${lock}`);
       const shared = before.filter(row => row.identityMatches && after.some(other => other.identityMatches && other.original.pid === row.original.pid));
       if (shared.length) assert.equal(sample.locks[lock].acquired, false, `Original surviving across ${lock} acquisition`);
-      return { before, shared, acquired: sample.locks[lock].acquired };
+      return [before, after].map(rows => ({
+        acquired: sample.locks[lock].acquired,
+        same: rows.filter(row => row.identityMatches),
+        gone: rows.filter(row => row.current.status === 'gone'),
+      }));
     });
-    if (bracketed.every(bracket => !bracket.acquired && engines.every(engine => gone(bracket.before, engine)) &&
-       monitors.some(monitor => gone(bracket.before, monitor)) &&
-       bracket.shared.some(row => row.original.pid === main.pid || monitors.some(monitor => monitor.pid === row.original.pid)))) {
+    const sole = bracketed[0].same[0]?.original;
+    const census = sample.order.find(row => row.stage === 'census')?.census;
+    if (census && !census.unavailable && sole && [main, ...monitors].some(member => member.pid === sole.pid) &&
+        bracketed.every(bracket => !bracket.acquired && bracket.same.length === 1 &&
+          bracket.same[0].original.pid === sole.pid && bracket.gone.length === identity.length - 1)) {
       teardownBeforeFinalHolder = true;
     }
   }
   if (requireFinalHolderSample && !teardownBeforeFinalHolder) throw Object.assign(
     new Error('Observer missed the final surviving holder after engine and peer disappearance'), { code: 'fixture_observation_unavailable' });
-  const final = trace.observations.at(-1);
-  assert.ok(rows(final, 'before-close').every(row => row.current.status === 'gone'));
-  assert.equal(final.locks.owner.acquired, true);
-  assert.equal(final.locks.build.acquired, true);
+  const final = trace.terminal;
+  assert.deepEqual(final.order.find(row => row.stage === 'census').census.members, []);
+  for (const name of ['owner', 'build']) {
+    assert.equal(final.locks[name].acquired, true);
+    for (const phase of ['before', 'after']) {
+      const observed = rows(final, phase + '-' + name);
+      assert.equal(observed.length, identity.length);
+      assert.ok(observed.every(row => row.current.status === 'gone'));
+    }
+  }
   assert.ok(mainGone);
   return mainGone;
 }
@@ -461,10 +525,13 @@ function assertFailureScenario(launch, records, scenario) {
     assert.ok(after.some(record => record.stage === 'host-frame' && /^H [1-9]/.test(record.frame)));
   } else if (scenario === 'eof') {
     assert.ok(at('stdin-ended'), 'The actual primary input did not finish closing');
+    assert.equal(at('native-block-enter')?.place, 'after-stdin-eof');
+    assert.ok(!at('host-frame'));
     assert.ok(elapsedMs(fault) >= 0 && elapsedMs(fault) < 600);
   } else if (scenario === 'malformed' || scenario === 'out-of-order') {
     const expected = scenario === 'malformed' ? 'H ?\n' : fault.acknowledgement.replace(/^A /, 'H ');
     assert.equal(at('fault-write')?.frame, expected);
+    assert.equal(at('native-block-enter')?.place, 'after-fault-write');
     assert.ok(elapsedMs(fault) >= 0 && elapsedMs(fault) < 600);
   } else if (scenario === 'cleanup-blocked' || scenario === 'integrity-refused') {
     assert.equal(fault.visible, true);
@@ -500,40 +567,47 @@ function assertFailureScenario(launch, records, scenario) {
 }
 
 export async function nativeFailureCustodyBoundary({ output }) {
-  const destination = resolve(output);
-  assert.ok(destination.startsWith('/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-8-20261115/'));
-  await mkdir(destination, { mode: 0o700 });
+  const destination = await createNativeOutput(output);
   const bodyPath = fileURLToPath(import.meta.url), sourceBodyDigest = digest(await readFile(bodyPath));
   const result = { format: 1, case: 'nativeFailureCustodyBoundary', status: 'incomplete', sourceBodyDigest, nativeConsumer,
-    gateAdmission: 'pending independent actual-body review', scenarios: [],
-    limits: ['The observer tracks the identified original processes and sampled group membership.',
-      'The blocked exit uses the real Electron quit request after packaged native seal in the fixture.'] };
+    scope: 'pinned-consumer native observations', scenarios: [],
+    limits: ['Identified originals are fork/exec-fenced from their verified pre-fault baseline. Earlier group membership is sampled.',
+      'The blocked exit uses the real Electron quit request after packaged native seal in the fixture.',
+      'Up to three fresh attempts can recover a pre-fault observation miss or a typed missing witness. A witnessed failure ends the scenario.'] };
   let failure;
   try {
     const fixtures = await prepareNativeFixtures(join(destination, 'fixtures'), { callbacks: true });
     for (const scenario of failureScenarios) {
-      const output = join(fixtures.directory, scenario);
-      const entry = { scenario, status: 'unavailable', launch: join(output, 'launch-result.json'), record: join(output, 'failure.jsonl') };
+      const entry = { scenario, status: 'unavailable', attempts: [] };
       result.scenarios.push(entry);
-      try {
-        const launch = await launchNativeFixture(fixtures, { mode: 'failure-custody', output, failureScenario: scenario });
-        const events = jsonLines(launch.stdout);
-        const unavailable = events.find(event => ['unavailable', 'failure-custody-unavailable'].includes(event.stage));
-        assert.equal(unavailable, undefined, unavailable?.error);
-        assert.equal(launch.timedOut, false);
-        assert.equal(launch.candidate, fixtures.consumer.candidate);
-        assert.ok(events.some(event => event.stage === 'armed'));
-        assert.ok(events.some(event => event.stage === 'installed' && event.status.phase === 'ready'));
-        const records = jsonLines(await readFile(entry.record, 'utf8'));
-        if (records.some(record => record.stage === 'fault') && launch.failureCustody?.complete) entry.status = 'failed';
-        assert.equal(launch.signal, 'SIGKILL');
-        assertFailureScenario(launch, records, scenario);
-        entry.status = 'passed';
-      } catch (error) {
-        if (error.code === 'fixture_observation_unavailable') entry.status = 'unavailable';
-        failure ??= error;
-        entry.error = String(error.stack ?? error);
+      let lastError;
+      for (let number = 1; number <= 3; number++) {
+        const output = join(fixtures.directory, number === 1 ? scenario : scenario + '-' + number);
+        const attempt = { number, status: 'failed', launch: join(output, 'launch-result.json'), record: join(output, 'failure.jsonl') };
+        entry.attempts.push(attempt);
+        try {
+          const launch = await launchNativeFixture(fixtures, { mode: 'failure-custody', output, failureScenario: scenario });
+          const events = jsonLines(launch.stdout);
+          const unavailable = events.find(event => ['unavailable', 'failure-custody-unavailable'].includes(event.stage));
+          assert.equal(unavailable, undefined, unavailable?.error);
+          assert.equal(launch.timedOut, false);
+          assert.equal(launch.candidate, fixtures.consumer.candidate);
+          assert.ok(events.some(event => event.stage === 'armed'));
+          assert.ok(events.some(event => event.stage === 'installed' && event.status.phase === 'ready'));
+          assert.equal(launch.signal, 'SIGKILL');
+          const records = jsonLines(await readFile(attempt.record, 'utf8'));
+          requireMonitorWitness(records.some(record => record.stage === 'fault'), 'SIGKILL after installation, before the requested fault');
+          assertFailureScenario(launch, records, scenario);
+          attempt.status = 'passed';
+        } catch (error) {
+          if (error.code === 'fixture_observation_unavailable') attempt.status = 'unavailable';
+          lastError = error;
+          attempt.error = String(error.stack ?? error);
+        }
+        entry.status = attempt.status;
+        if (entry.status !== 'unavailable') break;
       }
+      if (entry.status !== 'passed') failure ??= lastError;
     }
     if (!failure) result.status = 'passed';
   } catch (error) { failure = error; result.error = String(error.stack ?? error); }
@@ -557,12 +631,11 @@ function assertMonitorFault(launch, records, scenario) {
   assert.equal(armed.native.liveBindings, 1);
   assert.ok(records.some(record => record.stage === 'primary-frame' && record.frame === armed.acknowledgement));
   assert.ok(records.some(record => record.stage === 'host-frame' && record.frame === armed.acknowledgement.replace(/^A /, 'H ')));
-  const trace = requireMonitorWitness(launch.failureCustody?.complete && launch.failureCustody, launch.failureCustody?.unavailable ?? 'No full monitor trace');
+  assertFailureCustody(launch, armed, { requireFinalHolderSample: false });
+  const trace = launch.failureCustody;
   const fault = trace.monitor;
   requireMonitorWitness(fault?.triggeredAtNanos, 'The external observer did not trigger the requested monitor fault');
   assert.ok(BigInt(fault.triggeredAtNanos) > BigInt(armed.nanos));
-  assertFailureCustody(launch, armed, { requireFinalHolderSample: false });
-
   const original = trace.observations[0].expected;
   const main = original.processes.find(member => member.pid === launch.pid);
   const custody = original.anchor;
@@ -576,6 +649,11 @@ function assertMonitorFault(launch, records, scenario) {
   compare(fault.responsiveMain, main);
   assert.equal(fault.responsiveMain.stopped, false);
   const both = scenario === 'both-lost';
+  assert.equal(armed.writesFenced, !both);
+  if (!both) {
+    assert.equal(armed.lastWrite, armed.acknowledgement.replace(/^A /, 'H '));
+    assert.ok(!records.some(record => record.stage === 'host-frame' && BigInt(record.nanos) > BigInt(armed.nanos)));
+  }
   if (both) {
     assert.equal(fault.stoppedMain, undefined);
     assert.deepEqual(fault.lossSignals.map(signal => signal.original), [custody, primary]);
@@ -586,8 +664,9 @@ function assertMonitorFault(launch, records, scenario) {
   }
   const rows = (sample, stage) => sample.order.find(row => row.stage === stage).processes;
   const processRow = (sample, stage, expected) => rows(sample, stage).find(row => row.original.pid === expected.pid);
-  const heldAfterPeerLoss = expect => trace.observations.some(sample => ['owner', 'build'].every(lock => !sample.locks[lock].acquired &&
-    [`before-${lock}`, `after-${lock}`].every(stage => expect(sample, stage))));
+  const validCensus = sample => Boolean(sample.order.find(row => row.stage === 'census')?.census?.members);
+  const heldAfterPeerLoss = expect => trace.observations.some(sample => validCensus(sample) &&
+    ['owner', 'build'].every(lock => !sample.locks[lock].acquired && [`before-${lock}`, `after-${lock}`].every(stage => expect(sample, stage))));
   if (both) {
     requireMonitorWitness(heldAfterPeerLoss((sample, stage) => [custody, primary].every(monitor => processRow(sample, stage, monitor).current.status === 'gone') &&
       processRow(sample, stage, main).identityMatches && !processRow(sample, stage, main).current.stopped),
@@ -607,6 +686,7 @@ function assertMonitorFault(launch, records, scenario) {
       `Observer missed the real post-quiescence retirement frame (target exit signal ${targetExit?.signal ?? 'unobserved'})`);
     const pending = target === primary ? [0, 4] : [4, 0];
     assert.deepEqual([offer.queues.forwardBytes, offer.queues.reverseBytes], pending);
+    requireMonitorWitness(validCensus(offer.sample), 'Retirement-offer census unavailable');
     for (const lock of ['owner', 'build']) {
       assert.equal(offer.sample.locks[lock].acquired, false);
       for (const stage of [`before-${lock}`, `after-${lock}`]) {
@@ -626,7 +706,14 @@ function assertMonitorFault(launch, records, scenario) {
       assert.deepEqual([consent.queues.forwardBytes, consent.queues.reverseBytes], [0, 4]);
       compare(consent.queues.anchorAfter, custody);
       assert.equal(consent.queues.anchorAfter.stopped, false);
+      requireMonitorWitness(validCensus(consent.sample), 'Retirement-consent census unavailable');
       assert.ok(!consent.sample.locks.owner.acquired && !consent.sample.locks.build.acquired);
+      const custodyExit = requireMonitorWitness(fault.exitNotes?.find(note => note.pid === custody.pid), 'No custody exit status');
+      const primaryExit = requireMonitorWitness(fault.exitNotes?.find(note => note.pid === primary.pid), 'No primary exit status');
+      assert.equal(custodyExit.code, 0);
+      assert.equal(primaryExit.code, 0);
+      requireMonitorWitness(heldAfterPeerLoss((sample, stage) => processRow(sample, stage, custody).current.status === 'gone' &&
+        processRow(sample, stage, primary).identityMatches), 'No live primary holding both locks after successful custody exit');
     }
   }
   const sentinel = trace.sentinel;
@@ -645,13 +732,11 @@ function assertMonitorFault(launch, records, scenario) {
 }
 
 export async function nativeMonitorLossBoundary({ output }) {
-  const destination = resolve(output);
-  assert.ok(destination.startsWith('/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-8-20261115/'));
-  await mkdir(destination, { mode: 0o700 });
+  const destination = await createNativeOutput(output);
   const bodyPath = fileURLToPath(import.meta.url), sourceBodyDigest = digest(await readFile(bodyPath));
   const result = { format: 1, case: 'nativeMonitorLossBoundary', status: 'incomplete', sourceBodyDigest, nativeConsumer,
-    gateAdmission: 'pending independent actual-body review', scenarios: [],
-    limits: ['The observer sampled the identified family and its original lock inodes.',
+    scope: 'pinned-consumer native observations', scenarios: [],
+    limits: ['The observer fenced fork and exec of the identified originals from the verified pre-fault baseline through final acquisition.',
       'Retirement frames are inferred from queue lengths and the exact signed monitor source.',
       'An unavailable observation can use up to three fresh launches. Observed failures end the scenario.'],
     unsupported: ['Loss of both independent monitors while the main cannot execute.'] };
@@ -664,11 +749,10 @@ export async function nativeMonitorLossBoundary({ output }) {
       let lastError;
       for (let number = 1; number <= 3; number++) {
         const output = join(fixtures.directory, number === 1 ? scenario : `${scenario}-${number}`);
-        const attempt = { number, status: 'unavailable', launch: join(output, 'launch-result.json'), record: join(output, 'failure.jsonl') };
+        const attempt = { number, status: 'failed', launch: join(output, 'launch-result.json'), record: join(output, 'failure.jsonl') };
         entry.attempts.push(attempt);
         try {
           const launch = await launchNativeFixture(fixtures, { mode: 'monitor-loss', output, monitorScenario: scenario });
-          if (launch.timedOut || launch.failureCustody?.monitor?.triggeredAtNanos) attempt.status = 'failed';
           const events = jsonLines(launch.stdout);
           const unavailable = events.find(event => ['unavailable', 'monitor-loss-unavailable'].includes(event.stage));
           assert.equal(unavailable, undefined, unavailable?.error);

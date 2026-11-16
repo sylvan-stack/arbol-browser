@@ -4,7 +4,7 @@ import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createReadStream, constants } from 'node:fs';
 import { mkdir, readFile, writeFile, realpath, readdir, readlink, lstat, cp, appendFile } from 'node:fs/promises';
-import { join, resolve, sep, relative } from 'node:path';
+import { dirname, isAbsolute, join, resolve, sep, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 const root = resolve(fileURLToPath(new URL('../../', import.meta.url)));
 export const nativeConsumer = Object.freeze({
@@ -33,9 +33,11 @@ async function physicalInventory(directory) {
 const trustVariants = new WeakSet(); // Fixture provenance only; never a product capability.
 const trustResource = 'Contents/Resources/browser/metadata.json';
 export const trustProviderMethod = 'NSWindow#makeFirstResponder:';
+const publisherResource = 'Contents/Resources/publisher-requirement.json';
+export const publisherRequirement = '=anchor apple generic and certificate leaf[subject.OU] = "7V372XL59S" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists';
 const compatibilityResource = 'Contents/Resources/native-compatibility.json';
 export async function prepareNativeTrustVariant(fixtures, destination, { kind = 'sealed-resource' } = {}) {
-  assert.ok(['sealed-resource', 'frozen-trust', 'provider-mismatch'].includes(kind));
+  assert.ok(['sealed-resource', 'wrong-publisher', 'frozen-trust', 'provider-mismatch'].includes(kind));
   const consumer = await verifiedConsumer(), candidate = resolve(destination);
   assert.ok(candidate.startsWith(fixtures.directory + sep) && candidate.endsWith('.app'));
   const baseBytes = await readFile(consumer.bundle.inventory.path);
@@ -46,7 +48,9 @@ export async function prepareNativeTrustVariant(fixtures, destination, { kind = 
   assert.deepEqual(await physicalInventory(candidate), original, 'Trust copy does not match immutable baseline');
   run('/usr/bin/codesign', ['--verify', '--strict', '--deep', '-R', '=anchor apple generic and certificate leaf[subject.OU] = "7V372XL59S" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists', candidate]);
   let providerChange;
-  if (kind === 'sealed-resource') await appendFile(join(candidate, trustResource), '\n');
+  if (kind === 'sealed-resource') await appendFile(join(candidate, publisherResource), '\n');
+  if (kind === 'wrong-publisher') run('/usr/bin/codesign', ['--force', '--sign', '-',
+    '--preserve-metadata=identifier,entitlements,flags,runtime', candidate]);
   if (kind === 'provider-mismatch') {
     const path = join(candidate, compatibilityResource);
     const compatibility = JSON.parse(await readFile(path, 'utf8'));
@@ -64,17 +68,18 @@ export async function prepareNativeTrustVariant(fixtures, destination, { kind = 
   }
   const files = await physicalInventory(candidate);
   const differences = [...new Set([...Object.keys(original), ...Object.keys(files)])].filter(key => original[key] !== files[key]);
-  if (kind === 'provider-mismatch') {
-    assert.ok(differences.includes(compatibilityResource));
-    assert.ok(differences.every(path => [compatibilityResource, 'Contents/MacOS/arbol-browser-native',
-      'Contents/_CodeSignature/CodeResources'].includes(path)));
-  } else assert.deepEqual(differences, kind === 'frozen-trust' ? [] : [trustResource]);
-  const record = { format: 1, scope: 'disposable trust variant; never exact accepted consumer', kind,
+  if (kind === 'provider-mismatch' || kind === 'wrong-publisher') {
+    const outerSignatureFiles = ['Contents/MacOS/arbol-browser-native', 'Contents/_CodeSignature/CodeResources'];
+    const permitted = kind === 'provider-mismatch' ? [...outerSignatureFiles, compatibilityResource] : outerSignatureFiles;
+    assert.ok(differences.includes(kind === 'provider-mismatch' ? compatibilityResource : outerSignatureFiles[0]));
+    assert.ok(differences.every(path => permitted.includes(path)));
+  } else assert.deepEqual(differences, kind === 'frozen-trust' ? [] : [publisherResource]);
+  if (kind === 'sealed-resource') assert.deepEqual(JSON.parse(await readFile(join(candidate, publisherResource))),
+    JSON.parse(await readFile(join(consumer.candidate, publisherResource))));
+  const record = { format: 1, scope: 'disposable trust variant', kind,
     candidate, baseCandidate: consumer.candidate, baseConsumerManifest: nativeConsumer,
-    changedResource: kind === 'sealed-resource' ? { path: trustResource, before: original[trustResource], after: files[trustResource] } : null,
-    providerChange, differences, files, preCorruptionSignatureVerified: true,
-    signatureBytes: kind === 'provider-mismatch' ? 'outer disposable bundle only was re-signed; all executing runtime/addon bytes unchanged'
-      : 'all copied signature and executable file bytes match the immutable baseline; no signing operation' };
+    changedResource: kind === 'sealed-resource' ? { path: publisherResource, before: original[publisherResource], after: files[publisherResource] } : null,
+    providerChange, differences, files, preCorruptionSignatureVerified: true };
   const path = candidate + '.variant.json', bytes = JSON.stringify(record, null, 2) + '\n';
   await writeFile(path, bytes, { mode: 0o600, flag: 'wx' });
   const variant = Object.freeze({ ...record, manifest: { path, sha256: hash(bytes) } });
@@ -100,13 +105,22 @@ export async function verifiedConsumer() {
   assert.deepEqual(await physicalInventory(value.candidate), JSON.parse(inventoryBytes).files, 'Complete physical native consumer drift');
   return Object.freeze(value);
 }
+export async function createNativeOutput(output) {
+  assert.ok(isAbsolute(output) && resolve(output) === output);
+  assert.ok(![root, '/Users/msix/Artifacts', dirname(nativeConsumer.manifest)].some(path => output === path || output.startsWith(path + sep)));
+  const parent = dirname(output), stat = await lstat(parent);
+  assert.equal(await realpath(parent), parent);
+  assert.ok(stat.isDirectory() && stat.uid === process.getuid() && (stat.mode & 0o7777) === 0o700,
+    'Native evidence requires a private output parent');
+  await mkdir(output, { mode: 0o700 });
+  return output;
+}
 export async function prepareNativeFixtures(output, { callbacks = false } = {}) {
   const destination = resolve(output);
   assert.ok(!destination.startsWith(root + sep) && !destination.startsWith('/Users/msix/Artifacts/'));
   const consumer = await verifiedConsumer();
   assert.ok(!destination.startsWith(consumer.candidate + sep));
-  await mkdir(destination, { mode: 0o700 }); // refuse reuse
-  assert.equal(await realpath(destination), destination);
+  await createNativeOutput(destination);
   const compiler = run('/usr/bin/xcrun', ['--find', 'clang++']).trim();
   const sdk = run('/usr/bin/xcrun', ['--show-sdk-path']).trim();
   const sources = ['native-launch.mm', 'native-observer.mm', 'native-entry.mjs', 'native.mjs'];
@@ -142,7 +156,7 @@ export async function prepareNativeFixtures(output, { callbacks = false } = {}) 
     compiler, compilerVersion: run(compiler, ['--version']), sdk, callback,
     binaries: Object.fromEntries(await Promise.all(['native-launch', 'native-observer'].map(async file => [file, hash(await readFile(join(destination, file)))]))),
     harnessRuntime: { node: process.versions.node, arch: process.arch, platform: process.platform },
-    sourceCommit: run('/usr/bin/git', ['-C', root, 'rev-parse', 'HEAD']).trim(), qualification: 'fixtures-only; no native gate or production readiness claim' };
+    sourceCommit: run('/usr/bin/git', ['-C', root, 'rev-parse', 'HEAD']).trim(), scope: 'private native qualification fixtures' };
   await writeFile(join(destination, 'fixture-manifest.json'), JSON.stringify(record, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
   return Object.freeze({ directory: destination, consumer, record });
 }
@@ -183,7 +197,8 @@ async function observeStartupBirths(fixtures, directory, pid, mode, waitForStage
   assert.equal(main.executable, join(fixtures.consumer.candidate, 'Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron'));
   const helper = join(fixtures.consumer.candidate, 'Contents/Resources/browser/native/watchdog');
   const locks = { owner: { path: join(directory, 'owner.lock'), ...published.owner }, build: { path: join(directory, 'build.lock'), ...published.build } };
-  return observeWithMarker(fixtures, directory, 'startup-births', { main, helper, mode, locks }, 'startup-observer-ready');
+  const verb = mode === 'bootstrap-identity-refused' ? 'startup-refusal' : 'startup-births';
+  return observeWithMarker(fixtures, directory, verb, { main, helper, mode, locks }, 'startup-observer-ready');
 }
 
 async function observeFailureCustody(fixtures, directory, pid, waitForStage, monitorScenario) {
@@ -277,7 +292,7 @@ export async function launchNativeFixture(fixtures, {
   mode = 'boundary', callback = fixtures.record.callback?.path, output, variant, poisonScenario, bindingScenario, retirementScenario, startupScenario, failureScenario, monitorScenario,
 }) {
   const callbackModes = ['callbacks', 'resolver-control', 'install-poison', 'binding-lifetime', 'cached-routes', 'concurrent-responder', 'retirement', 'startup-custody', 'failure-custody', 'monitor-loss'];
-  assert.ok(['boundary', 'frozen-trust', 'provider-mismatch', ...callbackModes].includes(mode));
+  assert.ok(['boundary', 'frozen-trust', 'frozen-trust-restored', 'provider-mismatch', ...callbackModes].includes(mode));
   assert.ok(callback || !callbackModes.includes(mode));
   assert.equal(mode === 'install-poison', installPoisonScenarios.has(poisonScenario));
   assert.equal(mode === 'binding-lifetime', bindingScenarios.includes(bindingScenario));
@@ -285,7 +300,7 @@ export async function launchNativeFixture(fixtures, {
   assert.equal(mode === 'startup-custody', startupScenarios.includes(startupScenario));
   assert.equal(mode === 'failure-custody', failureScenarios.includes(failureScenario));
   assert.equal(mode === 'monitor-loss', monitorScenarios.includes(monitorScenario));
-  assert.equal(mode === 'frozen-trust', variant?.kind === 'frozen-trust');
+  assert.equal(['frozen-trust', 'frozen-trust-restored'].includes(mode), variant?.kind === 'frozen-trust');
   assert.equal(mode === 'provider-mismatch', variant?.kind === 'provider-mismatch');
   const consumer = await verifiedConsumer(); assert.equal(consumer.candidate, fixtures.consumer.candidate);
   for (const [file, digest] of Object.entries(fixtures.record.binaries))
@@ -326,7 +341,7 @@ export async function launchNativeFixture(fixtures, {
         if (!tracked.has(key)) tracked.set(key, member);
         // Custody remains in the original group; its actual parent identifies
         // the outside primary without trusting a fixture-supplied ready receipt.
-        if (member.executable === join(config.bundle, 'Contents/Resources/browser/native/watchdog')) {
+        if (member.parent > 1 && member.executable === join(config.bundle, 'Contents/Resources/browser/native/watchdog')) {
           const parent = observeNative(fixtures, 'process', member.parent);
           if (parent.status === 'alive' && parent.executable === member.executable && parent.startId === member.parentStartId)
             if (!tracked.has(`${parent.pid}:${parent.startId}:${parent.pidVersion}`))
@@ -371,14 +386,19 @@ export async function launchNativeFixture(fixtures, {
   }
   const trustProbe = mode === 'frozen-trust' ? observeFrozenTrust(variant, directory, waitForStage)
     .catch(error => ({ unavailable: String(error.message ?? error) })) : undefined;
-  const watchBirths = mode === 'startup-custody' && !['bootstrap-identity-refused', 'late-readiness'].includes(startupScenario);
+  const watchBirths = mode === 'startup-custody' && startupScenario !== 'late-readiness';
   const startupBirths = watchBirths ? observeStartupBirths(fixtures, directory, child.pid, startupScenario, waitForStage)
     .catch(error => ({ unavailable: String(error.message ?? error) })) : undefined;
   const failureCustody = ['failure-custody', 'monitor-loss'].includes(mode) ? observeFailureCustody(fixtures, directory, child.pid, waitForStage, monitorScenario)
     .catch(error => ({ unavailable: String(error.message ?? error) })) : undefined;
   // Timeout teardown is explicitly not production enforcement evidence.
-  const deadline = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, 90000);
-  const outcome = await new Promise((accept, reject) => { child.once('error', reject); child.once('exit', (code, signal) => accept({ code, signal })); })
+  const deadline = setTimeout(() => {
+    timedOut = true;
+    child.kill('SIGKILL');
+    child.stdout.destroy();
+    child.stderr.destroy();
+  }, 90000);
+  const outcome = await new Promise((accept, reject) => { child.once('error', reject); child.once('close', (code, signal) => accept({ code, signal })); })
     .finally(() => { clearInterval(timer); clearTimeout(deadline); });
   const exitObserved = performance.now();
   const births = await startupBirths;
@@ -396,7 +416,24 @@ export async function launchNativeFixture(fixtures, {
     elapsedMs: performance.now() - started, ...outcome, timedOut, stdout, stderr, observations,
     frozenTrust: await trustProbe, startupSlots: mode === 'startup-custody' ? startupSlots : undefined, startupBirths: births,
     failureCustody: await failureCustody,
-    qualification: 'fixture feasibility only; no complete gate/native qualification result' };
+    scope: 'one private fixture launch' };
   await writeFile(join(directory, 'launch-result.json'), JSON.stringify(record, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
   return record;
+}
+
+export function requireNativeLaunch(launch, events, { armed = false } = {}) {
+  const launcher = events.find(event => event.stage === 'launcher');
+  const executable = join(launch.candidate, 'Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron');
+  const fields = ['pid', 'startId', 'group', 'session', 'uid'];
+  const witnessed = identity => identity?.status === 'alive' && identity.executed === true && identity.executable === executable &&
+    fields.every(field => launcher?.[field] === identity[field]);
+  if (!launch.observations.some(sample => witnessed(sample.identity))) throw Object.assign(
+    new Error('Independent observer missed the post-exec Electron identity'), { code: 'fixture_observation_unavailable' });
+  if (armed) {
+    if (!launch.observations.some(({ ordered }) => ordered && !ordered.unavailable && ['owner', 'build'].every(name =>
+      ordered.locks[name]?.acquired === false && ['before', 'after'].every(stage =>
+        ordered.order.find(point => point.stage === stage + '-' + name)?.processes.some(row =>
+          row.identityMatches && witnessed(row.current)))))) throw Object.assign(
+      new Error('Independent observer missed live main holding both original locks'), { code: 'fixture_observation_unavailable' });
+  }
 }

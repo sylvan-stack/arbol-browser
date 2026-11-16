@@ -34,3 +34,31 @@ client cleanup and unrelated owner/Build guard preservation are the bounded
 claims; signed production startup, native readiness/exit, helper confinement,
 real stdio MCP and every prior unavailable route retain their downstream owner
 and actual execution requirements. Earlier five-case evidence remains preserved.
+
+
+ABR-8 adds nine independently admitted native top-tier cases against the pinned
+signed ABR-42 consumer. The external private fixture observes actual native
+preparation and representative input, retirement and watchdog behavior.
+Armed recovery records the exact known originals from the independently
+revalidated pre-fault baseline through terminal lock acquisition. Startup,
+pre-baseline continuous family confinement, production host integration and
+full flush/clean close still require their named downstream evidence.
+
+A separately authorized follow-up can pair each physical route with the same
+disposable field or target before blocking, while blocked and after re-enable.
+The physical trials would independently record native focus, pressed buttons,
+capture and trusted DOM effects for keys/click/pointer, and native phase plus
+renderer scroll for wheel and trackpad momentum. OS-generated source drag needs
+a genuine recognized external source and distinct local drop target, with
+source/target events and payload observed. Synthetic destination coverage is
+already in the top-tier responder case.
+
+A separate text-services trial requires an available human-operated input source
+or service, an observable candidate window and fictional text. Record live IME
+mark, candidate selection, commit/cancel, and the same-focus block/resume
+control. Dictation and Writing Tools each require an available configured
+service and observable effects. The cached custom AX handler, complementary
+edit/forwarding selectors, text marker and lifetime-exhaustion routes require
+individual positive references or a reviewed testability proposal. None of
+these follow-up trials has executed. The native fixtures supply no substitutes
+for unavailable physical devices, text services, or production host settlement.

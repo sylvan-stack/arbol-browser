@@ -31,8 +31,9 @@ static NSDictionary* process(pid_t pid) {
   return @{ @"pid":@(pid),@"status":@"alive",@"startId":[NSString stringWithFormat:@"%llu",first.unique.start],@"pidVersion":@(first.unique.version),@"uid":@(first.bsd.pbi_uid),@"group":@(first.bsd.pbi_pgid),@"session":@(getsid(pid)),@"parent":@(first.bsd.pbi_ppid),@"parentStartId":[NSString stringWithFormat:@"%llu",first.unique.parent],@"originalParentVersion":@(first.unique.parentVersion),@"executable":@(executable),@"stopped":@(last.bsd.pbi_status==SSTOP),@"executed":@((last.bsd.pbi_flags&PROC_FLAG_EXEC)!=0) };
 }
 static NSDictionary* group(pid_t value) {
-  std::vector<pid_t> pids(4097); int bytes=proc_listpids(PROC_PGRP_ONLY,(uint32_t)value,pids.data(),(int)(pids.size()*sizeof(pid_t)));
-  if(bytes<0||bytes%(int)sizeof(pid_t)||bytes>=(int)(pids.size()*sizeof(pid_t))) return nil;
+  std::vector<pid_t> pids(4097); errno=0;
+  int bytes=proc_listpids(PROC_PGRP_ONLY,(uint32_t)value,pids.data(),(int)(pids.size()*sizeof(pid_t)));
+  if(bytes<0||(!bytes&&errno)||bytes%(int)sizeof(pid_t)||bytes>=(int)(pids.size()*sizeof(pid_t))) return nil;
   NSMutableArray* members=[NSMutableArray new];
   for(int i=0;i<bytes/(int)sizeof(pid_t);++i) if(pids[i]>0) {
     NSDictionary* item=process(pids[i]);
@@ -213,8 +214,9 @@ static NSDictionary* observeBirths(const char* input) {
   std::vector<pid_t> pids(4097);
   while(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)<deadline) {
     @autoreleasepool {
+      errno=0;
       int size=proc_listpids(PROC_PGRP_ONLY,(uint32_t)pid,pids.data(),(int)(pids.size()*sizeof(pid_t)));
-      if(size<0||size%(int)sizeof(pid_t)||size>=(int)(pids.size()*sizeof(pid_t))) return nil;
+      if(size<0||(!size&&errno)||size%(int)sizeof(pid_t)||size>=(int)(pids.size()*sizeof(pid_t))) return nil;
       for(int i=0;i<size/(int)sizeof(pid_t);++i) {
         if(pids[i]<2||pids[i]==pid) continue;
         NSDictionary* candidate=process(pids[i]);
@@ -339,6 +341,54 @@ static NSDictionary* custody(const char* input) {
   NSString* heldThrough=monotonic();
   return @{@"format":@1,@"expected":request,@"locks":locks,@"heldThroughNanos":heldThrough,@"order":order,
     @"limit":@"ordered observations only; individual kernel reads and census are not atomic; unseen family members remain unavailable"};
+}
+// Observe fork/exec of each verified original from association onward.
+struct OriginalForkFence {
+  int queue=kqueue();
+  ~OriginalForkFence() { if(queue>=0) close(queue); }
+  bool watch(NSArray* expected) {
+    if(queue<0) return false;
+    for(NSDictionary* original in expected) {
+      const pid_t pid=[original[@"pid"] intValue];
+      if(!originalMatches(original,process(pid))) return false;
+      struct kevent add{}, receipt{};
+      EV_SET(&add,pid,EVFILT_PROC,EV_ADD|EV_ENABLE|EV_RECEIPT,NOTE_FORK|NOTE_EXEC,0,nullptr);
+      const struct timespec now{};
+      if(kevent(queue,&add,1,&receipt,1,&now)!=1||!(receipt.flags&EV_ERROR)||receipt.data||
+         !originalMatches(original,process(pid))) return false;
+    }
+    return true;
+  }
+  bool unchanged() {
+    struct kevent notifications[64]; const struct timespec now{};
+    const int count=kevent(queue,nullptr,0,notifications,64,&now);
+    if(count<0) return false;
+    for(int i=0;i<count;++i) {
+      if((notifications[i].flags&EV_ERROR)||(notifications[i].fflags&(NOTE_FORK|NOTE_EXEC))) return false;
+    }
+    return true;
+  }
+};
+static NSDictionary* observeStartupRefusal(const char* input) {
+  const size_t size=strlen(input);
+  if(!size||size>65536) return nil;
+  id request=[NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:input length:size] options:0 error:nil];
+  if(![request isKindOfClass:NSDictionary.class]||![request[@"main"] isKindOfClass:NSDictionary.class]||
+     ![request[@"mode"] isEqual:@"bootstrap-identity-refused"]) return nil;
+  NSDictionary* main=request[@"main"];
+  const pid_t pid=[main[@"pid"] intValue];
+  OriginalForkFence fence;
+  if(pid<2||!fence.watch(@[main])||!fence.unchanged()) return @{@"unavailable":@"startup-fork-registration"};
+  if(fputs("{\"stage\":\"watch-ready\"}\n",stdout)==EOF||fflush(stdout)) return nil;
+  const uint64_t deadline=clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)+4000000000ULL;
+  while(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)<deadline) {
+    NSDictionary* current=process(pid);
+    if(!fence.unchanged()) return @{@"unavailable":@"startup-fork-or-exec"};
+    if([current[@"status"] isEqual:@"gone"]) return @{@"main":main,@"forkFence":@YES,@"after":current};
+    if([current[@"status"] isEqual:@"alive"]&&!originalMatches(main,current)) return @{@"unavailable":@"startup-identity-drift"};
+    usleep(1000);
+  }
+  return @{@"unavailable":@"startup-refusal-deadline"};
 }
 static bool waitForTrigger(NSString* path) {
   if(![path isKindOfClass:NSString.class]||!path.isAbsolutePath) return false;
@@ -478,13 +528,31 @@ struct MonitorTrial {
 static NSDictionary* observeFailure(const char* input,NSDictionary* monitor=nil) {
   auto readSample=[&]() { return custody(input); };
   NSDictionary* baseline=readSample();
-  if(!baseline[@"order"]) return @{@"unavailable":@"initial-lock-sample",@"baseline":baseline?:@{}};
   NSArray* expected=baseline[@"expected"][@"processes"];
+  OriginalForkFence fence;
+  if(baseline[@"unavailable"]||!expected||!fence.watch(expected))
+    return @{@"unavailable":@"initial-lock-or-fork-registration",@"baseline":baseline?:@{}};
+  NSString* armedAt=monotonic();
+  baseline=readSample();
+  if(baseline[@"unavailable"]||!baseline[@"order"]||!fence.unchanged())
+    return @{@"unavailable":@"revalidated-initial-lock-sample",@"baseline":baseline?:@{}};
+  for(NSDictionary* row in baseline[@"order"]) {
+    if(![row[@"stage"] isEqual:@"census"]) continue;
+    NSDictionary* census=row[@"census"];
+    if(census[@"unavailable"]) return @{@"unavailable":@"initial-group-census",@"baseline":baseline};
+    for(NSDictionary* member in census[@"members"]) {
+      if(![member[@"status"] isEqual:@"alive"]) continue;
+      bool known=false;
+      for(NSDictionary* original in expected) if(originalMatches(original,member)) { known=true; break; }
+      if(!known) return @{@"unavailable":@"initial-unknown-member",@"baseline":baseline};
+    }
+  }
   auto identityState=[](NSDictionary* sample) {
     NSMutableArray* state=[NSMutableArray new];
     for(NSDictionary* row in sample[@"order"]) {
       for(NSDictionary* member in row[@"processes"])
         [state addObject:[member[@"identityMatches"] boolValue]?@"same":member[@"current"][@"status"]];
+      if([row[@"stage"] isEqual:@"census"]) [state addObject:row[@"census"][@"unavailable"]?:@"census-observed"];
     }
     for(NSString* name in @[@"owner",@"build"]) [state addObject:sample[@"locks"][name][@"acquired"]?:NSNull.null];
     return state;
@@ -504,10 +572,12 @@ static NSDictionary* observeFailure(const char* input,NSDictionary* monitor=nil)
   NSMutableArray* unexpected=[NSMutableArray new];
   NSMutableSet* seen=[NSMutableSet new];
   bool retiring=false;
+  NSDictionary* last=baseline;
   while(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)<deadline) {
     @autoreleasepool {
       NSDictionary* sample=readSample();
-      if(!sample[@"order"]) return @{@"unavailable":@"lock-sample",@"observations":observations,@"last":sample?:@{}};
+      if(sample[@"unavailable"]||!sample[@"order"]||!fence.unchanged()) return @{@"unavailable":@"lock-sample-or-fork-drift",@"observations":observations,@"last":sample?:@{}};
+      last=sample;
       NSArray* state=identityState(sample);
       if(![previous isEqual:state]) {
         if(observations.count>=128) return @{@"unavailable":@"observation-bound",@"observations":observations};
@@ -530,14 +600,31 @@ static NSDictionary* observeFailure(const char* input,NSDictionary* monitor=nil)
           if(!known&&![seen containsObject:key]) { [seen addObject:key]; [unexpected addObject:member]; }
         }
       }
-      if(gone&&[sample[@"locks"][@"owner"][@"acquired"] boolValue]&&[sample[@"locks"][@"build"][@"acquired"] boolValue]) {
+      bool finalClosed=gone;
+      for(NSDictionary* row in sample[@"order"]) {
+        NSString* stage=row[@"stage"];
+        if([@[@"before-owner",@"after-owner",@"before-build",@"after-build"] containsObject:stage]) {
+          for(NSDictionary* member in row[@"processes"]) if(![member[@"current"][@"status"] isEqual:@"gone"]) finalClosed=false;
+        }
+        if([stage isEqual:@"census"]&&([row[@"census"][@"members"] count]||row[@"census"][@"unavailable"])) finalClosed=false;
+      }
+      if(finalClosed&&[sample[@"locks"][@"owner"][@"acquired"] boolValue]&&[sample[@"locks"][@"build"][@"acquired"] boolValue]) {
         if(monitor) trial.events[@"sentinelAfter"]=process([trial.sentinel[@"pid"] intValue]);
-        return @{@"observations":observations,@"unexpected":unexpected,@"complete":@YES,@"monitor":trial.events};
+        return @{@"observations":observations,@"unexpected":unexpected,@"capturedOriginalsRetired":@YES,@"monitor":trial.events,
+          @"terminal":sample,@"forkFence":@{@"armedAtNanos":armedAt,@"verifiedThroughNanos":monotonic(),@"watched":expected}};
       }
     }
     if(!retiring) usleep(250);
   }
-  return @{@"unavailable":@"retirement-observation-deadline",@"observations":observations,@"unexpected":unexpected,@"monitor":trial.events};
+  for(NSDictionary* row in last[@"order"]) {
+    if(![row[@"stage"] isEqual:@"before-close"]) continue;
+    for(NSDictionary* member in row[@"processes"])
+      if([member[@"identityMatches"] boolValue])
+        return @{@"failure":@"original-survived-observation-deadline",@"terminal":last,
+          @"observations":observations,@"unexpected":unexpected,@"monitor":trial.events};
+  }
+  return @{@"unavailable":@"retirement-observation-deadline",@"terminal":last,
+    @"observations":observations,@"unexpected":unexpected,@"monitor":trial.events};
 }
 static NSDictionary* observeMonitorLoss(const char* input) {
   size_t size=strlen(input);
@@ -568,6 +655,7 @@ int main(int argc,const char* argv[]) {
     if(argc!=3) return 64; id result=nil; int value=0;
     if(!strcmp(argv[1],"process")&&positive(argv[2],value)) result=process(value);
     else if(!strcmp(argv[1],"startup-slots")&&positive(argv[2],value)) result=startupSlots(value);
+    else if(!strcmp(argv[1],"startup-refusal")) result=observeStartupRefusal(argv[2]);
     else if(!strcmp(argv[1],"startup-births")) result=observeBirths(argv[2]);
     else if(!strcmp(argv[1],"failure-custody")) result=observeFailure(argv[2]);
     else if(!strcmp(argv[1],"monitor-loss")) result=observeMonitorLoss(argv[2]);

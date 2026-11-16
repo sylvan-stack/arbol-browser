@@ -269,6 +269,22 @@ static napi_value block(napi_env env,napi_callback_info info) {
   napi_value value;int32_t ms=0;if(!args(env,info,1,&value)||napi_get_value_int32(env,value,&ms)!=napi_ok||ms<1||ms>8000) return fail(env,"fixture_block_bound");
   [NSThread sleepForTimeInterval:(double)ms/1000.0];return reply(env,@{@"returnedAfterMs":@(ms)});
 }
+static napi_value blockDetach(napi_env env,napi_callback_info info) {
+  napi_value value;
+  int32_t fd=0;
+  if(!args(env,info,1,&value)||napi_get_value_int32(env,value,&fd)!=napi_ok||fd<3||![NSThread isMainThread])
+    return fail(env,"fixture_detach_block_argument");
+  struct stat st{};
+  if(fstat(fd,&st)||!S_ISREG(st.st_mode)||st.st_uid!=geteuid()||st.st_nlink!=1||(st.st_mode&07777)!=0600)
+    return fail(env,"fixture_detach_block_journal");
+  char marker[160];
+  const int length=snprintf(marker,sizeof(marker),"{\"stage\":\"native-detach-in-call\",\"pid\":%d,\"nanos\":\"%llu\"}\n",getpid(),
+    (unsigned long long)clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW));
+  if(length<=0||length>=(int)sizeof(marker)||write(fd,marker,(size_t)length)!=length)
+    return fail(env,"fixture_detach_block_journal");
+  [NSThread sleepForTimeInterval:5.0];
+  return reply(env,@{@"returnedAfterMs":@5000});
+}
 static napi_value monotonicNanos(napi_env env,napi_callback_info info) {
   if(!args(env,info,0,nullptr)) return nullptr;
   return reply(env,@{@"nanos":[NSString stringWithFormat:@"%llu",clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)]});
@@ -552,7 +568,8 @@ NAPI_MODULE_INIT() {
   napi_property_descriptor exportsList[]={
     {"capture",nullptr,capture,nullptr,nullptr,nullptr,napi_default,nullptr},{"state",nullptr,state,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"invoke",nullptr,invoke,nullptr,nullptr,nullptr,napi_default,nullptr},{"descriptor",nullptr,descriptor,nullptr,nullptr,nullptr,napi_default,nullptr},
-    {"block",nullptr,block,nullptr,nullptr,nullptr,napi_default,nullptr},{"releaseClients",nullptr,releaseClients,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"block",nullptr,block,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"blockDetach",nullptr,blockDetach,nullptr,nullptr,nullptr,napi_default,nullptr},{"releaseClients",nullptr,releaseClients,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"monotonicNanos",nullptr,monotonicNanos,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"resolverDispatch",nullptr,resolverDispatch,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"auditMethods",nullptr,auditMethods,nullptr,nullptr,nullptr,napi_default,nullptr},

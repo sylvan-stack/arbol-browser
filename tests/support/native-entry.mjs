@@ -4,7 +4,7 @@ import { ChildProcess } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
-import { appendFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, openSync, writeFileSync } from 'node:fs';
 import { readFile, writeFile, realpath, lstat } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
@@ -95,12 +95,17 @@ function captureFailureStreams(child) {
   const path = join(config.output, 'failure.jsonl');
   const clock = () => JSON.parse(bridge.monotonicNanos()).nanos;
   const log = (stage, values = {}) => appendFileSync(path, JSON.stringify({ stage, nanos: clock(), ...values }) + '\n', { mode: 0o600 });
-  const protocol = { child, log, ack: null, write: null, withhold: false, afterFatalAck: null };
+  const protocol = { child, log, ack: null, write: null, withhold: false, freezeWrites: false, afterFatalAck: null };
   failureProtocol = protocol;
   log('spawn', { primary: child.pid });
   const write = child.stdin.write.bind(child.stdin);
   child.stdin.write = (chunk, ...options) => {
     const frame = chunk.toString();
+    if (protocol.freezeWrites) {
+      assert.match(frame, /^[HF] [1-9][0-9]*\n$/);
+      log('withheld-host-frame', { frame });
+      return true;
+    }
     protocol.write = frame;
     log('host-frame', { frame });
     return write(chunk, ...options);
@@ -160,17 +165,31 @@ async function observeFailure(bridge, addon) {
   await waitForObservation(() => protocol.ack, ack => ack && ack !== previousAck, 'No fresh signed watchdog acknowledgement');
   watchdog.assertArmed(prepared.trust);
   if (monitor) {
-    log('monitor-armed', { scenario, renderer, acknowledgement: protocol.ack, native: JSON.parse(addon.status()) });
+    if (scenario !== 'both-lost') {
+      await waitForObservation(() => protocol.ack, ack => ack && protocol.write === ack.replace(/^A /, 'H '),
+        'The last real host write had no matching acknowledgement');
+      assert.equal(protocol.write, protocol.ack.replace(/^A /, 'H '));
+      protocol.freezeWrites = true;
+    }
+    log('monitor-armed', { scenario, renderer, acknowledgement: protocol.ack, lastWrite: protocol.write,
+      writesFenced: protocol.freezeWrites, native: JSON.parse(addon.status()) });
     await writeFile(join(config.output, 'monitor-trigger'), 'ready\n', { mode: 0o600, flag: 'wx' });
     return;
   }
   log('fault', { scenario, renderer, acknowledgement: protocol.ack, native: JSON.parse(addon.status()), visible: window.isVisible() });
   if (scenario === 'heartbeat-silence') block('running-main');
   else if (scenario === 'ack-silence') protocol.withhold = true;
-  else if (scenario === 'eof') child.stdin.end(() => log('stdin-ended'));
+  else if (scenario === 'eof') child.stdin.end(() => {
+    log('stdin-ended');
+    block('after-stdin-eof');
+  });
   else if (scenario === 'malformed' || scenario === 'out-of-order') {
     const frame = scenario === 'malformed' ? 'H ?\n' : protocol.ack.replace(/^A /, 'H ');
-    child.stdin.write(frame, 'ascii', () => log('fault-write', { frame }));
+    child.stdin.write(frame, 'ascii', error => {
+      assert.ifError(error);
+      log('fault-write', { frame });
+      block('after-fault-write');
+    });
   } else if (scenario === 'integrity-refused') {
     app.commandLine.appendSwitch('site-per-process', 'fixture-invalid');
     log('integrity-check', { value: app.commandLine.getSwitchValue('site-per-process') });
@@ -417,14 +436,15 @@ async function observeCachedRoutes(bridge) {
   };
   const reset = () => contents.executeJavaScript("button.textContent='0';field.value='edit';field.focus();field.setSelectionRange(4,4);records.length=0");
   const settle = () => new Promise(accept => setTimeout(accept, 180));
-  const matrix = async (phase, token) => {
+  const matrix = async (phase, token, sequences) => {
     const routes = [];
-    for (const sequence of [['press'], ['axValue'], ['text'], ['delete'], ['directDelete'], ['selectAll'], ['mark', 'unmark']]) {
+    for (const sequence of sequences) {
       await reset();
       for (const route of sequence) {
-        const before = await state(), dispatched = invoke(token, route);
+        const before = await state(), responder = JSON.parse(bridge.state(token));
+        const dispatched = invoke(token, route);
         await settle();
-        routes.push({ route, before, dispatched, after: await state() });
+        routes.push({ route, before, responder, dispatched, after: await state() });
       }
     }
     await event('cached-route-matrix', { phase, routes });
@@ -437,35 +457,51 @@ async function observeCachedRoutes(bridge) {
   const originalState = JSON.parse(bridge.state(original.token));
   const originalFrame = frame();
   const focus = invoke(original.token, 'focus');
-  const user = await matrix('user', original.token);
+  const axRoutes = [['press'], ['axValue']];
+  const allRoutes = [...axRoutes, ['text'], ['delete'], ['directDelete'], ['selectAll'], ['mark', 'unmark']];
+  const user = await matrix('user', original.token, allRoutes);
   await reset();
   const beforeContexts = await state();
   const contexts = ['unknown', 'off-main', 'reentrant'].map(context => JSON.parse(bridge.invokePressContext(original.token, context)));
   await settle();
   const afterContexts = await state();
-  const resigned = invoke(original.token, 'resignFocus');
   const blockedBinding = ownership.mark(bindingKey(initialUser), true);
-  const blocked = await matrix('agent', original.token);
+  const blocked = await matrix('agent', original.token, [...allRoutes.slice(0, -1), ['mark']]);
   const restored = ownership.restore(bindingKey(blockedBinding));
   const resumedBinding = ownership.mark(bindingKey(restored), false);
-  invoke(original.token, 'focus');
-  const resumed = await matrix('resumed-user', original.token);
+  const resumed = await matrix('resumed-user', original.token, allRoutes);
+
+  await reset();
+  const prime = invoke(original.token, 'mark');
+  await settle();
+  const composition = async binding => ({ dom: await state(), native: ownership.interactionState(bindingKey(binding)),
+    responder: JSON.parse(bridge.state(original.token)) });
+  const primed = await composition(resumedBinding);
+  const compositionBlocked = ownership.mark(bindingKey(resumedBinding), true);
+  const beforeUnmark = await composition(compositionBlocked);
+  const deniedUnmark = invoke(original.token, 'unmark');
+  await settle();
+  const afterUnmark = await composition(compositionBlocked);
+  const compositionUser = ownership.mark(bindingKey(compositionBlocked), false);
+  const allowedUnmark = invoke(original.token, 'unmark');
+  await settle();
+  const cleared = await composition(compositionUser);
+  const liveUnmark = { prime, primed, beforeUnmark, deniedUnmark, afterUnmark, allowedUnmark, cleared };
   const custom = invoke(original.token, 'custom');
-  invoke(original.token, 'resignFocus');
-  const navigationBlocked = ownership.mark(bindingKey(resumedBinding), true);
+  const resigned = invoke(original.token, 'resignFocus');
+  const navigationBlocked = ownership.mark(bindingKey(compositionUser), true);
   await event('cached-route-navigating', { originalFrame, navigationBlocked });
   await contents.loadURL(`http://localhost:${port}/page`);
   const replacementFrame = frame(), replacement = await capture();
   const replacementBlocked = ownership.bindingInfo(bindingKey(navigationBlocked));
   const oldStateAfterNavigation = JSON.parse(bridge.state(original.token));
   const replacementState = JSON.parse(bridge.state(replacement.token));
-  const afterNavigation = await matrix('agent-after-frame-swap', replacement.token);
+  const afterNavigation = await matrix('agent-after-frame-swap', replacement.token, axRoutes);
   const replacementUser = ownership.mark(bindingKey(replacementBlocked), false);
-  invoke(replacement.token, 'focus');
-  const replacementPositive = await matrix('user-after-frame-swap', replacement.token);
+  const replacementPositive = await matrix('user-after-frame-swap', replacement.token, axRoutes);
   await new Promise((accept, reject) => server.close(error => error ? reject(error) : accept()));
   const report = { created, initialUser, original, originalFrame, originalState, focus, user, contexts, beforeContexts, afterContexts, resigned,
-    blockedBinding, blocked, restored, resumedBinding, resumed, custom, navigationBlocked, replacementFrame, replacement,
+    blockedBinding, blocked, restored, resumedBinding, resumed, liveUnmark, compositionBlocked, compositionUser, custom, navigationBlocked, replacementFrame, replacement,
     replacementBlocked, oldStateAfterNavigation, replacementState, afterNavigation, replacementUser, replacementPositive,
     status: boundary.native.assertIntegrity() };
   writeFileSync(join(config.output, 'cached-routes.json'), JSON.stringify(report) + '\n', { mode: 0o600, flag: 'wx' });
@@ -578,9 +614,11 @@ async function observeConcurrentResponder(bridge) {
   await waitForObservation(() => native(user), state => state.windowKey, 'Disposable window did not regain key status');
   const refocus = invoke(user, 'focus');
   await focusField(user);
+  const agentFocus = invoke(agent, 'focus');
+  const userAfterAgent = native(user), agentAfterFocus = native(agent);
   const unknownFocus = invoke(unknown, 'focus');
   const userAfterUnknown = native(user), unknownAfter = native(unknown);
-  await event('concurrent-ax-observed', { ax, refocus, unknownFocus, userAfterUnknown, unknownAfter });
+  await event('concurrent-ax-observed', { ax, refocus, agentFocus, userAfterAgent, agentAfterFocus, unknownFocus, userAfterUnknown, unknownAfter });
 
   const interaction = () => ({ native: ownership.interactionState(bindingKey(user.binding)),
     binding: ownership.bindingInfo(bindingKey(user.binding)) });
@@ -624,7 +662,7 @@ async function observeConcurrentResponder(bridge) {
     targets: Object.fromEntries(Object.entries(targets).map(([name, { contents, ...target }]) => [name, {
       ...target, native: native(target), finalBinding: target.binding && ownership.bindingInfo(bindingKey(target.binding)),
     }])),
-    focus, nativeBefore, before, firstKey, typedBefore, trace, agentAfter, userAfter, ax, refocus, unknownFocus, userAfterUnknown, unknownAfter,
+    focus, nativeBefore, before, firstKey, typedBefore, trace, agentAfter, userAfter, ax, refocus, agentFocus, userAfterAgent, agentAfterFocus, unknownFocus, userAfterUnknown, unknownAfter,
     pointer: { idle, down, held, heldAgain, up, released }, composition: { mark, marked, markedAgain, unmark, unmarked },
     destination: { enter, drag, dragAgain, exit, exited },
     status: boundary.native.assertIntegrity(),
@@ -668,7 +706,8 @@ async function observeRetirement(bridge, addon) {
   let destroyed = 0, admission = true, fixtureAuthority = contents.id;
   const snapshot = () => ({ attached: parent.children.includes(view), roots: JSON.parse(bridge.windowPages(handle)),
     destroyed, isDestroyed: contents.isDestroyed(), native: JSON.parse(addon.status()), state: state(), visible: window.isVisible() });
-  const log = (stage, fields = {}) => appendFileSync(join(config.output, 'retirement.jsonl'),
+  const journal = join(config.output, 'retirement.jsonl');
+  const log = (stage, fields = {}) => appendFileSync(journal,
     JSON.stringify({ stage, scenario, at: performance.now(), ...fields }) + '\n', { mode: 0o600 });
   contents.on('destroyed', () => { destroyed++; log('destroyed', { isDestroyed: contents.isDestroyed() }); });
   log('positive', { webContentsId: contents.id, client, created, user, baseline, positive, activated, resigned, snapshot: snapshot() });
@@ -686,8 +725,9 @@ async function observeRetirement(bridge, addon) {
     if (scenario === 'native-detach-blocked') {
       watchdog.assertArmed(prepared.trust);
       log('native-block-enter', { durationMs: 5000 });
-      const returned = JSON.parse(bridge.block(5000));
-      log('native-block-return', { returned });
+      const fd = openSync(journal, 'a');
+      try { log('native-block-return', { returned: JSON.parse(bridge.blockDetach(fd)) }); }
+      finally { closeSync(fd); }
     }
     realRemove(target);
     log('after-remove', { snapshot: snapshot(), press: press() });
@@ -747,7 +787,7 @@ try {
   const stat = await lstat(path);
   assert.ok(stat.isFile() && stat.uid === process.getuid() && (stat.mode & 0o7777) === 0o600 && stat.nlink === 1 && stat.size <= 16384);
   config = JSON.parse(await readFile(path, 'utf8'));
-  assert.equal(config.format, 1); assert.ok(['boundary', 'callbacks', 'frozen-trust', 'provider-mismatch', resolverMode, poisonMode, bindingMode,
+  assert.equal(config.format, 1); assert.ok(['boundary', 'callbacks', 'frozen-trust', 'frozen-trust-restored', 'provider-mismatch', resolverMode, poisonMode, bindingMode,
     cachedRoutesMode, concurrentResponderMode, retirementMode, startupCustodyMode, failureCustodyMode, monitorCustodyMode].includes(config.mode));
   const startupScenarios = ['startup-descriptors', 'bootstrap-identity-refused', 'late-readiness',
     'primary-producer-lost', 'custody-producer-lost', 'custody-withholds-c', 'custody-withholds-g', 'primary-withholds-j'];
@@ -786,10 +826,15 @@ try {
   await event('prepared', { snapshotDigest: prepared.trust.snapshotDigest, counterfeitRefused,
     crossModuleRefused: true, repeatPreparationRefused: true, appReady: app.isReady() });
 
-  if (config.mode === 'frozen-trust') {
+  if (['frozen-trust', 'frozen-trust-restored'].includes(config.mode)) {
     const manifestModule = await import(new URL('../native/manifest.js', bootstrapURL));
     manifestModule.assertCandidateTrust(prepared.trust);
     assert.ok(Object.isFrozen(prepared.trust.manifest) && Object.isFrozen(prepared.trust.manifest.files));
+    if (config.mode === 'frozen-trust-restored') {
+      await event('fresh-restored-control', { admission: admissionObservation() });
+      app.exit(0);
+      await new Promise(() => {});
+    }
     await event('frozen-trust-ready', { admission: admissionObservation() });
     await waitForFixtureMarker('drift-ready');
     assert.throws(() => manifestModule.assertCandidateTrust(prepared.trust), /native_candidate_unavailable/);
@@ -806,6 +851,8 @@ try {
   globalThis.qualificationOriginalLocks = { owner, build }; // strong originals, never finally-release
   await event('locks', { owner: owner.assertIdentity(), build: build.assertIdentity() });
   if (config.startupScenario === 'bootstrap-identity-refused') {
+    await event('startup-observer-waiting');
+    await waitForFixtureMarker('startup-observer-ready');
     const original = process.env.ARBOL_BROWSER_BOOTSTRAP;
     const [version, pid, start, group, session, uid] = original.split(':');
     assert.equal(pid, String(process.pid));
@@ -904,7 +951,7 @@ try {
         assert.notEqual(installed[key].implementation, original.implementation);
       }
     }
-    await event('resolver-control', { afterGetABI, afterInstall, originals, installed });
+    await event('resolver-control', { afterGetABI, afterInstall, originals, installed, resolverAfter: JSON.parse(bridge.resolverDispatch()) });
   } else boundary = await bootstrap.installNativeBoundary(prepared, watchdog, effects);
   assert.equal(boundary.pageAdmission, false);
   await event('installed', { status: boundary.native.assertIntegrity(), admission: admissionObservation(), appReady: app.isReady() });

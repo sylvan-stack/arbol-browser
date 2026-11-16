@@ -1,7 +1,7 @@
 {
   "format": 1,
   "component": "arbol-browser",
-  "reviewed": "2026-11-14",
+  "reviewed": "2026-11-16",
   "cases": [
     {
       "id": "receiptRace",
@@ -94,6 +94,186 @@
         "BRW-0.14",
         "BRW-3.11"
       ]
+    },
+    {
+      "id": "nativeTrustBoundary",
+      "file": "tests/top/test_native_boundary.mjs",
+      "tier": "top",
+      "status": "retained",
+      "reason": "Canonical preparation can load an invalid bundle, accept a counterfeit capability, overlook post-prepare mutation, or install against the wrong method provider.",
+      "oracle": "Exact no-page install, isolated outer seal and publisher controls, same-process poisoned trust with fresh restored preparation, and signed provider mismatch before a native hook is installed.",
+      "origins": [
+        "BRW-2.21",
+        "BRW-4.8"
+      ],
+      "scenarios": [
+        "exact-consumer-control",
+        "sealed-resource-copy-refusal",
+        "wrong-publisher-copy-refusal",
+        "frozen-trust-after-restored-copy",
+        "fresh-restored-control",
+        "provider-mismatch-refusal"
+      ]
+    },
+    {
+      "id": "nativeInstallPoison",
+      "file": "tests/top/test_native_boundary.mjs",
+      "tier": "top",
+      "status": "retained",
+      "reason": "Install may proceed on invalid inputs, misreport rolled-back state or retry after poison.",
+      "oracle": "One signed bridge passes canonical resolver control. Separate processes audit native Objective-C implementations, independently observe locks and distinguish rejected ABI, confirmed rollback and one unconfirmed guarded method.",
+      "origins": [
+        "BRW-4.8",
+        "BRW-4.15"
+      ],
+      "scenarios": [
+        "resolver-control",
+        "pre-commit-poison",
+        "rollback-confirmed",
+        "rollback-unconfirmed"
+      ]
+    },
+    {
+      "id": "nativeBindingLifetime",
+      "file": "tests/top/test_native_concurrency.mjs",
+      "tier": "top",
+      "status": "retained",
+      "reason": "An incorrect binding tuple or obsolete native view can retain input authority across creation, detach or replacement.",
+      "oracle": "Real checked creation, one-field stale-key controls, distinct attached-root/reentrancy observations, and useful cached clients across independently observed weak-view death.",
+      "origins": [
+        "BRW-4.1",
+        "BRW-4.4",
+        "BRW-4.16"
+      ],
+      "scenarios": [
+        "stale-nonce",
+        "stale-contents",
+        "stale-revision",
+        "detached-view",
+        "ambiguous-creation",
+        "reentrant-creation",
+        "retired-replacement"
+      ]
+    },
+    {
+      "id": "nativeCachedRouteBoundary",
+      "file": "tests/top/test_native_concurrency.mjs",
+      "tier": "top",
+      "status": "retained",
+      "reason": "Cached and direct native edit routes can bypass current policy or reactivate after a renderer/widget swap.",
+      "oracle": "DOM and AppKit controls compare a fixed native first responder across permission transitions. A positively marked composition survives blocked unmark. Cached AX press and value remain blocked across the actual renderer/widget swap and work after re-enable.",
+      "origins": [
+        "BRW-2.18",
+        "BRW-4.1",
+        "BRW-4.2",
+        "BRW-4.4",
+        "BRW-4.16"
+      ],
+      "scenarios": [
+        "matched-focus-and-renderer-swap"
+      ]
+    },
+    {
+      "id": "nativeConcurrentResponder",
+      "file": "tests/top/test_native_concurrency.mjs",
+      "tier": "top",
+      "status": "retained",
+      "reason": "Background CDP input can target or focus the wrong renderer, or native snapshots can miss a live interaction.",
+      "oracle": "Native first responder and trusted separate DOM effects bracket the pending CDP call. Blocked and unbound focus attempts are refused. Real capture and supported composition and destination callbacks have independent renderer witnesses.",
+      "origins": [
+        "BRW-2.18",
+        "BRW-2.20",
+        "BRW-4.2",
+        "BRW-4.13"
+      ],
+      "scenarios": [
+        "native-responder-and-trusted-input"
+      ]
+    },
+    {
+      "id": "nativeRetirementBoundary",
+      "file": "tests/top/test_native_recovery.mjs",
+      "tier": "top",
+      "status": "retained",
+      "reason": "Delegated native authority can survive an actual detach, failed destroy or blocked retirement.",
+      "oracle": "Positively used cached client is denied at packaged detach. Actual destruction or fatal observation follows. A native in-call marker brackets lock contention and final reacquisition after captured originals disappear.",
+      "origins": [
+        "BRW-4.9",
+        "BRW-4.16",
+        "BRW-4.17"
+      ],
+      "scenarios": [
+        "success",
+        "detach-throws",
+        "destroy-missing",
+        "native-detach-blocked"
+      ]
+    },
+    {
+      "id": "nativeStartupCustodyBoundary",
+      "file": "tests/top/test_native_recovery.mjs",
+      "tier": "top",
+      "status": "retained",
+      "reason": "The signed startup handshake can accept wrong birth identity or lose custody before real descriptor transfer or readiness.",
+      "oracle": "Independent exact original identities, read-only capsule and lock inode observations distinguish ordinary startup, no-fork refusal, producer loss, late R and three transfer phases.",
+      "origins": [
+        "BRW-4.8",
+        "BRW-4.18"
+      ],
+      "scenarios": [
+        "startup-descriptors",
+        "bootstrap-identity-refused",
+        "late-readiness",
+        "primary-producer-lost",
+        "custody-producer-lost",
+        "custody-withholds-c",
+        "custody-withholds-g",
+        "primary-withholds-j"
+      ]
+    },
+    {
+      "id": "nativeFailureCustodyBoundary",
+      "file": "tests/top/test_native_recovery.mjs",
+      "tier": "top",
+      "status": "retained",
+      "reason": "An armed main or watchdog failure can abandon original locks before identified processes disappear.",
+      "oracle": "Real protocol and main-loop faults, exact post-baseline fork and exec fence, one last original holding both locks after peer and engine loss, and both final acquisitions bracketed by disappearance.",
+      "origins": [
+        "BRW-4.9",
+        "BRW-4.17",
+        "BRW-4.18"
+      ],
+      "scenarios": [
+        "heartbeat-silence",
+        "ack-silence",
+        "eof",
+        "malformed",
+        "out-of-order",
+        "integrity-refused",
+        "cleanup-blocked",
+        "exit-blocked",
+        "fatal-shortening"
+      ]
+    },
+    {
+      "id": "nativeMonitorLossBoundary",
+      "file": "tests/top/test_native_recovery.mjs",
+      "tier": "top",
+      "status": "retained",
+      "reason": "An independently stopped or lost monitor can release custody early or couple unrelated processes to recovery.",
+      "oracle": "Exact injected faults, genuine matched heartbeat drain, stopped-peer queue observation, independent consent exit, exact locks and captured-originals retirement preserve an unrelated live sentinel.",
+      "origins": [
+        "BRW-4.17",
+        "BRW-4.18"
+      ],
+      "scenarios": [
+        "primary-lost",
+        "primary-hung",
+        "custody-lost",
+        "custody-hung",
+        "both-lost",
+        "custody-consent"
+      ]
     }
   ],
   "mid": [],
@@ -101,11 +281,11 @@
   "unavailable": [
     {
       "id": "native-host-start",
-      "reason": "Production ProcessIntegration, signed EngineAuthority, native readiness and HostNativeLifetime guard custody/watchdog providers absent; two successful CLI starters and LaunchServices host readiness unqualified."
+      "reason": "Positive packaged CLI and LaunchServices host start and native-to-host readiness integration await ABR-29/12. The external fixture exercises canonical preparation, arm and install."
     },
     {
       "id": "complete-close",
-      "reason": "No production complete original-main/helper confinement, force, exit and flush authority. No closed:true or clean engine marker pass."
+      "reason": "Production complete original-family confinement through startup, force, flush and clean close remain unqualified. The native fixtures observe captured originals and the named lock boundaries."
     },
     {
       "id": "engine-reader-session",
@@ -113,11 +293,23 @@
     },
     {
       "id": "native-pages-driver-release",
-      "reason": "No production input addon/watchdog/control/tools or signed distribution manifest. Native/page/Driver/account/model/install/update journeys unavailable; broader mid-tier execution not authorized."
+      "reason": "Physical and complementary input routes, complete application/Driver, account/model and signed distribution/install/update journeys require their separate providers and execution scope."
     },
     {
       "id": "destructive-tty-platform",
       "reason": "Negative default and absent controlling-TTY protection only; positive confirmed deletion/replacement, cross-UID peers, complete filesystem attack/race and capacity matrix unqualified."
+    },
+    {
+      "id": "native-remaining-input",
+      "reason": "Physical key/click/wheel/trackpad and momentum, OS source drag/drop, live multilingual candidate selection, dictation/writing and text services, and remaining selector and AX routes need separate controls."
+    },
+    {
+      "id": "native-lifetime-edge",
+      "reason": "Identifier/revision/lifetime exhaustion and complete dispatcher/frame/host settlement remain unqualified."
+    },
+    {
+      "id": "native-enforcement-limits",
+      "reason": "Runtime write failure, continuous process confinement before the observed baseline, and concurrent loss of both monitors while main is blocked remain unqualified."
     }
   ],
   "qualificationOwners": {
@@ -126,6 +318,16 @@
     "complete-close": "ABR-29/ABR-12",
     "engine-reader-session": "ABR-29/ABR-12",
     "native-pages-driver-release": "ABR-8/12/16/21/23/25; actual providers and explicit execution scope required",
-    "destructive-tty-platform": "ABR-12 for complete runtime removal; remaining distinct platform evidence requires explicit admission/scope"
+    "destructive-tty-platform": "ABR-12 for complete runtime removal; remaining distinct platform evidence requires explicit admission/scope",
+    "native-remaining-input": "ABR-8 bounded proposal; individual remaining native checks require explicit scope",
+    "native-lifetime-edge": "ABR-8 for native edges; ABR-9/29/12 for host transitions and settlement",
+    "native-enforcement-limits": "ABR-8 for fault feasibility; ABR-29/12 for continuous production confinement"
+  },
+  "nativeConsumer": {
+    "manifest": "/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-42-20261115/consumer-manifest.json",
+    "digest": "cb041c3918bba14ccd5ea299cbd0b6c4159e3d97b169138c96ed70397f57601f",
+    "codeCommit": "35c956028fbf8c9214803505458c31b6a077ad47",
+    "sourceDigest": "569c325b27e951aca953e761ada3d682ce84dafea729a0bfc0349f4d95538a84",
+    "compatibilityDigest": "a45a01bea9a1d2a0172213453f4939badbc08db1ba6bbe8a823c434487f7f00a"
   }
 }

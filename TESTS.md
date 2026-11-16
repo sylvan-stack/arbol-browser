@@ -1,43 +1,53 @@
 # Tests: arbol-browser
 
 The current [Test Strategy](/Users/msix/Artifacts/mycel/operations/test-strategy.md)
-governs execution. ABR-32 is the current Foundation final testing Beat. The complete
-inventory and individual admission reasons are in [test-tiers.json](test-tiers.json).
-There were no previous retained cases or low-tier bodies to restore or archive.
+governs execution. ABR-32 owns the Foundation testing record and ABR-8 owns
+native qualification of the pinned signed ABR-42 consumer. The exact case and
+scenario selection, admission reasons and unavailable routes are in
+[test-tiers.json](test-tiers.json). No earlier low-tier bodies existed.
 
-The normal unit gate explicitly runs all six retained cases: `receiptRace`,
-`ownershipBoundary`, `preservationBoundary`, `transportBoundary`,
-`closeAcquisitionBoundary`, `startupAcquisitionBoundary`. They use the
-actual packaged CLI, compiled libraries, Darwin process addon and embedded Node,
-private disposable state and kernel locks/AF_UNIX sockets. They open no engine or
-page. Test-only workers/dispatchers supply no successful native trust, readiness
-or exit evidence. No discovery, case filter or missing-runner success exists.
-Missing/commented exports or inventory drift refuse the gate.
+The normal Build gate executes all six Foundation cases and nine native cases.
+The Foundation worker uses the ordinary candidate's packaged CLI, compiled
+libraries, Darwin process addon and embedded Node with disposable state, kernel
+locks and AF_UNIX sockets. The native worker uses the independently bound,
+immutable ABR-42 signed consumer and separately built private fixtures. Its
+representative cases cover trust, transactional install, binding lifetime,
+cached routes, responder isolation, retirement, startup custody, failure custody
+and independent monitor loss. There are 46 separately recorded native scenarios.
+Case and scenario selection is fixed. Missing sources, results or required
+observations fail the gate.
 
-Normal isolated Build invocation (new private paths outside the checkout):
+Run the normal Build with a fresh isolated registry and bin directory outside
+the checkout.
 
 ```sh
 arbol-builds build arbol-browser --repo /Users/msix/repos/sylvan-stack/arbol-browser \
   --registry-dir /absolute/new-private-run/registry --bin-dir /absolute/new-private-run/bin
 ```
 
-The gate stores `result.json` and private fixture state in
-`<isolated-registry>/arbol-browser/.qualification-<build>/`, outside the payload.
-It verifies actual payload against metadata and records executing runtime,
-source/payload/harness identities and every named pass/failure. An immutable
-predecessor check uses the same complete selection:
+The gate writes `result.json`, a Foundation worker result and private native
+case directories under `<isolated-registry>/arbol-browser/.qualification-<build>/`.
+It validates the ordinary candidate payload and executing Foundation runtime
+against its metadata and current package source. Independently, it binds the
+accepted ABR-42 consumer manifest, frozen source, compiled closure, exact signed
+assembly, case/harness source and compiled fixture evidence. The Foundation
+worker has its own 90-second deadline. Each native launch and external observer
+has its own bounded deadline. Scenarios with a declared observation retry keep
+every attempt, and a witnessed failure ends the scenario.
+
+To repeat the complete gate against the exact ordinary package made from the
+same source and a fresh private output, use:
 
 ```sh
-node scripts/top-gate.mjs --candidate /absolute/immutable/package --out /absolute/new-private-output
+node scripts/top-gate.mjs --candidate /absolute/immutable/package --out /absolute/new-private-output \
+  --native-consumer /Users/msix/Builds/sylvan-stack/arbol-browser/ABR-42-20261115/consumer-manifest.json
 ```
 
-Never invoke this against owner profiles or the normal selected Build registry.
-The top-tier gate is foundation evidence, not full browser qualification. Native
-page admission remains blocked. A tool `working` status in an isolated registry
-means only its documented gate passed; it authorizes no normal installation,
-default selection, native page or complete-close claim. Required unavailable
-evidence is enumerated in the inventory and [MID_TIER.md](MID_TIER.md).
-No test result is stored in Git.
+Keep the run outside owner profiles, the normal registry and the accepted
+consumer's artifact tree. The isolated `working` status covers the documented
+Foundation and pinned-consumer cases. Production host start, complete family
+confinement, clean close, complementary input and full release remain tracked
+in [MID_TIER.md](MID_TIER.md). Evidence stays outside Git.
 
 The deadline case uses the unchanged packaged lifecycle module with testing-only
 acquisition/monotonic-clock seams via Node module hooks. Actual locks/sockets are
@@ -66,5 +76,4 @@ proof. A rejecting failed-attempt authority leaves real guard retention intact
 during observation; fixture teardown after transport shutdown is not verified
 production exit. Strong references/live process exclude garbage collection and
 process death as the cleanup oracle. Ordinary client exchanges demonstrate only
-usable resource transfer, not browser open, page control or stdio MCP. All six
-cases and every helper remain in the complete normal gate/harness digest.
+usable resource transfer, not browser open, page control or stdio MCP. All six Foundation cases and their helpers remain bound in the complete gate.
