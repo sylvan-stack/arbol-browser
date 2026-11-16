@@ -169,14 +169,16 @@ async function observeFrozenTrust(variant, output, onStage) {
 const installPoisonScenarios = new Set(['pre-commit-poison', 'rollback-confirmed', 'rollback-unconfirmed']);
 export const bindingScenarios = Object.freeze(['stale-nonce', 'stale-contents', 'stale-revision', 'detached-view',
   'ambiguous-creation', 'reentrant-creation', 'retired-replacement']);
+export const retirementScenarios = Object.freeze(['success', 'detach-throws', 'destroy-missing', 'native-detach-blocked']);
 export async function launchNativeFixture(fixtures, {
-  mode = 'boundary', callback = fixtures.record.callback?.path, output, variant, poisonScenario, bindingScenario,
+  mode = 'boundary', callback = fixtures.record.callback?.path, output, variant, poisonScenario, bindingScenario, retirementScenario,
 }) {
-  const callbackModes = ['callbacks', 'resolver-control', 'install-poison', 'binding-lifetime', 'cached-routes', 'concurrent-responder'];
+  const callbackModes = ['callbacks', 'resolver-control', 'install-poison', 'binding-lifetime', 'cached-routes', 'concurrent-responder', 'retirement'];
   assert.ok(['boundary', 'frozen-trust', 'provider-mismatch', ...callbackModes].includes(mode));
   assert.ok(callback || !callbackModes.includes(mode));
   assert.equal(mode === 'install-poison', installPoisonScenarios.has(poisonScenario));
   assert.equal(mode === 'binding-lifetime', bindingScenarios.includes(bindingScenario));
+  assert.equal(mode === 'retirement', retirementScenarios.includes(retirementScenario));
   assert.equal(mode === 'frozen-trust', variant?.kind === 'frozen-trust');
   assert.equal(mode === 'provider-mismatch', variant?.kind === 'provider-mismatch');
   const consumer = await verifiedConsumer(); assert.equal(consumer.candidate, fixtures.consumer.candidate);
@@ -197,7 +199,7 @@ export async function launchNativeFixture(fixtures, {
   for (const name of ['app-data', 'session-data']) await mkdir(join(home, name), { mode: 0o700 });
   if (callback) { assert.equal(callback, fixtures.record.callback?.path); assert.equal(hash(await readFile(callback)), fixtures.record.callback.signedDigest); }
   const config = { format: 1, mode, bundle: variant?.candidate ?? fixtures.consumer.candidate, output: directory, home, trustProbe: Boolean(variant),
-    providerMethod: variant?.providerChange?.method, poisonScenario, bindingScenario,
+    providerMethod: variant?.providerChange?.method, poisonScenario, bindingScenario, retirementScenario,
     owner: join(directory, 'owner.lock'), build: join(directory, 'build.lock'), callback };
   const request = join(directory, 'request.json');
   await writeFile(request, JSON.stringify(config) + '\n', { mode: 0o600, flag: 'wx' });

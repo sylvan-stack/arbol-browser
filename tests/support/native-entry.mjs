@@ -3,7 +3,7 @@ import { app, BaseWindow, WebContentsView, webContents } from 'electron';
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
-import { writeFileSync } from 'node:fs';
+import { appendFileSync, writeFileSync } from 'node:fs';
 import { readFile, writeFile, realpath, lstat } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
@@ -15,9 +15,11 @@ const poisonMode = 'install-poison';
 const bindingMode = 'binding-lifetime';
 const cachedRoutesMode = 'cached-routes';
 const concurrentResponderMode = 'concurrent-responder';
+const retirementMode = 'retirement';
 const viewOptions = { webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } };
 const bindingKey = ({ id, nonce, webContentsId, revision }) => ({ id, nonce, webContentsId, revision });
 let eventWrite = Promise.resolve();
+let retirementEffect;
 async function event(stage, values = {}) {
   const value = { stage, elapsedMs: performance.now(), ...values }; events.push(value);
   process.stdout.write(JSON.stringify(value) + '\n');
@@ -474,6 +476,75 @@ async function observeConcurrentResponder(bridge) {
   watchdog.terminate();
 }
 
+async function observeRetirement(bridge, addon) {
+  const scenario = config.retirementScenario;
+  assert.ok(['success', 'detach-throws', 'destroy-missing', 'native-detach-blocked'].includes(scenario));
+  await event('retirement-ready', { scenario });
+  app.setAccessibilitySupportEnabled(true);
+  const window = new BaseWindow({ width: 420, height: 260, show: false });
+  const view = new WebContentsView(viewOptions), contents = view.webContents;
+  const parent = window.contentView, handle = window.getNativeWindowHandle(), { ownership } = boundary.native;
+  const created = ownership.bind(handle, contents.id, () => { parent.addChildView(view); });
+  const user = ownership.mark(bindingKey(created), false);
+  view.setBounds({ x: 0, y: 0, width: 420, height: 260 });
+  await loadFixturePage(view, 'Retirement fixture activation');
+  window.show(); window.focus(); contents.focus();
+  const client = await waitForObservation(() => {
+    try {
+      const candidate = JSON.parse(bridge.capture(handle));
+      if (candidate.button) return candidate;
+      bridge.releaseClients(candidate.token);
+    } catch (error) {
+      if (error.message !== 'fixture_requires_one_actual_widget') throw error;
+    }
+    return undefined;
+  }, Boolean, 'No cached native AX client in retirement fixture');
+  const press = () => JSON.parse(bridge.invoke(client.token, 'press'));
+  const state = () => JSON.parse(bridge.state(client.token));
+  const button = () => contents.executeJavaScript('({button:Number(button.textContent), clicks:[...clicks]})');
+  const baseline = await button(), positive = press();
+  const activated = await waitForObservation(button, value => value.button === baseline.button + 1, 'Native retirement positive click unavailable');
+  window.focus();
+  await waitForObservation(state, value => value.windowKey, 'Retirement window lost key status');
+  const resigned = JSON.parse(bridge.invoke(client.token, 'resignFocus'));
+  const realRemove = parent.removeChildView.bind(parent), realClose = contents.close.bind(contents);
+  let destroyed = 0, admission = true, fixtureAuthority = contents.id;
+  const snapshot = () => ({ attached: parent.children.includes(view), roots: JSON.parse(bridge.windowPages(handle)),
+    destroyed, isDestroyed: contents.isDestroyed(), native: JSON.parse(addon.status()), state: state(), visible: window.isVisible() });
+  const log = (stage, fields = {}) => appendFileSync(join(config.output, 'retirement.jsonl'),
+    JSON.stringify({ stage, scenario, at: performance.now(), ...fields }) + '\n', { mode: 0o600 });
+  contents.on('destroyed', () => { destroyed++; log('destroyed', { isDestroyed: contents.isDestroyed() }); });
+  log('positive', { webContentsId: contents.id, client, created, user, baseline, positive, activated, resigned, snapshot: snapshot() });
+  retirementEffect = name => {
+    if (name === 'admission-closed') admission = false;
+    if (name === 'authority-invalidated') fixtureAuthority = null;
+    if (name === 'pages-hidden') window.hide();
+    log(name, { admission, fixtureAuthority, closed: boundary.fatal.closed, reason: boundary.fatal.reason,
+      watchdogFatal: watchdog.fatal, snapshot: snapshot(), press: press() });
+  };
+  parent.removeChildView = target => {
+    assert.equal(target, view);
+    log('before-remove', { snapshot: snapshot(), press: press() });
+    if (scenario === 'detach-throws') throw new Error('fixture_detach_refused');
+    if (scenario === 'native-detach-blocked') {
+      watchdog.assertArmed(prepared.trust);
+      log('native-block-enter', { durationMs: 5000 });
+      const returned = JSON.parse(bridge.block(5000));
+      log('native-block-return', { returned });
+    }
+    realRemove(target);
+    log('after-remove', { snapshot: snapshot(), press: press() });
+  };
+  contents.close = options => {
+    log('close-called', { options, snapshot: snapshot() });
+    if (scenario === 'destroy-missing') return;
+    realClose(options);
+  };
+  const retired = await boundary.retire(bindingKey(user), parent, view);
+  log('returned', { retired, snapshot: snapshot(), press: press() });
+  watchdog.terminate();
+}
+
 async function observeInstallPoison(bootstrapURL) {
   const features = await import(new URL('../native/features.js', bootstrapURL));
   features.configureNativeFeatures();
@@ -520,7 +591,7 @@ try {
   assert.ok(stat.isFile() && stat.uid === process.getuid() && (stat.mode & 0o7777) === 0o600 && stat.nlink === 1 && stat.size <= 16384);
   config = JSON.parse(await readFile(path, 'utf8'));
   assert.equal(config.format, 1); assert.ok(['boundary', 'callbacks', 'frozen-trust', 'provider-mismatch', resolverMode, poisonMode, bindingMode,
-    cachedRoutesMode, concurrentResponderMode].includes(config.mode));
+    cachedRoutesMode, concurrentResponderMode, retirementMode].includes(config.mode));
   assert.equal(await realpath(config.home), config.home); assert.equal(process.env.HOME, config.home);
   app.setPath('userData', join(config.home, 'app-data')); app.setPath('sessionData', join(config.home, 'session-data'));
   await event('entry', { pid: process.pid, appReady: app.isReady(), argv: process.argv, runtime: process.versions });
@@ -607,10 +678,11 @@ try {
         writeFileSync(join(config.output, 'provider-refusal.json'), JSON.stringify(observation) + '\n',
           { mode: 0o600, flag: 'wx' });
       }
+      retirementEffect?.('admission-closed');
       void event('admission-closed');
     },
-    invalidate() { void event('authority-invalidated'); },
-    hidePages() { void event('pages-hidden'); },
+    invalidate() { retirementEffect?.('authority-invalidated'); void event('authority-invalidated'); },
+    hidePages() { retirementEffect?.('pages-hidden'); void event('pages-hidden'); },
   };
   if (resolver) {
     const { addonPath, addon, bridge, inventory, keys, originals } = resolver;
@@ -640,17 +712,21 @@ try {
   } else boundary = await bootstrap.installNativeBoundary(prepared, watchdog, effects);
   assert.equal(boundary.pageAdmission, false);
   await event('installed', { status: boundary.native.assertIntegrity(), admission: admissionObservation(), appReady: app.isReady() });
-  if ([bindingMode, cachedRoutesMode, concurrentResponderMode].includes(config.mode)) {
+  if ([bindingMode, cachedRoutesMode, concurrentResponderMode, retirementMode].includes(config.mode)) {
     assert.ok(config.callback && await realpath(config.callback) === config.callback);
     const require = createRequire(import.meta.url);
     const bridge = require(config.callback);
-    const run = config.mode === bindingMode
-      ? () => observeBindingLifetime(bridge, require(join(config.bundle, 'Contents/Resources/browser/native/ownership.node')))
-      : config.mode === cachedRoutesMode ? () => observeCachedRoutes(bridge) : () => observeConcurrentResponder(bridge);
+    const loadAddon = () => require(join(config.bundle, 'Contents/Resources/browser/native/ownership.node'));
+    const run = {
+      [bindingMode]: () => observeBindingLifetime(bridge, loadAddon()),
+      [cachedRoutesMode]: () => observeCachedRoutes(bridge),
+      [concurrentResponderMode]: () => observeConcurrentResponder(bridge),
+      [retirementMode]: () => observeRetirement(bridge, loadAddon()),
+    }[config.mode];
     // Electron's entry must resolve before its application-ready event.
     app.whenReady().then(run).catch(async error => {
       const stage = { [bindingMode]: 'binding-unavailable', [cachedRoutesMode]: 'cached-route-unavailable',
-        [concurrentResponderMode]: 'concurrent-responder-unavailable' }[config.mode];
+        [concurrentResponderMode]: 'concurrent-responder-unavailable', [retirementMode]: 'retirement-unavailable' }[config.mode];
       await event(stage, { error: String(error.stack ?? error) });
       watchdog.terminate();
     });
