@@ -85,8 +85,12 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
   const snapshot = (): Event => {
     host.assertHealthy(); authority.assertReady();
     if (disposed || revision >= Number.MAX_SAFE_INTEGER) return authority.exhausted();
+    const selected = tabs.selected(host);
+    const targets = tabs.all().filter(target => target.page.window === host);
+    // Send real selection first without adding contract fields; retain visual order in the renderer.
+    const ordered = selected && targets.includes(selected) ? [selected, ...targets.filter(target => target !== selected)] : targets;
     const value: Event = { ui: 1, event: 'state', revision: ++revision,
-      tabs: tabs.all().filter(target => target.page.window === host).map(target => structuredClone(tabs.state(target))),
+      tabs: ordered.map(target => structuredClone(tabs.state(target))),
       attachments: authority.attachments().map(entry => ({ id: entry.id, label: entry.label })) };
     if (!eventShape(value)) throw unavailable('browser');
     return value;

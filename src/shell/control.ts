@@ -11,24 +11,32 @@ const api = window.browserShell;
 const element = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const button = (id: string) => element<HTMLButtonElement>(id);
 const address = element<HTMLInputElement>('address'), client = element<HTMLSelectElement>('client');
-let state: State | undefined, selected = '', synchronized = false, pending = 0, syncing = false, recoveryTab = '';
+let state: State | undefined, selected = '', synchronized = false, pending = 0, recoveryTab = '';
+let syncTask: Promise<void> | undefined, newestRevision = 0, selecting = false;
+let tabOrder: string[] = [], focusKey = '';
 const requests = new Set<string>();
 const current = () => state?.tabs.find(tab => tab.tab === selected);
 const problem = (text: string) => { element('problem').textContent = text; };
 function accept(value: State, snapshot = false) {
   if (!value || value.ui !== 1 || value.event !== 'state' || !Number.isSafeInteger(value.revision) || value.revision < 1 ||
       !Array.isArray(value.tabs) || !Array.isArray(value.attachments)) { synchronized = false; render(); return; }
-  if (state && value.revision <= state.revision) { if (snapshot && value.revision === state.revision) synchronized = true; render(); return; }
+  newestRevision = Math.max(newestRevision, value.revision);
+  if (state && value.revision <= state.revision) { if (snapshot && value.revision === state.revision) synchronized = state.revision >= newestRevision; render(); return; }
   if (!snapshot && state && value.revision !== state.revision + 1) { synchronized = false; render(); void resync(); return; }
-  state = value; synchronized = true;
-  if (!value.tabs.some(tab => tab.tab === selected)) selected = value.tabs[0]?.tab ?? '';
+  state = value; synchronized = value.revision >= newestRevision;
+  selected = value.tabs[0]?.tab ?? ''; // authoritative versioned native selection, never a reply
+  const ids = value.tabs.map(tab => tab.tab);
+  tabOrder = [...tabOrder.filter(id => ids.includes(id)), ...ids.filter(id => !tabOrder.includes(id))];
   render();
 }
-async function resync() {
-  if (syncing) return; syncing = true;
-  try { accept(await api.resync(), true); }
-  catch { synchronized = false; problem('Browser state is unavailable. Close and reopen this window.'); render(); }
-  finally { syncing = false; }
+async function resync(force = false): Promise<void> {
+  if (syncTask) { await syncTask; if (!force) return; return resync(true); }
+  const task = (async () => {
+    try { do { accept(await api.resync(), true); } while (state && state.revision < newestRevision); }
+    catch { synchronized = false; problem('Browser state is unavailable. Close and reopen this window.'); render(); }
+  })();
+  syncTask = task;
+  try { await task; } finally { if (syncTask === task) syncTask = undefined; }
 }
 function requestId() {
   return `req_${btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16)))).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '')}`;
@@ -36,28 +44,30 @@ function requestId() {
 async function send(method: Request['method'], extra: Record<string, unknown> = {}) {
   const priority = ['take', 'close_tab', 'close_window'].includes(method);
   const key = `${selected}:${method}`;
-  if (!synchronized || requests.has(key) || (pending > 0 && !priority)) return;
+  if ((method !== 'close_window' && (!synchronized || selecting)) || requests.has(key) || (pending > 0 && !priority)) return;
   const tab = current();
   const params = ['new_tab', 'close_window'].includes(method) ? extra : method === 'select' ? extra :
     { tab: tab?.tab, controlGeneration: tab?.generation, ...extra };
+  const foreground = ['select', 'new_tab', 'close_tab'].includes(method);
+  if (foreground) selecting = true;
   pending++; requests.add(key); problem(''); render();
   try {
     const reply = await api.request({ ui: 1, id: requestId(), method, params } as Request);
     if (!reply.ok) problem(`${reply.error.message} ${reply.error.remedy ?? ''}`);
-    else if (reply.state && ['select', 'new_tab'].includes(method)) selected = reply.state.tab;
-    await resync();
+    await resync(true); // a request begun before this transition cannot acknowledge its selection
   } catch { problem('The request did not complete. Read current state before trying again.'); synchronized = false; }
-  finally { pending--; requests.delete(key); render(); }
+  finally { pending--; if (foreground) selecting = false; requests.delete(key); render(); }
 }
 function render() {
   const tab = current(), user = tab?.controller.kind === 'user', idle = tab?.handoff === 'idle';
-  const enabled = synchronized, idleRequest = enabled && pending === 0;
+  const enabled = synchronized && !selecting, idleRequest = enabled && pending === 0;
   const focus = document.activeElement as HTMLElement | null;
-  const key = focus?.dataset.key;
-  element('tabs').replaceChildren(...(state?.tabs ?? []).map((entry, index) => {
+  if (focus && focus !== document.body) focusKey = focus.dataset.key ?? '';
+  element('tabs').replaceChildren(...tabOrder.flatMap((id, index) => {
+    const entry = state?.tabs.find(tab => tab.tab === id); if (!entry) return [];
     const node = document.createElement('button'); node.type = 'button'; node.textContent = `Tab ${index + 1}`;
     node.dataset.key = entry.tab; node.setAttribute('aria-current', entry.tab === selected ? 'page' : 'false');
-    node.disabled = !idleRequest; node.onclick = () => { recoveryTab = ''; void send('select', { tab: entry.tab }); }; return node;
+    node.disabled = !idleRequest; node.onclick = () => { recoveryTab = ''; void send('select', { tab: entry.tab }); }; return [node];
   }));
   const chosen = client.value;
   client.replaceChildren(...(state?.attachments ?? []).map(entry => {
@@ -66,9 +76,9 @@ function render() {
   if (state?.attachments.some(entry => entry.id === chosen)) client.value = chosen;
   client.disabled = !idleRequest || !state?.attachments.length;
   const owner = !tab ? 'No open tabs' : tab.controller.kind === 'user' ? 'You control this tab · Private' : `${tab.controller.label} controls this tab`;
-  element('state').textContent = `${owner}${tab ? ` · ${tab.pageAvailability} · ${tab.handoff === 'taking' ? 'Taking control…' : tab.inputReady ? 'Input ready' : 'Input unavailable'}` : ''}${!synchronized ? ' · State unavailable' : ''}`;
+  element('state').textContent = `${owner}${tab ? ` · ${tab.pageAvailability} · ${tab.handoff === 'taking' ? 'Taking control…' : tab.inputReady ? 'Input ready' : 'Input unavailable'}` : ''}${selecting ? ' · Selecting tab…' : ''}${!synchronized ? ' · State unavailable' : ''}`;
   button('new').disabled = !idleRequest;
-  button('close-window').disabled = !enabled;
+  button('close-window').disabled = false; // contains no tab identity/generation and stays independently authenticated
   for (const id of ['go', 'back', 'forward', 'reload']) button(id).disabled = !idleRequest || !user || !idle;
   address.disabled = !idleRequest || !user || !idle;
   button('close-tab').disabled = !enabled || !tab;
@@ -83,7 +93,7 @@ function render() {
     node.textContent = `Stop sharing with ${state?.attachments.find(entry => entry.id === id)?.label ?? 'disconnected agent'}`;
     node.disabled = !idleRequest; node.onclick = () => { void send('stop_sharing', { client: id }); }; return node;
   }));
-  if (key) [...document.querySelectorAll<HTMLElement>('[data-key]')].find(node => node.dataset.key === key)?.focus();
+  if (focusKey) [...document.querySelectorAll<HTMLElement>('[data-key]')].find(node => node.dataset.key === focusKey)?.focus();
 }
 button('new').onclick = () => { void send('new_tab'); };
 button('close-window').onclick = () => { void send('close_window'); };

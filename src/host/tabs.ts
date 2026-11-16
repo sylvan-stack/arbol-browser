@@ -117,6 +117,8 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
       handoff: 'idle', inputReady: false, observationSuspended: !creator, pageAvailability: 'unavailable' };
     tabs.set(target.id, target);
     try {
+      // First/foreground presentation precedes register, which may publish synchronously.
+      if (!background && (!creator || !selection.has(window))) { selection.set(window, target); window.select(target.page); }
       lifecycle.register(target, initial);
       if (budget) actions.set(target, { generation: 1, budget });
       target.page.view.webContents.setWindowOpenHandler(details => {
@@ -134,7 +136,6 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
       await lifecycle.prepare(target, url);
       assertTarget(target);
       if (creator && (!lifecycle.connected(creator.id) || state(target).controller.kind !== 'agent')) throw refused('control_changed');
-      if (!background && (!creator || !selection.has(window))) { selection.set(window, target); window.select(target.page); }
       lifecycle.changed(); return target;
     } catch (error) {
       // No failed open may retain an unreported lease. Retirement failures remain profile-fatal.
