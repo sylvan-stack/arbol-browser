@@ -224,10 +224,14 @@ export class TabAuthority {
     entry.generation = this.increment(entry.generation); entry.controller = { kind: 'user' };
     entry.ready = false; entry.handoff = 'taking'; this.invalidate(target);
   }
-  finishTake(target: TabTarget, ready: boolean, retired: boolean): void {
+  finishTake(target: TabTarget, ready: boolean, retired: boolean, receipt?: DocumentReceipt): void {
     const entry = this.entry(target);
     if (entry.closed || entry.controller.kind !== 'user' || entry.handoff !== 'taking') return this.exhausted();
     entry.retired = retired; entry.ready = ready && !retired; entry.handoff = 'idle';
+    if (ready && !retired) {
+      if (!receipt || receipt.page !== target.page || !receipt.ready || receipt.availability !== 'ready') return this.exhausted();
+      entry.document = receipt; entry.availability = 'ready';
+    }
     if (retired) { entry.availability = 'unavailable'; delete entry.document; }
   }
   publishReturn(target: TabTarget, recipient: string, expected: number, document: DocumentReceipt): void {

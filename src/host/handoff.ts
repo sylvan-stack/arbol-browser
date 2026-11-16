@@ -160,7 +160,7 @@ export class HandoffController {
       if (this.operations.unsafe(target) || page.retirement()) return this.authority.exhausted();
       this.mark(target, false);
       if (this.authority.wasClosed(target)) return this.superseded(target);
-      this.authority.finishTake(target, true, false);
+      this.authority.finishTake(target, true, false, readyDocument);
     } else {
       const known = this.operations.outcome(target);
       if (known) settledAction = { ...known };
