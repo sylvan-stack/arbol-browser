@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 const events = [];
 let config, boundary, prepared, watchdog, bootstrap, preparationBefore;
+const resolverMode = 'resolver-control';
 let eventWrite = Promise.resolve();
 async function event(stage, values = {}) {
   const value = { stage, elapsedMs: performance.now(), ...values }; events.push(value);
@@ -40,7 +41,7 @@ try {
   const stat = await lstat(path);
   assert.ok(stat.isFile() && stat.uid === process.getuid() && (stat.mode & 0o7777) === 0o600 && stat.nlink === 1 && stat.size <= 16384);
   config = JSON.parse(await readFile(path, 'utf8'));
-  assert.equal(config.format, 1); assert.ok(['boundary', 'callbacks', 'frozen-trust', 'provider-mismatch'].includes(config.mode));
+  assert.equal(config.format, 1); assert.ok(['boundary', 'callbacks', 'frozen-trust', 'provider-mismatch', resolverMode].includes(config.mode));
   assert.equal(await realpath(config.home), config.home); assert.equal(process.env.HOME, config.home);
   app.setPath('userData', join(config.home, 'app-data')); app.setPath('sessionData', join(config.home, 'session-data'));
   await event('entry', { pid: process.pid, appReady: app.isReady(), argv: process.argv, runtime: process.versions });
@@ -91,7 +92,29 @@ try {
   await event('locks', { owner: owner.assertIdentity(), build: build.assertIdentity() });
   watchdog = await prepared.arm(owner, build); watchdog.assertArmed(prepared.trust);
   await event('armed', { descriptors: watchdog.custody.descriptors, startupDescriptor: watchdog.custody.startupDescriptor, appReady: app.isReady() });
-  boundary = await bootstrap.installNativeBoundary(prepared, watchdog, {
+  let resolver;
+  if (config.mode === resolverMode) {
+    assert.ok(config.callback && await realpath(config.callback) === config.callback);
+    const require = createRequire(import.meta.url);
+    const addonPath = join(config.bundle, 'Contents/Resources/browser/native/ownership.node');
+    const addon = require(addonPath), bridge = require(config.callback);
+    const inventory = JSON.parse(addon.getABI());
+    assert.deepEqual(inventory, prepared.trust.manifest.nativeABI);
+    const keys = Object.keys(inventory.methods);
+    const dispatch = JSON.parse(bridge.resolverDispatch());
+    const originals = JSON.parse(bridge.auditMethods(keys));
+    for (const [key, expected] of Object.entries(inventory.methods)) {
+      const entry = originals[key];
+      if (expected === '<absent>') assert.equal(entry, expected);
+      else {
+        assert.equal(entry.encoding, expected.encoding);
+        assert.equal(entry.image.split('/').at(-1), expected.provider);
+      }
+    }
+    await event('resolver-dispatch', { dispatch, admission: admissionObservation() });
+    resolver = { addonPath, addon, bridge, inventory, keys, originals };
+  }
+  const effects = {
     closeAdmission() {
       if (config.mode === 'provider-mismatch') {
         const addonPath = join(config.bundle, 'Contents/Resources/browser/native/ownership.node');
@@ -108,13 +131,40 @@ try {
     },
     invalidate() { void event('authority-invalidated'); },
     hidePages() { void event('pages-hidden'); },
-  });
+  };
+  if (resolver) {
+    const { addonPath, addon, bridge, inventory, keys, originals } = resolver;
+    let control, afterGetABI, afterInstall;
+    try {
+      assert.equal(JSON.parse(bridge.startResolverControl(addonPath)).active, true);
+      control = true;
+      assert.deepEqual(JSON.parse(addon.getABI()), inventory);
+      assert.deepEqual(JSON.parse(bridge.auditMethods(keys)), originals);
+      afterGetABI = JSON.parse(bridge.resolverControlObservation());
+      assert.ok(afterGetABI.appKit > 0 && afterGetABI.electron > 0, 'No matching synchronous provider callback');
+      boundary = await bootstrap.installNativeBoundary(prepared, watchdog, effects);
+    } finally {
+      if (control) afterInstall = JSON.parse(bridge.stopResolverControl());
+    }
+    assert.ok(afterInstall.appKit > afterGetABI.appKit && afterInstall.electron > afterGetABI.electron);
+    const installed = JSON.parse(bridge.auditMethods(keys));
+    for (const [key, original] of Object.entries(originals)) {
+      if (original === '<absent>') assert.equal(installed[key], original);
+      else {
+        assert.equal(installed[key].encoding, original.encoding);
+        assert.equal(installed[key].image, addonPath);
+        assert.notEqual(installed[key].implementation, original.implementation);
+      }
+    }
+    await event('resolver-control', { afterGetABI, afterInstall, originals, installed });
+  } else boundary = await bootstrap.installNativeBoundary(prepared, watchdog, effects);
   assert.equal(boundary.pageAdmission, false);
   await event('installed', { status: boundary.native.assertIntegrity(), admission: admissionObservation(), appReady: app.isReady() });
   if (config.mode === 'callbacks') {
     assert.ok(config.callback && await realpath(config.callback) === config.callback);
     const bridge = createRequire(import.meta.url)(config.callback);
-    assert.deepEqual(Object.getOwnPropertyNames(bridge).sort(), ['block', 'capture', 'descriptor', 'invoke', 'releaseClients', 'state']);
+    assert.deepEqual(Object.getOwnPropertyNames(bridge).sort(), ['auditMethods', 'block', 'capture', 'descriptor', 'invoke',
+      'releaseClients', 'resolverControlObservation', 'resolverDispatch', 'startResolverControl', 'state', 'stopResolverControl']);
     await event('callback-loaded', { path: config.callback,
       capsule: JSON.parse(bridge.descriptor(watchdog.custody.startupDescriptor)),
       owner: JSON.parse(bridge.descriptor(watchdog.custody.descriptors[0])),

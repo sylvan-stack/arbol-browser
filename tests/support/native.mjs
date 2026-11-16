@@ -167,7 +167,8 @@ async function observeFrozenTrust(variant, output, onStage) {
   return { before: hash(original), altered, restored: hash(await readFile(resourcePath)) };
 }
 export async function launchNativeFixture(fixtures, { mode = 'boundary', callback = fixtures.record.callback?.path, output, variant = undefined }) {
-  assert.ok(['boundary', 'callbacks', 'frozen-trust', 'provider-mismatch'].includes(mode)); assert.ok(mode !== 'callbacks' || callback);
+  assert.ok(['boundary', 'callbacks', 'frozen-trust', 'provider-mismatch', 'resolver-control'].includes(mode));
+  assert.ok(callback || !['callbacks', 'resolver-control'].includes(mode));
   assert.equal(mode === 'frozen-trust', variant?.kind === 'frozen-trust');
   assert.equal(mode === 'provider-mismatch', variant?.kind === 'provider-mismatch');
   const consumer = await verifiedConsumer(); assert.equal(consumer.candidate, fixtures.consumer.candidate);

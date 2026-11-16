@@ -1,12 +1,15 @@
 // Testing-only callback bridge, independently compiled/signed outside the app.
-// It neither links production boundary code nor installs/replaces any method.
+// The pass-through control observes one Foundation resolver in its own process.
 #import <Cocoa/Cocoa.h>
 #import <objc/message.h>
 #include <node_api.h>
+#include <dlfcn.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <atomic>
 #include <cstring>
+#include <pthread.h>
 #include <set>
 @interface QualificationRoutes : NSObject
 @property(nonatomic,weak) NSView* root;
@@ -124,11 +127,144 @@ static napi_value block(napi_env env,napi_callback_info info) {
   napi_value value;int32_t ms=0;if(!args(env,info,1,&value)||napi_get_value_int32(env,value,&ms)!=napi_ok||ms<1||ms>8000) return fail(env,"fixture_block_bound");
   [NSThread sleepForTimeInterval:(double)ms/1000.0];return reply(env,@{@"returnedAfterMs":@(ms)});
 }
+static NSString* imagePath(IMP implementation) {
+  Dl_info image{};
+  return implementation && dladdr((void*)implementation,&image) && image.dli_fname ? @(image.dli_fname) : nil;
+}
+static Method declaredResolver() {
+  Method declared=nullptr;
+  unsigned count=0;
+  Method* methods=class_copyMethodList(NSString.class,&count);
+  for(unsigned index=0;index<count;++index) {
+    if(method_getName(methods[index])==@selector(stringByResolvingSymlinksInPath)) { declared=methods[index];break; }
+  }
+  free(methods);
+  return declared;
+}
+static NSDictionary* resolverReceivers(Method declared) {
+  SEL resolver=method_getName(declared);
+  IMP original=method_getImplementation(declared);
+  NSMutableDictionary* observations=[NSMutableDictionary new];
+  for(NSString* name in @[@"NSWindow",@"BrowserAccessibilityCocoa"]) {
+    Class cls=objc_getClass(name.UTF8String);
+    SEL selector=[name isEqualToString:@"NSWindow"] ? @selector(makeFirstResponder:) : @selector(accessibilityPerformPress);
+    Method method=cls ? class_getInstanceMethod(cls,selector) : nullptr;
+    NSString* path=method ? imagePath(method_getImplementation(method)) : nil;
+    if(!path) return nil;
+    Class concrete=object_getClass(path);
+    Method resolved=class_getInstanceMethod(concrete,resolver);
+    IMP implementation=resolved ? method_getImplementation(resolved) : nullptr;
+    observations[name]=@{ @"providerPath":path,@"receiverClass":NSStringFromClass(concrete),
+      @"sameMethod":@(resolved==declared),@"sameImplementation":@(implementation==original),
+      @"resolverImage":imagePath(implementation) ?: @"<unknown>" };
+  }
+  return observations;
+}
+static napi_value resolverDispatch(napi_env env,napi_callback_info info) {
+  if(!args(env,info,0,nullptr)) return nullptr;
+  Method declared=declaredResolver();
+  if(!declared) return fail(env,"fixture_resolver_not_declared");
+  IMP original=method_getImplementation(declared);
+  NSDictionary* observations=resolverReceivers(declared);
+  if(!observations) return fail(env,"fixture_provider_image_unavailable");
+  return reply(env,@{ @"declaredEncoding":@(method_getTypeEncoding(declared)),@"declaredImage":imagePath(original) ?: @"<unknown>",
+    @"receivers":observations });
+}
+static napi_value auditMethods(napi_env env,napi_callback_info info) {
+  napi_value argument;
+  if(!args(env,info,1,&argument)) return nullptr;
+  uint32_t count=0;
+  if(napi_get_array_length(env,argument,&count)!=napi_ok||!count||count>256) return fail(env,"fixture_inventory_bound");
+  NSMutableDictionary* result=[NSMutableDictionary new];
+  for(uint32_t index=0;index<count;++index) {
+    napi_value value;
+    if(napi_get_element(env,argument,index,&value)!=napi_ok) return fail(env,"fixture_inventory_key");
+    NSString* key=string(env,value);
+    NSArray<NSString*>* parts=[key componentsSeparatedByString:@"#"];
+    if(parts.count!=2||!parts[0].length||!parts[1].length||result[key]) return fail(env,"fixture_inventory_key");
+    Class cls=objc_getClass(parts[0].UTF8String);
+    Method method=cls ? class_getInstanceMethod(cls,sel_registerName(parts[1].UTF8String)) : nullptr;
+    if(!method) { result[key]=@"<absent>";continue; }
+    IMP implementation=method_getImplementation(method);
+    result[key]=@{ @"implementation":[NSString stringWithFormat:@"%p",(void*)implementation],
+      @"encoding":@(method_getTypeEncoding(method)),@"image":imagePath(implementation) ?: @"<unknown>" };
+  }
+  return reply(env,result);
+}
+static std::atomic<IMP> resolverOriginal{nullptr};
+static Method controlledResolver;
+static char ownershipImage[PATH_MAX], providerPaths[2][PATH_MAX];
+static unsigned resolverCalls[2];
+static bool resolverActive;
+static thread_local bool resolving;
+static id observeResolver(id receiver, SEL selector) {
+  auto original=reinterpret_cast<id(*)(id,SEL)>(resolverOriginal.load(std::memory_order_acquire));
+  if(!pthread_main_np()||!resolverActive||resolving) return original(receiver,selector);
+  resolving=true;
+  @try {
+    Dl_info caller{};
+    char receiverPath[PATH_MAX];
+    if(dladdr(__builtin_return_address(0),&caller)&&caller.dli_fname&&!strcmp(caller.dli_fname,ownershipImage)&&
+        CFStringGetCString((__bridge CFStringRef)receiver,receiverPath,sizeof(receiverPath),kCFStringEncodingUTF8)) {
+      for(unsigned index=0;index<2;++index) if(!strcmp(receiverPath,providerPaths[index])) ++resolverCalls[index];
+    }
+    return original(receiver,selector);
+  } @finally { resolving=false; }
+}
+static napi_value startResolverControl(napi_env env,napi_callback_info info) {
+  napi_value argument;
+  if(!args(env,info,1,&argument)) return nullptr;
+  size_t length=0;
+  if(resolverOriginal.load()||napi_get_value_string_utf8(env,argument,ownershipImage,sizeof(ownershipImage),&length)!=napi_ok||
+      !length||length>=sizeof(ownershipImage)-1||ownershipImage[0]!='/') return fail(env,"fixture_resolver_context");
+  Method declared=declaredResolver();
+  if(!declared||strcmp(method_getTypeEncoding(declared),"@16@0:8")) return fail(env,"fixture_resolver_abi");
+  IMP original=method_getImplementation(declared);
+  if(![imagePath(original) isEqualToString:@"/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation"])
+    return fail(env,"fixture_resolver_provider");
+  NSDictionary* observations=resolverReceivers(declared);
+  if(!observations) return fail(env,"fixture_resolver_provider_paths");
+  unsigned index=0;
+  for(NSString* name in @[@"NSWindow",@"BrowserAccessibilityCocoa"]) {
+    NSDictionary* row=observations[name];
+    NSString* path=row[@"providerPath"];
+    if(![row[@"sameMethod"] boolValue]||![row[@"sameImplementation"] boolValue]||
+        ![path getCString:providerPaths[index] maxLength:sizeof(providerPaths[index]) encoding:NSUTF8StringEncoding])
+      return fail(env,"fixture_resolver_dispatch_unavailable");
+    ++index;
+  }
+  controlledResolver=declared;
+  resolverOriginal.store(original,std::memory_order_release);
+  resolverActive=true;
+  IMP control=(IMP)&observeResolver;
+  if(method_setImplementation(declared,control)!=original||method_getImplementation(declared)!=control)
+    return fail(env,"fixture_resolver_control_unconfirmed");
+  return reply(env,@{ @"active":@YES });
+}
+static napi_value resolverControlObservation(napi_env env,napi_callback_info info) {
+  if(!args(env,info,0,nullptr)) return nullptr;
+  return reply(env,@{ @"appKit":@(resolverCalls[0]),@"electron":@(resolverCalls[1]) });
+}
+static napi_value stopResolverControl(napi_env env,napi_callback_info info) {
+  if(!args(env,info,0,nullptr)) return nullptr;
+  IMP control=(IMP)&observeResolver;
+  if(!resolverActive||method_getImplementation(controlledResolver)!=control) return fail(env,"fixture_resolver_control_unconfirmed");
+  resolverActive=false;
+  IMP original=resolverOriginal.load();
+  if(method_setImplementation(controlledResolver,original)!=control||method_getImplementation(controlledResolver)!=original)
+    return fail(env,"fixture_resolver_restore_unconfirmed");
+  return resolverControlObservation(env,info);
+}
 NAPI_MODULE_INIT() {
   if(![NSThread isMainThread]) return fail(env,"fixture_main_thread_only");
   napi_property_descriptor exportsList[]={
     {"capture",nullptr,capture,nullptr,nullptr,nullptr,napi_default,nullptr},{"state",nullptr,state,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"invoke",nullptr,invoke,nullptr,nullptr,nullptr,napi_default,nullptr},{"descriptor",nullptr,descriptor,nullptr,nullptr,nullptr,napi_default,nullptr},
-    {"block",nullptr,block,nullptr,nullptr,nullptr,napi_default,nullptr},{"releaseClients",nullptr,releaseClients,nullptr,nullptr,nullptr,napi_default,nullptr}};
+    {"block",nullptr,block,nullptr,nullptr,nullptr,napi_default,nullptr},{"releaseClients",nullptr,releaseClients,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"resolverDispatch",nullptr,resolverDispatch,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"auditMethods",nullptr,auditMethods,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"startResolverControl",nullptr,startResolverControl,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"resolverControlObservation",nullptr,resolverControlObservation,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"stopResolverControl",nullptr,stopResolverControl,nullptr,nullptr,nullptr,napi_default,nullptr}};
   if(napi_define_properties(env,exports,sizeof(exportsList)/sizeof(exportsList[0]),exportsList)!=napi_ok) return nullptr;return exports;
 }
