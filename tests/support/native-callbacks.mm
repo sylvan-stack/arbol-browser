@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <time.h>
 #include <atomic>
 #include <cstring>
 #include <pthread.h>
@@ -267,6 +268,10 @@ static napi_value descriptor(napi_env env,napi_callback_info info) {
 static napi_value block(napi_env env,napi_callback_info info) {
   napi_value value;int32_t ms=0;if(!args(env,info,1,&value)||napi_get_value_int32(env,value,&ms)!=napi_ok||ms<1||ms>8000) return fail(env,"fixture_block_bound");
   [NSThread sleepForTimeInterval:(double)ms/1000.0];return reply(env,@{@"returnedAfterMs":@(ms)});
+}
+static napi_value monotonicNanos(napi_env env,napi_callback_info info) {
+  if(!args(env,info,0,nullptr)) return nullptr;
+  return reply(env,@{@"nanos":[NSString stringWithFormat:@"%llu",clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)]});
 }
 static NSString* imagePath(IMP implementation) {
   Dl_info image{};
@@ -548,6 +553,7 @@ NAPI_MODULE_INIT() {
     {"capture",nullptr,capture,nullptr,nullptr,nullptr,napi_default,nullptr},{"state",nullptr,state,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"invoke",nullptr,invoke,nullptr,nullptr,nullptr,napi_default,nullptr},{"descriptor",nullptr,descriptor,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"block",nullptr,block,nullptr,nullptr,nullptr,napi_default,nullptr},{"releaseClients",nullptr,releaseClients,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"monotonicNanos",nullptr,monotonicNanos,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"resolverDispatch",nullptr,resolverDispatch,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"auditMethods",nullptr,auditMethods,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"startResolverControl",nullptr,startResolverControl,nullptr,nullptr,nullptr,napi_default,nullptr},

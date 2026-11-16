@@ -337,6 +337,62 @@ static NSDictionary* custody(const char* input) {
   return @{@"format":@1,@"expected":request,@"locks":locks,@"heldThroughNanos":heldThrough,@"order":order,
     @"limit":@"ordered observations only; individual kernel reads and census are not atomic; unseen family members remain unavailable"};
 }
+static NSDictionary* observeFailure(const char* input) {
+  auto readSample=[&]() { return custody(input); };
+  NSDictionary* baseline=readSample();
+  if(!baseline[@"order"]) return @{@"unavailable":@"initial-lock-sample",@"baseline":baseline?:@{}};
+  NSArray* expected=baseline[@"expected"][@"processes"];
+  auto identityState=[](NSDictionary* sample) {
+    NSMutableArray* state=[NSMutableArray new];
+    for(NSDictionary* row in sample[@"order"]) {
+      for(NSDictionary* member in row[@"processes"])
+        [state addObject:[member[@"identityMatches"] boolValue]?@"same":member[@"current"][@"status"]];
+    }
+    for(NSString* name in @[@"owner",@"build"]) [state addObject:sample[@"locks"][name][@"acquired"]?:NSNull.null];
+    return state;
+  };
+  NSDictionary* initial=[baseline[@"order"] lastObject];
+  for(NSDictionary* row in initial[@"processes"]) if(![row[@"identityMatches"] boolValue])
+    return @{@"unavailable":@"original-not-alive-before-fault",@"baseline":baseline};
+  if(fputs("{\"stage\":\"watch-ready\"}\n",stdout)==EOF||fflush(stdout)) return nil;
+  uint64_t deadline=clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)+8000000000ULL;
+  NSMutableArray* observations=[NSMutableArray arrayWithObject:baseline];
+  NSArray* previous=identityState(baseline);
+  NSMutableArray* unexpected=[NSMutableArray new];
+  NSMutableSet* seen=[NSMutableSet new];
+  bool retiring=false;
+  while(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)<deadline) {
+    @autoreleasepool {
+      NSDictionary* sample=readSample();
+      if(!sample[@"order"]) return @{@"unavailable":@"lock-sample",@"observations":observations,@"last":sample?:@{}};
+      NSArray* state=identityState(sample);
+      if(![previous isEqual:state]) {
+        if(observations.count>=128) return @{@"unavailable":@"observation-bound",@"observations":observations};
+        [observations addObject:sample]; previous=state;
+      }
+      bool gone=true;
+      for(NSDictionary* row in sample[@"order"]) {
+        if([row[@"stage"] isEqual:@"before-close"]) {
+          for(NSDictionary* member in row[@"processes"]) {
+            if(![member[@"current"][@"status"] isEqual:@"gone"]) gone=false;
+            if(![member[@"identityMatches"] boolValue]) retiring=true;
+          }
+        }
+        for(NSDictionary* member in row[@"census"][@"members"]) {
+          if(![member[@"status"] isEqual:@"alive"]) continue;
+          bool known=false;
+          for(NSDictionary* original in expected) if(originalMatches(original,member)) { known=true; break; }
+          NSString* key=member[@"startId"];
+          if(!known&&![seen containsObject:key]) { [seen addObject:key]; [unexpected addObject:member]; }
+        }
+      }
+      if(gone&&[sample[@"locks"][@"owner"][@"acquired"] boolValue]&&[sample[@"locks"][@"build"][@"acquired"] boolValue])
+        return @{@"observations":observations,@"unexpected":unexpected,@"complete":@YES};
+    }
+    if(!retiring) usleep(250);
+  }
+  return @{@"unavailable":@"retirement-observation-deadline",@"observations":observations,@"unexpected":unexpected};
+}
 static bool positive(const char* text,int& value) { char* end=nullptr; errno=0; long n=strtol(text,&end,10); if(errno||!end||*end||n<2||n>INT_MAX) return false; value=(int)n; return true; }
 int main(int argc,const char* argv[]) {
   @autoreleasepool {
@@ -344,6 +400,7 @@ int main(int argc,const char* argv[]) {
     if(!strcmp(argv[1],"process")&&positive(argv[2],value)) result=process(value);
     else if(!strcmp(argv[1],"startup-slots")&&positive(argv[2],value)) result=startupSlots(value);
     else if(!strcmp(argv[1],"startup-births")) result=observeBirths(argv[2]);
+    else if(!strcmp(argv[1],"failure-custody")) result=observeFailure(argv[2]);
     else if(!strcmp(argv[1],"group")&&positive(argv[2],value)) {
       result=group(value);if(!result)return 70;
     } else if(!strcmp(argv[1],"custody")) {

@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { launchNativeFixture, nativeConsumer, prepareNativeFixtures, retirementScenarios, startupScenarios } from '../support/native.mjs';
+import { failureScenarios, launchNativeFixture, nativeConsumer, prepareNativeFixtures, retirementScenarios, startupScenarios } from '../support/native.mjs';
 
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const jsonLines = text => text.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
@@ -388,6 +388,152 @@ export async function nativeStartupCustodyBoundary({ output }) {
         }
         entry.status = 'observed';
       } catch (error) { failure ??= error; entry.error = String(error.stack ?? error); }
+    }
+    if (!failure) result.status = 'passed';
+  } catch (error) { failure = error; result.error = String(error.stack ?? error); }
+  assert.equal(digest(await readFile(bodyPath)), sourceBodyDigest);
+  await writeFile(join(destination, 'case-result.json'), JSON.stringify(result, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+  if (failure) throw failure;
+  return result;
+}
+
+function assertFailureCustody(launch, fault) {
+  const trace = launch.failureCustody;
+  assert.ok(trace?.complete, trace?.unavailable ?? 'No complete independent custody observation');
+  assert.deepEqual(trace.unexpected, [], 'A process joined the original group after the initial census');
+  const identity = trace.observations[0].expected.processes;
+  const monitors = identity.filter(member => member.executable.endsWith('/native/watchdog'));
+  const main = identity.find(member => member.pid === launch.pid);
+  const engines = identity.filter(member => member !== main && !monitors.includes(member));
+  assert.ok(main);
+  assert.equal(monitors.length, 2);
+  assert.ok(engines.some(member => member.pid === fault.renderer));
+  const rows = (sample, stage) => sample.order.find(item => item.stage === stage).processes;
+  const gone = (rows, target) => rows.some(row => row.original.pid === target.pid && row.current.status === 'gone');
+  let teardownBeforeFinalHolder = false;
+  let mainGone;
+  for (const sample of trace.observations) {
+    const finalRows = rows(sample, 'before-close');
+    if (!mainGone && gone(finalRows, main)) mainGone = BigInt(sample.order.find(item => item.stage === 'before-close').nanos);
+    const bracketed = ['owner', 'build'].map(lock => {
+      const before = rows(sample, `before-${lock}`), after = rows(sample, `after-${lock}`);
+      const shared = before.filter(row => row.identityMatches && after.some(other => other.identityMatches && other.original.pid === row.original.pid));
+      if (shared.length) assert.equal(sample.locks[lock].acquired, false, `Original surviving across ${lock} acquisition`);
+      return { before, shared, acquired: sample.locks[lock].acquired };
+    });
+    if (bracketed.every(bracket => !bracket.acquired && engines.every(engine => gone(bracket.before, engine)) &&
+       monitors.some(monitor => gone(bracket.before, monitor)) &&
+       bracket.shared.some(row => row.original.pid === main.pid || monitors.some(monitor => monitor.pid === row.original.pid)))) {
+      teardownBeforeFinalHolder = true;
+    }
+  }
+  if (!teardownBeforeFinalHolder) throw Object.assign(
+    new Error('Observer missed the final surviving holder after engine and peer disappearance'), { code: 'fixture_observation_unavailable' });
+  const final = trace.observations.at(-1);
+  assert.ok(rows(final, 'before-close').every(row => row.current.status === 'gone'));
+  assert.equal(final.locks.owner.acquired, true);
+  assert.equal(final.locks.build.acquired, true);
+  assert.ok(mainGone);
+  return mainGone;
+}
+
+function assertFailureScenario(launch, records, scenario) {
+  const index = records.findIndex(record => record.stage === 'fault');
+  assert.ok(index > 0, 'The signed process did not reach the requested fault');
+  const before = records.slice(0, index), fault = records[index], after = records.slice(index + 1);
+  const at = (stage) => after.find(record => record.stage === stage);
+  const output = before.find(record => record.stage === 'primary-frame' && record.frame === `R 1 ${launch.pid}\n`);
+  assert.ok(output);
+  assert.equal(fault.scenario, scenario);
+  assert.equal(fault.native.phase, 'ready');
+  assert.equal(fault.native.liveBindings, 1);
+  assert.ok(before.some(record => record.stage === 'primary-frame' && record.frame === fault.acknowledgement));
+  assert.ok(before.some(record => record.stage === 'host-frame' && record.frame === fault.acknowledgement.replace(/^A /, 'H ')));
+  assert.ok(!['native-block-return', 'integrity-return', 'will-quit', 'exit-return'].some(stage => at(stage)));
+  const mainGone = assertFailureCustody(launch, fault);
+  const elapsedMs = record => Number(mainGone - BigInt(record.nanos)) / 1e6;
+  if (scenario === 'heartbeat-silence') {
+    assert.equal(at('native-block-enter')?.place, 'running-main');
+    assert.ok(!at('host-frame'));
+    assert.ok(elapsedMs(fault) >= 1700 && elapsedMs(fault) < 5000);
+  } else if (scenario === 'ack-silence') {
+    assert.ok(after.some(record => record.stage === 'withheld-frame' && /^A [1-9]/.test(record.frame)));
+    assert.ok(after.some(record => record.stage === 'host-frame' && /^H [1-9]/.test(record.frame)));
+  } else if (scenario === 'eof') {
+    assert.ok(at('stdin-ended'), 'The actual primary input did not finish closing');
+    assert.ok(elapsedMs(fault) >= 0 && elapsedMs(fault) < 600);
+  } else if (scenario === 'malformed' || scenario === 'out-of-order') {
+    const expected = scenario === 'malformed' ? 'H ?\n' : fault.acknowledgement.replace(/^A /, 'H ');
+    assert.equal(at('fault-write')?.frame, expected);
+    assert.ok(elapsedMs(fault) >= 0 && elapsedMs(fault) < 600);
+  } else if (scenario === 'cleanup-blocked' || scenario === 'integrity-refused') {
+    assert.equal(fault.visible, true);
+    assert.deepEqual(after.filter(record => fatalStages.includes(record.stage)).map(record => record.stage), fatalStages);
+    assert.ok(after.some(record => record.stage === 'host-frame' && /^F [1-9]/.test(record.frame)));
+    for (const stage of fatalStages) {
+      const value = at(stage);
+      assert.equal(value.admission, false);
+      assert.equal(value.closed, true);
+      assert.equal(value.fatal, true);
+      assert.equal(value.reason, scenario === 'cleanup-blocked' ? 'native_retirement_unavailable' : 'native_integrity_unavailable');
+    }
+    assert.equal(at('authority-invalidated').authority, null);
+    assert.equal(at('pages-hidden').native.phase, 'closing');
+    assert.equal(at('pages-hidden').native.liveBindings, 0);
+    assert.equal(at('pages-hidden').visible, false);
+    if (scenario === 'cleanup-blocked') assert.equal(at('native-block-enter')?.place, 'cleanup');
+    else assert.equal(at('integrity-check')?.value, 'fixture-invalid');
+  } else if (scenario === 'exit-blocked') {
+    assert.equal(at('exit-request')?.sealed.phase, 'closing');
+    assert.equal(at('native-block-enter')?.place, 'before-quit');
+  } else {
+    assert.equal(scenario, 'fatal-shortening');
+    const frames = after.filter(record => record.stage === 'host-frame');
+    assert.equal(frames.length, 2);
+    const [fatal, heartbeat] = frames;
+    assert.match(fatal.frame, /^F [1-9][0-9]*\n$/);
+    assert.equal(heartbeat.frame, `H ${BigInt(fatal.frame.slice(2)) + 1n}\n`);
+    for (const frame of frames) assert.ok(after.some(record => record.stage === 'primary-frame' && record.frame === frame.frame.replace(/^[FH] /, 'A ')));
+    assert.equal(at('native-block-enter')?.place, 'after-post-fatal-heartbeat');
+    assert.ok(elapsedMs(fatal) >= 650 && elapsedMs(fatal) < 1700);
+  }
+}
+
+export async function nativeFailureCustodyBoundary({ output }) {
+  const destination = resolve(output);
+  assert.ok(destination.startsWith('/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-8-20261115/'));
+  await mkdir(destination, { mode: 0o700 });
+  const bodyPath = fileURLToPath(import.meta.url), sourceBodyDigest = digest(await readFile(bodyPath));
+  const result = { format: 1, case: 'nativeFailureCustodyBoundary', status: 'incomplete', sourceBodyDigest, nativeConsumer,
+    gateAdmission: 'pending independent actual-body review', scenarios: [],
+    limits: ['The observer tracks the identified original processes and sampled group membership.',
+      'The blocked exit uses the real Electron quit request after packaged native seal in the fixture.'] };
+  let failure;
+  try {
+    const fixtures = await prepareNativeFixtures(join(destination, 'fixtures'), { callbacks: true });
+    for (const scenario of failureScenarios) {
+      const output = join(fixtures.directory, scenario);
+      const entry = { scenario, status: 'unavailable', launch: join(output, 'launch-result.json'), record: join(output, 'failure.jsonl') };
+      result.scenarios.push(entry);
+      try {
+        const launch = await launchNativeFixture(fixtures, { mode: 'failure-custody', output, failureScenario: scenario });
+        const events = jsonLines(launch.stdout);
+        const unavailable = events.find(event => ['unavailable', 'failure-custody-unavailable'].includes(event.stage));
+        assert.equal(unavailable, undefined, unavailable?.error);
+        assert.equal(launch.timedOut, false);
+        assert.equal(launch.candidate, fixtures.consumer.candidate);
+        assert.ok(events.some(event => event.stage === 'armed'));
+        assert.ok(events.some(event => event.stage === 'installed' && event.status.phase === 'ready'));
+        const records = jsonLines(await readFile(entry.record, 'utf8'));
+        if (records.some(record => record.stage === 'fault') && launch.failureCustody?.complete) entry.status = 'failed';
+        assert.equal(launch.signal, 'SIGKILL');
+        assertFailureScenario(launch, records, scenario);
+        entry.status = 'passed';
+      } catch (error) {
+        if (error.code === 'fixture_observation_unavailable') entry.status = 'unavailable';
+        failure ??= error;
+        entry.error = String(error.stack ?? error);
+      }
     }
     if (!failure) result.status = 'passed';
   } catch (error) { failure = error; result.error = String(error.stack ?? error); }

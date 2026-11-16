@@ -172,6 +172,8 @@ export const bindingScenarios = Object.freeze(['stale-nonce', 'stale-contents', 
 export const retirementScenarios = Object.freeze(['success', 'detach-throws', 'destroy-missing', 'native-detach-blocked']);
 export const startupScenarios = Object.freeze(['startup-descriptors', 'bootstrap-identity-refused', 'late-readiness',
   'primary-producer-lost', 'custody-producer-lost', 'custody-withholds-c', 'custody-withholds-g', 'primary-withholds-j']);
+export const failureScenarios = Object.freeze(['heartbeat-silence', 'ack-silence', 'eof', 'malformed', 'out-of-order',
+  'integrity-refused', 'cleanup-blocked', 'exit-blocked', 'fatal-shortening']);
 
 async function observeStartupBirths(fixtures, directory, pid, mode, waitForStage) {
   const published = await waitForStage('locks');
@@ -180,13 +182,44 @@ async function observeStartupBirths(fixtures, directory, pid, mode, waitForStage
   assert.equal(main.executable, join(fixtures.consumer.candidate, 'Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron'));
   const helper = join(fixtures.consumer.candidate, 'Contents/Resources/browser/native/watchdog');
   const locks = { owner: { path: join(directory, 'owner.lock'), ...published.owner }, build: { path: join(directory, 'build.lock'), ...published.build } };
-  const observer = spawn(join(fixtures.directory, 'native-observer'), ['startup-births', JSON.stringify({ main, helper, mode, locks })],
+  return observeWithMarker(fixtures, directory, 'startup-births', { main, helper, mode, locks }, 'startup-observer-ready');
+}
+
+async function observeFailureCustody(fixtures, directory, pid, waitForStage) {
+  const published = await waitForStage('locks');
+  const ready = await waitForStage('failure-observer-waiting');
+  const browser = join(fixtures.consumer.candidate, 'Contents/Resources/browser');
+  const engine = join(browser, 'runtime/Electron.app/Contents');
+  const helper = join(browser, 'native/watchdog');
+  const family = observeNative(fixtures, 'group', pid).members.filter(member => member.status === 'alive');
+  const main = family.find(member => member.pid === pid);
+  const anchor = family.find(member => member.executable === helper && member.parent !== pid);
+  assert.equal(main?.executable, join(engine, 'MacOS/Electron'));
+  assert.ok(anchor, 'No actual custody process in the original group');
+  const primary = observeNative(fixtures, 'process', anchor.parent);
+  assert.equal(primary.executable, helper);
+  assert.equal(primary.group, primary.pid);
+  assert.equal(primary.originalParentVersion, main.pidVersion);
+  assert.equal(anchor.originalParentVersion, primary.pidVersion);
+  const engineHelpers = ['', ' (Renderer)', ' (GPU)', ' (Plugin)'].map(suffix =>
+    join(engine, `Frameworks/Electron Helper${suffix}.app/Contents/MacOS/Electron Helper${suffix}`));
+  for (const member of family) assert.ok(member === main || member === anchor || (
+    engineHelpers.includes(member.executable) && member.originalParentVersion === main.pidVersion),
+  `Unclassified process ${member.pid} in the original group`);
+  assert.ok(family.some(member => member.pid === ready.renderer && member.executable === engineHelpers[1]), 'No actual fixture renderer');
+  const locks = { owner: { path: join(directory, 'owner.lock'), ...published.owner }, build: { path: join(directory, 'build.lock'), ...published.build } };
+  return observeWithMarker(fixtures, directory, 'failure-custody', { format: 1, group: pid, anchor,
+    processes: [...family, primary], locks }, 'failure-observer-ready');
+}
+
+async function observeWithMarker(fixtures, directory, command, request, markerName) {
+  const observer = spawn(join(fixtures.directory, 'native-observer'), [command, JSON.stringify(request)],
     { stdio: ['ignore', 'pipe', 'pipe'], env: { PATH: '/usr/bin:/bin' } });
   let out = '', err = '', marker;
   observer.stdout.on('data', chunk => {
     out += chunk;
     if (!marker && out.startsWith('{"stage":"watch-ready"}\n')) {
-      marker = writeFile(join(directory, 'startup-observer-ready'), 'ready\n', { mode: 0o600, flag: 'wx' });
+      marker = writeFile(join(directory, markerName), 'ready\n', { mode: 0o600, flag: 'wx' });
       void marker.catch(() => {});
     }
   });
@@ -198,20 +231,23 @@ async function observeStartupBirths(fixtures, directory, pid, mode, waitForStage
   await marker;
   assert.equal(code, 0, err);
   const lines = out.trim().split('\n');
-  assert.equal(lines.length, 2, 'The external startup observer did not finish its bracketed read');
-  return JSON.parse(lines[1]);
+  assert.ok(lines.length === 2 || lines.length === 1, 'The external observer did not finish its bracketed read');
+  const result = JSON.parse(lines.at(-1));
+  if (lines.length === 1) assert.ok(result.unavailable);
+  return result;
 }
 
 export async function launchNativeFixture(fixtures, {
-  mode = 'boundary', callback = fixtures.record.callback?.path, output, variant, poisonScenario, bindingScenario, retirementScenario, startupScenario,
+  mode = 'boundary', callback = fixtures.record.callback?.path, output, variant, poisonScenario, bindingScenario, retirementScenario, startupScenario, failureScenario,
 }) {
-  const callbackModes = ['callbacks', 'resolver-control', 'install-poison', 'binding-lifetime', 'cached-routes', 'concurrent-responder', 'retirement', 'startup-custody'];
+  const callbackModes = ['callbacks', 'resolver-control', 'install-poison', 'binding-lifetime', 'cached-routes', 'concurrent-responder', 'retirement', 'startup-custody', 'failure-custody'];
   assert.ok(['boundary', 'frozen-trust', 'provider-mismatch', ...callbackModes].includes(mode));
   assert.ok(callback || !callbackModes.includes(mode));
   assert.equal(mode === 'install-poison', installPoisonScenarios.has(poisonScenario));
   assert.equal(mode === 'binding-lifetime', bindingScenarios.includes(bindingScenario));
   assert.equal(mode === 'retirement', retirementScenarios.includes(retirementScenario));
   assert.equal(mode === 'startup-custody', startupScenarios.includes(startupScenario));
+  assert.equal(mode === 'failure-custody', failureScenarios.includes(failureScenario));
   assert.equal(mode === 'frozen-trust', variant?.kind === 'frozen-trust');
   assert.equal(mode === 'provider-mismatch', variant?.kind === 'provider-mismatch');
   const consumer = await verifiedConsumer(); assert.equal(consumer.candidate, fixtures.consumer.candidate);
@@ -232,7 +268,7 @@ export async function launchNativeFixture(fixtures, {
   for (const name of ['app-data', 'session-data']) await mkdir(join(home, name), { mode: 0o700 });
   if (callback) { assert.equal(callback, fixtures.record.callback?.path); assert.equal(hash(await readFile(callback)), fixtures.record.callback.signedDigest); }
   const config = { format: 1, mode, bundle: variant?.candidate ?? fixtures.consumer.candidate, output: directory, home, trustProbe: Boolean(variant),
-    providerMethod: variant?.providerChange?.method, poisonScenario, bindingScenario, retirementScenario, startupScenario,
+    providerMethod: variant?.providerChange?.method, poisonScenario, bindingScenario, retirementScenario, startupScenario, failureScenario,
     owner: join(directory, 'owner.lock'), build: join(directory, 'build.lock'), callback };
   const request = join(directory, 'request.json');
   await writeFile(request, JSON.stringify(config) + '\n', { mode: 0o600, flag: 'wx' });
@@ -301,6 +337,8 @@ export async function launchNativeFixture(fixtures, {
   const watchBirths = mode === 'startup-custody' && !['bootstrap-identity-refused', 'late-readiness'].includes(startupScenario);
   const startupBirths = watchBirths ? observeStartupBirths(fixtures, directory, child.pid, startupScenario, waitForStage)
     .catch(error => ({ unavailable: String(error.message ?? error) })) : undefined;
+  const failureCustody = mode === 'failure-custody' ? observeFailureCustody(fixtures, directory, child.pid, waitForStage)
+    .catch(error => ({ unavailable: String(error.message ?? error) })) : undefined;
   // Timeout teardown is explicitly not production enforcement evidence.
   const deadline = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, 90000);
   const outcome = await new Promise((accept, reject) => { child.once('error', reject); child.once('exit', (code, signal) => accept({ code, signal })); })
@@ -320,6 +358,7 @@ export async function launchNativeFixture(fixtures, {
     consumerRole: variant ? 'immutable baseline only; executing copy is explicitly derived' : 'exact executing consumer', pid: child.pid,
     elapsedMs: performance.now() - started, ...outcome, timedOut, stdout, stderr, observations,
     frozenTrust: await trustProbe, startupSlots: mode === 'startup-custody' ? startupSlots : undefined, startupBirths: births,
+    failureCustody: await failureCustody,
     qualification: 'fixture feasibility only; no complete gate/native qualification result' };
   await writeFile(join(directory, 'launch-result.json'), JSON.stringify(record, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
   return record;
