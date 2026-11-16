@@ -173,3 +173,84 @@ export function createNativeLifetime(boundary: NativeFailureBoundary, host: Host
     },
   });
 }
+
+import type { ProfileSessions } from '../profiles/session.js';
+import type { TabLifecycle, TabRegistry } from '../host/tabs.js';
+import type { WindowHost } from '../host/windows.js';
+import type { ShellAuthority, ShellRegistration } from '../host/shell-ipc.js';
+import type { Contract } from '../contracts/generated.js';
+/** Opaque trusted main-process contribution, explicitly not production page authority. */
+export interface NativeShellPort { readonly pageAdmission: false }
+interface ShellModules {
+  windows: typeof import('../host/windows.js');
+  tabs: typeof import('../host/tabs.js');
+  ipc: typeof import('../host/shell-ipc.js');
+  projections: typeof import('../host/projections.js');
+}
+const nativeShellPorts = new WeakMap<NativeShellPort, { boundary: NativeFailureBoundary; modules: ShellModules }>();
+/** Canonical physical module URLs avoid duplicate native brands and bundled-entry asset paths. */
+export async function prepareNativeShellPort(boundary: NativeFailureBoundary): Promise<NativeShellPort> {
+  if (!installedBoundaries.has(boundary)) throw unavailable('browser');
+  boundary.fatal.assertHealthy(); boundary.native.assertIntegrity();
+  const windowsURL = new URL('../host/windows.js', import.meta.url).href;
+  const tabsURL = new URL('../host/tabs.js', import.meta.url).href;
+  const ipcURL = new URL('../host/shell-ipc.js', import.meta.url).href;
+  const projectionsURL = new URL('../host/projections.js', import.meta.url).href;
+  const windows = await import(windowsURL) as ShellModules['windows'];
+  const tabs = await import(tabsURL) as ShellModules['tabs'];
+  const ipc = await import(ipcURL) as ShellModules['ipc'];
+  const projections = await import(projectionsURL) as ShellModules['projections'];
+  boundary.fatal.assertHealthy(); boundary.native.assertIntegrity();
+  const port: NativeShellPort = Object.freeze({ pageAdmission: false as const });
+  nativeShellPorts.set(port, { boundary, modules: { windows, tabs, ipc, projections } }); return port;
+}
+export interface TrustedShellIntegration {
+  readonly pageAdmission: false;
+  readonly host: WindowHost;
+  readonly tabs: TabRegistry;
+  readonly registration: ShellRegistration;
+  /** Invoke synchronously at ABR-10's actual authorized transport commit boundary. */
+  agentTabs(recipient: string): Contract<'browser.TabsResult'>;
+}
+/** ABR-29 must supply its actual owned/prepared host and ABR-10/11 services.
+ * No default services, EngineAuthority or readiness are invented here. The ordinary
+ * entry above continues to refuse; this function is never invoked by this Beat. */
+export async function integrateTrustedShell(port: NativeShellPort, prepared: HostPreparation,
+  selection: BuildSelection, sessions: ProfileSessions, lifecycle: TabLifecycle, authority: ShellAuthority): Promise<TrustedShellIntegration> {
+  const value = nativeShellPorts.get(port);
+  if (!value) throw unavailable('browser');
+  const { boundary, modules } = value;
+  const ownership = handovers.get(boundary.watchdog);
+  if (!ownership || !installedBoundaries.has(boundary)) throw unavailable('browser');
+  await prepared.instance.owner.assert(); await prepared.buildGuard.assert(); await prepared.engine.assertReady();
+  await assertHeldPath(prepared.instance.owner.profile.paths.owner, ownership.owner);
+  if (!selection.guard || prepared.instance.record.build !== selection.build) throw unavailable('browser');
+  await assertHeldPath(selection.guard, ownership.build);
+  boundary.fatal.assertHealthy(); boundary.native.assertIntegrity(); authority.assertReady(); lifecycle.assertAdmission();
+  const guardedLifecycle: TabLifecycle = {
+    assertAdmission() { boundary.fatal.assertHealthy(); boundary.native.assertIntegrity(); authority.assertReady(); lifecycle.assertAdmission(); },
+    connected: client => lifecycle.connected(client),
+    register: (target, initial) => lifecycle.register(target, initial),
+    state: target => modules.projections.projectShellTab(lifecycle.state(target), client => lifecycle.connected(client)),
+    invalidate: target => lifecycle.invalidate(target), removed: target => lifecycle.removed(target),
+    prepare: (target, url) => boundary.native.guard(() => lifecycle.prepare(target, url)),
+    changed: () => lifecycle.changed(), exhausted: () => lifecycle.exhausted(),
+  };
+  const tabs = modules.tabs.createTabRegistry(guardedLifecycle);
+  const guardedAuthority: ShellAuthority = {
+    assertReady() { guardedLifecycle.assertAdmission(); },
+    attachments: () => authority.attachments().map(client => ({ id: client.id, label: modules.projections.clientLabel(client.label) })),
+    execute: (request, target) => boundary.native.guard(() => authority.execute(request, target)),
+    subscribe: changed => authority.subscribe(changed), exhausted: () => authority.exhausted(),
+  };
+  let host: WindowHost;
+  try {
+    host = modules.windows.createWindowHost(sessions, boundary, () => {
+      void tabs.closeWindow(host).catch(() => boundary.fatal.fail('native_retirement_unavailable'));
+    });
+    const registration = modules.ipc.registerShellIPC(host, tabs, guardedAuthority);
+    await registration.load();
+    return Object.freeze({ pageAdmission: false as const, host, tabs, registration,
+      agentTabs: (recipient: string) => modules.projections.projectAgentTabs(tabs, recipient, client => lifecycle.connected(client)) });
+  } catch { return boundary.fatal.fail('native_boundary_unavailable'); }
+}

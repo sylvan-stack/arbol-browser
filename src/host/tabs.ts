@@ -16,6 +16,7 @@ export interface TabLifecycle {
   removed(target: TabTarget): void;
   prepare(target: TabTarget, url: string): Promise<void>;
   changed(): void;
+  exhausted(): never;
 }
 export function refused(code: 'control_refused' | 'control_changed' | 'tab_not_found', remedy = 'Read current browser state before trying again.'): BrowserFailure {
   return new BrowserFailure({ code, message: code === 'tab_not_found' ? 'Tab not found.' : 'The browser control request was refused.',
@@ -48,14 +49,19 @@ export function assertTabRegistry(value: TabRegistry): void {
 }
 /** One registry per profile, shared by all its windows. IDs never repeat in this process. */
 const issued = new Set<string>();
-function tabId(): string {
+function tabId(exhausted: () => never): string {
   const id = `tab_${randomBytes(16).toString('base64url')}`;
-  if (issued.has(id)) throw unavailable('browser'); issued.add(id); return id;
+  if (issued.size >= 1000000 || issued.has(id)) return exhausted(); issued.add(id); return id;
 }
 export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
   const tabs = new Map<string, TabTarget>(), closing = new Set<TabTarget>();
   const selection = new Map<WindowHost, TabTarget>();
-  const actions = new Map<TabTarget, { generation: number; count: number; client: string }>();
+  interface PopupBudget { count: number; client: string; active: boolean }
+  const actions = new Map<TabTarget, { generation: number; budget: PopupBudget }>();
+  const finishBudget = (budget: PopupBudget) => {
+    budget.active = false;
+    for (const [target, action] of actions) if (action.budget === budget) actions.delete(target);
+  };
   const assertTarget = (target: TabTarget) => {
     lifecycle.assertAdmission(); assertPageSurface(target.page);
     if (tabs.get(target.id) !== target || closing.has(target)) throw refused('tab_not_found');
@@ -78,11 +84,14 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
     lifecycle.changed();
   }
   async function open(window: WindowHost, url: string, creator?: Contract<'browser.ClientIdentity'>,
-    inherited?: TabState): Promise<TabTarget> {
+    inherited?: TabState, inheritedBudget?: PopupBudget): Promise<TabTarget> {
     lifecycle.assertAdmission(); assertWindowHost(window); url = userURL(url);
     if (tabs.size >= 64) throw refused('control_refused', 'Close an existing tab before opening another.');
     if (creator && !lifecycle.connected(creator.id)) throw refused('control_refused');
-    const target = Object.freeze({ id: tabId(), page: window.createPage() });
+    const budget = creator ? inheritedBudget ?? { count: 0, client: creator.id, active: true } : undefined;
+    if (budget && (!budget.active || budget.count >= 10 || budget.client !== creator?.id)) throw refused('control_refused');
+    if (budget) budget.count++; // shared by every descendant; includes the initial agent-open tab
+    const target = Object.freeze({ id: tabId(() => lifecycle.exhausted()), page: window.createPage() });
     const initial: TabState = { tab: target.id, generation: 1, controller: creator
       ? { kind: 'agent', client: creator.id, label: creator.label } : { kind: 'user' },
       visibleTo: creator ? [...(inherited?.visibleTo ?? [creator.id])].filter(id => lifecycle.connected(id)) : [],
@@ -90,6 +99,7 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
     tabs.set(target.id, target);
     try {
       lifecycle.register(target, initial);
+      if (budget) actions.set(target, { generation: 1, budget });
       target.page.view.webContents.setWindowOpenHandler(details => {
         // Always deny the engine route: frameName is never used to retarget an existing tab.
         void popup(target, details.url).catch(() => { /* redacted refusal; no content diagnostics */ });
@@ -111,6 +121,8 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
       // No failed open may retain an unreported lease. Retirement failures remain profile-fatal.
       if (tabs.has(target.id) && !closing.has(target)) await retire(target);
       throw error;
+    } finally {
+      if (budget && !inheritedBudget) finishBudget(budget);
     }
   }
   async function popup(opener: TabTarget, url: string) {
@@ -118,10 +130,9 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
     if (before.handoff !== 'idle') throw refused('control_refused');
     if (before.controller.kind === 'user') return open(opener.page.window, url);
     const action = actions.get(opener);
-    if (!action || action.generation !== before.generation || action.client !== before.controller.client ||
-        action.count >= 10 || !lifecycle.connected(action.client)) throw refused('control_refused');
-    action.count++;
-    return open(opener.page.window, url, { id: action.client, label: before.controller.label }, before);
+    if (!action || action.generation !== before.generation || action.budget.client !== before.controller.client ||
+        !action.budget.active || action.budget.count >= 10 || !lifecycle.connected(action.budget.client)) throw refused('control_refused');
+    return open(opener.page.window, url, { id: action.budget.client, label: before.controller.label }, before, action.budget);
   }
   const registry: TabRegistry = Object.freeze({
     all: () => [...tabs.values()].filter(target => !closing.has(target)),
@@ -153,9 +164,9 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
     beginPopupAction(target: TabTarget, expected: number) {
       const current = generation(target, expected);
       if (actions.has(target) || current.controller.kind !== 'agent' || !lifecycle.connected(current.controller.client)) throw refused('control_refused');
-      const action = { generation: expected, client: current.controller.client, count: 0 };
+      const action = { generation: expected, budget: { client: current.controller.client, count: 0, active: true } };
       actions.set(target, action);
-      return () => { if (actions.get(target) === action) actions.delete(target); };
+      return () => finishBudget(action.budget);
     },
   });
   registries.add(registry); return registry;
