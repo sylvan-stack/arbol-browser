@@ -62,3 +62,16 @@ edit/forwarding selectors, text marker and lifetime-exhaustion routes require
 individual positive references or a reviewed testability proposal. None of
 these follow-up trials has executed. The native fixtures supply no substitutes
 for unavailable physical devices, text services, or production host settlement.
+
+ABR-47 adds no mid-tier suite. Its cached aria-actions handler now has positive
+trusted DOM controls and blocked/retired exclusion with the same originating AX
+tab retained and attached, followed by a fresh positive. The installed full method
+inventory and sealed MacAccessibilityTextOperation disable pin are observed.
+Complementary AX forwarding/action/attribute/focus/selection effects, one-argument
+insertText forwarding, finishComposingText, remaining generated edits and
+undo/redo/paste effects are unqualified even though their installed guards and
+static dispatch are reviewed. The exact text-marker setter is absent; this is
+not a positive general text-service qualification. Physical keys/click/wheel,
+trackpad/momentum, OS source drag and multilingual IME/dictation/Writing Tools
+remain unavailable under this Beat. These routes prevent trusting production
+agent admission; every previous host/Driver/release obligation remains.

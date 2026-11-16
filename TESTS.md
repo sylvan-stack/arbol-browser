@@ -1,19 +1,21 @@
 # Tests: arbol-browser
 
 The current [Test Strategy](/Users/msix/Artifacts/mycel/operations/test-strategy.md)
-governs execution. ABR-32 owns the Foundation testing record and ABR-8 owns
-native qualification of the pinned signed ABR-42 consumer. The exact case and
+governs execution. ABR-32 owns the Foundation testing record. ABR-47 owns
+the current native qualification of the pinned signed ABR-46 consumer,
+retaining ABR-8's earlier cases and recorded limitations. The exact case and
 scenario selection, admission reasons and unavailable routes are in
 [test-tiers.json](test-tiers.json). No earlier low-tier bodies existed.
 
-The normal Build gate executes all six Foundation cases and nine native cases.
+The normal Build gate executes all six Foundation cases and ten native cases.
 The Foundation worker uses the ordinary candidate's packaged CLI, compiled
 libraries, Darwin process addon and embedded Node with disposable state, kernel
 locks and AF_UNIX sockets. The native worker uses the independently bound,
-immutable ABR-42 signed consumer and separately built private fixtures. Its
+immutable ABR-46 signed consumer and separately built private fixtures. Its
 representative cases cover trust, transactional install, binding lifetime,
 cached routes, responder isolation, retirement, startup custody, failure custody
-and independent monitor loss. There are 46 separately recorded native scenarios.
+independent monitor loss, and source-sensitive plus signed supported helper exit.
+There are 50 separately recorded native scenarios.
 Case and scenario selection is fixed. Missing sources, results or required
 observations fail the gate.
 
@@ -29,7 +31,7 @@ The gate writes `result.json`, a Foundation worker result and private native
 case directories under `<isolated-registry>/arbol-browser/.qualification-<build>/`.
 It validates the ordinary candidate payload and executing Foundation runtime
 against its metadata and current package source. Independently, it binds the
-accepted ABR-42 consumer manifest, frozen source, compiled closure, exact signed
+accepted ABR-46 consumer manifest, frozen source, compiled closure, exact signed
 assembly, case/harness source and compiled fixture evidence. The Foundation
 worker has its own 90-second deadline. Each native launch and external observer
 has its own bounded deadline. Scenarios with a declared observation retry keep
@@ -40,7 +42,7 @@ same source and a fresh private output, use:
 
 ```sh
 node scripts/top-gate.mjs --candidate /absolute/immutable/package --out /absolute/new-private-output \
-  --native-consumer /Users/msix/Builds/sylvan-stack/arbol-browser/ABR-42-20261115/consumer-manifest.json
+  --native-consumer /Users/msix/Builds/sylvan-stack/arbol-browser/ABR-46-20261116-6df9y348/consumer-manifest.json
 ```
 
 Keep the run outside owner profiles, the normal registry and the accepted
@@ -77,3 +79,16 @@ during observation; fixture teardown after transport shutdown is not verified
 production exit. Strong references/live process exclude garbage collection and
 process death as the cleanup oracle. Ordinary client exchanges demonstrate only
 usable resource transfer, not browser open, page control or stdio MCP. All six Foundation cases and their helpers remain bound in the complete gate.
+
+ABR-47 renews the exact consumer binding and adds source-bound census controls,
+supported signed helper exit, a distinct still-live primary timeout, and the
+positive cached aria-actions cycle with its original AX tab attached through
+retirement. All earlier cases/scenarios remain selected. The census record binds
+the driver, effective frozen shared header, compile command and actual binary;
+the ordinary gate rechecks those bytes and all four effective callback headers.
+The one-time published-predecessor sensitivity is separate from candidate gate
+results. Natural primary SIGHUP remains distinct from measured timeout SIGKILL.
+Actual installed route guards and sealed features do not qualify unmeasured
+complementary effects, physical input or configured text services. Production
+agent admission remains false; no normal registry, installed profile or real
+account is used. See MID_TIER.md for the explicit limitations.

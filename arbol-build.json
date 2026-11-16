@@ -13,7 +13,7 @@
     {
       "name": "complete-top-tier",
       "kind": "unit",
-      "command": "node scripts/top-gate.mjs --candidate \"$ARBOL_BUILD_DIR\" --out \"$ARBOL_BUILD_DIR/../.qualification-$ARBOL_BUILD_NUMBER\" --native-consumer /Users/msix/Builds/sylvan-stack/arbol-browser/ABR-42-20261115/consumer-manifest.json"
+      "command": "node scripts/top-gate.mjs --candidate \"$ARBOL_BUILD_DIR\" --out \"$ARBOL_BUILD_DIR/../.qualification-$ARBOL_BUILD_NUMBER\" --native-consumer /Users/msix/Builds/sylvan-stack/arbol-browser/ABR-46-20261116-6df9y348/consumer-manifest.json"
     }
   ]
 }

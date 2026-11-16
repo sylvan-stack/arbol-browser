@@ -161,7 +161,7 @@
       "tier": "top",
       "status": "retained",
       "reason": "Cached and direct native edit routes can bypass current policy or reactivate after a renderer/widget swap.",
-      "oracle": "DOM and AppKit controls compare a fixed native first responder across permission transitions. A positively marked composition survives blocked unmark. Cached AX press and value remain blocked across the actual renderer/widget swap and work after re-enable.",
+      "oracle": "DOM and AppKit controls compare a fixed native first responder across permission transitions. A positively marked composition survives blocked unmark. Cached AX press and value remain blocked across the actual renderer/widget swap and work after re-enable. The same target-specific aria-actions handler retains its live AX origin attached through allowed/blocked/resumed/retired DOM effect checks and a fresh positive. Exact installed method guards and sealed features are audited; complementary unmeasured effects remain unavailable.",
       "origins": [
         "BRW-2.18",
         "BRW-4.1",
@@ -170,7 +170,8 @@
         "BRW-4.16"
       ],
       "scenarios": [
-        "matched-focus-and-renderer-swap"
+        "matched-focus-and-renderer-swap",
+        "cached-custom-ax-attached-retirement"
       ]
     },
     {
@@ -261,7 +262,7 @@
       "tier": "top",
       "status": "retained",
       "reason": "An independently stopped or lost monitor can release custody early or couple unrelated processes to recovery.",
-      "oracle": "Exact injected faults, genuine matched heartbeat drain, stopped-peer queue observation, independent consent exit, exact locks and captured-originals retirement preserve an unrelated live sentinel.",
+      "oracle": "Exact injected faults, genuine matched heartbeat drain, stopped-peer queue observation, independent consent exit, exact locks and captured-originals retirement preserve an unrelated live sentinel. Distinct primary-timeout keeps an observer-owned child in the primary group without descriptors, observes empty queues after engine exit and current P, a stopped exact primary at 900ms, SIGKILL around one second and original locks through disappearance before observer cleanup. Natural SIGHUP stays separate.",
       "origins": [
         "BRW-4.17",
         "BRW-4.18"
@@ -269,10 +270,26 @@
       "scenarios": [
         "primary-lost",
         "primary-hung",
+        "primary-timeout",
         "custody-lost",
         "custody-hung",
         "both-lost",
         "custody-consent"
+      ]
+    },
+    {
+      "id": "nativeHelperExitBoundary",
+      "file": "tests/top/test_native_recovery.mjs",
+      "tier": "top",
+      "status": "retained",
+      "reason": "Routine verified helper exit during executable observation could falsely make a healthy profile fatal. This source-level race is distinct from signed runtime helper lifecycle.",
+      "oracle": "Actual frozen shared census with controlled kernel observations requires true absence and separate outside-group reuse, refuses live/unresolved/same-start drift/in-group replacement/unverified identities, retains originals in final reconciliation with no replacement target. Exact driver/header/compile/binary binding. Separately, supported signed renderer exit preserves original main/monitors, continued genuine heartbeat/ack and both original lock refusals. Published predecessor sensitivity remains a separate one-time record.",
+      "origins": [
+        "BRW-4.18"
+      ],
+      "scenarios": [
+        "kernel-helper-exit-controls",
+        "signed-supported-helper-exit"
       ]
     }
   ],
@@ -301,7 +318,7 @@
     },
     {
       "id": "native-remaining-input",
-      "reason": "Physical key/click/wheel/trackpad and momentum, OS source drag/drop, live multilingual candidate selection, dictation/writing and text services, and remaining selector and AX routes need separate controls."
+      "reason": "Unmeasured AX action/attribute/focus/selection, one-argument text forwarding/finish, generated edits other than deleteBackward/selectAll, undo/redo/paste, physical key/click/wheel/trackpad/momentum, OS source drag, live multilingual IME and configured dictation/Writing Tools/text services remain unqualified. Actual guard inventory and sealed disabled MacAccessibilityTextOperation do not substitute for positive effects. Production agent admission remains false."
     },
     {
       "id": "native-lifetime-edge",
@@ -319,15 +336,15 @@
     "engine-reader-session": "ABR-29/ABR-12",
     "native-pages-driver-release": "ABR-8/12/16/21/23/25; actual providers and explicit execution scope required",
     "destructive-tty-platform": "ABR-12 for complete runtime removal; remaining distinct platform evidence requires explicit admission/scope",
-    "native-remaining-input": "ABR-8 bounded proposal; individual remaining native checks require explicit scope",
+    "native-remaining-input": "ABR-47 route-review: installed guards and sealed disabled feature are bounded; complementary positive effects and physical/configured-service routes remain unavailable; production agent admission stays false",
     "native-lifetime-edge": "ABR-8 for native edges; ABR-9/29/12 for host transitions and settlement",
     "native-enforcement-limits": "ABR-8 for fault feasibility; ABR-29/12 for continuous production confinement"
   },
   "nativeConsumer": {
-    "manifest": "/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-42-20261115/consumer-manifest.json",
-    "digest": "cb041c3918bba14ccd5ea299cbd0b6c4159e3d97b169138c96ed70397f57601f",
-    "codeCommit": "35c956028fbf8c9214803505458c31b6a077ad47",
-    "sourceDigest": "569c325b27e951aca953e761ada3d682ce84dafea729a0bfc0349f4d95538a84",
-    "compatibilityDigest": "a45a01bea9a1d2a0172213453f4939badbc08db1ba6bbe8a823c434487f7f00a"
+    "manifest": "/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-46-20261116-6df9y348/consumer-manifest.json",
+    "digest": "25fe40877f7c3415bc5c5cce034320440bdfbb287170e30c9cb319728ca9490e",
+    "codeCommit": "c2103947d8ae1bb6626457c595add162cd59e287",
+    "sourceDigest": "626b24e82ad74f0ec13268e6395945151edb8a76eb9325a818bcf3bd0645c1ee",
+    "compatibilityDigest": "1a7cbc55fa6183dcfd9302aefda18edd8c8f798567ffdf61800806c19b559d93"
   }
 }
