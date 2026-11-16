@@ -187,7 +187,18 @@ struct Context {
       if (pid==custody.pid&&same(id,custody)) { if(!monitor(custody,true)) return false; continue; }
       std::string path;
       if (pid == main.pid) { if (!same(id, main) || !executable(id,path) || path != engine()) return false; }
-      else if (!executable(id,path) || !enginePath(path) || (info.unique.parent != main.start && info.unique.originalParentVersion != main.version)) return false;
+      else {
+        if (!executable(id,path)) {
+          auto known=seen.find(pid); Identity now;
+          if (known==seen.end() || !same(known->second,id)) return false;
+          int state=observe(pid,now);
+          // Keep the verified original for final reconciliation. Only proven
+          // absence or unique-start reuse outside our group explains this race.
+          if (!state || (state==1 && now.start!=id.start && now.group!=main.group)) continue;
+          return false;
+        }
+        if (!enginePath(path) || (info.unique.parent != main.start && info.unique.originalParentVersion != main.version)) return false;
+      }
       auto known=seen.find(pid);
       if ((known==seen.end() || !same(known->second,id)) && !signature(path,true)) return false; seen[pid] = id; targets.push_back(id);
     }
