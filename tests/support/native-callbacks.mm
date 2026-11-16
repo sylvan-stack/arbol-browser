@@ -48,13 +48,29 @@ static void accessibility(id element,NSMutableArray* found,std::set<void*>& seen
   if([element respondsToSelector:@selector(accessibilityChildren)])
     for(id child in [element accessibilityChildren]) accessibility(child,found,seen,depth+1);
 }
+static NSWindow* findWindow(napi_env env,napi_value value) {
+  bool buffer=false;void* bytes=nullptr;size_t size=0;
+  if(napi_is_buffer(env,value,&buffer)!=napi_ok||!buffer||napi_get_buffer_info(env,value,&bytes,&size)!=napi_ok||size!=sizeof(void*)) return nil;
+  void* pointer=nullptr;std::memcpy(&pointer,bytes,size);NSWindow* window=nil;
+  for(NSWindow* candidate in NSApp.windows) if((__bridge void*)candidate.contentView==pointer) {
+    if(window) return nil;
+    window=candidate;
+  }
+  return window;
+}
+static napi_value windowPages(napi_env env,napi_callback_info info) {
+  napi_value value;if(!args(env,info,1,&value)) return nullptr;
+  NSWindow* window=findWindow(env,value);
+  if(!window) return fail(env,"fixture_unknown_window");
+  NSMutableArray* roots=[NSMutableArray new];views(window.contentView,@"WebContentsViewCocoa",roots);
+  NSMutableArray* identities=[NSMutableArray new];
+  for(NSView* root in roots) [identities addObject:[NSString stringWithFormat:@"%p",root]];
+  return reply(env,identities);
+}
 static napi_value capture(napi_env env,napi_callback_info info) {
   napi_value value; if(!args(env,info,1,&value)) return nullptr;
   @try {
-    bool buffer=false;void* bytes=nullptr;size_t size=0;
-    if(napi_is_buffer(env,value,&buffer)!=napi_ok||!buffer||napi_get_buffer_info(env,value,&bytes,&size)!=napi_ok||size!=sizeof(void*)) return fail(env,"fixture_window_handle");
-    void* pointer=nullptr;std::memcpy(&pointer,bytes,size);NSWindow* window=nil;
-    for(NSWindow* candidate in NSApp.windows) if((__bridge void*)candidate.contentView==pointer) { if(window) return fail(env,"fixture_ambiguous_window");window=candidate; }
+    NSWindow* window=findWindow(env,value);
     if(!window) return fail(env,"fixture_unknown_window");
     NSMutableArray* roots=[NSMutableArray new];views(window.contentView,@"WebContentsViewCocoa",roots);
     if(roots.count!=1) return fail(env,"fixture_requires_one_actual_page");
@@ -72,6 +88,7 @@ static napi_value capture(napi_env env,napi_callback_info info) {
     }
     if(!routes) routes=[NSMutableDictionary new];NSString* token=NSUUID.UUID.UUIDString.lowercaseString;routes[token]=row;
     return reply(env,@{@"token":token,@"root":[NSString stringWithFormat:@"%p",root],@"widget":[NSString stringWithFormat:@"%p",row.widget],
+      @"buttonIdentity":[NSString stringWithFormat:@"%p",row.button],
       @"axNodes":@(elements.count),@"button":@(row.button!=nil),@"field":@(row.field!=nil),@"cachedHandler":@(row.action!=nil)});
   } @catch(NSException*) { return fail(env,"fixture_capture_exception"); }
 }
@@ -79,6 +96,8 @@ static napi_value state(napi_env env,napi_callback_info info) {
   napi_value value;if(!args(env,info,1,&value)) return nullptr;QualificationRoutes* row=routes[string(env,value)];
   if(!row) return fail(env,"fixture_unknown_token");NSView* root=row.root;NSView* widget=row.widget;
   return reply(env,@{@"weakRootAlive":@(root!=nil),@"weakWidgetAlive":@(widget!=nil),@"attached":@(root&&root.superview!=nil),
+    @"rootHidden":@(root&&[root isHiddenOrHasHiddenAncestor]),@"widgetHidden":@(widget&&[widget isHiddenOrHasHiddenAncestor]),
+    @"windowVisible":@(widget.window.isVisible),@"windowKey":@(widget.window.isKeyWindow),
     @"firstResponder":@(widget&&widget.window.firstResponder==widget),@"cachedButton":@(row.button!=nil),@"cachedHandler":@(row.action!=nil)});
 }
 // Drop only clients retained by this testing fixture; weak page witnesses remain.
@@ -377,6 +396,7 @@ NAPI_MODULE_INIT() {
     {"resolverControlObservation",nullptr,resolverControlObservation,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"stopResolverControl",nullptr,stopResolverControl,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"armInstallPoison",nullptr,armInstallPoison,nullptr,nullptr,nullptr,napi_default,nullptr},
-    {"finishInstallPoison",nullptr,finishInstallPoison,nullptr,nullptr,nullptr,napi_default,nullptr}};
+    {"finishInstallPoison",nullptr,finishInstallPoison,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"windowPages",nullptr,windowPages,nullptr,nullptr,nullptr,napi_default,nullptr}};
   if(napi_define_properties(env,exports,sizeof(exportsList)/sizeof(exportsList[0]),exportsList)!=napi_ok) return nullptr;return exports;
 }

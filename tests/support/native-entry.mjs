@@ -1,6 +1,7 @@
 // External trusted qualification entry; never packaged as the production host.
 import { app, BaseWindow, WebContentsView, webContents } from 'electron';
 import { createRequire } from 'node:module';
+import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
 import { readFile, writeFile, realpath, lstat } from 'node:fs/promises';
@@ -10,6 +11,9 @@ const events = [];
 let config, boundary, prepared, watchdog, bootstrap, preparationBefore;
 const resolverMode = 'resolver-control';
 const poisonMode = 'install-poison';
+const bindingMode = 'binding-lifetime';
+const viewOptions = { webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } };
+const bindingKey = ({ id, nonce, webContentsId, revision }) => ({ id, nonce, webContentsId, revision });
 let eventWrite = Promise.resolve();
 async function event(stage, values = {}) {
   const value = { stage, elapsedMs: performance.now(), ...values }; events.push(value);
@@ -39,6 +43,162 @@ async function waitForFixtureMarker(name) {
 function observeCall(call) {
   try { return { returned: call() }; }
   catch (error) { return { error: String(error.message ?? error) }; }
+}
+async function waitForObservation(read, matches, message) {
+  const deadline = performance.now() + 2500;
+  for (;;) {
+    const observed = await read();
+    if (matches(observed)) return observed;
+    assert.ok(performance.now() < deadline, message);
+    await new Promise(accept => setTimeout(accept, 50));
+  }
+}
+async function loadFixturePage(view, label) {
+  const html = `<!doctype html><button id="button" aria-label="${label}">0</button>
+    <input id="field" aria-label="Native fixture field" value="abc">
+    <script>
+      globalThis.clicks = [];
+      button.addEventListener('click', event => {
+        button.textContent = Number(button.textContent) + 1;
+        clicks.push(event.isTrusted);
+      });
+      field.focus();
+    </script>`;
+  await view.webContents.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
+}
+async function observeBindingLifetime(bridge, addon) {
+  app.setAccessibilitySupportEnabled(true);
+  app.on('window-all-closed', () => {});
+  const window = new BaseWindow({ width: 640, height: 360, show: false });
+  const handle = window.getNativeWindowHandle();
+  const native = boundary.native.ownership;
+  const roots = () => JSON.parse(bridge.windowPages(handle));
+  const status = () => JSON.parse(addon.status());
+  const rawInfo = key => addon.bindingInfo(JSON.stringify(key));
+  const attach = view => window.contentView.addChildView(view);
+  const bind = view => native.bind(handle, view.webContents.id, () => attach(view));
+  const bounds = view => view.setBounds({ x: 0, y: 0, width: 640, height: 360 });
+  const state = token => JSON.parse(bridge.state(token));
+  const press = token => JSON.parse(bridge.invoke(token, 'press'));
+  const readPage = view => view.webContents.executeJavaScript('({count:Number(button.textContent),clicks:[...clicks]})');
+  const captureClient = async (stage, contents) => {
+    let client;
+    try {
+      await new Promise(accept => setTimeout(accept, 350));
+      return await waitForObservation(() => {
+        try { client = JSON.parse(bridge.capture(handle)); } catch (error) {
+          if (error.message !== 'fixture_requires_one_actual_widget') throw error;
+          return undefined;
+        }
+        if (!client.button) bridge.releaseClients(client.token);
+        return client;
+      }, value => value?.button, `Cached accessibility client unavailable for ${stage}`);
+    } catch (error) {
+      await event('binding-ax-unavailable', { stageName: stage, client, state: client && state(client.token), roots: roots(),
+        enabled: app.isAccessibilitySupportEnabled(), focused: contents.isFocused(), bounds: window.getBounds(), status: status() });
+      throw error;
+    }
+  };
+  const scenario = config.bindingScenario;
+  const before = status();
+  await event('binding-started', { scenario });
+  let observation;
+  let view = new WebContentsView(viewOptions);
+  if (scenario === 'ambiguous-creation' || scenario === 'reentrant-creation') {
+    const extra = new WebContentsView(viewOptions);
+    const empty = roots();
+    assert.equal(addon.beginBinding(handle, view.webContents.id), undefined);
+    attach(view);
+    if (scenario === 'ambiguous-creation') attach(extra);
+    const attached = roots(), during = status();
+    const refusal = observeCall(() => scenario === 'ambiguous-creation'
+      ? addon.finishBinding() : addon.beginBinding(handle, extra.webContents.id));
+    observation = { empty, attached, during, refusal, contents: [view.webContents.id, extra.webContents.id],
+      retry: observeCall(() => addon.finishBinding()) };
+  } else {
+    const created = bind(view);
+    const initial = JSON.parse(rawInfo(bindingKey(created)));
+    const attached = roots();
+    if (scenario === 'retired-replacement') {
+      bounds(view);
+      const user = native.mark(bindingKey(created), false);
+      const restored = native.restore(bindingKey(user));
+      await loadFixturePage(view, 'Original fixture button');
+      window.show();
+      window.focus();
+      view.webContents.focus();
+      await event('binding-original-loaded', { created });
+      const oldClient = await captureClient('original', view.webContents);
+      const oldPress = press(oldClient.token);
+      const oldEffect = await waitForObservation(() => readPage(view), value => value.count === 1, 'Original native click did not arrive');
+      await event('binding-original-clicked', { oldClient, oldPress, oldEffect });
+      const resigned = JSON.parse(bridge.invoke(oldClient.token, 'resignFocus'));
+      assert.equal(resigned.returned, true);
+      const blocked = native.mark(bindingKey(restored), true);
+      const restoreBlocked = native.restore(bindingKey(blocked));
+      const blockedPress = press(oldClient.token);
+      const blockedEffect = await readPage(view);
+      const retired = native.retire(bindingKey(restoreBlocked));
+      const retiredState = state(oldClient.token);
+      const retiredPress = press(oldClient.token);
+      const retiredEffect = await readPage(view);
+      await event('binding-tombstoned', { retired, retiredState, retiredPress, retiredEffect });
+      const newView = new WebContentsView(viewOptions);
+      window.contentView.removeChildView(view);
+      const detached = roots();
+      let contents = view.webContents;
+      let destroyEvent = false;
+      contents.once('destroyed', () => { destroyEvent = true; });
+      contents.close({ waitForBeforeUnload: false });
+      await waitForObservation(() => destroyEvent && contents.isDestroyed(), Boolean, 'Original WebContents did not destroy');
+      view = null; contents = null;
+      const gone = await waitForObservation(() => state(oldClient.token), value => !value.weakRootAlive && !value.weakWidgetAlive,
+        'Original native weak references did not clear');
+      await event('binding-original-destroyed', { destroyEvent, detached, gone });
+      const replacement = bind(newView);
+      const replacementBlocked = JSON.parse(rawInfo(bindingKey(replacement)));
+      bounds(newView);
+      const replacementUser = native.mark(bindingKey(replacement), false);
+      await loadFixturePage(newView, 'Replacement fixture button');
+      newView.webContents.focus();
+      await event('binding-replacement-loaded', { replacement });
+      const newClient = await captureClient('replacement', newView.webContents);
+      const newRoots = roots(), newBefore = await readPage(newView);
+      const oldStateAfterReplacement = state(oldClient.token), newState = state(newClient.token);
+      const stalePress = press(oldClient.token);
+      const afterStalePress = await readPage(newView);
+      const newPress = press(newClient.token);
+      const newEffect = await waitForObservation(() => readPage(newView), value => value.count > 0, 'Replacement native click did not arrive');
+      const readyAfterClicks = boundary.native.assertIntegrity();
+      const refusal = observeCall(() => rawInfo(bindingKey(retired)));
+      observation = { created, initial, attached, user, restored, oldClient, oldPress, oldEffect, resigned, blocked, restoreBlocked,
+        blockedPress, blockedEffect, retired, retiredState, retiredPress, retiredEffect, detached, destroyEvent, gone,
+        replacement, replacementBlocked, replacementUser, newClient, newRoots, oldStateAfterReplacement, newState, newBefore, stalePress, afterStalePress,
+        newPress, newEffect, readyAfterClicks, refusal };
+    } else {
+      const marked = native.mark(bindingKey(created), false);
+      const correct = bindingKey(marked), stale = { ...correct };
+      const live = JSON.parse(rawInfo(correct));
+      let other, detached;
+      if (scenario === 'stale-nonce') stale.nonce = randomUUID();
+      if (scenario === 'stale-contents') {
+        const extra = new WebContentsView(viewOptions);
+        other = bind(extra);
+        stale.webContentsId = other.webContentsId;
+      }
+      if (scenario === 'stale-revision') stale.revision = created.revision;
+      if (scenario === 'detached-view') {
+        window.contentView.removeChildView(view);
+        detached = { roots: roots(), contentsAlive: !view.webContents.isDestroyed() };
+      }
+      const refusal = observeCall(() => rawInfo(stale));
+      observation = { created, initial, live, marked, attached, correct, stale, other, detached, refusal,
+        retry: observeCall(() => rawInfo(correct)) };
+    }
+  }
+  writeFileSync(join(config.output, 'binding-lifetime.json'), JSON.stringify({ scenario, before, after: status(), ...observation }) + '\n',
+    { mode: 0o600, flag: 'wx' });
+  watchdog.terminate();
 }
 async function observeInstallPoison(bootstrapURL) {
   const features = await import(new URL('../native/features.js', bootstrapURL));
@@ -85,7 +245,7 @@ try {
   const stat = await lstat(path);
   assert.ok(stat.isFile() && stat.uid === process.getuid() && (stat.mode & 0o7777) === 0o600 && stat.nlink === 1 && stat.size <= 16384);
   config = JSON.parse(await readFile(path, 'utf8'));
-  assert.equal(config.format, 1); assert.ok(['boundary', 'callbacks', 'frozen-trust', 'provider-mismatch', resolverMode, poisonMode].includes(config.mode));
+  assert.equal(config.format, 1); assert.ok(['boundary', 'callbacks', 'frozen-trust', 'provider-mismatch', resolverMode, poisonMode, bindingMode].includes(config.mode));
   assert.equal(await realpath(config.home), config.home); assert.equal(process.env.HOME, config.home);
   app.setPath('userData', join(config.home, 'app-data')); app.setPath('sessionData', join(config.home, 'session-data'));
   await event('entry', { pid: process.pid, appReady: app.isReady(), argv: process.argv, runtime: process.versions });
@@ -205,11 +365,21 @@ try {
   } else boundary = await bootstrap.installNativeBoundary(prepared, watchdog, effects);
   assert.equal(boundary.pageAdmission, false);
   await event('installed', { status: boundary.native.assertIntegrity(), admission: admissionObservation(), appReady: app.isReady() });
-  if (config.mode === 'callbacks') {
+  if (config.mode === bindingMode) {
+    assert.ok(config.callback && await realpath(config.callback) === config.callback);
+    const require = createRequire(import.meta.url);
+    const bridge = require(config.callback);
+    const addon = require(join(config.bundle, 'Contents/Resources/browser/native/ownership.node'));
+    // Electron's entry must resolve before its application-ready event.
+    app.whenReady().then(() => observeBindingLifetime(bridge, addon)).catch(async error => {
+      await event('binding-unavailable', { error: String(error.stack ?? error) });
+      watchdog.terminate();
+    });
+  } else if (config.mode === 'callbacks') {
     assert.ok(config.callback && await realpath(config.callback) === config.callback);
     const bridge = createRequire(import.meta.url)(config.callback);
     assert.deepEqual(Object.getOwnPropertyNames(bridge).sort(), ['armInstallPoison', 'auditMethods', 'block', 'capture', 'descriptor', 'finishInstallPoison', 'invoke',
-      'releaseClients', 'resolverControlObservation', 'resolverDispatch', 'startResolverControl', 'state', 'stopResolverControl']);
+      'releaseClients', 'resolverControlObservation', 'resolverDispatch', 'startResolverControl', 'state', 'stopResolverControl', 'windowPages']);
     await event('callback-loaded', { path: config.callback,
       capsule: JSON.parse(bridge.descriptor(watchdog.custody.startupDescriptor)),
       owner: JSON.parse(bridge.descriptor(watchdog.custody.descriptors[0])),
@@ -225,9 +395,9 @@ try {
       void event('callback-accessibility-enabled');
       let window = new BaseWindow({ width: 640, height: 360, show: false });
       void event('callback-window-created');
-      let view = new WebContentsView({ webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } });
+      let view = new WebContentsView(viewOptions);
       void event('callback-view-created');
-      const key = value => ({ id: value.id, nonce: value.nonce, webContentsId: value.webContentsId, revision: value.revision });
+      const key = bindingKey;
       let binding = boundary.native.ownership.bind(window.getNativeWindowHandle(), view.webContents.id, () => window.contentView.addChildView(view));
       void event('callback-bound', { binding });
       view.setBounds({ x: 0, y: 0, width: 640, height: 360 });
