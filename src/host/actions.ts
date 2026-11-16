@@ -45,6 +45,18 @@ interface Slot { active?: Task; waiting: Task[] }
 interface Preparation {
   target: TabTarget; generation: number; controller: AbortController; completion: Promise<void>; retired: boolean;
 }
+export interface IssuedNavigation {
+  readonly token: NavigationContinuation;
+  readonly command: number;
+  readonly operation: string;
+  assertCurrent(): void;
+}
+const issuedExecutions = new WeakMap<ActionExecution, (authority: TabAuthority) => IssuedNavigation>();
+/** Private host adapter proof of an actual ActionQueue-issued command. */
+export function issuedNavigation(execution: ActionExecution, authority: TabAuthority): IssuedNavigation {
+  const current = issuedExecutions.get(execution);
+  if (!current) throw refused('control_refused'); return current(authority);
+}
 /** One profile-wide owner for real mutation queues and original issued work. */
 export class ActionQueue implements HandoffOperations {
   private readonly slots = new Map<TabTarget, Slot>();
@@ -108,7 +120,10 @@ export class ActionQueue implements HandoffOperations {
         let issuedResolve!: () => void;
         const issued = new Promise<void>(yes => { issuedResolve = yes; }); task.issued.add(issued); task.dispatched = true;
         let promise: Promise<U>;
-        try { promise = Promise.resolve(command()); }
+        try {
+          if (task.navigation) this.authority.issuedNavigation(task.navigation, task.command);
+          promise = Promise.resolve(command());
+        }
         catch (error) { promise = Promise.reject(error); }
         return promise.finally(() => { task.issued.delete(issued); issuedResolve(); this.safe(task); });
       },
@@ -130,6 +145,18 @@ export class ActionQueue implements HandoffOperations {
         task.settled = true; task.sequences.clear();
         this.safe(task);
       },
+    });
+    issuedExecutions.set(execution, authority => {
+      if (authority !== this.authority || !task.navigation || !task.started || task.terminal || task.retired ||
+          task.workDone || task.issued.size !== 1 || task.controller.signal.aborted || performance.now() >= task.deadline)
+        throw this.failure(task, 'control_refused');
+      const token = task.navigation, command = task.command;
+      const assertCurrent = () => {
+        if (task.retired || task.terminal || task.workDone || task.controller.signal.aborted ||
+            task.command !== command || task.issued.size !== 1 || performance.now() >= task.deadline) throw this.failure(task);
+        authority.assertNavigationCommand(token, command);
+      };
+      assertCurrent(); return Object.freeze({ token, command, operation: task.operation, assertCurrent });
     });
     const execute = async () => {
       task.started = true;

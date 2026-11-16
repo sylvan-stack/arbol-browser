@@ -35,6 +35,7 @@ export interface DocumentAuthority {
 export interface NavigationContinuation { readonly target: TabTarget; readonly action: string }
 interface ContinuationState {
   stamp: AuthorityStamp; operation: string; valid: boolean; used: boolean; successor?: DocumentReceipt; successorEpoch?: number;
+  issuedCommand?: number; provisionalEpoch?: number;
 }
 /** Opaque by identity as well as fields; only completed actual host transitions
  * can mint these. They are never accepted from an agent or renderer. */
@@ -343,6 +344,12 @@ export class TabAuthority {
     if (!receipt.ready) entry.ready = false;
     entry.availability = receipt.availability; return receipt;
   }
+  /** External/provisional navigation closes dispatch even before a new frame
+   * exists. It never needs a live replacement document to revoke old work. */
+  suspendDocument(target: TabTarget): void {
+    const entry = this.entry(target);
+    entry.ready = false; entry.availability = 'unavailable'; this.invalidate(target);
+  }
   beginContinuation(stamp: AuthorityStamp, action: string, operation: string): NavigationContinuation {
     this.check(stamp, true);
     if (!this.issued.has(action) || !validator('browser.ActionId')(action) || this.activeContinuations.has(stamp.target))
@@ -351,14 +358,47 @@ export class TabAuthority {
     this.continuations.set(token, { stamp, operation, valid: true, used: false });
     this.activeContinuations.set(stamp.target, token); return token;
   }
+  /** ActionQueue calls this only after reserving the actual issued slot, before
+   * invoking the engine producer. A document event cannot mint that slot. */
+  issuedNavigation(token: NavigationContinuation, command: number): void {
+    const record = this.continuations.get(token);
+    if (!record || !record.valid || record.used || record.provisionalEpoch !== undefined ||
+        this.activeContinuations.get(token.target) !== token || !Number.isSafeInteger(command) || command < 1)
+      throw staleSnapshot();
+    this.check(record.stamp, true); record.issuedCommand = command;
+  }
+  assertNavigationCommand(token: NavigationContinuation, command: number): void {
+    const record = this.continuations.get(token), entry = this.entry(token.target);
+    if (!record || !record.valid || record.issuedCommand !== command || this.activeContinuations.get(token.target) !== token)
+      throw staleSnapshot();
+    const stamp = record.stamp;
+    this.owner(token.target, stamp.attachment.id, stamp.generation);
+    if (this.attachment(stamp.attachment.id) !== stamp.attachment ||
+        (entry.recipients.get(stamp.attachment.id) ?? 0) !== stamp.recipientEpoch ||
+        entry.epoch !== (record.successorEpoch ?? record.provisionalEpoch ?? stamp.epoch) ||
+        entry.document !== (record.successor ?? stamp.document)) throw staleSnapshot();
+  }
+  /** Only the already-issued command enters this one-use quarantine. Close
+   * every old reference, delivery and dispatch while retaining its result slot. */
+  provisionalNavigation(token: NavigationContinuation, command: number): void {
+    this.assertNavigationCommand(token, command);
+    const record = this.continuations.get(token)!, entry = this.entry(token.target);
+    if (record.used || record.provisionalEpoch !== undefined) throw staleSnapshot();
+    entry.ready = false; entry.availability = 'unavailable';
+    // Reserve before invalidation callbacks, including synchronous reentry.
+    record.provisionalEpoch = this.increment(entry.epoch);
+    this.invalidate(token.target, undefined, token);
+    this.assertNavigationCommand(token, command);
+  }
   /** Called only by the real document producer at the exact expected navigation
    * boundary. Default refreshDocument revokes every operation, including this. */
   acceptNavigation(token: NavigationContinuation, successor: DocumentReceipt): void {
     const record = this.continuations.get(token), entry = this.entry(token.target);
-    if (!record || !record.valid || record.used || this.activeContinuations.get(token.target) !== token) throw staleSnapshot();
+    if (!record || !record.valid || record.used || record.provisionalEpoch === undefined || record.issuedCommand === undefined ||
+        this.activeContinuations.get(token.target) !== token) throw staleSnapshot();
     const stamp = record.stamp;
     this.owner(token.target, stamp.attachment.id, stamp.generation);
-    if (this.attachment(stamp.attachment.id) !== stamp.attachment || entry.epoch !== stamp.epoch ||
+    if (this.attachment(stamp.attachment.id) !== stamp.attachment || entry.epoch !== record.provisionalEpoch ||
         (entry.recipients.get(stamp.attachment.id) ?? 0) !== stamp.recipientEpoch || entry.document !== stamp.document ||
         successor.page !== token.target.page || successor === stamp.document || successor.document === stamp.document.document ||
         successor.epoch <= stamp.document.epoch || successor.navigation === stamp.document.navigation) throw staleSnapshot();
@@ -367,7 +407,7 @@ export class TabAuthority {
     this.assertDocument(token.target, successor);
     if (this.documents.current(token.target) !== successor) throw staleSnapshot();
     this.owner(token.target, stamp.attachment.id, stamp.generation);
-    if (!record.valid || record.used || this.activeContinuations.get(token.target) !== token || entry.epoch !== stamp.epoch ||
+    if (!record.valid || record.used || this.activeContinuations.get(token.target) !== token || entry.epoch !== record.provisionalEpoch ||
         (entry.recipients.get(stamp.attachment.id) ?? 0) !== stamp.recipientEpoch || entry.document !== stamp.document ||
         this.attachment(stamp.attachment.id) !== stamp.attachment) throw staleSnapshot();
     // Consume before any invalidation callback reenters; no second successor.
