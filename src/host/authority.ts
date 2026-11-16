@@ -42,6 +42,7 @@ export interface CompletedTransition {
   readonly kind: 'open' | 'release' | 'close'; readonly target: TabTarget;
   readonly recipient: string; readonly request: string; readonly action: string;
   readonly fromGeneration: number; readonly generation: number;
+  readonly recipientEpoch: number;
 }
 export interface AuthorityStamp {
   readonly target: TabTarget;
@@ -87,7 +88,7 @@ export class TabAuthority {
   private readonly activeContinuations = new Map<TabTarget, NavigationContinuation>();
   private readonly receipts = new WeakSet<CompletedTransition>();
   private readonly creators = new WeakMap<TabTarget, string>();
-  private readonly takes = new WeakMap<TabTarget, { owner: string; from: number; to: number }>();
+  private readonly takes = new WeakMap<TabTarget, { owner: string; from: number; to: number; recipientEpoch: number }>();
   private readonly closes = new WeakMap<TabTarget, { owner?: string; from: number; to: number }>();
   private sealed = false;
   constructor(readonly boundary: NativeFailureBoundary, readonly documents: DocumentAuthority) {
@@ -212,7 +213,8 @@ export class TabAuthority {
   beginTake(target: TabTarget, expected: number): void {
     this.expected(target, expected); const entry = this.entry(target);
     if (entry.handoff !== 'idle' || entry.controller.kind !== 'agent') throw refused('control_refused');
-    this.takes.set(target, { owner: entry.controller.client, from: entry.generation, to: this.increment(entry.generation) });
+    this.takes.set(target, { owner: entry.controller.client, from: entry.generation, to: this.increment(entry.generation),
+      recipientEpoch: entry.recipients.get(entry.controller.client) ?? 0 });
     entry.generation = this.increment(entry.generation); entry.controller = { kind: 'user' };
     entry.ready = false; entry.handoff = 'taking'; this.invalidate(target);
   }
@@ -249,7 +251,8 @@ export class TabAuthority {
     action: string, fromGeneration: number, generation: number): CompletedTransition {
     this.assertAdmission(); this.attachment(recipient);
     if (!this.knowsAction(action) || !validator('browser.RequestId')(request)) throw refused('control_refused');
-    const receipt = Object.freeze({ kind, target, recipient, request, action, fromGeneration, generation });
+    const receipt = Object.freeze({ kind, target, recipient, request, action, fromGeneration, generation,
+      recipientEpoch: this.entries.get(target)?.recipients.get(recipient) ?? 0 });
     this.receipts.add(receipt); return receipt;
   }
   completedOpen(target: TabTarget, recipient: string, request: string, action: string): CompletedTransition {
@@ -260,7 +263,8 @@ export class TabAuthority {
   completedRelease(target: TabTarget, recipient: string, request: string, action: string, from: number): CompletedTransition {
     const transition = this.takes.get(target), state = this.state(target);
     if (!transition || transition.owner !== recipient || transition.from !== from || transition.to !== state.generation ||
-        state.controller.kind !== 'user' || state.handoff !== 'idle' || this.wasClosed(target)) throw refused('control_changed');
+        state.controller.kind !== 'user' || state.handoff !== 'idle' || this.wasClosed(target) || !this.entry(target).grants.has(recipient) ||
+        (this.entry(target).recipients.get(recipient) ?? 0) !== transition.recipientEpoch) throw refused('control_changed');
     const retired = target.page.retirement();
     if (retired) { assertPageRetirement(target.page, retired); if (retired.phase !== 'retired') throw refused('control_changed'); }
     else if (!state.inputReady || target.page.binding().blocked) throw refused('control_changed');
@@ -286,7 +290,9 @@ export class TabAuthority {
     } else if (kind === 'open') this.owner(receipt.target, recipient, receipt.generation);
     else {
       const state = this.state(receipt.target);
-      if (this.wasClosed(receipt.target) || state.generation !== receipt.generation || state.controller.kind !== 'user' || state.handoff !== 'idle')
+      const entry = this.entry(receipt.target);
+      if (this.wasClosed(receipt.target) || state.generation !== receipt.generation || state.controller.kind !== 'user' || state.handoff !== 'idle' ||
+          !entry.grants.has(recipient) || (entry.recipients.get(recipient) ?? 0) !== receipt.recipientEpoch)
         throw refused('control_changed');
     }
   }

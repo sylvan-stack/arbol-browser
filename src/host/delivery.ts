@@ -115,7 +115,9 @@ export class DeliveryAuthority {
             proof.stamp.target !== proof.receipt.target || proof.stamp.generation !== proof.receipt.generation) throw unavailable('browser');
         this.authority.verifyTransition(proof.receipt, 'open', recipient, request.id); this.authority.check(proof.stamp, true);
         const tab = body.tab as Record<string, unknown>;
-        if (body.action !== proof.receipt.action || tab.tab !== proof.stamp.target.id || tab.controlGeneration !== proof.stamp.generation)
+        if (body.action !== proof.receipt.action || tab.tab !== proof.stamp.target.id || tab.controlGeneration !== proof.stamp.generation ||
+            tab.ownsControl !== true || tab.inputReady !== true || tab.pageAvailability !== 'ready' ||
+            (tab.navigation !== undefined && tab.navigation !== proof.stamp.document.navigation))
           throw unavailable('browser');
         break;
       }
@@ -199,7 +201,8 @@ export class DeliveryAuthority {
       const proof = record.proof;
       if ((event.recipient === undefined || context.attachment?.id === event.recipient) &&
           (proof.kind === 'tabs' || ('stamp' in proof && proof.stamp.target === event.target) ||
-          ((proof.kind === 'release' || proof.kind === 'close') && event.recipient === undefined && proof.receipt.target === event.target))) {
+          (proof.kind === 'release' && proof.receipt.target === event.target) ||
+          (proof.kind === 'close' && event.recipient === undefined && proof.receipt.target === event.target))) {
         record.bytes.fill(0); entries.delete(id);
       }
     }
