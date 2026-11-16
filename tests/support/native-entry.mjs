@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
 import { readFile, writeFile, realpath, lstat } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 const events = [];
@@ -12,6 +13,7 @@ let config, boundary, prepared, watchdog, bootstrap, preparationBefore;
 const resolverMode = 'resolver-control';
 const poisonMode = 'install-poison';
 const bindingMode = 'binding-lifetime';
+const cachedRoutesMode = 'cached-routes';
 const viewOptions = { webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } };
 const bindingKey = ({ id, nonce, webContentsId, revision }) => ({ id, nonce, webContentsId, revision });
 let eventWrite = Promise.resolve();
@@ -200,6 +202,115 @@ async function observeBindingLifetime(bridge, addon) {
     { mode: 0o600, flag: 'wx' });
   watchdog.terminate();
 }
+async function observeCachedRoutes(bridge) {
+  app.setAccessibilitySupportEnabled(true);
+  const window = new BaseWindow({ title: 'Arbol Browser native test', width: 640, height: 360, show: false });
+  const handle = window.getNativeWindowHandle();
+  const view = new WebContentsView(viewOptions), contents = view.webContents;
+  let unrelatedKeyEvents = 0;
+  contents.on('before-input-event', () => { unrelatedKeyEvents++; });
+  const ownership = boundary.native.ownership;
+  const created = ownership.bind(handle, contents.id, () => window.contentView.addChildView(view));
+  view.setBounds({ x: 0, y: 0, width: 640, height: 360 });
+  const initialUser = ownership.mark(bindingKey(created), false);
+  const html = `<!doctype html><button id="button" aria-label="Route fixture button">0</button>
+    <input id="field" aria-label="Route fixture field" value="edit">
+    <script>
+      globalThis.records = [];
+      for (const type of ['input', 'compositionstart', 'compositionupdate', 'compositionend']) {
+        field.addEventListener(type, event => records.push({ type: event.type, trusted: event.isTrusted,
+          data: event.data ?? null, inputType: event.inputType ?? null }));
+      }
+      button.addEventListener('click', event => {
+        button.textContent = Number(button.textContent) + 1;
+        records.push({ type: 'click', trusted: event.isTrusted });
+      });
+      field.focus();
+    </script>`;
+  const server = createServer((request, response) => {
+    if (request.url !== '/page') { response.writeHead(404).end(); return; }
+    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }).end(html);
+  });
+  await new Promise((accept, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', accept);
+  });
+  const port = server.address().port;
+  const frame = () => {
+    const { url, osProcessId, processId, routingId, frameTreeNodeId } = contents.mainFrame;
+    return { url, osProcessId, processId, routingId, frameTreeNodeId };
+  };
+  const capture = () => waitForObservation(() => {
+    let client;
+    try { client = JSON.parse(bridge.capture(handle)); } catch (error) {
+      if (error.message !== 'fixture_requires_one_actual_widget') throw error;
+      return undefined;
+    }
+    if (!client.button || !client.field) bridge.releaseClients(client.token);
+    return client;
+  }, value => value?.button && value?.field, 'Real cached accessibility controls unavailable');
+  const invoke = (token, route) => observeCall(() => JSON.parse(bridge.invoke(token, route)));
+  const state = () => {
+    assert.equal(unrelatedKeyEvents, 0, 'An unrelated keyboard event reached the disposable fixture');
+    return contents.executeJavaScript(
+      '({button:Number(button.textContent),text:field.value,selection:[field.selectionStart,field.selectionEnd],events:[...records]})');
+  };
+  const reset = () => contents.executeJavaScript("button.textContent='0';field.value='edit';field.focus();field.setSelectionRange(4,4);records.length=0");
+  const settle = () => new Promise(accept => setTimeout(accept, 180));
+  const matrix = async (phase, token) => {
+    const routes = [];
+    for (const sequence of [['press'], ['axValue'], ['text'], ['delete'], ['directDelete'], ['selectAll'], ['mark', 'unmark']]) {
+      await reset();
+      for (const route of sequence) {
+        const before = await state(), dispatched = invoke(token, route);
+        await settle();
+        routes.push({ route, before, dispatched, after: await state() });
+      }
+    }
+    await event('cached-route-matrix', { phase, routes });
+    return routes;
+  };
+  await contents.loadURL(`http://127.0.0.1:${port}/page`);
+  window.show(); window.focus(); contents.focus();
+  await settle();
+  const original = await capture();
+  const originalState = JSON.parse(bridge.state(original.token));
+  const originalFrame = frame();
+  const focus = invoke(original.token, 'focus');
+  const user = await matrix('user', original.token);
+  await reset();
+  const beforeContexts = await state();
+  const contexts = ['unknown', 'off-main', 'reentrant'].map(context => JSON.parse(bridge.invokePressContext(original.token, context)));
+  await settle();
+  const afterContexts = await state();
+  const resigned = invoke(original.token, 'resignFocus');
+  const blockedBinding = ownership.mark(bindingKey(initialUser), true);
+  const blocked = await matrix('agent', original.token);
+  const restored = ownership.restore(bindingKey(blockedBinding));
+  const resumedBinding = ownership.mark(bindingKey(restored), false);
+  invoke(original.token, 'focus');
+  const resumed = await matrix('resumed-user', original.token);
+  const custom = invoke(original.token, 'custom');
+  invoke(original.token, 'resignFocus');
+  const navigationBlocked = ownership.mark(bindingKey(resumedBinding), true);
+  await event('cached-route-navigating', { originalFrame, navigationBlocked });
+  await contents.loadURL(`http://localhost:${port}/page`);
+  const replacementFrame = frame(), replacement = await capture();
+  const replacementBlocked = ownership.bindingInfo(bindingKey(navigationBlocked));
+  const oldStateAfterNavigation = JSON.parse(bridge.state(original.token));
+  const replacementState = JSON.parse(bridge.state(replacement.token));
+  const afterNavigation = await matrix('agent-after-frame-swap', replacement.token);
+  const replacementUser = ownership.mark(bindingKey(replacementBlocked), false);
+  invoke(replacement.token, 'focus');
+  const replacementPositive = await matrix('user-after-frame-swap', replacement.token);
+  await new Promise((accept, reject) => server.close(error => error ? reject(error) : accept()));
+  const report = { created, initialUser, original, originalFrame, originalState, focus, user, contexts, beforeContexts, afterContexts, resigned,
+    blockedBinding, blocked, restored, resumedBinding, resumed, custom, navigationBlocked, replacementFrame, replacement,
+    replacementBlocked, oldStateAfterNavigation, replacementState, afterNavigation, replacementUser, replacementPositive,
+    status: boundary.native.assertIntegrity() };
+  writeFileSync(join(config.output, 'cached-routes.json'), JSON.stringify(report) + '\n', { mode: 0o600, flag: 'wx' });
+  watchdog.terminate();
+}
 async function observeInstallPoison(bootstrapURL) {
   const features = await import(new URL('../native/features.js', bootstrapURL));
   features.configureNativeFeatures();
@@ -245,7 +356,7 @@ try {
   const stat = await lstat(path);
   assert.ok(stat.isFile() && stat.uid === process.getuid() && (stat.mode & 0o7777) === 0o600 && stat.nlink === 1 && stat.size <= 16384);
   config = JSON.parse(await readFile(path, 'utf8'));
-  assert.equal(config.format, 1); assert.ok(['boundary', 'callbacks', 'frozen-trust', 'provider-mismatch', resolverMode, poisonMode, bindingMode].includes(config.mode));
+  assert.equal(config.format, 1); assert.ok(['boundary', 'callbacks', 'frozen-trust', 'provider-mismatch', resolverMode, poisonMode, bindingMode, cachedRoutesMode].includes(config.mode));
   assert.equal(await realpath(config.home), config.home); assert.equal(process.env.HOME, config.home);
   app.setPath('userData', join(config.home, 'app-data')); app.setPath('sessionData', join(config.home, 'session-data'));
   await event('entry', { pid: process.pid, appReady: app.isReady(), argv: process.argv, runtime: process.versions });
@@ -365,20 +476,22 @@ try {
   } else boundary = await bootstrap.installNativeBoundary(prepared, watchdog, effects);
   assert.equal(boundary.pageAdmission, false);
   await event('installed', { status: boundary.native.assertIntegrity(), admission: admissionObservation(), appReady: app.isReady() });
-  if (config.mode === bindingMode) {
+  if (config.mode === bindingMode || config.mode === cachedRoutesMode) {
     assert.ok(config.callback && await realpath(config.callback) === config.callback);
     const require = createRequire(import.meta.url);
     const bridge = require(config.callback);
-    const addon = require(join(config.bundle, 'Contents/Resources/browser/native/ownership.node'));
+    const run = config.mode === bindingMode
+      ? () => observeBindingLifetime(bridge, require(join(config.bundle, 'Contents/Resources/browser/native/ownership.node')))
+      : () => observeCachedRoutes(bridge);
     // Electron's entry must resolve before its application-ready event.
-    app.whenReady().then(() => observeBindingLifetime(bridge, addon)).catch(async error => {
-      await event('binding-unavailable', { error: String(error.stack ?? error) });
+    app.whenReady().then(run).catch(async error => {
+      await event(config.mode === bindingMode ? 'binding-unavailable' : 'cached-route-unavailable', { error: String(error.stack ?? error) });
       watchdog.terminate();
     });
   } else if (config.mode === 'callbacks') {
     assert.ok(config.callback && await realpath(config.callback) === config.callback);
     const bridge = createRequire(import.meta.url)(config.callback);
-    assert.deepEqual(Object.getOwnPropertyNames(bridge).sort(), ['armInstallPoison', 'auditMethods', 'block', 'capture', 'descriptor', 'finishInstallPoison', 'invoke',
+    assert.deepEqual(Object.getOwnPropertyNames(bridge).sort(), ['armInstallPoison', 'auditMethods', 'block', 'capture', 'descriptor', 'finishInstallPoison', 'invoke', 'invokePressContext',
       'releaseClients', 'resolverControlObservation', 'resolverDispatch', 'startResolverControl', 'state', 'stopResolverControl', 'windowPages']);
     await event('callback-loaded', { path: config.callback,
       capsule: JSON.parse(bridge.descriptor(watchdog.custody.startupDescriptor)),

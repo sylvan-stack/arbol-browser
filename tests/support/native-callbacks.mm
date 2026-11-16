@@ -11,6 +11,7 @@
 #include <cstring>
 #include <pthread.h>
 #include <set>
+#include <thread>
 @interface QualificationRoutes : NSObject
 @property(nonatomic,weak) NSView* root;
 @property(nonatomic,weak) NSView* widget;
@@ -19,6 +20,18 @@
 @property(nonatomic,copy) BOOL (^action)(void);
 @end
 @implementation QualificationRoutes
+@end
+@interface QualificationAXParent : NSObject
+@property(nonatomic,strong) id client;
+@property(nonatomic) NSUInteger nestedCalls;
+@property(nonatomic) BOOL nestedResult;
+@end
+@implementation QualificationAXParent
+- (id)accessibilityParent {
+  ++_nestedCalls;
+  _nestedResult=((BOOL(*)(id,SEL))objc_msgSend)(_client,@selector(accessibilityPerformPress));
+  return nil;
+}
 @end
 static NSMutableDictionary<NSString*,QualificationRoutes*>* routes;
 static napi_value fail(napi_env env,const char* reason) { napi_throw_error(env,nullptr,reason); return nullptr; }
@@ -113,6 +126,10 @@ static napi_value invoke(napi_env env,napi_callback_info info) {
   @try {
     NSView* widget=row.widget;BOOL result=YES;
     if([route isEqualToString:@"press"]) { if(!row.button) return fail(env,"fixture_missing_button");result=((BOOL(*)(id,SEL))objc_msgSend)(row.button,@selector(accessibilityPerformPress)); }
+    else if([route isEqualToString:@"axValue"]) {
+      if(!row.field||![row.field respondsToSelector:@selector(setAccessibilityValue:)]) return fail(env,"fixture_missing_ax_value");
+      ((void(*)(id,SEL,id))objc_msgSend)(row.field,@selector(setAccessibilityValue:),@"AX fixture edit");
+    }
     else if([route isEqualToString:@"custom"]) { if(!row.action) return fail(env,"fixture_missing_handler");result=row.action(); }
     else {
       if(!widget) return fail(env,"fixture_weak_widget_gone");
@@ -149,6 +166,42 @@ static napi_value block(napi_env env,napi_callback_info info) {
 static NSString* imagePath(IMP implementation) {
   Dl_info image{};
   return implementation && dladdr((void*)implementation,&image) && image.dli_fname ? @(image.dli_fname) : nil;
+}
+static napi_value invokePressContext(napi_env env,napi_callback_info info) {
+  napi_value values[2];if(!args(env,info,2,values)) return nullptr;
+  id client=routes[string(env,values[0])].button;
+  NSString* context=string(env,values[1]);
+  if(!client||!context) return fail(env,"fixture_missing_button_or_context");
+  SEL selector=@selector(accessibilityPerformPress);
+  Method method=class_getInstanceMethod(object_getClass(client),selector);
+  IMP implementation=method ? method_getImplementation(method) : nullptr;
+  NSString* image=imagePath(implementation);
+  if(![image.lastPathComponent isEqualToString:@"ownership.node"]) return fail(env,"fixture_expected_native_guard");
+  auto press=reinterpret_cast<BOOL(*)(id,SEL)>(implementation);
+  if([context isEqualToString:@"off-main"]) {
+    BOOL mainThread=YES,result=YES,threw=NO;
+    std::thread worker([&] {
+      @autoreleasepool {
+        mainThread=pthread_main_np()!=0;
+        @try { result=press(client,selector); } @catch(NSException*) { threw=YES; }
+      }
+    });
+    worker.join();
+    return reply(env,@{ @"context":context,@"image":image,@"mainThread":@(mainThread),@"returned":@(result),@"threw":@(threw) });
+  }
+  if([context isEqualToString:@"unknown"]) {
+    BOOL result=press([NSObject new],selector);
+    return reply(env,@{ @"context":context,@"image":image,@"returned":@(result) });
+  }
+  if([context isEqualToString:@"reentrant"]) {
+    // Owner resolution calls accessibilityParent inside the actual guard's
+    // callback scope. The probe has no owner and can only reenter this client.
+    QualificationAXParent* parent=[QualificationAXParent new];parent.client=client;
+    BOOL result=press(parent,selector);
+    return reply(env,@{ @"context":context,@"image":image,@"returned":@(result),
+      @"nestedCalls":@(parent.nestedCalls),@"nestedResult":@(parent.nestedResult) });
+  }
+  return fail(env,"fixture_unknown_press_context");
 }
 static Method declaredMethod(Class cls,SEL selector) {
   Method declared=nullptr;
@@ -397,6 +450,7 @@ NAPI_MODULE_INIT() {
     {"stopResolverControl",nullptr,stopResolverControl,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"armInstallPoison",nullptr,armInstallPoison,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"finishInstallPoison",nullptr,finishInstallPoison,nullptr,nullptr,nullptr,napi_default,nullptr},
-    {"windowPages",nullptr,windowPages,nullptr,nullptr,nullptr,napi_default,nullptr}};
+    {"windowPages",nullptr,windowPages,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"invokePressContext",nullptr,invokePressContext,nullptr,nullptr,nullptr,napi_default,nullptr}};
   if(napi_define_properties(env,exports,sizeof(exportsList)/sizeof(exportsList[0]),exportsList)!=napi_ok) return nullptr;return exports;
 }
