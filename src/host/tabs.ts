@@ -84,20 +84,28 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
     retirements.set(target, { generation: currentGeneration, promise });
     closing.add(target); actions.delete(target);
     // Both guards exist before invalidate/removed/changed can synchronously re-enter.
-    let invalidationError: unknown;
-    try { lifecycle.invalidate(target); } catch (error) { invalidationError = error; }
-    const complete = () => {
-      tabs.delete(target.id); closing.delete(target);
-      const window = target.page.window;
+    const window = target.page.window;
+    let failed = false, transitionError: unknown;
+    try {
+      target.page.setNativeBlocked(true);
       if (selection.get(window) === target) {
         selection.delete(window);
         const next = [...tabs.values()].find(tab => tab.page.window === window && !closing.has(tab));
-        if (!windowClosures.has(window) && next) { selection.set(window, next); window.select(next.page); }
+        if (!windowClosures.has(window) && next) { window.select(next.page); selection.set(window, next); }
+        else target.page.present(false);
       }
+    } catch (error) { failed = true; transitionError = error; }
+    // Starting the exact native retirement also prevents a resize from presenting
+    // an empty-fallback retired page again before the lifecycle callbacks below.
+    let nativeRetirement: Promise<void>;
+    try { nativeRetirement = target.page.retire(); } catch (error) { reject(error); return promise; }
+    try { lifecycle.invalidate(target); } catch (error) { failed = true; transitionError = error; }
+    const complete = () => {
+      tabs.delete(target.id); closing.delete(target);
       lifecycle.removed(target); lifecycle.changed();
-      if (invalidationError !== undefined) throw invalidationError;
+      if (failed) throw transitionError;
     };
-    try { void target.page.retire().then(() => { try { complete(); resolve(); } catch (error) { reject(error); } }, reject); }
+    try { void nativeRetirement.then(() => { try { complete(); resolve(); } catch (error) { reject(error); } }, reject); }
     catch (error) { reject(error); }
     return promise;
   }
