@@ -55,12 +55,23 @@ export class HandoffController {
   }
   /** Exact full native acknowledgement; all failures retain the real fatal path. */
   private mark(target: TabTarget, blocked: boolean): void {
-    target.page.window.guardRetirementTransition(() => {
-      const before = target.page.binding(), after = target.page.setNativeBlocked(blocked);
+    const page = target.page;
+    page.window.guardRetirementTransition(() => {
+      const before = page.binding(), after = page.setNativeBlocked(blocked);
       // The real native wrapper already checked its mark acknowledgement before
       // shield/presentation callbacks. A genuine same-target Close may now have
       // advanced that binding again; its exact destruction proof governs next.
       if (this.authority.wasClosed(target)) return;
+      if (this.authority.faultAvailability(target)) {
+        if (target.page !== page) return this.authority.exhausted();
+        if (page.retirement()) { assertPageRetirement(page, page.retirement()!); return; }
+        let actual = page.binding();
+        if (!actual.blocked) actual = page.setNativeBlocked(true);
+        if (actual.retired || actual.id !== before.id || actual.nonce !== before.nonce ||
+            actual.webContentsId !== before.webContentsId || actual.revision < before.revision + 1 || !actual.blocked)
+          return this.authority.exhausted();
+        return; // genuine fault supersedes the requested unlock with checked exclusion
+      }
       if (before.retired || after.retired || after.id !== before.id || after.nonce !== before.nonce ||
           after.webContentsId !== before.webContentsId || after.webContentsId !== target.page.view.webContents.id ||
           after.revision !== before.revision + 1 || after.blocked !== blocked) return this.authority.exhausted();
@@ -119,7 +130,10 @@ export class HandoffController {
     const existing = this.pending.get(target);
     if (existing) {
       if (expected !== existing.expected && expected !== existing.expected + 1) throw refused('control_changed');
-      if (fault) this.authority.pageFailed(target, fault);
+      if (fault) {
+        this.authority.pageFailed(target, fault);
+        if (!this.authority.wasClosed(target) && target.page === existing.page && !existing.page.retirement()) this.mark(target, true);
+      }
       return existing.promise;
     }
     const before = this.authority.expected(target, expected);
@@ -155,6 +169,7 @@ export class HandoffController {
     this.original(target);
     if (this.authority.wasClosed(target)) return this.superseded(target);
     this.authority.assertAdmission();
+    let enabled = false;
     if (readyDocument && !this.operations.unsafe(target) && !target.page.retirement()) {
       this.authority.assertDocument(target, readyDocument);
       if (this.authority.wasClosed(target)) return this.superseded(target);
@@ -162,8 +177,11 @@ export class HandoffController {
       if (this.operations.unsafe(target) || page.retirement()) return this.authority.exhausted();
       this.mark(target, false);
       if (this.authority.wasClosed(target)) return this.superseded(target);
-      this.authority.finishTake(target, true, false, readyDocument);
-    } else {
+      if (!this.authority.faultAvailability(target) && !page.retirement()) {
+        this.authority.finishTake(target, true, false, readyDocument); enabled = true;
+      }
+    }
+    if (!enabled) {
       const known = this.operations.outcome(target);
       if (known) settledAction = { ...known };
       try {

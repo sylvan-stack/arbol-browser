@@ -279,6 +279,7 @@ export class TabAuthority {
   pageFailed(target: TabTarget, fault: DocumentFault): void {
     this.latchFault(target, fault); if (!this.entry(target).closed) this.invalidate(target);
   }
+  faultAvailability(target: TabTarget): Contract<'browser.Availability'> | undefined { return this.entry(target).fault; }
   beginRecovery(target: TabTarget, expected: number): RecoveryTransition {
     const state = this.expected(target, expected), entry = this.entry(target);
     if (state.controller.kind !== 'user' || state.handoff !== 'idle' || state.inputReady || state.pageAvailability === 'ready' ||
