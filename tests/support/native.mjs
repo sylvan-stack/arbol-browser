@@ -166,9 +166,11 @@ async function observeFrozenTrust(variant, output, onStage) {
   await onStage('frozen-trust-restored-refused');
   return { before: hash(original), altered, restored: hash(await readFile(resourcePath)) };
 }
-export async function launchNativeFixture(fixtures, { mode = 'boundary', callback = fixtures.record.callback?.path, output, variant = undefined }) {
-  assert.ok(['boundary', 'callbacks', 'frozen-trust', 'provider-mismatch', 'resolver-control'].includes(mode));
-  assert.ok(callback || !['callbacks', 'resolver-control'].includes(mode));
+const installPoisonScenarios = new Set(['pre-commit-poison', 'rollback-confirmed', 'rollback-unconfirmed']);
+export async function launchNativeFixture(fixtures, { mode = 'boundary', callback = fixtures.record.callback?.path, output, variant, poisonScenario }) {
+  assert.ok(['boundary', 'callbacks', 'frozen-trust', 'provider-mismatch', 'resolver-control', 'install-poison'].includes(mode));
+  assert.ok(callback || !['callbacks', 'resolver-control', 'install-poison'].includes(mode));
+  assert.equal(mode === 'install-poison', installPoisonScenarios.has(poisonScenario));
   assert.equal(mode === 'frozen-trust', variant?.kind === 'frozen-trust');
   assert.equal(mode === 'provider-mismatch', variant?.kind === 'provider-mismatch');
   const consumer = await verifiedConsumer(); assert.equal(consumer.candidate, fixtures.consumer.candidate);
@@ -189,7 +191,7 @@ export async function launchNativeFixture(fixtures, { mode = 'boundary', callbac
   for (const name of ['app-data', 'session-data']) await mkdir(join(home, name), { mode: 0o700 });
   if (callback) { assert.equal(callback, fixtures.record.callback?.path); assert.equal(hash(await readFile(callback)), fixtures.record.callback.signedDigest); }
   const config = { format: 1, mode, bundle: variant?.candidate ?? fixtures.consumer.candidate, output: directory, home, trustProbe: Boolean(variant),
-    providerMethod: variant?.providerChange?.method,
+    providerMethod: variant?.providerChange?.method, poisonScenario,
     owner: join(directory, 'owner.lock'), build: join(directory, 'build.lock'), callback };
   const request = join(directory, 'request.json');
   await writeFile(request, JSON.stringify(config) + '\n', { mode: 0o600, flag: 'wx' });

@@ -9,6 +9,7 @@ import { pathToFileURL } from 'node:url';
 const events = [];
 let config, boundary, prepared, watchdog, bootstrap, preparationBefore;
 const resolverMode = 'resolver-control';
+const poisonMode = 'install-poison';
 let eventWrite = Promise.resolve();
 async function event(stage, values = {}) {
   const value = { stage, elapsedMs: performance.now(), ...values }; events.push(value);
@@ -35,13 +36,56 @@ async function waitForFixtureMarker(name) {
     await new Promise(accept => setTimeout(accept, 25));
   }
 }
+function observeCall(call) {
+  try { return { returned: call() }; }
+  catch (error) { return { error: String(error.message ?? error) }; }
+}
+async function observeInstallPoison(bootstrapURL) {
+  const features = await import(new URL('../native/features.js', bootstrapURL));
+  features.configureNativeFeatures();
+  features.assertNativeFeatures();
+  watchdog.assertArmed(prepared.trust);
+  assert.ok(config.callback && await realpath(config.callback) === config.callback);
+  const require = createRequire(import.meta.url);
+  const addonPath = join(config.bundle, 'Contents/Resources/browser/native/ownership.node');
+  const addon = require(addonPath), bridge = require(config.callback);
+  const expected = JSON.parse(addon.getABI());
+  assert.deepEqual(expected, prepared.trust.manifest.nativeABI);
+  const keys = Object.keys(expected.methods), audit = () => JSON.parse(bridge.auditMethods(keys));
+  assert.equal(JSON.parse(addon.status()).phase, 'new');
+  const originals = audit();
+  const preCommit = config.poisonScenario === 'pre-commit-poison';
+  const argument = preCommit ? { ...expected, abi: expected.abi + 1 } : expected;
+  let install, status, returnedMethods, journal, poisonArmed;
+  if (!preCommit) assert.equal(JSON.parse(bridge.startResolverControl(addonPath)).active, true);
+  try {
+    if (!preCommit) {
+      assert.equal(JSON.parse(bridge.armInstallPoison(config.poisonScenario)).armed, true);
+      poisonArmed = true;
+    }
+    install = observeCall(() => addon.install(JSON.stringify(argument)));
+    status = JSON.parse(addon.status());
+    returnedMethods = audit();
+  } finally {
+    if (!preCommit) {
+      bridge.stopResolverControl();
+      if (poisonArmed) journal = JSON.parse(bridge.finishInstallPoison());
+    }
+  }
+  const methods = audit();
+  const retry = observeCall(() => addon.install(JSON.stringify(expected)));
+  const result = { scenario: config.poisonScenario, install, status, originals, returnedMethods, methods, journal,
+    retry, retryStatus: JSON.parse(addon.status()), retryMethods: audit(), admission: admissionObservation() };
+  writeFileSync(join(config.output, 'install-poison.json'), JSON.stringify(result) + '\n', { mode: 0o600, flag: 'wx' });
+  watchdog.terminate();
+}
 try {
   const path = process.env.ARBOL_BROWSER_QUALIFICATION_REQUEST;
   assert.ok(path && await realpath(path) === path);
   const stat = await lstat(path);
   assert.ok(stat.isFile() && stat.uid === process.getuid() && (stat.mode & 0o7777) === 0o600 && stat.nlink === 1 && stat.size <= 16384);
   config = JSON.parse(await readFile(path, 'utf8'));
-  assert.equal(config.format, 1); assert.ok(['boundary', 'callbacks', 'frozen-trust', 'provider-mismatch', resolverMode].includes(config.mode));
+  assert.equal(config.format, 1); assert.ok(['boundary', 'callbacks', 'frozen-trust', 'provider-mismatch', resolverMode, poisonMode].includes(config.mode));
   assert.equal(await realpath(config.home), config.home); assert.equal(process.env.HOME, config.home);
   app.setPath('userData', join(config.home, 'app-data')); app.setPath('sessionData', join(config.home, 'session-data'));
   await event('entry', { pid: process.pid, appReady: app.isReady(), argv: process.argv, runtime: process.versions });
@@ -92,6 +136,7 @@ try {
   await event('locks', { owner: owner.assertIdentity(), build: build.assertIdentity() });
   watchdog = await prepared.arm(owner, build); watchdog.assertArmed(prepared.trust);
   await event('armed', { descriptors: watchdog.custody.descriptors, startupDescriptor: watchdog.custody.startupDescriptor, appReady: app.isReady() });
+  if (config.mode === poisonMode) await observeInstallPoison(bootstrapURL);
   let resolver;
   if (config.mode === resolverMode) {
     assert.ok(config.callback && await realpath(config.callback) === config.callback);
@@ -163,7 +208,7 @@ try {
   if (config.mode === 'callbacks') {
     assert.ok(config.callback && await realpath(config.callback) === config.callback);
     const bridge = createRequire(import.meta.url)(config.callback);
-    assert.deepEqual(Object.getOwnPropertyNames(bridge).sort(), ['auditMethods', 'block', 'capture', 'descriptor', 'invoke',
+    assert.deepEqual(Object.getOwnPropertyNames(bridge).sort(), ['armInstallPoison', 'auditMethods', 'block', 'capture', 'descriptor', 'finishInstallPoison', 'invoke',
       'releaseClients', 'resolverControlObservation', 'resolverDispatch', 'startResolverControl', 'state', 'stopResolverControl']);
     await event('callback-loaded', { path: config.callback,
       capsule: JSON.parse(bridge.descriptor(watchdog.custody.startupDescriptor)),

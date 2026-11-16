@@ -131,15 +131,18 @@ static NSString* imagePath(IMP implementation) {
   Dl_info image{};
   return implementation && dladdr((void*)implementation,&image) && image.dli_fname ? @(image.dli_fname) : nil;
 }
-static Method declaredResolver() {
+static Method declaredMethod(Class cls,SEL selector) {
   Method declared=nullptr;
   unsigned count=0;
-  Method* methods=class_copyMethodList(NSString.class,&count);
+  Method* methods=class_copyMethodList(cls,&count);
   for(unsigned index=0;index<count;++index) {
-    if(method_getName(methods[index])==@selector(stringByResolvingSymlinksInPath)) { declared=methods[index];break; }
+    if(method_getName(methods[index])==selector) { declared=methods[index];break; }
   }
   free(methods);
   return declared;
+}
+static Method declaredResolver() {
+  return declaredMethod(NSString.class,@selector(stringByResolvingSymlinksInPath));
 }
 static NSDictionary* resolverReceivers(Method declared) {
   SEL resolver=method_getName(declared);
@@ -197,6 +200,70 @@ static char ownershipImage[PATH_MAX], providerPaths[2][PATH_MAX];
 static unsigned resolverCalls[2];
 static bool resolverActive;
 static thread_local bool resolving;
+
+enum class PoisonScenario { None, Restored, Unconfirmed };
+static PoisonScenario poisonScenario=PoisonScenario::None;
+struct MethodWitness {
+  const char* selector;
+  const char* encoding;
+  SEL target;
+  IMP original;
+};
+static MethodWitness witnesses[]={
+  {"accessibilityCustomActions","@16@0:8",nullptr,nullptr},
+  {"accessibilityPerformAction:","v24@0:8@16",nullptr,nullptr},
+  {"accessibilityPerformDecrement","B16@0:8",nullptr,nullptr},
+  {"accessibilityPerformIncrement","B16@0:8",nullptr,nullptr},
+  {"accessibilityPerformPress","B16@0:8",nullptr,nullptr}
+};
+static IMP commitBefore[5],commitAfter[5],rollbackBefore[5],rollbackAfter[5];
+static Class witnessClass;
+static Method observedDecrementGuard;
+static unsigned observedGuardMasks;
+static bool driftApplied, confirmationFault, journalUncertain;
+
+static BOOL fixturePress(id,SEL) { return NO; }
+static bool fromImage(IMP implementation,const char* path) {
+  Dl_info image{};
+  return implementation&&dladdr((void*)implementation,&image)&&image.dli_fname&&!strcmp(image.dli_fname,path);
+}
+static Method liveWitness(unsigned index) {
+  return class_getInstanceMethod(witnessClass,witnesses[index].target);
+}
+static void readWitnesses(IMP (&current)[5]) {
+  for(unsigned index=0;index<5;++index) {
+    Method method=liveWitness(index);
+    current[index]=method ? method_getImplementation(method) : nullptr;
+  }
+}
+static bool productGuard(unsigned index, IMP implementation) {
+  return implementation!=witnesses[index].original&&fromImage(implementation,ownershipImage);
+}
+static bool observeInstallTransaction() {
+  if(poisonScenario==PoisonScenario::None||journalUncertain||confirmationFault) return false;
+  IMP current[5];readWitnesses(current);
+  unsigned mask=0;
+  for(unsigned index=0;index<5;++index) if(productGuard(index,current[index])) mask|=1u<<index;
+  observedGuardMasks|=1u<<mask;
+  if(!driftApplied&&mask==7&&
+      current[3]==witnesses[3].original&&current[4]==witnesses[4].original) {
+    std::memcpy(commitBefore,current,sizeof(current));
+    observedDecrementGuard=liveWitness(2);
+    IMP previous=method_setImplementation(liveWitness(4),(IMP)&fixturePress);
+    readWitnesses(commitAfter);
+    driftApplied=commitAfter[4]==(IMP)&fixturePress;
+    journalUncertain=!driftApplied||previous!=witnesses[4].original;
+  } else if(driftApplied&&poisonScenario==PoisonScenario::Unconfirmed&&current[0]==commitBefore[0]&&current[1]==commitBefore[1]&&
+      current[2]==witnesses[2].original&&current[3]==witnesses[3].original&&current[4]==(IMP)&fixturePress&&liveWitness(2)==observedDecrementGuard) {
+    std::memcpy(rollbackBefore,current,sizeof(current));
+    IMP previous=method_setImplementation(liveWitness(2),commitBefore[2]);
+    readWitnesses(rollbackAfter);
+    confirmationFault=previous==witnesses[2].original&&rollbackAfter[2]==commitBefore[2];
+    journalUncertain=!confirmationFault;
+    return confirmationFault;
+  }
+  return false;
+}
 static id observeResolver(id receiver, SEL selector) {
   auto original=reinterpret_cast<id(*)(id,SEL)>(resolverOriginal.load(std::memory_order_acquire));
   if(!pthread_main_np()||!resolverActive||resolving) return original(receiver,selector);
@@ -204,11 +271,14 @@ static id observeResolver(id receiver, SEL selector) {
   @try {
     Dl_info caller{};
     char receiverPath[PATH_MAX];
+    bool rejectConfirmation=false;
     if(dladdr(__builtin_return_address(0),&caller)&&caller.dli_fname&&!strcmp(caller.dli_fname,ownershipImage)&&
         CFStringGetCString((__bridge CFStringRef)receiver,receiverPath,sizeof(receiverPath),kCFStringEncodingUTF8)) {
       for(unsigned index=0;index<2;++index) if(!strcmp(receiverPath,providerPaths[index])) ++resolverCalls[index];
+      if(!strcmp(receiverPath,providerPaths[1])) rejectConfirmation=observeInstallTransaction();
     }
-    return original(receiver,selector);
+    id path=original(receiver,selector);
+    return rejectConfirmation ? @"/arbol-browser-qualification/invalid-provider" : path;
   } @finally { resolving=false; }
 }
 static napi_value startResolverControl(napi_env env,napi_callback_info info) {
@@ -255,6 +325,46 @@ static napi_value stopResolverControl(napi_env env,napi_callback_info info) {
     return fail(env,"fixture_resolver_restore_unconfirmed");
   return resolverControlObservation(env,info);
 }
+static napi_value armInstallPoison(napi_env env,napi_callback_info info) {
+  napi_value argument;
+  if(!args(env,info,1,&argument)) return nullptr;
+  NSString* scenario=string(env,argument);
+  if(!resolverActive||poisonScenario!=PoisonScenario::None) return fail(env,"fixture_poison_state");
+  const bool unconfirmed=[scenario isEqualToString:@"rollback-unconfirmed"];
+  if(!unconfirmed&&![scenario isEqualToString:@"rollback-confirmed"]) return fail(env,"fixture_poison_scenario");
+  witnessClass=objc_getClass("BrowserAccessibilityCocoa");
+  if(!witnessClass) return fail(env,"fixture_poison_class");
+  for(auto& witness:witnesses) {
+    witness.target=sel_registerName(witness.selector);
+    Method method=class_getInstanceMethod(witnessClass,witness.target);
+    if(!method||strcmp(method_getTypeEncoding(method),witness.encoding)) return fail(env,"fixture_poison_abi");
+    witness.original=method_getImplementation(method);
+    if(!fromImage(witness.original,providerPaths[1])) return fail(env,"fixture_poison_provider");
+  }
+  if(declaredMethod(witnessClass,witnesses[4].target)!=liveWitness(4)) return fail(env,"fixture_poison_press_not_declared");
+  poisonScenario=unconfirmed ? PoisonScenario::Unconfirmed : PoisonScenario::Restored;
+  return reply(env,@{ @"armed":@YES });
+}
+static NSArray* witnessSnapshot(const IMP (&snapshot)[5]) {
+  NSMutableArray* result=[NSMutableArray new];
+  for(IMP implementation:snapshot) [result addObject:[NSString stringWithFormat:@"%p",(void*)implementation]];
+  return result;
+}
+static napi_value finishInstallPoison(napi_env env,napi_callback_info info) {
+  if(!args(env,info,0,nullptr)) return nullptr;
+  if(resolverActive||poisonScenario==PoisonScenario::None) return fail(env,"fixture_poison_state");
+  bool externalRestored=!driftApplied;
+  Method press=liveWitness(4);
+  if(driftApplied&&press&&method_getImplementation(press)==(IMP)&fixturePress) {
+    IMP previous=method_setImplementation(press,witnesses[4].original);
+    externalRestored=previous==(IMP)&fixturePress&&method_getImplementation(press)==witnesses[4].original;
+  }
+  return reply(env,@{ @"driftApplied":@(driftApplied),@"confirmationFault":@(confirmationFault),
+    @"uncertain":@(journalUncertain),@"externalRestored":@(externalRestored),@"observedGuardMasks":@(observedGuardMasks),
+    @"appKitCalls":@(resolverCalls[0]),@"electronCalls":@(resolverCalls[1]),
+    @"commitBefore":witnessSnapshot(commitBefore),@"commitAfter":witnessSnapshot(commitAfter),
+    @"rollbackBefore":witnessSnapshot(rollbackBefore),@"rollbackAfter":witnessSnapshot(rollbackAfter) });
+}
 NAPI_MODULE_INIT() {
   if(![NSThread isMainThread]) return fail(env,"fixture_main_thread_only");
   napi_property_descriptor exportsList[]={
@@ -265,6 +375,8 @@ NAPI_MODULE_INIT() {
     {"auditMethods",nullptr,auditMethods,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"startResolverControl",nullptr,startResolverControl,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"resolverControlObservation",nullptr,resolverControlObservation,nullptr,nullptr,nullptr,napi_default,nullptr},
-    {"stopResolverControl",nullptr,stopResolverControl,nullptr,nullptr,nullptr,napi_default,nullptr}};
+    {"stopResolverControl",nullptr,stopResolverControl,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"armInstallPoison",nullptr,armInstallPoison,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"finishInstallPoison",nullptr,finishInstallPoison,nullptr,nullptr,nullptr,napi_default,nullptr}};
   if(napi_define_properties(env,exports,sizeof(exportsList)/sizeof(exportsList[0]),exportsList)!=napi_ok) return nullptr;return exports;
 }

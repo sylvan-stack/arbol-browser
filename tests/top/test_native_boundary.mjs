@@ -101,3 +101,80 @@ export async function nativeTrustBoundary({ output }) {
   if (failure) throw failure;
   return result;
 }
+
+export async function nativeInstallPoison({ output }) {
+  const destination = resolve(output);
+  assert.ok(destination.startsWith('/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-8-20261115/'));
+  await mkdir(destination, { mode: 0o700 });
+  const bodyPath = fileURLToPath(import.meta.url), bodyDigest = digest(await readFile(bodyPath));
+  const result = { format: 1, case: 'nativeInstallPoison', status: 'incomplete', sourceBodyDigest: bodyDigest,
+    nativeConsumer, scenarios: [], gateAdmission: 'pending independent actual-body review' };
+  const decrement = 'BrowserAccessibilityCocoa#accessibilityPerformDecrement';
+  const press = 'BrowserAccessibilityCocoa#accessibilityPerformPress';
+  let failure;
+  try {
+    const fixtures = await prepareNativeFixtures(join(destination, 'fixtures'), { callbacks: true });
+    const addonPath = join(fixtures.consumer.candidate, 'Contents/Resources/browser/native/ownership.node');
+    for (const id of ['pre-commit-poison', 'rollback-confirmed', 'rollback-unconfirmed']) {
+      const output = join(fixtures.directory, id);
+      const launch = await launchNativeFixture(fixtures, { mode: 'install-poison', poisonScenario: id, output });
+      const record = join(output, 'install-poison.json');
+      const observation = { id, status: 'unavailable', launch: join(output, 'launch-result.json'), record };
+      result.scenarios.push(observation);
+      assert.equal(launch.timedOut, false);
+      assert.equal(launch.signal, 'SIGKILL');
+      assert.equal(launch.candidate, fixtures.consumer.candidate);
+      const events = stages(launch);
+      assert.ok(events.some(event => event.stage === 'armed'));
+      assert.ok(!events.some(event => event.stage === 'installed'));
+      const report = JSON.parse(await readFile(record, 'utf8'));
+      const { status, retryStatus, originals, returnedMethods, methods, journal } = report;
+      assert.equal(report.scenario, id);
+      assert.deepEqual(report.install, { error: 'native_install_failed' });
+      assert.deepEqual(report.retry, { error: 'native_install_not_repeatable' });
+      assert.equal(retryStatus.phase, 'poisoned');
+      assert.deepEqual(report.retryMethods, methods);
+      assert.deepEqual(report.admission.windows, []);
+      assert.deepEqual(report.admission.webContents, []);
+      assert.ok(report.admission.nativeImages.includes(addonPath));
+      assert.equal(status.phase, 'poisoned');
+      assert.equal(status.liveBindings, 0);
+      const changed = Object.keys(originals).filter(key => JSON.stringify(originals[key]) !== JSON.stringify(methods[key]));
+      if (id === 'pre-commit-poison') {
+        assert.equal(status.reason, 'native_install_failed');
+        assert.equal(status.hooks, 0);
+        assert.equal(status.appliedHooks, 0);
+        assert.deepEqual(returnedMethods, originals);
+        assert.deepEqual(changed, []);
+      } else {
+        const unconfirmed = id === 'rollback-unconfirmed';
+        assert.equal(status.reason, unconfirmed ? 'native_rollback_failed' : 'native_install_failed');
+        assert.equal(status.hooks, Object.values(originals).filter(method => method !== '<absent>').length);
+        assert.equal(status.appliedHooks, unconfirmed ? 1 : 0);
+        assert.equal(journal.driftApplied, true);
+        assert.equal(journal.confirmationFault, unconfirmed);
+        assert.equal(journal.uncertain, false);
+        assert.equal(journal.externalRestored, true);
+        assert.deepEqual(changed, unconfirmed ? [decrement] : []);
+        assert.deepEqual({ ...returnedMethods, [press]: originals[press] }, methods);
+        assert.notEqual(returnedMethods[press].implementation, originals[press].implementation);
+        assert.equal(returnedMethods[press].image, fixtures.record.callback.path);
+        assert.equal(returnedMethods[press].encoding, originals[press].encoding);
+        if (unconfirmed) {
+          assert.equal(methods[decrement].image, addonPath);
+          assert.equal(methods[decrement].encoding, originals[decrement].encoding);
+          assert.equal(methods[decrement].implementation, journal.commitBefore[2]);
+        }
+      }
+      observation.status = 'passed';
+      observation.install = status;
+      observation.retry = retryStatus;
+      observation.changed = changed;
+    }
+    result.status = 'passed';
+  } catch (error) { failure = error; result.status = 'incomplete'; result.error = String(error.stack ?? error); }
+  assert.equal(digest(await readFile(bodyPath)), bodyDigest, 'Case source changed during observation');
+  await writeFile(join(destination, 'case-result.json'), JSON.stringify(result, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+  if (failure) throw failure;
+  return result;
+}
