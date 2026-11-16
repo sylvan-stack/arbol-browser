@@ -66,6 +66,7 @@ interface PageRecord {
   presentation: string;
   presentationPending?: boolean;
   barrierDeadline?: number;
+  holdReadiness: boolean;
 }
 function navigationFailed(): BrowserFailure {
   return new BrowserFailure({ code: 'navigation_failed', message: 'The page did not complete its current navigation.', retryable: true,
@@ -140,7 +141,11 @@ export class HostDocuments implements DocumentAuthority {
   private abortJobs(jobs: readonly Job[]): void { for (const job of jobs) job.controller.abort(); }
   private suspend(record: PageRecord, preserve = false): void {
     const jobs = this.poisonEpoch(record);
-    if (!preserve) { delete record.ticket; this.authority().suspendDocument(record.target); }
+    if (!preserve) {
+      delete record.ticket;
+      if (record.fault) this.authority().pageFailed(record.target, record.fault);
+      else this.authority().suspendDocument(record.target);
+    }
     this.abortJobs(jobs);
     this.emit(record, 'changed'); this.authority().changed();
   }
@@ -166,7 +171,7 @@ export class HostDocuments implements DocumentAuthority {
     return Boolean(frame && !frame.isDestroyed() && !frame.detached && webContents.fromFrame(frame) === record.page.view.webContents &&
       record.page.view.webContents.mainFrame.framesInSubtree.includes(frame));
   }
-  watch(target: TabTarget): void {
+  watch(target: TabTarget, holdReadiness = false): void {
     this.authority(); assertPageSurface(target.page);
     const previous = this.records.get(target);
     if (previous?.page === target.page && !previous.closed) return;
@@ -174,13 +179,13 @@ export class HostDocuments implements DocumentAuthority {
     const page = target.page, contents = page.view.webContents;
     const record: PageRecord = { target, page, contents, use: Object.freeze({}), channel: this.preparation!.channel(page), closed: false,
       committed: false, mainDOM: false, lastSafeURL: previous?.lastSafeURL ?? 'about:blank', startHTTPS: false, redirects: 0,
-      listeners: [], presentation: presentationCategory(page) };
+      listeners: [], presentation: presentationCategory(page), holdReadiness };
     this.records.set(target, record);
     const on = <K extends string>(name: K, receive: (...args: any[]) => void) => {
       contents.on(name as never, receive); record.listeners.push(() => contents.removeListener(name as never, receive));
     };
     const committed = (process: number, routing: number, main: boolean, address: string, sameDocument: boolean) => {
-      if (!this.frameEvent(record, process, routing) || record.fault) return;
+      if (!this.frameEvent(record, process, routing)) return;
       let safe: string; try { safe = userURL(address); } catch { this.failPage(target, page, 'unavailable', 'navigation_policy'); return; }
       const jobs = this.poisonEpoch(record);
       if (main) { record.committed = true; if (sameDocument) record.mainDOM = true; record.lastSafeURL = safe; }
@@ -188,7 +193,11 @@ export class HostDocuments implements DocumentAuthority {
       if (ticket && !sameDocument && ticket.commits === 0) {
         if (main) { ticket.commits++; ticket.candidate = receipt; }
       }
-      else { delete record.ticket; this.authority().suspendDocument(target); this.authority().refreshDocument(target); }
+      else {
+        delete record.ticket;
+        if (record.fault) this.authority().pageFailed(target, record.fault);
+        else { this.authority().suspendDocument(target); this.authority().refreshDocument(target); }
+      }
       this.abortJobs(jobs);
       this.emit(record, 'changed'); this.authority().changed();
       if (!record.ticket) this.schedule(record);
@@ -274,7 +283,7 @@ export class HostDocuments implements DocumentAuthority {
         binding.webContentsId !== record.page.identity.webContentsId) return this.authority().exhausted();
   }
   private schedule(record: PageRecord): void {
-    if (!this.alive(record) || record.fault || !record.current || !record.committed || !record.mainDOM || record.ticket || record.barrier) return;
+    if (!this.alive(record) || record.fault || !record.current || !record.committed || !record.mainDOM || record.ticket || record.barrier || record.holdReadiness) return;
     const receipt = record.current, generation = this.authority().state(record.target).generation;
     const job: Job = { active: true, controller: new AbortController() }; record.barrier = job;
     const deadline = record.barrierDeadline ?? performance.now() + 2000;
@@ -464,6 +473,31 @@ export class HostDocuments implements DocumentAuthority {
   stopped(target: TabTarget, page: PageSurface): PageRecord['stopped'] {
     const record = this.records.get(target); return record?.page === page ? record.stopped : undefined;
   }
+  originalContents(target: TabTarget, page: PageSurface): WebContents {
+    const record = this.records.get(target);
+    if (!record || record.page !== page || !this.isOriginal(record)) throw staleSnapshot(); return record.contents;
+  }
+  originalReceipt(target: TabTarget, page: PageSurface): HostDocument | undefined {
+    const record = this.records.get(target); return record?.page === page && this.isOriginal(record) ? record.current : undefined;
+  }
+  fenceFrameObservation(target: TabTarget, page: PageSurface, receipt: HostDocument): void {
+    const value = this.receipts.get(receipt), record = value?.record;
+    if (!record || record.target !== target || record.page !== page || record.current !== receipt || !this.alive(record) || record.fault) return;
+    this.suspend(record);
+    try { this.current(target); this.schedule(record); } catch { /* No current frame proof: keep admission unavailable. */ }
+  }
+  releasePreparation(target: TabTarget, page: PageSurface, deadline: number): HostDocument {
+    const record = this.records.get(target);
+    if (!record || record.page !== page || !this.alive(record) || record.fault || !record.holdReadiness ||
+        !record.committed || !record.mainDOM || performance.now() >= deadline) throw staleSnapshot();
+    record.holdReadiness = false; record.barrierDeadline = Math.min(deadline, performance.now() + 2000);
+    const receipt = this.current(target); this.schedule(record); return receipt;
+  }
+  forget(target: TabTarget, page: PageSurface): void {
+    if (!this.authority().wasClosed(target)) throw staleSnapshot();
+    const record = this.records.get(target); if (!record || record.page !== page) return;
+    this.close(target, page); if (this.records.get(target) === record) this.records.delete(target);
+  }
   close(target: TabTarget, page: PageSurface): void {
     const record = this.records.get(target); if (!record || record.page !== page || record.closed) return;
     record.closed = true;
@@ -474,5 +508,5 @@ export class HostDocuments implements DocumentAuthority {
     for (const remove of record.listeners.splice(0)) remove();
     this.preparation!.close(page); this.emit(record, 'closed');
   }
-  closeAll(): void { for (const record of this.records.values()) this.close(record.target, record.page); }
+  closeAll(): void { for (const record of this.records.values()) this.close(record.target, record.page); this.records.clear(); }
 }

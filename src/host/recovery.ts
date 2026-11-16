@@ -1,0 +1,277 @@
+import { webFrameMain, type WebContents } from 'electron';
+import { performance } from 'node:perf_hooks';
+import { setTimeout as pause } from 'node:timers/promises';
+import { BrowserFailure } from '../contracts/errors.js';
+import { assertNativeFailureBoundary } from '../runtime/bootstrap.js';
+import { staleSnapshot, type RecoveryTransition } from './authority.js';
+import { bounded, type OwnershipHost } from './handoff.js';
+import { physicalFrames, type HostDocument, type HostDocuments, type PhysicalFrame } from './documents.js';
+import type { RendererHealth, RecoveryAttempt } from './health.js';
+import { assertPageRetirement, type PageSurface } from './windows.js';
+import { assertTabRegistry, refused, userURL, type TabRegistry, type TabTarget } from './tabs.js';
+
+export interface RecoveryReport {
+  readonly tab: string; readonly generation: number; readonly status: 'recovered' | 'failed';
+  readonly stop: 'already-retired' | 'already-gone' | 'terminated' | 'unproved';
+  readonly affectedTabs: readonly string[];
+  readonly changedDuringStop: readonly string[];
+  readonly frameEffects: readonly Readonly<{ tab: string; observed: 'unavailable' | 'replaced' | 'uncertain' }>[];
+  readonly error?: string;
+}
+interface Job {
+  active: boolean; controller: AbortController; transition: RecoveryTransition; attempt: RecoveryAttempt;
+  original: PageSurface; replacement?: PageSurface; deadline: number; workDeadline: number;
+  committed: boolean;
+}
+interface SharedCandidate { target: TabTarget; page: PageSurface; contents: WebContents; receipt: HostDocument; frames: readonly PhysicalFrame[] }
+class RecoveryFailure extends BrowserFailure {
+  constructor(readonly recoveryReason: string) {
+    super({ code: 'control_refused', message: 'The page could not be recovered.', retryable: true,
+      remedy: `Recovery stopped (${recoveryReason}). The original failure is retained. Unsaved page state may be lost; try another explicit recovery.` });
+  }
+}
+function recoveryFailed(reason: string): RecoveryFailure { return new RecoveryFailure(reason); }
+/** Explicit trusted-shell replacement only. No reload of an original page,
+ * POST/history restoration, action retry or agent lease is implemented here. */
+export class PageRecovery {
+  private registry?: TabRegistry;
+  private readonly pending = new Map<TabTarget, Job>();
+  private readonly reports = new Map<TabTarget, RecoveryReport>();
+  constructor(readonly host: OwnershipHost, readonly documents: HostDocuments, readonly health: RendererHealth,
+    readonly commit: (transition: RecoveryTransition, receipt: HostDocument, assertCurrent: () => void) => void) {
+    assertNativeFailureBoundary(host.authority.boundary);
+    if (host.authority.documents !== documents || health.documents !== documents || health.owner !== host.authority)
+      throw refused('control_refused');
+  }
+  bind(registry: TabRegistry): void {
+    assertTabRegistry(registry); if (this.registry && this.registry !== registry) throw refused('control_refused'); this.registry = registry;
+  }
+  private tabs(): TabRegistry { if (!this.registry) throw refused('control_refused'); assertTabRegistry(this.registry); return this.registry; }
+  private native(): void { assertNativeFailureBoundary(this.host.authority.boundary); }
+  report(target: TabTarget): RecoveryReport | undefined {
+    if (this.host.authority.wasClosed(target)) return; return this.reports.get(target);
+  }
+  cancel(target: TabTarget): void {
+    const job = this.pending.get(target);
+    if (job) { job.active = false; job.controller.abort(); }
+    if (this.host.authority.wasClosed(target)) this.reports.delete(target);
+  }
+  closeAll(): void { for (const target of this.pending.keys()) this.cancel(target); this.reports.clear(); }
+  private async within<T>(deadline: number, guard: () => void, work: () => Promise<T>, expire: () => void): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      guard();
+      if (performance.now() >= deadline) { expire(); throw recoveryFailed('timeout'); }
+      const result = await Promise.race([work(), new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => { expire(); reject(recoveryFailed('timeout')); }, Math.max(1, deadline - performance.now()));
+      })]);
+      guard(); if (performance.now() >= deadline) { expire(); throw recoveryFailed('timeout'); } return result;
+    } finally { if (timer) clearTimeout(timer); }
+  }
+  private async retirement(page: PageSurface, deadline: number): Promise<void> {
+    try {
+      let receipt = page.retirement();
+      if (!receipt) { const started = page.retire(); void started.catch(() => {}); receipt = page.retirement(); }
+      if (!receipt) return this.host.authority.exhausted();
+      assertPageRetirement(page, receipt);
+      const retired = () => receipt.phase === 'retired';
+      if (retired()) return;
+      await bounded(deadline, () => receipt.completion);
+      assertPageRetirement(page, receipt);
+      if (!retired()) return this.host.authority.exhausted();
+    } catch { return this.host.authority.exhausted(); }
+  }
+  private shared(renderer: HostDocument['renderer'], original: TabTarget): readonly SharedCandidate[] {
+    const candidates: SharedCandidate[] = [];
+    for (const target of this.tabs().all()) {
+      if (target === original || target.page.retirement()) continue;
+      const page = target.page, receipt = this.documents.originalReceipt(target, page);
+      if (!receipt) continue;
+      try {
+        const frames = physicalFrames(page).filter(frame => frame.process === renderer.process && frame.osProcess === renderer.osProcess);
+        if (frames.length) candidates.push({ target, page, receipt, frames, contents: this.documents.originalContents(target, page) });
+      } catch { /* No invented renderer membership or ready proof. Its own health owns this absence. */ }
+    }
+    return candidates;
+  }
+  private async stop(job: Job, guard: () => void, changed: Set<string>, effects: { tab: string; observed: 'unavailable' | 'replaced' | 'uncertain' }[]): Promise<RecoveryReport['stop']> {
+    const { original, transition, attempt } = job, target = transition.target;
+    if (original.retirement()) {
+      await this.retirement(original, Math.min(job.workDeadline, performance.now() + 1000)); guard(); return 'already-retired';
+    }
+    const contents = this.documents.originalContents(target, original);
+    if (contents.isDestroyed()) return this.host.authority.exhausted(); // no authentic retirement is not destruction authority
+    const gone = this.documents.stopped(target, original);
+    if (gone && contents.isCrashed() && contents.getOSProcessId() === 0) return 'already-gone';
+    if (contents.isCrashed() && contents.getOSProcessId() === 0) {
+      const deadline = Math.min(job.workDeadline, performance.now() + 2000);
+      for (;;) {
+        guard();
+        const proof = this.documents.stopped(target, original);
+        if (proof && contents.isCrashed() && contents.getOSProcessId() === 0) return 'already-gone';
+        if (performance.now() >= deadline) throw recoveryFailed('renderer_gone_unproved');
+        await pause(Math.max(1, Math.min(10, deadline - performance.now())), undefined, { signal: job.controller.signal });
+      }
+    }
+    const frames = physicalFrames(original), main = frames.find(frame => frame.handle.parent === null);
+    if (!main || contents.getProcessId() !== main.process || contents.getOSProcessId() !== main.osProcess) throw recoveryFailed('renderer_identity');
+    const renderer = Object.freeze({ process: main.process, osProcess: main.osProcess });
+    const candidates = this.shared(renderer, target), listeners: (() => void)[] = [];
+    const affected = (candidate: SharedCandidate) => {
+      if (this.host.authority.wasClosed(candidate.target) || candidate.target.page !== candidate.page) return;
+      if (candidate.receipt.renderer.process !== renderer.process || candidate.receipt.renderer.osProcess !== renderer.osProcess ||
+          this.documents.originalReceipt(candidate.target, candidate.page) !== candidate.receipt || candidate.contents.isDestroyed() ||
+          !candidate.contents.isCrashed() || candidate.contents.getProcessId() !== renderer.process || candidate.contents.getOSProcessId() !== 0) return;
+      const fault = this.documents.failure(candidate.target);
+      if (fault?.page === candidate.page && fault.availability === 'crashed') this.health.affected(attempt, candidate.target, fault);
+    };
+    for (const candidate of candidates) {
+      const listener = () => {
+        if (!job.active || candidate.contents.isDestroyed() || !candidate.contents.isCrashed() || candidate.contents.getOSProcessId() !== 0) return;
+        // The document producer registered first and latched this actual native gone event.
+        try { affected(candidate); } catch { this.host.authority.assertHealthy(); }
+      };
+      candidate.contents.on('render-process-gone', listener);
+      listeners.push(() => candidate.contents.removeListener('render-process-gone', listener));
+    }
+    const deadline = Math.min(job.workDeadline, performance.now() + 2000);
+    let witnessedGone = false;
+    const onGone = () => {
+      if (!job.active || contents.isDestroyed()) return;
+      if (contents.isCrashed() && contents.getProcessId() === renderer.process && contents.getOSProcessId() === 0) witnessedGone = true;
+    };
+    contents.on('render-process-gone', onGone); listeners.push(() => contents.removeListener('render-process-gone', onGone));
+    try {
+      guard(); this.health.stopping(attempt);
+      // Subscribe before issue; compare immutable original frame/process facts
+      // directly before the real supported engine API, never a supplied callback.
+      const current = physicalFrames(original).find(frame => frame.node === main.node);
+      if (!current || current.token !== main.token || current.process !== renderer.process || current.osProcess !== renderer.osProcess)
+        throw recoveryFailed('renderer_changed');
+      guard(); contents.forcefullyCrashRenderer();
+      while (!witnessedGone) {
+        guard();
+        const proof = this.documents.stopped(target, original);
+        if (proof?.renderer.process === renderer.process && proof.renderer.osProcess === renderer.osProcess &&
+            contents.isCrashed() && contents.getOSProcessId() === 0) witnessedGone = true;
+        if (witnessedGone) break;
+        if (performance.now() >= deadline) throw recoveryFailed('renderer_stop_timeout');
+        await pause(Math.max(1, Math.min(10, deadline - performance.now())), undefined, { signal: job.controller.signal });
+      }
+      guard();
+      for (const candidate of candidates) {
+        affected(candidate);
+        if (this.host.authority.wasClosed(candidate.target) || candidate.target.page !== candidate.page || candidate.page.retirement()) continue;
+        // Never use an old shared-renderer callback to poison a newer receipt.
+        if (this.documents.originalReceipt(candidate.target, candidate.page) !== candidate.receipt) {
+          changed.add(candidate.target.id); effects.push({ tab: candidate.target.id, observed: 'replaced' }); continue;
+        }
+        try {
+          const live = physicalFrames(candidate.page);
+          const changedFrame = candidate.frames.some(frame => !live.some(value => value.node === frame.node && value.token === frame.token &&
+            value.process === frame.process && value.osProcess === frame.osProcess));
+          if (changedFrame) {
+            changed.add(candidate.target.id); effects.push({ tab: candidate.target.id, observed: 'replaced' });
+            this.documents.fenceFrameObservation(candidate.target, candidate.page, candidate.receipt);
+          }
+        } catch {
+          // A census exception is not a crash proof. Check the original copied
+          // RFH/token itself, and never use a retargeted wrapper as the old frame.
+          const unavailable = candidate.frames.some(frame => {
+            try {
+              if (frame.handle.isDestroyed() || frame.handle.detached) return true;
+              return frame.handle.processId === frame.process && frame.handle.frameToken === frame.token && frame.handle.osProcessId === 0;
+            } catch { return webFrameMain.fromFrameToken(frame.process, frame.token) === null; }
+          });
+          if (unavailable && this.documents.originalReceipt(candidate.target, candidate.page) === candidate.receipt) {
+            effects.push({ tab: candidate.target.id, observed: 'unavailable' });
+            this.documents.failPage(candidate.target, candidate.page, 'unavailable', 'frame_unavailable_during_renderer_stop');
+          } else {
+            effects.push({ tab: candidate.target.id, observed: 'uncertain' });
+            this.documents.fenceFrameObservation(candidate.target, candidate.page, candidate.receipt);
+          }
+        }
+      }
+      return 'terminated';
+    } finally { for (const remove of listeners) remove(); }
+  }
+  async recover(target: TabTarget, expected: number, context: { readonly deadline: number; assertCurrent(): void }): Promise<void> {
+    this.native(); const tabs = this.tabs(), owner = this.host.authority, original = target.page;
+    if (this.pending.has(target) || tabs.get(target.id) !== target || tabs.selected(original.window) !== target) throw refused('control_refused');
+    const before = owner.expected(target, expected);
+    if (before.controller.kind !== 'user' || before.handoff !== 'idle' || before.inputReady || before.pageAvailability === 'ready')
+      throw refused('control_refused');
+    const deadline = Math.min(context.deadline, performance.now() + 8000), workDeadline = deadline - 1000;
+    if (performance.now() >= workDeadline) throw recoveryFailed('timeout');
+    const checkContext = () => { const result: unknown = context.assertCurrent(); if (result !== undefined) return owner.exhausted(); };
+    checkContext(); const address = userURL(this.documents.lastSafeURL(target));
+    const transition = owner.beginRecovery(target, expected), attempt = this.health.beginRecovery(target, original, transition.generation);
+    const job: Job = { active: true, controller: new AbortController(), transition, attempt, original, deadline, workDeadline, committed: false };
+    this.pending.set(target, job); owner.changed();
+    const guard = () => {
+      checkContext(); this.native();
+      if (!job.active || job.controller.signal.aborted || this.pending.get(target) !== job || performance.now() >= workDeadline ||
+          tabs.get(target.id) !== target || tabs.selected(original.window) !== target) throw staleSnapshot();
+      owner.assertRecovery(transition); this.health.assertAttempt(attempt);
+    };
+    let stop: RecoveryReport['stop'] = 'unproved', reason = 'preparation_failed';
+    const changed = new Set<string>(), effects: { tab: string; observed: 'unavailable' | 'replaced' | 'uncertain' }[] = [];
+    try {
+      const receipt = await this.within(workDeadline, guard, async () => {
+        guard();
+        if (!original.retirement()) original.window.guardRetirementTransition(() => {
+          const blocked = original.setNativeBlocked(true);
+          if (!blocked.blocked || blocked.retired || blocked.id !== original.identity.id || blocked.nonce !== original.identity.nonce)
+            return owner.exhausted();
+        });
+        guard(); reason = 'renderer_stop'; stop = await this.stop(job, guard, changed, effects); guard();
+        reason = 'original_retirement'; await this.retirement(original, Math.min(workDeadline, performance.now() + 1000)); guard();
+        reason = 'replacement_creation';
+        const replacement = original.window.createPage(); job.replacement = replacement; guard();
+        tabs.replace(target, original, replacement, guard, () => {
+          owner.rebindRecovery(transition, replacement);
+          this.documents.watch(target, true); // no early DOM/compositor proof can unlock before exact load success
+          this.health.replaced(attempt, replacement);
+        });
+        guard(); reason = 'load_failed';
+        const contents = this.documents.originalContents(target, replacement);
+        await this.within(workDeadline - 2000, guard, () => {
+          guard(); return contents.loadURL(address); // fresh WebContents, no postData/referrer/history/form state
+        }, () => { job.active = false; });
+        guard(); reason = 'readiness_failed';
+        const receipt = this.documents.releasePreparation(target, replacement, workDeadline);
+        await this.documents.waitReady(target, receipt, job.controller.signal, workDeadline, guard); guard();
+        return receipt;
+      }, () => { job.active = false; });
+      guard(); const committed: unknown = this.commit(transition, receipt, guard);
+      if (committed !== undefined) return owner.exhausted();
+      this.health.completeRecovery(attempt, receipt); // no await or auto Return between native publication and health commit
+      job.committed = true;
+      if (!owner.wasClosed(target)) {
+        this.reports.set(target, Object.freeze({ tab: target.id, generation: transition.generation, status: 'recovered', stop,
+          affectedTabs: this.health.affectedTabs(attempt), changedDuringStop: Object.freeze([...changed]),
+          frameEffects: Object.freeze(effects.map(effect => Object.freeze(effect))) })); owner.changed();
+      }
+    } catch (error) {
+      if (job.committed) throw error;
+      if (error instanceof RecoveryFailure) reason = error.recoveryReason;
+      job.active = false;
+      // Close attempt state before abort listeners or cleanup can reenter. Every
+      // later action keeps literal original/replacement pages, never target.page.
+      if (job.replacement) this.documents.close(target, job.replacement);
+      owner.failRecovery(transition); this.health.failRecovery(attempt, reason); job.controller.abort();
+      if (job.replacement) await this.retirement(job.replacement, deadline);
+      else if (!original.retirement() || original.retirement()!.phase !== 'retired') await this.retirement(original, deadline);
+      if (!owner.wasClosed(target)) {
+        this.reports.set(target, Object.freeze({ tab: target.id, generation: transition.generation, status: 'failed', stop, error: reason,
+          affectedTabs: this.health.affectedTabs(attempt), changedDuringStop: Object.freeze([...changed]),
+          frameEffects: Object.freeze(effects.map(effect => Object.freeze(effect))) })); owner.changed();
+      }
+      if (error instanceof BrowserFailure && error.detail.code === 'control_changed') throw error;
+      throw recoveryFailed(reason);
+    } finally {
+      job.active = false; if (this.pending.get(target) === job) this.pending.delete(target);
+      if (owner.wasClosed(target)) this.reports.delete(target);
+    }
+  }
+}
