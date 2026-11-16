@@ -132,6 +132,11 @@ export class TabAuthority {
     this.connections.delete(id); return targets;
   }
   targets(): readonly TabTarget[] { return [...this.entries.values()].filter(entry => !entry.closed).map(entry => entry.target); }
+  knowsTarget(target: TabTarget): boolean { return this.entries.has(target) && this.ids.get(target.id) === target; }
+  assertDocument(target: TabTarget, receipt: DocumentReceipt): void {
+    try { const result: unknown = this.documents.assertCurrent(target, receipt); if (result !== undefined) return this.exhausted(); }
+    catch { this.assertHealthy(); throw staleSnapshot(); }
+  }
   private entry(target: TabTarget): Entry {
     const entry = this.entries.get(target);
     if (!entry || this.ids.get(target.id) !== target) throw refused('tab_not_found'); return entry;
@@ -182,6 +187,7 @@ export class TabAuthority {
     this.invalidators.add(invalidate); return () => { this.invalidators.delete(invalidate); };
   }
   changed(): void {
+    if (this.sealed) return;
     this.assertHealthy();
     try { for (const listener of this.listeners) { const result: unknown = listener(); if (result !== undefined) return this.exhausted(); } }
     catch { return this.exhausted(); }
@@ -225,7 +231,7 @@ export class TabAuthority {
     if (retired) { entry.availability = 'unavailable'; delete entry.document; }
   }
   publishReturn(target: TabTarget, recipient: string, expected: number, document: DocumentReceipt): void {
-    const state = this.expected(target, expected); this.attachment(recipient); this.documents.assertCurrent(target, document);
+    const state = this.expected(target, expected); this.attachment(recipient); this.assertDocument(target, document);
     if (state.controller.kind !== 'user' || state.handoff !== 'idle' || !state.visibleTo.includes(recipient) || !document.ready)
       throw refused('control_refused');
     const entry = this.entry(target); entry.generation = this.increment(entry.generation);
@@ -304,7 +310,7 @@ export class TabAuthority {
   document(target: TabTarget, requireReady = true): DocumentReceipt {
     this.assertAdmission(); const entry = this.entry(target);
     if (entry.closed || entry.retired) throw refused('control_refused');
-    const receipt = this.documents.current(target); this.documents.assertCurrent(target, receipt);
+    const receipt = this.documents.current(target); this.assertDocument(target, receipt);
     if (receipt.page !== target.page || !Number.isSafeInteger(receipt.epoch) || receipt.epoch < 1 ||
         !validator('browser.NavigationId')(receipt.navigation)) return this.exhausted();
     if (requireReady && (!receipt.ready || receipt.availability !== 'ready')) throw refused('control_refused');
@@ -337,7 +343,7 @@ export class TabAuthority {
         successor.epoch <= stamp.document.epoch || successor.navigation === stamp.document.navigation) throw staleSnapshot();
     const proof: unknown = this.documents.assertSuccessor(token.target, stamp.document, successor, token.action, record.operation);
     if (proof !== undefined) return this.exhausted();
-    this.documents.assertCurrent(token.target, successor);
+    this.assertDocument(token.target, successor);
     if (this.documents.current(token.target) !== successor) throw staleSnapshot();
     this.owner(token.target, stamp.attachment.id, stamp.generation);
     if (!record.valid || record.used || this.activeContinuations.get(token.target) !== token || entry.epoch !== stamp.epoch ||
@@ -353,7 +359,7 @@ export class TabAuthority {
   settleContinuation(token: NavigationContinuation, original: DocumentReceipt, current: DocumentReceipt): AuthorityStamp | undefined {
     const record = this.continuations.get(token);
     if (!record || record.stamp.document !== original || current !== (record.successor ?? original)) throw staleSnapshot();
-    this.assertHealthy(); this.documents.assertCurrent(token.target, current);
+    this.assertHealthy(); this.assertDocument(token.target, current);
     let result: AuthorityStamp | undefined;
     try {
       if (!record.valid || this.activeContinuations.get(token.target) !== token) throw staleSnapshot();
@@ -368,7 +374,7 @@ export class TabAuthority {
   }
   /** Only the verified native/readiness adapter may publish initial readiness. */
   prepared(target: TabTarget, receipt: DocumentReceipt): void {
-    this.documents.assertCurrent(target, receipt); const entry = this.entry(target);
+    this.assertDocument(target, receipt); const entry = this.entry(target);
     if (receipt !== this.document(target) || entry.closed || entry.handoff !== 'idle') throw refused('control_changed');
     entry.document = receipt; entry.ready = true; entry.availability = 'ready';
   }
@@ -402,10 +408,10 @@ export class TabAuthority {
     this.check(stamp); const snapshot = this.snapshots.get(id);
     if (!snapshot || snapshot.stamp !== stamp || snapshot.expires <= performance.now()) throw staleSnapshot(); snapshot.delivered = true;
   }
-  requireSnapshot(id: string, stamp: AuthorityStamp): void {
-    this.check(stamp, true); const snapshot = this.snapshots.get(id);
+  requireSnapshot(id: string, stamp: AuthorityStamp, mutation = true): void {
+    this.check(stamp, mutation); const snapshot = this.snapshots.get(id);
     if (!snapshot || !snapshot.delivered || snapshot.expires <= performance.now()) throw staleSnapshot();
-    this.check(snapshot.stamp, true);
+    this.check(snapshot.stamp, mutation);
     if (snapshot.stamp.attachment !== stamp.attachment || snapshot.stamp.target !== stamp.target || snapshot.stamp.document !== stamp.document ||
         snapshot.stamp.epoch !== stamp.epoch || snapshot.stamp.recipientEpoch !== stamp.recipientEpoch) throw staleSnapshot();
   }

@@ -89,6 +89,10 @@ export interface NativeFailureBoundary {
   retire(key: BindingKey, parent: View, view: WebContentsView): Promise<Binding>;
 }
 const installedBoundaries = new WeakSet<object>();
+export function assertNativeFailureBoundary(value: NativeFailureBoundary): void {
+  if (!installedBoundaries.has(value)) throw unavailable('browser');
+  value.fatal.assertHealthy(); value.native.assertIntegrity();
+}
 /** The same concrete armed child covers feature setup and the one addon install.
  * Variable module URLs keep Electron-only imports out of the Node CLI bundle. */
 export async function installNativeBoundary(prepared: NativeBoundaryPreparation, watchdog: NativeWatchdog,
@@ -226,7 +230,7 @@ export async function integrateTrustedShell(port: NativeShellPort, prepared: Hos
   await assertHeldPath(prepared.instance.owner.profile.paths.owner, ownership.owner);
   if (!selection.guard || prepared.instance.record.build !== selection.build) throw unavailable('browser');
   await assertHeldPath(selection.guard, ownership.build);
-  boundary.fatal.assertHealthy(); boundary.native.assertIntegrity(); authority.assertReady(); lifecycle.assertAdmission();
+  boundary.fatal.assertHealthy(); boundary.native.assertIntegrity(); authority.assertReady();
   const guardedLifecycle: TabLifecycle = {
     assertAdmission() { boundary.fatal.assertHealthy(); boundary.native.assertIntegrity(); authority.assertReady(); lifecycle.assertAdmission(); },
     connected: client => lifecycle.connected(client),
@@ -238,7 +242,8 @@ export async function integrateTrustedShell(port: NativeShellPort, prepared: Hos
   };
   const tabs = modules.tabs.createTabRegistry(guardedLifecycle);
   const guardedAuthority: ShellAuthority = {
-    assertReady() { guardedLifecycle.assertAdmission(); },
+    assertReady() { boundary.fatal.assertHealthy(); boundary.native.assertIntegrity(); authority.assertReady(); },
+    assertOperational() { guardedLifecycle.assertAdmission(); authority.assertOperational(); },
     attachments: () => authority.attachments().map(client => ({ id: client.id, label: modules.projections.clientLabel(client.label) })),
     execute: (request, target) => boundary.native.guard(() => authority.execute(request, target)),
     subscribe: changed => authority.subscribe(changed), exhausted: () => authority.exhausted(),
@@ -249,7 +254,9 @@ export async function integrateTrustedShell(port: NativeShellPort, prepared: Hos
       void tabs.closeWindow(host).catch(() => boundary.fatal.fail('native_retirement_unavailable'));
     });
     const registration = modules.ipc.registerShellIPC(host, tabs, guardedAuthority);
-    await registration.load();
+    // Return the actual registered hidden resources before any asynchronous
+    // loading. Assembly must bind ownership/window closure first, then await
+    // registration.load and genuine lifecycle.ready before showing the shell.
     return Object.freeze({ pageAdmission: false as const, host, tabs, registration,
       agentTabs: (recipient: string) => modules.projections.projectAgentTabs(tabs, recipient, client => lifecycle.connected(client)) });
   } catch { return boundary.fatal.fail('native_boundary_unavailable'); }

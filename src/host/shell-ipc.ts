@@ -13,6 +13,7 @@ type State = Contract<'browser.ShellTab'>;
  * execute owns atomic native/generation/settlement semantics, including reply fencing. */
 export interface ShellAuthority {
   assertReady(): void;
+  assertOperational(): void;
   attachments(): readonly Contract<'browser.ClientIdentity'>[];
   execute(request: Request, target: TabTarget): Promise<{ state: State; settledAction?: Contract<'browser.SettledAction'> }>;
   subscribe(changed: () => void): () => void;
@@ -21,6 +22,8 @@ export interface ShellAuthority {
 export interface ShellRegistration {
   /** The only supported loader; handlers and the initial projection already exist. */
   load(): Promise<void>;
+  assertLoaded(): void;
+  show(): void;
   publish(): void;
   dispose(): void;
 }
@@ -80,7 +83,7 @@ export function assertShellRegistration(value: ShellRegistration, host: WindowHo
 export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority: ShellAuthority): ShellRegistration {
   assertWindowHost(host); assertTabRegistry(tabs); host.assertHealthy(); authority.assertReady();
   if (senders.has(host.shell.webContents)) throw unavailable('browser');
-  let revision = 0, loaded = false, disposed = false;
+  let revision = 0, loaded = false, prepared = false, disposed = false;
   const ids = new Set<string>();
   const snapshot = (): Event => {
     host.assertHealthy(); authority.assertReady();
@@ -147,7 +150,15 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
       snapshot(); // initial authority/projection must validate before any load
       await host.shell.webContents.loadURL(shellURL);
       assertShellRegistration(registration, host);
-      registration.publish(); host.window.show();
+      registration.publish(); prepared = true;
+    },
+    assertLoaded() {
+      assertShellRegistration(registration, host);
+      if (!prepared || disposed || host.shell.webContents.getURL() !== shellURL) throw unavailable('browser');
+    },
+    show() {
+      registration.assertLoaded(); authority.assertOperational();
+      host.window.show();
     },
     publish() {
       assertShellRegistration(registration, host);

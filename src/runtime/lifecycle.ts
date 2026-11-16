@@ -216,6 +216,9 @@ export function createProcessService(options: { selection: BuildSelection; platf
 }
 
 export interface HostControlPort {
+  assertPrepared(): void;
+  /** Only actual lifecycle-ready may open operations and show prepared shells. */
+  openAdmission(): void;
   /** Must synchronously invalidate ALL content, grants and admission. */
   closeAdmission(): void;
   disconnect(attachment: string): void;
@@ -223,6 +226,27 @@ export interface HostControlPort {
   settleDisconnect(attachment: string, deadline: number): Promise<void>;
   retireAll(deadline: number): Promise<void>;
   windowCount(): number;
+}
+export interface HostLifecycle {
+  readonly phase: 'starting' | 'ready' | 'closing' | 'fatal';
+  fatal(): void;
+  ready(): Promise<void>;
+  assertAdmission(): void;
+  disconnect(context: ConnectionContext): void;
+  close(): Promise<void>;
+  lastWindowClosed(): void;
+}
+const hostLifecycles = new WeakSet<object>();
+export function assertHostLifecycle(value: HostLifecycle): void {
+  if (!hostLifecycles.has(value)) throw unavailable('browser');
+}
+/** Canonical host-only dynamic boundary: never import Electron through the Node
+ * CLI static graph. No provider, profile or native capability is defaulted. */
+export async function prepareOwnershipControl(boundary: import('./bootstrap.js').NativeFailureBoundary,
+  documents: import('../host/authority.js').DocumentAuthority, operations: import('../host/handoff.js').OwnershipOperations): Promise<import('../host/handoff.js').OwnershipHost> {
+  const address = new URL('../host/handoff.js', import.meta.url).href;
+  const host = await import(address) as typeof import('../host/handoff.js');
+  return host.createOwnershipHost(boundary, documents, operations);
 }
 export interface HostNativeLifetime {
   /** Validate the already acknowledged native custody receipt against this exact
@@ -237,29 +261,42 @@ export interface HostNativeLifetime {
 }
 /** One authoritative host; no automatic restart and no saved action/lease state. */
 export function createHostLifecycle(prepared: HostPreparation, sessions: ProfileSessions, transport: TransportServer,
-  control: HostControlPort, native: HostNativeLifetime) {
+  control: HostControlPort, native: HostNativeLifetime): HostLifecycle {
   let phase: 'starting' | 'ready' | 'closing' | 'fatal' = 'starting';
   let closing: Promise<void> | undefined;
+  let arming: Promise<void> | undefined, readyPublication: Promise<void> | undefined;
+  let readyAttempt: Promise<void> | undefined;
   const pending = new Set<Promise<void>>();
-  function closeAdmission() { control.closeAdmission(); transport.closeAdmission(); }
+  const disconnected = new WeakSet<ConnectionContext>();
+  const currentPhase = (): HostLifecycle['phase'] => phase;
+  const arm = () => arming ??= Promise.resolve().then(() => native.armRetainedLifetime(prepared));
+  function synchronous(work: () => void): void { const result: unknown = work(); if (result !== undefined) throw unavailable('browser'); }
+  function closeAdmission() { synchronous(() => control.closeAdmission()); synchronous(() => transport.closeAdmission()); }
   function fatal(): void {
     if (phase === 'fatal') return;
     phase = 'fatal';
     // Independent fatal enforcement comes first, even when control cleanup throws.
     try { native.quarantine(); } finally {
-      try { control.closeAdmission(); } finally { transport.closeAdmission(); }
+      try { synchronous(() => control.closeAdmission()); } finally { synchronous(() => transport.closeAdmission()); }
     }
   }
   const shutdown = () => {
     if (closing) return closing;
-    if (phase !== 'ready') { fatal(); return Promise.reject(unavailable('browser')); }
+    if (phase === 'fatal') return Promise.reject(unavailable('browser'));
+    let resolve!: () => void, reject!: (error: unknown) => void;
+    const result = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
+    closing = result; // before close/revoke/window callbacks may reenter
     phase = 'closing';
     // Close admission synchronously before the first await or queue operation.
-    try { closeAdmission(); } catch { fatal(); return Promise.reject(unavailable('browser')); }
+    try { closeAdmission(); } catch (error) { try { fatal(); } finally { reject(error); } return result; }
     const deadline = now() + 8000;
-    closing = (async () => {
+    void (async () => {
       const timer = globalThis.setTimeout(() => { try { fatal(); } catch { /* native already armed */ } }, 5000);
       try {
+        // A genuine still-starting abandonment never publishes ready. Both
+        // paths retain the same actual custody and arm native lifetime once.
+        await arm();
+        if (readyPublication) await readyPublication;
         await prepared.instance.phase('closing');
         await Promise.all([control.retireAll(deadline - 3000), ...pending]);
         await sessions.flushStorage(); // necessary; explicitly insufficient to mark clean
@@ -271,27 +308,44 @@ export function createHostLifecycle(prepared: HostPreparation, sessions: Profile
         // Never release owner/Build or call completeExit from a window/quit event.
       } catch (error) { fatal(); throw error; }
       finally { clearTimeout(timer); }
-    })();
-    return closing;
+    })().then(resolve, reject);
+    return result;
   };
-  return Object.freeze({
-    get phase() { return phase; }, fatal,
-    async ready() {
+  const ready = (): Promise<void> => {
+    if (readyAttempt) return readyAttempt;
+    if (phase !== 'starting') return Promise.reject(unavailable('browser'));
+    let resolve!: () => void, reject!: (error: unknown) => void;
+    const result = new Promise<void>((yes, no) => { resolve = yes; reject = no; }); readyAttempt = result;
+    void (async () => {
       try {
       if (phase !== 'starting' || control.windowCount() < 1) throw unavailable('browser');
-      await native.armRetainedLifetime(prepared); await native.assertReady();
-      await prepared.engine.assertReady(); await prepared.buildGuard.assert();
+      synchronous(() => control.assertPrepared());
+      await arm(); if (phase !== 'starting') throw unavailable('browser');
+      await native.assertReady(); if (phase !== 'starting') throw unavailable('browser');
+      await prepared.engine.assertReady(); if (phase !== 'starting') throw unavailable('browser');
+      await prepared.buildGuard.assert();
       if (phase !== 'starting') throw unavailable('browser');
-      await prepared.instance.phase('ready');
+      await prepared.instance.owner.assert();
       if (phase !== 'starting') throw unavailable('browser');
-      phase = 'ready'; transport.openAdmission();
-      } catch (error) { fatal(); throw error; }
-    },
+      // Real ready proofs have completed. Serialize its publication with any
+      // later normal close so phase writes cannot race or resurrect readiness.
+      phase = 'ready'; readyPublication = prepared.instance.phase('ready'); await readyPublication;
+      if (phase !== 'ready') throw unavailable('browser');
+      synchronous(() => control.openAdmission());
+      if (phase !== 'ready') throw unavailable('browser');
+      synchronous(() => transport.openAdmission());
+      } catch (error) { if (currentPhase() !== 'closing') fatal(); throw error; }
+    })().then(resolve, reject);
+    return result;
+  };
+  const lifecycle: HostLifecycle = Object.freeze({
+    get phase() { return phase; }, fatal, ready,
     assertAdmission() { if (phase !== 'ready') throw unavailable('browser'); },
     disconnect(context: ConnectionContext) {
       if (!context.attachment) return;
+      if (disconnected.has(context)) return; disconnected.add(context);
       const id = context.attachment.id;
-      try { control.disconnect(id); } catch { fatal(); return; }
+      try { synchronous(() => control.disconnect(id)); } catch { fatal(); return; }
       const deadline = now() + 6000;
       const timer = globalThis.setTimeout(() => { try { fatal(); } catch { /* native already armed */ } }, 6000);
       const cleanup = Promise.resolve().then(() => control.settleDisconnect(id, deadline));
@@ -301,4 +355,5 @@ export function createHostLifecycle(prepared: HostPreparation, sessions: Profile
     close: shutdown,
     lastWindowClosed() { if (control.windowCount() === 0) void shutdown().catch(() => {}); },
   });
+  hostLifecycles.add(lifecycle); return lifecycle;
 }
