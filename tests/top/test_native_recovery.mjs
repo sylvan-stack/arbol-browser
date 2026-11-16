@@ -700,6 +700,46 @@ function assertMonitorFault(launch, records, scenario) {
     }
     const stop = target === primary ? offer.queues.primary : offer.queues.anchorAfter;
     assert.equal(stop.stopped, true);
+    if (scenario === 'primary-timeout') {
+      const keeper = requireMonitorWitness(fault.keeper, 'No independent primary group keeper');
+      assert.equal(keeper.descriptorBytes, 0); assert.equal(keeper.descriptorErrno, 0); assert.equal(keeper.readyPipeClosed, true);
+      assert.equal(keeper.child.group, primary.group); assert.equal(keeper.child.parent, keeper.parent.pid);
+      assert.equal(keeper.child.session, primary.session); assert.equal(keeper.parent.session, primary.session);
+      assert.notEqual(keeper.parent.group, primary.group);
+      compare(fault.keeperBeforeCleanup, keeper.child);
+      compare(fault.observerBeforeCleanup, keeper.parent);
+      assert.ok(BigInt(fault.emptyQueuesAtNanos) < BigInt(offer.nanos));
+      const empty = requireMonitorWitness(fault.lastQuiescentEmpty, 'No empty queue bracket after original main and engine disappeared');
+      assert.deepEqual([empty.queues.forwardBytes, empty.queues.reverseBytes], [0, 0]);
+      assert.ok(BigInt(fault.emptyQueuesAtNanos) < BigInt(empty.nanos) && BigInt(empty.nanos) < BigInt(offer.nanos));
+      for (const name of ['owner', 'build']) for (const stage of ['before-' + name, 'after-' + name]) {
+        assert.equal(empty.sample.locks[name].acquired, false);
+        assert.ok(rows(empty.sample, stage).filter(row => ![primary.pid, custody.pid].includes(row.original.pid))
+          .every(row => row.current.status === 'gone'));
+      }
+      const near = requireMonitorWitness(fault.nearTimeout, 'No still-live stopped primary near the one-second deadline');
+      const elapsed = Number(BigInt(near.nanos) - BigInt(offer.nanos)) / 1e6;
+      assert.ok(elapsed >= 900 && elapsed < 1000, `Near-timeout observation at ${elapsed} ms`);
+      assert.deepEqual([near.queues.forwardBytes, near.queues.reverseBytes], [0, 4], 'Current P remains unanswered; no T');
+      compare(near.queues.primary, primary); assert.equal(near.queues.primary.stopped, true);
+      compare(near.queues.anchorAfter, custody); assert.equal(near.queues.anchorAfter.stopped, false);
+      compare(near.keeper, keeper.child);
+      for (const name of ['owner', 'build']) {
+        assert.equal(near.sample.locks[name].acquired, false);
+        for (const stage of ['before-' + name, 'after-' + name]) {
+          const row = processRow(near.sample, stage, primary);
+          assert.equal(row.identityMatches, true); assert.equal(row.current.stopped, true);
+        }
+      }
+      const exited = requireMonitorWitness(fault.exitNotes?.find(note => note.pid === primary.pid), 'No independent primary exit status');
+      assert.equal(exited.signal, 9, 'Natural SIGHUP is not timeout retirement');
+      const retirementMs = Number(BigInt(exited.observedAtNanos) - BigInt(offer.nanos)) / 1e6;
+      assert.ok(retirementMs >= 990 && retirementMs < 1500, `Primary retirement at ${retirementMs} ms`);
+      assert.ok(BigInt(exited.observedAtNanos) < BigInt(fault.keeperCleanupAtNanos));
+      requireMonitorWitness(heldAfterPeerLoss((sample, stage) => processRow(sample, stage, primary).current.status === 'gone' &&
+        processRow(sample, stage, custody).identityMatches), 'No original custody holding both locks after exact primary disappearance');
+      assert.equal(fault.keeperCleanup.signal, 9);
+    }
     if (scenario === 'custody-consent') {
       const consent = requireMonitorWitness(fault.retirementConsent, 'Observer missed the real reverse queue after custody consumed the retirement request');
       assert.ok(BigInt(offer.nanos) < BigInt(fault.resumedForConsent) && BigInt(fault.resumedForConsent) < BigInt(consent.nanos));

@@ -408,8 +408,44 @@ struct MonitorTrial {
   ResumeOriginal releaseMain{nil}, releaseTarget{nil};
   NSMutableDictionary* events=[NSMutableDictionary new];
   int exitEvents=-1;
-  bool hangs=false, consent=false;
-  ~MonitorTrial() { if(exitEvents>=0) close(exitEvents); }
+  pid_t keeper=-1;
+  bool hangs=false, consent=false, timedPrimary=false;
+  ~MonitorTrial() { cleanupKeeper(); if(exitEvents>=0) close(exitEvents); }
+  bool startKeeper() {
+    int ready[2]; if(pipe(ready)) return false;
+    const int group=[primary[@"group"] intValue], maxfd=getdtablesize();
+    keeper=fork();
+    if(!keeper) {
+      // The observer has no product descriptors. Close every inherited fd,
+      // including observer output and kqueue; report only setpgid success.
+      close(ready[0]); int error=setpgid(0,group)?errno:0;
+      for(int fd=0;fd<maxfd;++fd) if(fd!=ready[1]) close(fd);
+      (void)write(ready[1],&error,sizeof(error));close(ready[1]);
+      if(error) _exit(71);
+      alarm(20); for(;;) pause();
+    }
+    close(ready[1]); int error=-1; const ssize_t count=read(ready[0],&error,sizeof(error));
+    char eof;const ssize_t ended=read(ready[0],&eof,1);close(ready[0]);
+    if(keeper<2||count!=sizeof(error)||ended!=0||error) return false;
+    NSDictionary* child=process(keeper), *parent=process(getpid());
+    struct proc_fdinfo fds[256];errno=0;int bytes=proc_pidinfo(keeper,PROC_PIDLISTFDS,0,fds,sizeof(fds));
+    events[@"keeper"]=@{@"child":child,@"parent":parent,@"descriptorBytes":@(bytes),@"descriptorErrno":@(errno),
+      @"readyPipeClosed":@YES,@"nanos":monotonic()};
+    return [child[@"status"] isEqual:@"alive"]&&[child[@"parent"] intValue]==getpid()&&[child[@"group"] intValue]==group&&
+      [child[@"session"] isEqual:primary[@"session"]]&&[parent[@"session"] isEqual:primary[@"session"]]&&
+      [parent[@"group"] intValue]!=group&&bytes==0;
+  }
+  void cleanupKeeper() {
+    if(keeper<2) return;
+    // Cleanup starts only after the observation has finished. An unreaped
+    // test-owned child cannot be a recycled PID. Never signal product here.
+    events[@"keeperCleanupAtNanos"]=monotonic();
+    events[@"keeperBeforeCleanup"]=process(keeper);
+    events[@"observerBeforeCleanup"]=process(getpid());
+    (void)kill(keeper,SIGKILL);int status=0;pid_t reaped=waitpid(keeper,&status,0);
+    events[@"keeperCleanup"]=@{@"reaped":@(reaped),@"signal":@(WIFSIGNALED(status)?WTERMSIG(status):0)};
+    keeper=-1;
+  }
   void registerExitObservations() {
     exitEvents=kqueue();
     if(exitEvents<0) { events[@"exitObservationError"]=@(errno); return; }
@@ -439,7 +475,7 @@ struct MonitorTrial {
   }
   NSString* impose(NSDictionary* scenario,NSDictionary* baseline) {
     mode=scenario[@"mode"];
-    if(![mode isKindOfClass:NSString.class]||![@[@"primary-lost",@"primary-hung",@"custody-lost",@"custody-hung",@"both-lost",@"custody-consent"] containsObject:mode])
+    if(![mode isKindOfClass:NSString.class]||![@[@"primary-lost",@"primary-hung",@"primary-timeout",@"custody-lost",@"custody-hung",@"both-lost",@"custody-consent"] containsObject:mode])
       return @"unknown-monitor-fault";
     NSDictionary* expected=baseline[@"expected"];
     NSArray* originals=expected[@"processes"];
@@ -456,9 +492,11 @@ struct MonitorTrial {
        !originalMatches(sentinel,process([sentinel[@"pid"] intValue]))) return @"monitor-family-identity";
     if(!waitForTrigger(scenario[@"trigger"])) return @"monitor-trigger-unavailable";
     registerExitObservations();
+    timedPrimary=[mode isEqual:@"primary-timeout"];
+    if(timedPrimary&&!startKeeper()) return @"keeper-topology-or-descriptors";
     const bool both=[mode isEqual:@"both-lost"];
     consent=[mode isEqual:@"custody-consent"];
-    hangs=consent||[mode hasSuffix:@"-hung"];
+    hangs=timedPrimary||consent||[mode hasSuffix:@"-hung"];
     target=[mode hasPrefix:@"primary-"]?primary:anchor;
     NSDictionary* active=process([main[@"pid"] intValue]);
     if(!originalMatches(main,active)||[active[@"stopped"] boolValue]) return @"main-not-responsive-at-trigger";
@@ -487,6 +525,7 @@ struct MonitorTrial {
       if(!stopped||!queues||[queues[@"forwardBytes"] intValue]||[queues[@"reverseBytes"] intValue]) return @"monitor-stop-unobserved";
       events[@"stoppedMonitor"]=stopped;
       events[@"emptyQueues"]=queues;
+      events[@"emptyQueuesAtNanos"]=monotonic();
     } else {
       NSArray* losses=both?@[anchor,primary]:@[target];
       NSMutableArray* signals=[NSMutableArray new]; events[@"lossSignals"]=signals;
@@ -499,7 +538,7 @@ struct MonitorTrial {
     return nil;
   }
   void sampleRetirement(NSDictionary* sample) {
-    if(!hangs||(!consent&&events[@"retirementOffer"])||events[@"retirementConsent"]) return;
+    if(!hangs||(!timedPrimary&&!consent&&events[@"retirementOffer"])||events[@"retirementConsent"]) return;
     auto quiescent=[&](NSArray* rows) {
       for(NSDictionary* row in rows) {
         NSDictionary* original=row[@"original"];
@@ -512,10 +551,18 @@ struct MonitorTrial {
     NSDictionary* queues=startupQueues(primary,anchor);
     if(!queues) return;
     if(events[@"retirementOffer"]) {
+      if(timedPrimary) {
+        uint64_t elapsed=strtoull(monotonic().UTF8String,nullptr,10)-strtoull([events[@"retirementOffer"][@"nanos"] UTF8String],nullptr,10);
+        if(!events[@"nearTimeout"]&&elapsed>=900000000ULL)
+          events[@"nearTimeout"]=@{@"nanos":monotonic(),@"queues":queues,@"sample":sample,@"keeper":process(keeper)};
+        return;
+      }
       if([queues[@"forwardBytes"] intValue]==0&&[queues[@"reverseBytes"] intValue]==4)
         events[@"retirementConsent"]=@{@"nanos":monotonic(),@"queues":queues,@"sample":sample};
       return;
     }
+    if(timedPrimary&&[queues[@"forwardBytes"] intValue]==0&&[queues[@"reverseBytes"] intValue]==0)
+      events[@"lastQuiescentEmpty"]=@{@"nanos":monotonic(),@"queues":queues,@"sample":sample};
     const bool primaryStopped=[target[@"pid"] isEqual:primary[@"pid"]];
     if(!transferPending(queues,!primaryStopped)||![queues[primaryStopped?@"primary":@"anchorAfter"][@"stopped"] boolValue]) return;
     events[@"retirementOffer"]=@{@"nanos":monotonic(),@"queues":queues,@"sample":sample};
@@ -610,6 +657,7 @@ static NSDictionary* observeFailure(const char* input,NSDictionary* monitor=nil)
       }
       if(finalClosed&&[sample[@"locks"][@"owner"][@"acquired"] boolValue]&&[sample[@"locks"][@"build"][@"acquired"] boolValue]) {
         if(monitor) trial.events[@"sentinelAfter"]=process([trial.sentinel[@"pid"] intValue]);
+        if(monitor) { trial.readExitObservations();trial.events[@"terminalAtNanos"]=monotonic();trial.cleanupKeeper(); }
         return @{@"observations":observations,@"unexpected":unexpected,@"capturedOriginalsRetired":@YES,@"monitor":trial.events,
           @"terminal":sample,@"forkFence":@{@"armedAtNanos":armedAt,@"verifiedThroughNanos":monotonic(),@"watched":expected}};
       }

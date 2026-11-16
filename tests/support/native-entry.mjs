@@ -820,7 +820,7 @@ try {
   const failureScenarios = ['heartbeat-silence', 'ack-silence', 'eof', 'malformed', 'out-of-order',
     'integrity-refused', 'cleanup-blocked', 'exit-blocked', 'fatal-shortening'];
   assert.equal(config.mode === failureCustodyMode, failureScenarios.includes(config.failureScenario));
-  const monitorScenarios = ['primary-lost', 'primary-hung', 'custody-lost', 'custody-hung', 'both-lost', 'custody-consent'];
+  const monitorScenarios = ['primary-lost', 'primary-hung', 'primary-timeout', 'custody-lost', 'custody-hung', 'both-lost', 'custody-consent'];
   assert.equal(config.mode === monitorCustodyMode, monitorScenarios.includes(config.monitorScenario));
   assert.equal(await realpath(config.home), config.home); assert.equal(process.env.HOME, config.home);
   app.setPath('userData', join(config.home, 'app-data')); app.setPath('sessionData', join(config.home, 'session-data'));

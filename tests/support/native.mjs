@@ -248,7 +248,7 @@ export const startupScenarios = Object.freeze(['startup-descriptors', 'bootstrap
   'primary-producer-lost', 'custody-producer-lost', 'custody-withholds-c', 'custody-withholds-g', 'primary-withholds-j']);
 export const failureScenarios = Object.freeze(['heartbeat-silence', 'ack-silence', 'eof', 'malformed', 'out-of-order',
   'integrity-refused', 'cleanup-blocked', 'exit-blocked', 'fatal-shortening']);
-export const monitorScenarios = Object.freeze(['primary-lost', 'primary-hung', 'custody-lost', 'custody-hung', 'both-lost', 'custody-consent']);
+export const monitorScenarios = Object.freeze(['primary-lost', 'primary-hung', 'primary-timeout', 'custody-lost', 'custody-hung', 'both-lost', 'custody-consent']);
 
 async function observeStartupBirths(fixtures, directory, pid, mode, waitForStage) {
   const published = await waitForStage('locks');
