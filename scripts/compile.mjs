@@ -1,7 +1,7 @@
 /** Static/schema/TypeScript/native compilation only. Never invokes tests or a gate. */
 import { build } from 'esbuild';
 import { spawnSync } from 'node:child_process';
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, copyFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { Ajv2020 } from 'ajv/dist/2020.js';
@@ -28,6 +28,15 @@ for (const tool of contracts.agentToolSchemas) {
 }
 console.log(`Compiled ${count} named contract roots and ${contracts.agentToolSchemas.length * 2} public schema roots`);
 run(['node_modules/typescript/bin/tsc', '-p', 'tsconfig.json']);
+// tsc must finish first: its ESM control.js/preload.js are not sandbox entrypoints.
+const shell = join(root, 'dist/lib/shell');
+await mkdir(shell, { recursive: true });
+for (const name of ['index.html', 'style.css'])
+  await copyFile(join(root, 'src/shell', name), join(shell, name));
+await build({ entryPoints: [join(root, 'src/shell/control.ts')], outfile: join(shell, 'control.js'),
+  bundle: true, platform: 'browser', format: 'iife', target: 'chrome156' });
+await build({ entryPoints: [join(root, 'src/shell/preload.ts')], outfile: join(shell, 'preload.cjs'),
+  bundle: true, platform: 'node', format: 'cjs', target: 'node24.22.2', external: ['electron'] });
 run(['scripts/compile-platform.mjs']);
 await build({ entryPoints: [join(root, 'src/cli/main.ts')], outfile: join(root, 'dist/cli/main.mjs'),
   bundle: true, platform: 'node', format: 'esm', target: 'node24.22.2',

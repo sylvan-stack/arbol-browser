@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en" data-theme="redwood">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'none'; img-src 'none'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Arbol Browser</title>
+  <link rel="stylesheet" href="style.css">
+  <script defer src="control.js"></script>
+</head>
+<body>
+  <header aria-label="Trusted browser controls">
+    <div class="heading"><strong>Arbol Browser</strong><button id="new">New tab</button><button id="close-window">Close window</button></div>
+    <nav id="tabs" aria-label="Browser tabs"></nav>
+    <form id="navigate"><label for="address">Open address</label><input id="address" type="url" autocomplete="off" spellcheck="false" placeholder="https://example.com"><button id="go" type="submit">Go</button></form>
+    <div class="row" id="history"><button id="back">Back</button><button id="forward">Forward</button><button id="reload">Reload</button><button id="close-tab">Close tab</button></div>
+    <p id="state" role="status" aria-live="polite">Connecting to browser…</p>
+    <div class="row"><label for="client">Agent</label><select id="client" aria-describedby="privacy"></select><button id="share">Share</button><button id="return">Return control</button><button id="take">Take control</button><button id="recover">Recover page</button></div>
+    <div class="row" id="grants" aria-label="Sharing permissions"></div>
+    <p id="privacy">User control is private. Sharing alone does not return control.</p>
+    <div id="recovery-confirmation" hidden><p>Recovery discards unsaved page state. Interrupted actions will not be replayed.</p><button id="recover-confirm">Recover and discard page state</button><button id="recover-cancel">Keep page</button></div>
+    <p id="problem" role="alert"></p>
+  </header>
+</body>
+</html>

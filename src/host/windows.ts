@@ -26,6 +26,7 @@ export interface WindowHost {
   readonly shell: WebContentsView;
   readonly origin: string;
   createPage(): PageSurface;
+  assertHealthy(): void;
   select(page: PageSurface): void;
   close(): Promise<void>;
 }
@@ -71,6 +72,7 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
     for (const page of pages) page.present(page === selected);
   };
   const host: WindowHost = Object.freeze({ window, shell, origin: shellURL,
+    assertHealthy() { assertWindowHost(host); boundary.fatal.assertHealthy(); boundary.native.assertIntegrity(); },
     createPage(): PageSurface {
       assertWindowHost(host); boundary.fatal.assertHealthy(); boundary.native.assertIntegrity();
       if (closing) throw unavailable('browser');
@@ -78,6 +80,9 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
       let current = boundary.native.ownership.bind(window.getNativeWindowHandle(), view.webContents.id,
         () => { window.contentView.addChildView(view); });
       let retired = false;
+      const shield = new View();
+      shield.setBackgroundColor('#00000000');
+      window.contentView.addChildView(shield);
       view.webContents.on('before-input-event', (event) => {
         if (retired || current.blocked) event.preventDefault();
       });
@@ -89,7 +94,8 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
           current = boundary.native.ownership.bindingInfo(bindingKey(current)); return current; },
         setNativeBlocked(blocked: boolean) {
           if (retired) throw unavailable('browser');
-          current = boundary.native.ownership.mark(bindingKey(current), blocked); return current;
+          current = boundary.native.ownership.mark(bindingKey(current), blocked);
+          shield.setVisible(selected === page && current.blocked); return current;
         },
         restorePresentation() {
           if (retired) throw unavailable('browser');
@@ -100,11 +106,13 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
           const { width, height } = window.getContentBounds();
           view.setVisible(active);
           view.setBounds({ x: 0, y: 272, width, height: Math.max(0, height - 272) });
+          shield.setBounds(view.getBounds()); shield.setVisible(active && current.blocked);
         },
         async retire() {
           if (retired) throw unavailable('browser');
           retired = true;
           current = await boundary.retire(bindingKey(current), window.contentView, view);
+          window.contentView.removeChildView(shield);
           pages.delete(page); if (selected === page) selected = undefined;
         },
       });
