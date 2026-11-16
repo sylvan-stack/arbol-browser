@@ -1,7 +1,7 @@
 // Scoped native qualification of the pinned signed consumer.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { readFile, writeFile } from 'node:fs/promises';
+import { lstat, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createNativeOutput, failureScenarios, launchNativeFixture, monitorScenarios, nativeConsumer, prepareNativeFixtures, requireNativeLaunch, retirementScenarios, startupScenarios } from '../support/native.mjs';
@@ -97,48 +97,71 @@ export async function nativeRetirementBoundary({ output }) {
     scope: 'pinned-consumer native observations', scenarios: [],
     limits: ['The test intercepts detach and close on disposable Electron objects.',
       'Native blocking acts inside the fixture detach call. The observed signal and process identities do not identify its issuer or certify complete helper custody.',
-      'Full host lifecycle transitions are downstream.'] };
+      'Full host lifecycle transitions are downstream.',
+      'At most three fresh attempts can recover an independently witnessed exit before retirement readiness or journal activity.'] };
   let failure;
   try {
     const fixtures = await prepareNativeFixtures(join(destination, 'fixtures'), { callbacks: true });
     for (const scenario of retirementScenarios) {
-      const output = join(fixtures.directory, scenario);
-      const entry = { scenario, status: 'incomplete', launch: join(output, 'launch-result.json'), record: join(output, 'retirement.jsonl') };
+      const entry = { scenario, status: 'unavailable', attempts: [] };
       result.scenarios.push(entry);
-      try {
-        const launch = await launchNativeFixture(fixtures, { mode: 'retirement', output, retirementScenario: scenario });
-        const events = jsonLines(launch.stdout);
-        const unavailable = events.find(event => ['unavailable', 'retirement-unavailable'].includes(event.stage));
-        assert.equal(unavailable, undefined, unavailable?.error);
-        assert.equal(launch.timedOut, false);
-        assert.equal(launch.signal, 'SIGKILL');
-        assert.equal(launch.candidate, fixtures.consumer.candidate);
-        assert.ok(events.some(event => event.stage === 'armed'));
-        assert.ok(events.some(event => event.stage === 'installed' && event.status.phase === 'ready'));
-        assert.ok(events.some(event => event.stage === 'retirement-ready' && event.scenario === scenario),
-          `The ${scenario} process ended before the retirement readiness observation`);
-        const final = launch.observations.at(-1);
-        const original = final.current?.find(row => row.original.pid === launch.pid);
-        assert.equal(original?.original.executable, join(launch.candidate, 'Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron'));
-        assert.equal(original.current.status, 'gone');
-        requireNativeLaunch(launch, events);
-        const records = jsonLines(await readFile(entry.record, 'utf8'));
-        assertRetirement(scenario, records);
-        if (scenario === 'native-detach-blocked') {
-          const marker = records.find(record => record.stage === 'native-detach-in-call');
-          assert.equal(marker.pid, launch.pid);
-          const during = launch.observations.find(({ ordered }) => ordered && !ordered.unavailable &&
-            ['owner', 'build'].every(name => !ordered.locks[name].acquired && ['before', 'after'].every(phase => {
-              const point = ordered.order.find(row => row.stage === phase + '-' + name);
-              return BigInt(point.nanos) > BigInt(marker.nanos) &&
-                point.processes.some(row => row.original.pid === marker.pid && row.identityMatches);
-            })));
-          assert.ok(during, 'Both locks must contend while the original main is in the native detach block');
-          assert.ok(BigInt(final.ordered.order.find(row => row.stage === 'before-close').nanos) > BigInt(marker.nanos));
-          assertOriginalsGoneOnAcquisition(launch, final.ordered.expected.processes);
+      let lastError;
+      for (let number = 1; number <= 3; number++) {
+        const output = join(fixtures.directory, number === 1 ? scenario : scenario + '-' + number);
+        const attempt = { number, status: 'failed', launch: join(output, 'launch-result.json'), record: join(output, 'retirement.jsonl') };
+        entry.attempts.push(attempt);
+        try {
+          const launch = await launchNativeFixture(fixtures, { mode: 'retirement', output, retirementScenario: scenario });
+          const events = jsonLines(launch.stdout);
+          const unavailable = events.find(event => ['unavailable', 'retirement-unavailable'].includes(event.stage));
+          assert.equal(unavailable, undefined, unavailable?.error);
+          assert.equal(launch.timedOut, false);
+          assert.equal(launch.signal, 'SIGKILL');
+          assert.equal(launch.candidate, fixtures.consumer.candidate);
+          assert.ok(events.some(event => event.stage === 'armed'));
+          assert.ok(events.some(event => event.stage === 'installed' && event.status.phase === 'ready'));
+          const final = launch.observations.at(-1);
+          const original = final.current?.find(row => row.original.pid === launch.pid);
+          assert.equal(original?.original.executable, join(launch.candidate, 'Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron'));
+          assert.equal(original.current.status, 'gone');
+          requireNativeLaunch(launch, events);
+          const ready = events.find(event => event.stage === 'retirement-ready');
+          if (!ready) {
+            const persisted = JSON.parse(await readFile(join(output, 'entry-events.json'), 'utf8'));
+            assert.deepEqual(persisted, events.filter(event => event.stage !== 'launcher'));
+            assert.equal(persisted.at(-1).stage, 'installed');
+            assert.equal(persisted.at(-1).status.phase, 'ready');
+            assert.equal(launch.stderr, '');
+            await assert.rejects(lstat(attempt.record), { code: 'ENOENT' }, 'A retirement journal precludes retry');
+            assertOriginalsGoneOnAcquisition(launch, final.ordered.expected.processes);
+            attempt.status = 'unavailable';
+            throw new Error(`The ${scenario} process ended before retirement readiness or journal activity`);
+          }
+          assert.equal(ready.scenario, scenario);
+          const records = jsonLines(await readFile(attempt.record, 'utf8'));
+          assertRetirement(scenario, records);
+          if (scenario === 'native-detach-blocked') {
+            const marker = records.find(record => record.stage === 'native-detach-in-call');
+            assert.equal(marker.pid, launch.pid);
+            const during = launch.observations.find(({ ordered }) => ordered && !ordered.unavailable &&
+              ['owner', 'build'].every(name => !ordered.locks[name].acquired && ['before', 'after'].every(phase => {
+                const point = ordered.order.find(row => row.stage === phase + '-' + name);
+                return BigInt(point.nanos) > BigInt(marker.nanos) &&
+                  point.processes.some(row => row.original.pid === marker.pid && row.identityMatches);
+              })));
+            assert.ok(during, 'Both locks must contend while the original main is in the native detach block');
+            assert.ok(BigInt(final.ordered.order.find(row => row.stage === 'before-close').nanos) > BigInt(marker.nanos));
+            assertOriginalsGoneOnAcquisition(launch, final.ordered.expected.processes);
+          }
+          attempt.status = 'passed';
+        } catch (error) {
+          lastError = error;
+          attempt.error = String(error.stack ?? error);
         }
-        entry.status = 'passed';
-      } catch (error) { failure ??= error; entry.error = String(error.stack ?? error); }
+        entry.status = attempt.status;
+        if (entry.status !== 'unavailable') break;
+      }
+      if (entry.status !== 'passed') failure ??= lastError;
     }
     if (!failure) result.status = 'passed';
   } catch (error) { failure = error; result.error = String(error.stack ?? error); }
