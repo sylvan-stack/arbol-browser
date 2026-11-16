@@ -29,7 +29,7 @@ export interface ActionExecution {
 }
 export interface ActionCompletion<T> { readonly value: T; readonly action?: string; readonly stamp: AuthorityStamp }
 interface Task {
-  stamp: AuthorityStamp; operation: string; mutation: boolean; screenshot: boolean; snapshot?: string;
+  stamp: AuthorityStamp; request: string; operation: string; mutation: boolean; screenshot: boolean; snapshot?: string;
   action?: string; controller: AbortController; deadline: number;
   dispatched: boolean; settled: boolean; retired: boolean; started: boolean; workDone: boolean; countedRead: boolean;
   resultStamp?: AuthorityStamp;
@@ -63,9 +63,11 @@ export class ActionQueue implements HandoffOperations {
       task.safeResolve(); this.tasks.delete(task);
     }
   }
-  run<T>(stamp: AuthorityStamp, operation: string, options: { mutation: boolean; screenshot?: boolean; snapshot?: string;
+  run<T>(stamp: AuthorityStamp, operation: string, options: { request: string; mutation: boolean; screenshot?: boolean; snapshot?: string;
     deadline: number; signal: AbortSignal }, work: (execution: ActionExecution) => Promise<T>): Promise<ActionCompletion<T>> {
     this.authority.check(stamp, options.mutation);
+    if ([...this.tasks].some(task => task.stamp.attachment === stamp.attachment && task.request === options.request))
+      throw refused('control_refused');
     if (options.mutation) {
       if (!options.snapshot) throw refused('control_refused'); this.authority.requireSnapshot(options.snapshot, stamp);
     } else if (this.reads >= 4 || (options.screenshot && this.screenshots >= 1)) throw refused('control_refused');
@@ -76,7 +78,7 @@ export class ActionQueue implements HandoffOperations {
     let resolve!: (result: ActionCompletion<T>) => void, reject!: (error: unknown) => void, safeResolve!: () => void;
     const result = new Promise<ActionCompletion<T>>((yes, no) => { resolve = yes; reject = no; });
     const safe = new Promise<void>(yes => { safeResolve = yes; });
-    const task: Task = { stamp, operation, mutation: options.mutation, screenshot: options.screenshot ?? false,
+    const task: Task = { stamp, request: options.request, operation, mutation: options.mutation, screenshot: options.screenshot ?? false,
       ...(options.snapshot ? { snapshot: options.snapshot } : {}), ...(options.mutation ? { action: this.authority.opaque('act') } : {}),
       controller: new AbortController(), deadline: options.deadline, dispatched: false, settled: false, retired: false,
       started: false, workDone: false, countedRead: false, sequences: new Set(), issued: new Set(), safe, safeResolve, reject,
@@ -164,6 +166,17 @@ export class ActionQueue implements HandoffOperations {
   private invalidate(event: Invalidation): void {
     for (const task of [...this.tasks]) if (task.stamp.target === event.target &&
         (event.recipient === undefined || task.stamp.attachment.id === event.recipient)) this.cancelTask(task, 'control_changed');
+  }
+  status(recipient: string, request: string): Readonly<{ target: TabTarget; mutation: boolean; action?: string;
+    dispatchOutcome: Contract<'browser.Outcome'> }> | undefined {
+    const task = [...this.tasks].find(task => task.stamp.attachment.id === recipient && task.request === request);
+    return task ? Object.freeze({ target: task.stamp.target, mutation: task.mutation,
+      ...(task.action ? { action: task.action } : {}),
+      dispatchOutcome: task.settled ? 'completed' : task.dispatched ? 'outcome_unknown' : 'not_dispatched' }) : undefined;
+  }
+  cancel(recipient: string, request: string): void {
+    const task = [...this.tasks].find(task => task.stamp.attachment.id === recipient && task.request === request);
+    if (task) this.cancelTask(task, 'control_refused');
   }
   stop(target: TabTarget): void {
     const current = [...this.tasks].find(task => task.stamp.target === target && task.mutation && task.dispatched);
