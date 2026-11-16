@@ -117,6 +117,54 @@ export async function createNativeOutput(output) {
   await mkdir(output, { mode: 0o700 });
   return output;
 }
+export const censusScenarios = Object.freeze(['absent', 'outside-reuse', 'live-original', 'unresolved',
+  'same-start-uid', 'same-start-version', 'inside-reuse', 'never-verified', 'final-original-live']);
+export async function runCensusWitness(output, { predecessor = false } = {}) {
+  await createNativeOutput(output);
+  const consumer = await verifiedConsumer();
+  const review = JSON.parse(await readFile(consumer.sourceReviewManifest.path));
+  const sourceRecord = JSON.parse(await readFile(review.sourceRecord.path));
+  const effectiveHeader = join(review.frozenSource, 'watchdog/boundary.hpp');
+  assert.equal(hash(await readFile(effectiveHeader)), sourceRecord.sources['watchdog/boundary.hpp']);
+  const driver = join(root, 'tests/support/native-census.mm');
+  let header = effectiveHeader;
+  if (predecessor) {
+    header = join(output, 'predecessor-boundary.hpp');
+    await writeFile(header, execFileSync('/usr/bin/git', ['-C', root, 'show', consumer.parent + ':watchdog/boundary.hpp']), { mode: 0o600, flag: 'wx' });
+  }
+  const compiler = run('/usr/bin/xcrun', ['--find', 'clang++']).trim();
+  const sdk = run('/usr/bin/xcrun', ['--show-sdk-path']).trim();
+  const binary = join(output, 'native-census');
+  const arguments_ = ['-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror', '-fobjc-arc', '-arch', 'arm64',
+    '-isysroot', sdk, '-mmacosx-version-min=27.0', `-DARBOL_CENSUS_HEADER="${header}"`, driver,
+    '-framework', 'Foundation', '-framework', 'Security', '-o', binary];
+  const inputs = { driver: { path: driver, sha256: hash(await readFile(driver)) },
+    header: { path: header, sha256: hash(await readFile(header)) },
+    acceptedHeader: { path: effectiveHeader, sha256: sourceRecord.sources['watchdog/boundary.hpp'] } };
+  const record = { consumerManifest: nativeConsumer, sourceReview: consumer.sourceReviewManifest, sourceRecord: review.sourceRecord,
+    sourceCommit: consumer.commit, predecessorCommit: predecessor ? consumer.parent : null, inputs,
+    compiler, compilerVersion: run(compiler, ['--version']), arguments: arguments_, sdk, scenarios: [], passed: false };
+  try {
+    run(compiler, arguments_);
+    record.binary = { path: binary, sha256: hash(await readFile(binary)) };
+    for (const scenario of predecessor ? ['absent'] : censusScenarios) {
+      const row = JSON.parse(run(binary, [consumer.candidate, scenario]));
+      record.scenarios.push(row);
+      assert.equal(row.admitted, true);
+      assert.equal(row.helperVerified, scenario !== 'never-verified');
+      assert.equal(row.accepted, !predecessor && ['absent', 'outside-reuse'].includes(scenario), scenario);
+      assert.ok(row.targets.every(target => target.pid !== row.originalHelper.pid), 'No exited or replacement helper may be a signal target');
+      assert.equal(row.seen.some(item => JSON.stringify(item) === JSON.stringify(row.originalHelper)), scenario !== 'never-verified');
+      if (!predecessor && ['absent', 'outside-reuse', 'final-original-live'].includes(scenario))
+        assert.ok(row.faultObservations.filter(item => item.call === 'pidinfo' && item.pid === row.originalHelper.pid).length >= 3,
+          'The original must reach final reconciliation');
+    }
+    for (const value of [inputs.driver, inputs.header]) assert.equal(hash(await readFile(value.path)), value.sha256);
+    record.passed = true;
+  } catch (error) { record.error = String(error.stack ?? error); throw error; }
+  finally { await writeFile(join(output, 'census-record.json'), JSON.stringify(record, null, 2) + '\n', { mode: 0o600, flag: 'wx' }); }
+  return record;
+}
 export async function prepareNativeFixtures(output, { callbacks = false } = {}) {
   const destination = resolve(output);
   assert.ok(!destination.startsWith(root + sep) && !destination.startsWith('/Users/msix/Artifacts/'));

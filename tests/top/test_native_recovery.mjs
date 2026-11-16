@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { assertOriginalsGoneOnAcquisition, createNativeOutput, failureScenarios, launchNativeFixture, monitorScenarios, nativeConsumer, prepareNativeFixtures, requireNativeLaunch, requirePreTrialExit, retirementScenarios, startupScenarios } from '../support/native.mjs';
+import { assertOriginalsGoneOnAcquisition, createNativeOutput, runCensusWitness, failureScenarios, launchNativeFixture, monitorScenarios, nativeConsumer, prepareNativeFixtures, requireNativeLaunch, requirePreTrialExit, retirementScenarios, startupScenarios } from '../support/native.mjs';
 
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const jsonLines = text => text.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
@@ -776,6 +776,24 @@ export async function nativeMonitorLossBoundary({ output }) {
     if (!failure) result.status = 'passed';
   } catch (error) { failure = error; result.error = String(error.stack ?? error); }
   assert.equal(digest(await readFile(bodyPath)), sourceBodyDigest);
+  await writeFile(join(destination, 'case-result.json'), JSON.stringify(result, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+  if (failure) throw failure;
+  return result;
+}
+
+// Prospective ABR-47 case; admission and ordinary gate wiring follow body review.
+export async function nativeHelperExitBoundary({ output }) {
+  const destination = await createNativeOutput(output);
+  const sourceBodyDigest = digest(await readFile(fileURLToPath(import.meta.url)));
+  const result = { format: 1, case: 'nativeHelperExitBoundary', status: 'incomplete', sourceBodyDigest, nativeConsumer, scenarios: [] };
+  let failure;
+  try {
+    const fixtures = await prepareNativeFixtures(join(destination, 'fixtures'), { callbacks: true });
+    const census = await runCensusWitness(join(fixtures.directory, 'census'));
+    result.scenarios.push({ id: 'kernel-helper-exit-controls', status: 'passed', record: join(fixtures.directory, 'census/census-record.json'),
+      inputs: census.inputs, binary: census.binary });
+    result.status = 'passed';
+  } catch (error) { failure = error; result.error = String(error.stack ?? error); }
   await writeFile(join(destination, 'case-result.json'), JSON.stringify(result, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
   if (failure) throw failure;
   return result;
