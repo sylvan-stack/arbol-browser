@@ -1,5 +1,6 @@
 import { performance } from 'node:perf_hooks';
 import type { Contract } from '../contracts/generated.js';
+import { bindingKey } from '../native/retirement.js';
 import { TabAuthority, type DocumentReceipt } from './authority.js';
 import { refused, type TabState, type TabTarget } from './tabs.js';
 import { assertPageRetirement } from './windows.js';
@@ -122,5 +123,33 @@ export class HandoffController {
   }
   release(target: TabTarget, recipient: string, expected: number): Promise<HandoffResult> {
     this.authority.owner(target, recipient, expected); return this.take(target, expected);
+  }
+  /** Entire native check/mark/controller commit executes without yielding to an
+   * OS input event. Refused busy interaction stays intact and is never queued. */
+  returnControl(target: TabTarget, recipient: string, expected: number): HandoffResult {
+    const state = this.authority.expected(target, expected);
+    const attachment = this.authority.attachment(recipient);
+    if (!this.selected(target) || state.controller.kind !== 'user' || state.handoff !== 'idle' ||
+        !state.visibleTo.includes(recipient) || !state.inputReady || state.pageAvailability !== 'ready' ||
+        this.operations.unsafe(target) || target.page.retirement()) throw refused('control_refused');
+    const document = this.authority.document(target);
+    const before = target.page.binding();
+    if (before.blocked || before.retired) return this.authority.exhausted();
+    const interaction = this.authority.boundary.native.ownership.interactionState(bindingKey(before));
+    if (interaction.busy || interaction.buttons || interaction.pressedButtons || interaction.wheel || interaction.momentum ||
+        interaction.htmlSource || interaction.htmlTarget || interaction.marked)
+      throw refused('control_refused', 'Finish or cancel the current interaction, then Return control.');
+    // Providers may check facts; none can schedule a deferred grant. Recheck
+    // selection, recipient and document immediately before the native commit.
+    this.authority.documents.assertCurrent(target, document);
+    this.authority.expected(target, expected);
+    if (!this.selected(target) || this.authority.attachment(recipient) !== attachment ||
+        !this.authority.state(target).visibleTo.includes(recipient)) throw refused('control_changed');
+    this.mark(target, true);
+    this.authority.publishReturn(target, recipient, expected, document);
+    this.authority.changed();
+    const after = this.authority.owner(target, recipient, expected + 1);
+    if (after.handoff !== 'idle' || this.authority.document(target) !== document) throw refused('control_changed');
+    return { state: after };
   }
 }
