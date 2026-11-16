@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createReadStream, constants } from 'node:fs';
-import { mkdir, readFile, writeFile, realpath, readdir, readlink, lstat, cp, appendFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, realpath, readdir, readlink, lstat, cp, appendFile, link, unlink } from 'node:fs/promises';
 import { dirname, isAbsolute, join, resolve, sep, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 const root = resolve(fileURLToPath(new URL('../../', import.meta.url)));
@@ -12,7 +12,7 @@ export const nativeConsumer = Object.freeze({
   digest: 'cb041c3918bba14ccd5ea299cbd0b6c4159e3d97b169138c96ed70397f57601f',
 });
 const hash = value => createHash('sha256').update(value).digest('hex');
-const run = (file, args) => execFileSync(file, args, { encoding: 'utf8', timeout: 30000,
+const run = (file, args, timeout = 30000) => execFileSync(file, args, { encoding: 'utf8', timeout,
   env: { PATH: '/usr/bin:/bin', HOME: process.env.HOME }, maxBuffer: 1024 * 1024 });
 async function physicalInventory(directory) {
   const actual = {};
@@ -160,10 +160,20 @@ export async function prepareNativeFixtures(output, { callbacks = false } = {}) 
   await writeFile(join(destination, 'fixture-manifest.json'), JSON.stringify(record, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
   return Object.freeze({ directory: destination, consumer, record });
 }
-export function observeNative(fixtures, kind, value) {
+export function observeNative(fixtures, kind, value, timeout) {
   assert.ok(['process', 'group', 'contend', 'custody', 'startup-slots'].includes(kind));
-  return JSON.parse(run(join(fixtures.directory, 'native-observer'), [kind, String(value)]));
+  return JSON.parse(run(join(fixtures.directory, 'native-observer'), [kind, String(value)], timeout));
 }
+async function publishReadyMarker(path) {
+  const pending = path + '.pending';
+  await writeFile(pending, 'ready\n', { mode: 0o600, flag: 'wx' });
+  try {
+    await link(pending, path); // Publish complete bytes without replacing an existing marker.
+  } finally {
+    await unlink(pending);
+  }
+}
+
 async function observeFrozenTrust(variant, output, onStage) {
   const resourcePath = join(variant.candidate, trustResource);
   const original = await readFile(resourcePath);
@@ -172,11 +182,11 @@ async function observeFrozenTrust(variant, output, onStage) {
   await appendFile(resourcePath, '\n');
   const altered = hash(await readFile(resourcePath));
   assert.notEqual(altered, hash(original));
-  await writeFile(join(output, 'drift-ready'), 'ready\n', { mode: 0o600, flag: 'wx' });
+  await publishReadyMarker(join(output, 'drift-ready'));
   await onStage('frozen-trust-drift-refused');
   await writeFile(resourcePath, original);
   assert.deepEqual(await physicalInventory(variant.candidate), variant.files);
-  await writeFile(join(output, 'restore-ready'), 'ready\n', { mode: 0o600, flag: 'wx' });
+  await publishReadyMarker(join(output, 'restore-ready'));
   await onStage('frozen-trust-restored-refused');
   return { before: hash(original), altered, restored: hash(await readFile(resourcePath)) };
 }
@@ -270,7 +280,7 @@ async function observeWithMarker(fixtures, directory, command, request, markerNa
   observer.stdout.on('data', chunk => {
     out += chunk;
     if (!marker && out.startsWith('{"stage":"watch-ready"}\n')) {
-      marker = writeFile(join(directory, markerName), 'ready\n', { mode: 0o600, flag: 'wx' });
+      marker = publishReadyMarker(join(directory, markerName));
       void marker.catch(() => {});
     }
   });
@@ -333,16 +343,21 @@ export async function launchNativeFixture(fixtures, {
   const startupSlots = [];
   child.stdout.on('data', bytes => { stdout += bytes; }); child.stderr.on('data', bytes => { stderr += bytes; });
   const started = performance.now();
-  function sample() {
+  function sample(stopAt = Infinity) {
+    const inspect = (kind, value) => {
+      const milliseconds = Math.floor(stopAt - performance.now());
+      assert.ok(milliseconds > 0, 'Terminal kernel observation deadline reached');
+      return observeNative(fixtures, kind, value, Math.min(milliseconds, 30000));
+    };
     try {
-      const identity = observeNative(fixtures, 'process', child.pid), group = observeNative(fixtures, 'group', child.pid);
+      const identity = inspect('process', child.pid), group = inspect('group', child.pid);
       for (const member of group.members) if (member.status === 'alive') {
         const key = `${member.pid}:${member.startId}:${member.pidVersion}`;
         if (!tracked.has(key)) tracked.set(key, member);
         // Custody remains in the original group; its actual parent identifies
         // the outside primary without trusting a fixture-supplied ready receipt.
         if (member.parent > 1 && member.executable === join(config.bundle, 'Contents/Resources/browser/native/watchdog')) {
-          const parent = observeNative(fixtures, 'process', member.parent);
+          const parent = inspect('process', member.parent);
           if (parent.status === 'alive' && parent.executable === member.executable && parent.startId === member.parentStartId)
             if (!tracked.has(`${parent.pid}:${parent.startId}:${parent.pidVersion}`))
               tracked.set(`${parent.pid}:${parent.startId}:${parent.pidVersion}`, parent);
@@ -355,21 +370,22 @@ export async function launchNativeFixture(fixtures, {
         const monitors = originals.filter(value => value.executable === join(config.bundle, 'Contents/Resources/browser/native/watchdog'));
         const anchor = monitors.find(value => value.group === child.pid && value.parent !== child.pid);
         const primary = monitors.find(value => value.pid === anchor?.parent && value.startId === anchor.parentStartId);
-        if (anchor && primary) startupSlots.push(...[primary, anchor].map(expected => ({ expected, ...observeNative(fixtures, 'startup-slots', expected.pid) })));
+        if (anchor && primary) startupSlots.push(...[primary, anchor].map(expected => ({ expected, ...inspect('startup-slots', expected.pid) })));
       }
       if (published && originals.length) {
         const anchor = originals.find(value => value.executable === join(config.bundle, 'Contents/Resources/browser/native/watchdog') && value.group === child.pid && value.parent !== child.pid) ?? null;
-        ordered = observeNative(fixtures, 'custody', JSON.stringify({ format: 1, group: child.pid, anchor, processes: originals,
+        ordered = inspect('custody', JSON.stringify({ format: 1, group: child.pid, anchor, processes: originals,
           locks: { owner: { path: config.owner, ...published.owner }, build: { path: config.build, ...published.build } } }));
       }
       if (ordered?.order) {
         current = ordered.order.find(point => point.stage === 'before-close')?.processes ?? [];
         locks = ordered.locks ?? {};
       } else {
-        current = originals.map(original => ({ original, current: observeNative(fixtures, 'process', original.pid) }));
+        current = originals.map(original => ({ original, current: inspect('process', original.pid) }));
       }
       // The combined observer supplies post-reads/locks; do not add sequential
       // process/contender subprocesses that obscure ordering and burden startup.
+      assert.ok(performance.now() <= stopAt, 'Terminal sample completed after the deadline');
       const value = { elapsedMs: performance.now() - started, identity, group, current, locks, ordered }; observations.push(value); return value;
     } catch (error) { const value = { elapsedMs: performance.now() - started, unavailable: String(error) }; observations.push(value); return value; }
   }
@@ -406,10 +422,17 @@ export async function launchNativeFixture(fixtures, {
     const key = `${identity.pid}:${identity.startId}:${identity.pidVersion}`;
     if (!tracked.has(key)) tracked.set(key, identity);
   }
-  let final = sample();
-  while (performance.now() - exitObserved < 10000 && (!final.current || final.current.some(({ original, current }) =>
-    current.status === 'uncertain' || (current.status === 'alive' && current.startId === original.startId)))) {
-    await new Promise(accept => setTimeout(accept, 100)); final = sample();
+  const locksPublished = stdout.split('\n').some(line => line.startsWith('{"stage":"locks",'));
+  const awaitingRetirement = sample => !sample.current || sample.current.some(({ original, current }) =>
+    current.status === 'uncertain' || (current.status === 'alive' && current.startId === original.startId));
+  const awaitingLockRelease = sample => locksPublished && (sample.ordered?.unavailable ||
+    !['owner', 'build'].every(name => sample.ordered?.locks?.[name]?.acquired === true));
+  const terminalDeadline = exitObserved + 10000;
+  let final = sample(terminalDeadline);
+  while (performance.now() < terminalDeadline && (awaitingRetirement(final) || awaitingLockRelease(final))) {
+    await new Promise(accept => setTimeout(accept, 100));
+    if (performance.now() >= terminalDeadline) break;
+    final = sample(terminalDeadline);
   }
   const record = { format: 1, mode, candidate: config.bundle, consumerManifest: nativeConsumer, derivation: variant ?? null,
     consumerRole: variant ? 'immutable baseline only; executing copy is explicitly derived' : 'exact executing consumer', pid: child.pid,
@@ -436,4 +459,43 @@ export function requireNativeLaunch(launch, events, { armed = false } = {}) {
           row.identityMatches && witnessed(row.current)))))) throw Object.assign(
       new Error('Independent observer missed live main holding both original locks'), { code: 'fixture_observation_unavailable' });
   }
+}
+
+export function assertOriginalsGoneOnAcquisition(launch, captured) {
+  const final = launch.observations.at(-1).ordered;
+  assert.ok(final && !final.unavailable, 'No ordered final exact-inode observations');
+  const originals = captured ?? final.expected.processes;
+  for (const name of ['owner', 'build']) {
+    assert.equal(final.locks[name].acquired, true);
+    for (const phase of ['before', 'after']) {
+      const rows = final.order.find(row => row.stage === phase + '-' + name).processes;
+      for (const original of originals) {
+        const match = rows.find(row => ['pid', 'startId', 'pidVersion', 'uid', 'session', 'executable']
+          .every(key => row.original[key] === original[key]));
+        assert.ok(match, 'Final sample omitted original ' + original.pid);
+        assert.equal(match.current.status, 'gone');
+      }
+    }
+  }
+}
+
+export async function requirePreTrialExit(launch, events, reportPath) {
+  requireNativeLaunch(launch, events, { armed: true });
+  const persisted = JSON.parse(await readFile(join(dirname(reportPath), 'entry-events.json'), 'utf8'));
+  assert.deepEqual(persisted, events.filter(event => event.stage !== 'launcher'));
+  assert.equal(persisted.at(-1).stage, 'installed');
+  assert.equal(persisted.at(-1).status.phase, 'ready');
+  assert.equal(launch.stderr, '');
+  await assert.rejects(lstat(reportPath), { code: 'ENOENT' }, 'An existing case record precludes retry');
+  for (const { ordered } of launch.observations) {
+    for (const name of ['owner', 'build']) {
+      if (ordered?.locks?.[name]?.acquired !== true) continue;
+      const before = ordered.order.find(point => point.stage === 'before-' + name).processes;
+      const after = ordered.order.find(point => point.stage === 'after-' + name).processes;
+      assert.ok(!before.some(row => row.identityMatches && after.some(other => other.identityMatches &&
+        other.original.pid === row.original.pid && other.original.startId === row.original.startId)),
+      'A captured original survived acquisition of the ' + name + ' lock');
+    }
+  }
+  assertOriginalsGoneOnAcquisition(launch);
 }

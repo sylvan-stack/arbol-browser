@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createNativeOutput, bindingScenarios, launchNativeFixture, nativeConsumer, prepareNativeFixtures } from '../support/native.mjs';
+import { createNativeOutput, bindingScenarios, launchNativeFixture, nativeConsumer, prepareNativeFixtures, requireNativeLaunch, requirePreTrialExit } from '../support/native.mjs';
 
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const refusal = { error: 'native_binding_failed' };
@@ -411,26 +411,46 @@ export async function nativeConcurrentResponder({ output }) {
   const destination = await createNativeOutput(output);
   const bodyPath = fileURLToPath(import.meta.url), sourceBodyDigest = digest(await readFile(bodyPath));
   const result = { format: 1, case: 'nativeConcurrentResponder', status: 'incomplete', sourceBodyDigest, nativeConsumer,
-    scope: 'pinned-consumer native observations',
+    scope: 'pinned-consumer native observations', scenarios: [],
     limits: ['Window-local AppKit events exercise the native dispatcher without physical input.',
       'Interaction state is a snapshot. Controller and generation changes, Take/Return and operation settlement are outside this case.',
       'The destination callback uses fictional NSDraggingInfo and a unique pasteboard. Physical OS source drag and trackpad momentum are unobserved.'] };
   let failure;
   try {
     const fixtures = await prepareNativeFixtures(join(destination, 'fixtures'), { callbacks: true });
-    const output = join(fixtures.directory, 'responders');
-    result.launch = join(output, 'launch-result.json');
-    result.record = join(output, 'concurrent-responder.json');
-    const launch = await launchNativeFixture(fixtures, { mode: 'concurrent-responder', output });
-    const events = launch.stdout.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
-    const unavailable = events.find(event => ['unavailable', 'concurrent-responder-unavailable'].includes(event.stage));
-    assert.equal(unavailable, undefined, unavailable?.error);
-    assert.equal(launch.timedOut, false);
-    assert.equal(launch.signal, 'SIGKILL');
-    assert.equal(launch.candidate, fixtures.consumer.candidate);
-    assert.ok(events.some(event => event.stage === 'armed'));
-    assert.ok(events.some(event => event.stage === 'installed' && event.status.phase === 'ready'));
-    assertConcurrentResponder(JSON.parse(await readFile(result.record, 'utf8')));
+    const scenario = { id: 'native-responder-and-trusted-input', status: 'unavailable', attempts: [] };
+    result.scenarios.push(scenario);
+    let lastError;
+    for (let number = 1; number <= 3; number++) {
+      const output = join(fixtures.directory, number === 1 ? 'responders' : 'responders-' + number);
+      const attempt = { number, status: 'failed', launch: join(output, 'launch-result.json'), record: join(output, 'concurrent-responder.json') };
+      scenario.attempts.push(attempt);
+      try {
+        const launch = await launchNativeFixture(fixtures, { mode: 'concurrent-responder', output });
+        const events = launch.stdout.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+        const unavailable = events.find(event => ['unavailable', 'concurrent-responder-unavailable'].includes(event.stage));
+        assert.equal(unavailable, undefined, unavailable?.error);
+        assert.equal(launch.timedOut, false);
+        assert.equal(launch.signal, 'SIGKILL');
+        assert.equal(launch.candidate, fixtures.consumer.candidate);
+        assert.ok(events.some(event => event.stage === 'armed'));
+        assert.ok(events.some(event => event.stage === 'installed' && event.status.phase === 'ready'));
+        requireNativeLaunch(launch, events);
+        if (!events.some(event => event.stage === 'concurrent-window-shown')) {
+          await requirePreTrialExit(launch, events, attempt.record);
+          attempt.status = 'unavailable';
+          throw new Error('The signed process exited before the concurrent responder trial');
+        }
+        assertConcurrentResponder(JSON.parse(await readFile(attempt.record, 'utf8')));
+        attempt.status = 'passed';
+      } catch (error) {
+        lastError = error;
+        attempt.error = String(error.stack ?? error);
+      }
+      scenario.status = attempt.status;
+      if (scenario.status !== 'unavailable') break;
+    }
+    if (scenario.status !== 'passed') throw lastError;
     result.status = 'passed';
   } catch (error) { failure = error; result.error = String(error.stack ?? error); }
   assert.equal(digest(await readFile(bodyPath)), sourceBodyDigest);

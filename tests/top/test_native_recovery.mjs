@@ -1,10 +1,10 @@
 // Scoped native qualification of the pinned signed consumer.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { lstat, readFile, writeFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createNativeOutput, failureScenarios, launchNativeFixture, monitorScenarios, nativeConsumer, prepareNativeFixtures, requireNativeLaunch, retirementScenarios, startupScenarios } from '../support/native.mjs';
+import { assertOriginalsGoneOnAcquisition, createNativeOutput, failureScenarios, launchNativeFixture, monitorScenarios, nativeConsumer, prepareNativeFixtures, requireNativeLaunch, requirePreTrialExit, retirementScenarios, startupScenarios } from '../support/native.mjs';
 
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const jsonLines = text => text.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
@@ -127,13 +127,7 @@ export async function nativeRetirementBoundary({ output }) {
           requireNativeLaunch(launch, events);
           const ready = events.find(event => event.stage === 'retirement-ready');
           if (!ready) {
-            const persisted = JSON.parse(await readFile(join(output, 'entry-events.json'), 'utf8'));
-            assert.deepEqual(persisted, events.filter(event => event.stage !== 'launcher'));
-            assert.equal(persisted.at(-1).stage, 'installed');
-            assert.equal(persisted.at(-1).status.phase, 'ready');
-            assert.equal(launch.stderr, '');
-            await assert.rejects(lstat(attempt.record), { code: 'ENOENT' }, 'A retirement journal precludes retry');
-            assertOriginalsGoneOnAcquisition(launch, final.ordered.expected.processes);
+            await requirePreTrialExit(launch, events, attempt.record);
             attempt.status = 'unavailable';
             throw new Error(`The ${scenario} process ended before retirement readiness or journal activity`);
           }
@@ -305,23 +299,6 @@ function assertStartupIdentityRefusal(launch, events) {
   assert.equal(witness.main.pid, launch.pid);
   assert.equal(witness.main.startId, actual.startId);
   assert.deepEqual(witness.after, { pid: launch.pid, status: 'gone' });
-}
-
-function assertOriginalsGoneOnAcquisition(launch, captured) {
-  const final = launch.observations.at(-1).ordered;
-  assert.ok(final && !final.unavailable, 'No ordered final exact-inode observations');
-  for (const name of ['owner', 'build']) {
-    assert.equal(final.locks[name].acquired, true);
-    for (const phase of ['before', 'after']) {
-      const rows = final.order.find(row => row.stage === phase + '-' + name).processes;
-      for (const original of captured) {
-        const match = rows.find(row => ['pid', 'startId', 'pidVersion', 'uid', 'session', 'executable']
-          .every(key => row.original[key] === original[key]));
-        assert.ok(match, 'Final sample omitted original ' + original.pid);
-        assert.equal(match.current.status, 'gone');
-      }
-    }
-  }
 }
 
 function assertReadinessDelivery(launch, events, records, delayed) {
