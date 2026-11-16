@@ -170,7 +170,38 @@ const installPoisonScenarios = new Set(['pre-commit-poison', 'rollback-confirmed
 export const bindingScenarios = Object.freeze(['stale-nonce', 'stale-contents', 'stale-revision', 'detached-view',
   'ambiguous-creation', 'reentrant-creation', 'retired-replacement']);
 export const retirementScenarios = Object.freeze(['success', 'detach-throws', 'destroy-missing', 'native-detach-blocked']);
-export const startupScenarios = Object.freeze(['startup-descriptors', 'bootstrap-identity-refused']);
+export const startupScenarios = Object.freeze(['startup-descriptors', 'bootstrap-identity-refused', 'late-readiness',
+  'primary-producer-lost', 'custody-producer-lost', 'custody-withholds-c', 'custody-withholds-g', 'primary-withholds-j']);
+
+async function observeStartupBirths(fixtures, directory, pid, mode, waitForStage) {
+  const published = await waitForStage('locks');
+  await waitForStage('startup-observer-waiting');
+  const main = observeNative(fixtures, 'process', pid);
+  assert.equal(main.executable, join(fixtures.consumer.candidate, 'Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron'));
+  const helper = join(fixtures.consumer.candidate, 'Contents/Resources/browser/native/watchdog');
+  const locks = { owner: { path: join(directory, 'owner.lock'), ...published.owner }, build: { path: join(directory, 'build.lock'), ...published.build } };
+  const observer = spawn(join(fixtures.directory, 'native-observer'), ['startup-births', JSON.stringify({ main, helper, mode, locks })],
+    { stdio: ['ignore', 'pipe', 'pipe'], env: { PATH: '/usr/bin:/bin' } });
+  let out = '', err = '', marker;
+  observer.stdout.on('data', chunk => {
+    out += chunk;
+    if (!marker && out.startsWith('{"stage":"watch-ready"}\n')) {
+      marker = writeFile(join(directory, 'startup-observer-ready'), 'ready\n', { mode: 0o600, flag: 'wx' });
+      void marker.catch(() => {});
+    }
+  });
+  observer.stderr.on('data', chunk => { err += chunk; });
+  const code = await new Promise((accept, reject) => {
+    observer.once('error', reject);
+    observer.once('close', accept);
+  });
+  await marker;
+  assert.equal(code, 0, err);
+  const lines = out.trim().split('\n');
+  assert.equal(lines.length, 2, 'The external startup observer did not finish its bracketed read');
+  return JSON.parse(lines[1]);
+}
+
 export async function launchNativeFixture(fixtures, {
   mode = 'boundary', callback = fixtures.record.callback?.path, output, variant, poisonScenario, bindingScenario, retirementScenario, startupScenario,
 }) {
@@ -255,20 +286,31 @@ export async function launchNativeFixture(fixtures, {
     } catch (error) { const value = { elapsedMs: performance.now() - started, unavailable: String(error) }; observations.push(value); return value; }
   }
   const timer = setInterval(sample, 100);
-  const trustProbe = mode === 'frozen-trust' ? observeFrozenTrust(variant, directory, async stage => {
+  async function waitForStage(stage) {
     const deadline = performance.now() + 15000;
     const marker = `"stage":"${stage}"`;
-    while (!stdout.split('\n').slice(0, -1).some(line => line.startsWith('{' + marker))) {
-      assert.ok(child.exitCode === null && child.signalCode === null && performance.now() < deadline,
-        `Missing signed-copy observation ${stage}`);
+    for (;;) {
+      const line = stdout.split('\n').slice(0, -1).find(line => line.startsWith('{' + marker));
+      if (line) return JSON.parse(line);
+      assert.ok(child.exitCode === null && child.signalCode === null && performance.now() < deadline, `Missing fixture observation ${stage}`);
       await new Promise(accept => setTimeout(accept, 25));
     }
-  }).catch(error => ({ unavailable: String(error.message ?? error) })) : undefined;
+  }
+  const trustProbe = mode === 'frozen-trust' ? observeFrozenTrust(variant, directory, waitForStage)
+    .catch(error => ({ unavailable: String(error.message ?? error) })) : undefined;
+  const watchBirths = mode === 'startup-custody' && !['bootstrap-identity-refused', 'late-readiness'].includes(startupScenario);
+  const startupBirths = watchBirths ? observeStartupBirths(fixtures, directory, child.pid, startupScenario, waitForStage)
+    .catch(error => ({ unavailable: String(error.message ?? error) })) : undefined;
   // Timeout teardown is explicitly not production enforcement evidence.
   const deadline = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, 90000);
   const outcome = await new Promise((accept, reject) => { child.once('error', reject); child.once('exit', (code, signal) => accept({ code, signal })); })
     .finally(() => { clearInterval(timer); clearTimeout(deadline); });
   const exitObserved = performance.now();
+  const births = await startupBirths;
+  for (const identity of Object.values(births?.first ?? {})) {
+    const key = `${identity.pid}:${identity.startId}:${identity.pidVersion}`;
+    if (!tracked.has(key)) tracked.set(key, identity);
+  }
   let final = sample();
   while (performance.now() - exitObserved < 10000 && (!final.current || final.current.some(({ original, current }) =>
     current.status === 'uncertain' || (current.status === 'alive' && current.startId === original.startId)))) {
@@ -277,7 +319,7 @@ export async function launchNativeFixture(fixtures, {
   const record = { format: 1, mode, candidate: config.bundle, consumerManifest: nativeConsumer, derivation: variant ?? null,
     consumerRole: variant ? 'immutable baseline only; executing copy is explicitly derived' : 'exact executing consumer', pid: child.pid,
     elapsedMs: performance.now() - started, ...outcome, timedOut, stdout, stderr, observations,
-    frozenTrust: await trustProbe, startupSlots: mode === 'startup-custody' ? startupSlots : undefined,
+    frozenTrust: await trustProbe, startupSlots: mode === 'startup-custody' ? startupSlots : undefined, startupBirths: births,
     qualification: 'fixture feasibility only; no complete gate/native qualification result' };
   await writeFile(join(directory, 'launch-result.json'), JSON.stringify(record, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
   return record;

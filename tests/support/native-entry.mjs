@@ -1,5 +1,6 @@
 // External trusted qualification entry; never packaged as the production host.
 import { app, BaseWindow, WebContentsView, webContents } from 'electron';
+import { ChildProcess } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
@@ -36,6 +37,50 @@ function admissionObservation() {
   assert.ok(Array.isArray(report.sharedObjects) && report.sharedObjects.every(path => typeof path === 'string'));
   return { nativeImages: report.sharedObjects.filter(path => /\/(?:platform|ownership)\.node$/.test(path)),
     windows: BaseWindow.getAllWindows().map(value => value.id), webContents: webContents.getAllWebContents().map(value => value.id), appReady: app.isReady() };
+}
+
+function armWithReadinessWitness(owner, build) {
+  const helper = join(config.bundle, 'Contents/Resources/browser/native/watchdog');
+  const spawn = ChildProcess.prototype.spawn;
+  const delayed = config.startupScenario === 'late-readiness';
+  const path = join(config.output, 'readiness.jsonl');
+  const waitCell = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+  let witnessed = false;
+  const record = (stage, values) => appendFileSync(path, JSON.stringify({ stage, ...values }) + '\n', { mode: 0o600 });
+  ChildProcess.prototype.spawn = function observeSpawn(options) {
+    if (options.file !== helper) return spawn.call(this, options);
+    assert.equal(witnessed, false);
+    assert.deepEqual(options.args, [helper, '--watchdog']);
+    assert.equal(options.detached, false);
+    const spawnStarted = performance.now();
+    const result = spawn.call(this, options);
+    const spawnReturned = performance.now();
+    assert.ok(this.pid > 1 && this.stdout);
+    witnessed = true;
+    const primary = this.pid;
+    record('spawn', { primary, executable: helper, spawnStarted, spawnReturned, delayed });
+    // The real client installs its data listener after spawn returns. Observe
+    // the actual first chunk before that listener runs, preserving its bytes.
+    this.stdout.prependOnceListener('data', chunk => {
+      const received = performance.now();
+      assert.ok(Buffer.isBuffer(chunk));
+      assert.equal(chunk.toString('ascii'), `R 1 ${process.pid}\n`);
+      record('received', { primary, received, frame: chunk.toString('ascii') });
+      if (delayed) {
+        // The packaged startup clock was started before spawn. Waiting past
+        // this upper bound makes delivery late even if the timer cannot run.
+        const releaseAt = spawnReturned + 1050;
+        while (performance.now() < releaseAt) Atomics.wait(waitCell, 0, 0, releaseAt - performance.now());
+      }
+      record('deliver', { primary, delivered: performance.now(), admission: admissionObservation() });
+    });
+    return result;
+  };
+  try {
+    const ready = prepared.arm(owner, build);
+    assert.ok(witnessed, 'Canonical arm did not spawn the signed watchdog synchronously');
+    return ready;
+  } finally { ChildProcess.prototype.spawn = spawn; }
 }
 async function waitForFixtureMarker(name) {
   const deadline = performance.now() + 15000;
@@ -593,7 +638,9 @@ try {
   config = JSON.parse(await readFile(path, 'utf8'));
   assert.equal(config.format, 1); assert.ok(['boundary', 'callbacks', 'frozen-trust', 'provider-mismatch', resolverMode, poisonMode, bindingMode,
     cachedRoutesMode, concurrentResponderMode, retirementMode, startupCustodyMode].includes(config.mode));
-  assert.equal(config.mode === startupCustodyMode, ['startup-descriptors', 'bootstrap-identity-refused'].includes(config.startupScenario));
+  const startupScenarios = ['startup-descriptors', 'bootstrap-identity-refused', 'late-readiness',
+    'primary-producer-lost', 'custody-producer-lost', 'custody-withholds-c', 'custody-withholds-g', 'primary-withholds-j'];
+  assert.equal(config.mode === startupCustodyMode, startupScenarios.includes(config.startupScenario));
   assert.equal(await realpath(config.home), config.home); assert.equal(process.env.HOME, config.home);
   app.setPath('userData', join(config.home, 'app-data')); app.setPath('sessionData', join(config.home, 'session-data'));
   await event('entry', { pid: process.pid, appReady: app.isReady(), argv: process.argv, runtime: process.versions });
@@ -657,7 +704,12 @@ try {
     app.exit(0);
     await new Promise(() => {});
   }
-  watchdog = await prepared.arm(owner, build); watchdog.assertArmed(prepared.trust);
+  if (config.mode === startupCustodyMode && config.startupScenario !== 'late-readiness') {
+    await event('startup-observer-waiting');
+    await waitForFixtureMarker('startup-observer-ready');
+  }
+  watchdog = await (config.mode === startupCustodyMode ? armWithReadinessWitness(owner, build) : prepared.arm(owner, build));
+  watchdog.assertArmed(prepared.trust);
   await event('armed', { descriptors: watchdog.custody.descriptors, startupDescriptor: watchdog.custody.startupDescriptor, appReady: app.isReady() });
   if (config.startupScenario === 'startup-descriptors') {
     assert.ok(config.callback && await realpath(config.callback) === config.callback);

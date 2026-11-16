@@ -204,6 +204,47 @@ function assertStartupDescriptors(launch, events) {
   }
   assert.ok(launch.observations.some(sample => sample.locks.owner?.acquired === false && sample.locks.build?.acquired === false &&
     sample.current.some(row => row.identityMatches && row.original.pid === custody.before.pid)));
+  const births = launch.startupBirths;
+  assert.ok(births.capsules, births.unavailable);
+  for (const [role, running] of [['primary', primary], ['custody', custody]]) {
+    const born = births.capsules[role]?.observation;
+    assert.ok(born, `The observer missed the live startup capsule of ${role}`);
+    for (const point of [born.before, born.after]) {
+      for (const field of ['pid', 'startId', 'pidVersion', 'uid', 'executable']) assert.equal(point[field], running.before[field]);
+      assert.equal(point.group, main.group);
+    }
+    const [ownerSlot, buildSlot, capsuleSlot] = born.slots;
+    assert.deepEqual([ownerSlot.inode, buildSlot.inode], [owner.inode, build.inode]);
+    assert.equal(capsuleSlot.fd, 5);
+    assert.equal(capsuleSlot.flags & 3, 1); // Darwin f_flag: FREAD, without FWRITE.
+    assert.equal(capsuleSlot.mode, 0o600);
+    assert.equal(capsuleSlot.links, 0);
+    assert.equal(capsuleSlot.uid, main.uid);
+    assert.equal(capsuleSlot.regular, true);
+    assert.ok(capsuleSlot.bytes > 0 && capsuleSlot.bytes <= 16384);
+  }
+  const originalCapsule = births.capsules.primary.observation.slots[2];
+  assert.equal(originalCapsule.device, capsule.device);
+  assert.equal(originalCapsule.inode, capsule.inode);
+  assert.equal(originalCapsule.bytes, capsule.size);
+  const custodyCapsule = births.capsules.custody.observation.slots[2];
+  assert.notDeepEqual([custodyCapsule.device, custodyCapsule.inode], [originalCapsule.device, originalCapsule.inode]);
+  assert.ok(BigInt(births.capsules.primary.observedAtNanos) < BigInt(births.capsules.custody.observedAtNanos));
+  const overlap = births.capsules.custody.primaryOverlap;
+  assert.equal(overlap.length, 2);
+  for (const point of overlap) {
+    assert.equal(point.status, 'alive');
+    assert.equal(point.group, main.group);
+    for (const key of ['pid', 'startId', 'pidVersion', 'uid', 'executable']) assert.equal(point[key], primary.before[key]);
+  }
+  const mainOverlap = births.capsules.custody.mainOverlap;
+  assert.equal(mainOverlap.length, 2);
+  for (const point of mainOverlap) {
+    assert.equal(point.status, 'alive');
+    assert.equal(point.stopped, true);
+    for (const key of Object.keys(main)) assert.equal(point[key], main[key]);
+  }
+  assert.ok(BigInt(births.capsules.primary.mainHeldAtNanos) < BigInt(births.capsules.custody.observedAtNanos));
 }
 
 function assertStartupIdentityRefusal(launch, events) {
@@ -223,16 +264,101 @@ function assertStartupIdentityRefusal(launch, events) {
   assert.ok(!launch.observations.some(sample => sample.current?.some(row => row.original.executable.endsWith('/native/watchdog'))));
 }
 
-// The reviewed startup case needs all of its adverse transfer phases. This
-// standalone probe records the subset with an observable trigger and result.
-export async function observeNativeStartupCustody({ output }) {
+function assertReadinessDelivery(launch, events, records, delayed) {
+  assert.deepEqual(records.map(record => record.stage), ['spawn', 'received', 'deliver']);
+  const [spawn, received, delivery] = records;
+  assert.equal(spawn.delayed, delayed);
+  assert.equal(spawn.executable, join(launch.candidate, 'Contents/Resources/browser/native/watchdog'));
+  assert.equal(received.frame, `R 1 ${launch.pid}\n`);
+  assert.equal(spawn.primary, received.primary);
+  assert.equal(spawn.primary, delivery.primary);
+  assert.ok(spawn.spawnStarted <= spawn.spawnReturned && spawn.spawnReturned <= received.received && received.received <= delivery.delivered);
+  assert.deepEqual(delivery.admission.windows, []);
+  assert.deepEqual(delivery.admission.webContents, []);
+  assert.ok(!delivery.admission.nativeImages.some(path => path.endsWith('/ownership.node')));
+  if (!delayed) {
+    assert.ok(events.find(event => event.stage === 'armed').elapsedMs >= delivery.delivered);
+    assert.equal(launch.startupSlots[0].before.pid, spawn.primary);
+    return;
+  }
+  assert.ok(received.received - spawn.spawnStarted < 1000, 'The fixture did not observe R before applying its delay');
+  assert.ok(delivery.delivered - spawn.spawnReturned >= 1050, 'R was not delayed beyond the startup deadline');
+  assert.equal(launch.signal, 'SIGKILL');
+  assert.ok(!events.some(event => event.stage === 'armed' || event.stage === 'installed'));
+  const primary = launch.observations.flatMap(sample => sample.current ?? []).find(row =>
+    row.identityMatches && row.original.pid === spawn.primary && row.original.executable === spawn.executable);
+  assert.ok(primary, 'No external kernel observation of the actual primary');
+  const final = launch.observations.at(-1);
+  assert.equal(final.current.find(row => row.original.pid === launch.pid).current.status, 'gone');
+  assert.equal(final.current.find(row => row.original.pid === spawn.primary).current.status, 'gone');
+}
+
+function assertStartupBirthFault(launch, events, scenario) {
+  const births = launch.startupBirths;
+  const fault = births?.fault;
+  assert.ok(fault, births?.unavailable ?? 'The observer missed the requested startup phase');
+  assert.equal(fault.unavailable, undefined, fault.unavailable);
+  const { observed, sample, producer, targetAfter, queued } = fault;
+  const target = observed.before;
+  const transfer = scenario === 'custody-withholds-g' || scenario === 'primary-withholds-j';
+  const withholds = transfer || scenario === 'custody-withholds-c';
+  const targetGroup = scenario === 'primary-withholds-j' ? target.pid : launch.pid;
+  assert.equal(observed.identityMatches, true);
+  assert.equal(target.stopped, true);
+  assert.equal(observed.after.stopped, true);
+  assert.equal(target.group, targetGroup);
+  if (transfer) {
+    const g = scenario === 'custody-withholds-g';
+    for (const queues of [fault.beforeStop, queued]) {
+      assert.equal(queues.primary.group, births.first.primary.pid);
+      assert.equal(queues.anchorBefore.group, launch.pid);
+      assert.equal(queues.anchorAfter.group, launch.pid);
+      assert.deepEqual([queues.forwardBytes, queues.reverseBytes], g ? [4, 0] : [0, 4]);
+    }
+    assert.equal(target.pid, g ? queued.anchorAfter.pid : queued.primary.pid);
+    assert.equal((g ? queued.anchorAfter : queued.primary).stopped, true);
+  } else {
+    assert.equal(observed.slots[2].fd, 5);
+    assert.equal(observed.slots[2].links, 0);
+    assert.equal(observed.slots[2].flags & 3, 1);
+    assert.equal(fault.primaryBefore.group, launch.pid);
+    assert.equal(producer.pid, scenario === 'primary-producer-lost' ? launch.pid : births.first.primary.pid);
+  }
+  assert.ok(sample.order, sample.unavailable);
+  for (const lock of ['owner', 'build']) {
+    assert.equal(sample.locks[lock].acquired, false);
+    for (const stage of [`before-${lock}`, `after-${lock}`]) {
+      const rows = sample.order.find(point => point.stage === stage).processes;
+      const row = rows.find(row => row.original.pid === target.pid);
+      assert.equal(row.identityMatches, true);
+      assert.equal(row.current.stopped, true);
+      assert.equal(row.current.group, targetGroup);
+      if (!withholds) assert.equal(rows.find(row => row.original.pid === producer.pid).current.status, 'gone');
+    }
+  }
+  if (withholds) {
+    assert.equal(targetAfter.status, 'gone', 'The fixture reached the resume limit with the stopped process still alive');
+    assert.ok(BigInt(fault.finishedAtNanos) - BigInt(fault.triggeredAtNanos) >= 600000000n, 'The stopped process disappeared before the startup deadline');
+  }
+  assert.equal(launch.signal, 'SIGKILL');
+  assert.ok(!events.some(event => event.stage === 'armed' || event.stage === 'installed'));
+  const final = launch.observations.at(-1);
+  for (const pid of [launch.pid, ...Object.values(births.first).map(identity => identity.pid)])
+    assert.equal(final.current.find(row => row.original.pid === pid).current.status, 'gone');
+  assert.equal(final.locks.owner.acquired, true);
+  assert.equal(final.locks.build.acquired, true);
+}
+
+export async function nativeStartupCustodyBoundary({ output }) {
   const destination = resolve(output);
   assert.ok(destination.startsWith('/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-8-20261115/'));
   await mkdir(destination, { mode: 0o700 });
   const bodyPath = fileURLToPath(import.meta.url), sourceBodyDigest = digest(await readFile(bodyPath));
-  const result = { format: 1, case: 'nativeStartupCustodyBoundary', status: 'incomplete', sourceBodyDigest, nativeConsumer, scenarios: [],
-    unavailable: ['Direct helper FD 5 observation before startup closes it', 'Continuous original-group census',
-      'Independent phase-specific producer death and C/G/J transfer refusal', 'An independently observed late R before install'] };
+  const result = { format: 1, case: 'nativeStartupCustodyBoundary', status: 'incomplete', sourceBodyDigest, nativeConsumer,
+    gateAdmission: 'pending independent actual-body review', scenarios: [],
+    limits: ['The original main is held in its process group across the measured startup handoff until custody is observed.',
+      'Private transfer phases are inferred from the exact signed startup sequence and the observed pipe queue lengths.',
+      'The fixture records identified originals and lock contention. Its census is sampled.'] };
   let failure;
   try {
     const fixtures = await prepareNativeFixtures(join(destination, 'fixtures'), { callbacks: true });
@@ -247,11 +373,23 @@ export async function observeNativeStartupCustody({ output }) {
         assert.equal(unavailable, undefined, unavailable?.error);
         assert.equal(launch.timedOut, false);
         assert.equal(launch.candidate, fixtures.consumer.candidate);
-        if (scenario === 'startup-descriptors') assertStartupDescriptors(launch, events);
-        else assertStartupIdentityRefusal(launch, events);
+        if (scenario === 'bootstrap-identity-refused') assertStartupIdentityRefusal(launch, events);
+        else if (scenario === 'startup-descriptors' || scenario === 'late-readiness') {
+          if (scenario === 'startup-descriptors') assertStartupDescriptors(launch, events);
+          entry.readiness = join(output, 'readiness.jsonl');
+          assertReadinessDelivery(launch, events, jsonLines(await readFile(entry.readiness, 'utf8')), scenario === 'late-readiness');
+        } else {
+          assertStartupBirthFault(launch, events, scenario);
+          if (scenario === 'custody-withholds-g' || scenario === 'primary-withholds-j') {
+            const trace = jsonLines(await readFile(join(output, 'readiness.jsonl'), 'utf8'));
+            assert.deepEqual(trace.map(record => record.stage), ['spawn']);
+            assert.equal(trace[0].primary, launch.startupBirths.first.primary.pid);
+          }
+        }
         entry.status = 'observed';
       } catch (error) { failure ??= error; entry.error = String(error.stack ?? error); }
     }
+    if (!failure) result.status = 'passed';
   } catch (error) { failure = error; result.error = String(error.stack ?? error); }
   assert.equal(digest(await readFile(bodyPath)), sourceBodyDigest);
   await writeFile(join(destination, 'case-result.json'), JSON.stringify(result, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
