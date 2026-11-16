@@ -243,10 +243,12 @@ export class PageRecovery {
         await this.documents.waitReady(target, receipt, job.controller.signal, workDeadline, guard); guard();
         return receipt;
       }, () => { job.active = false; });
-      guard(); const committed: unknown = this.commit(transition, receipt, guard);
+      guard(); const healthCommit = this.health.prepareRecoveryCompletion(attempt, receipt);
+      const terminalGuard = () => { guard(); healthCommit.assertCurrent(); };
+      terminalGuard(); const committed: unknown = this.commit(transition, receipt, terminalGuard);
       if (committed !== undefined) return owner.exhausted();
-      this.health.completeRecovery(attempt, receipt); // no await or auto Return between native publication and health commit
-      job.committed = true;
+      job.committed = true; // before any post-commit readback/report/notification can reject
+      healthCommit.commit();
       if (!owner.wasClosed(target)) {
         this.reports.set(target, Object.freeze({ tab: target.id, generation: transition.generation, status: 'recovered', stop,
           affectedTabs: this.health.affectedTabs(attempt), changedDuringStop: Object.freeze([...changed]),

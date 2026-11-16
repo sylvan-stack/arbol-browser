@@ -181,14 +181,27 @@ export class RendererHealth {
   affectedTabs(attempt: RecoveryAttempt): readonly string[] {
     const value = this.attempts.get(attempt); if (!value) throw staleSnapshot(); return Object.freeze([...value.affected]);
   }
-  completeRecovery(attempt: RecoveryAttempt, receipt: HostDocument): void {
+  prepareRecoveryCompletion(attempt: RecoveryAttempt, receipt: HostDocument): Readonly<{ assertCurrent(): void; commit(): void }> {
     this.assertAttempt(attempt); this.documents.assertCurrent(attempt.target, receipt);
-    const value = this.attempts.get(attempt)!, state = this.owner.state(attempt.target);
+    const value = this.attempts.get(attempt)!, revision = value.record.revision, state = this.owner.state(attempt.target);
     if (receipt.page === attempt.original || receipt.page !== attempt.target.page || !receipt.ready || receipt.availability !== 'ready' ||
-        !state.inputReady || state.controller.kind !== 'user' || state.pageAvailability !== 'ready' || receipt.page.binding().blocked)
+        state.controller.kind !== 'user' || state.handoff !== 'idle')
       throw staleSnapshot();
-    value.active = false; delete value.record.attempt; delete value.record.fault; delete value.record.recoveryError;
-    value.record.receipt = receipt; value.record.phase = 'ready'; this.increment(value.record);
+    const assertCurrent = () => {
+      this.assertAttempt(attempt); this.documents.assertCurrent(attempt.target, receipt);
+      if (value.record.revision !== revision || !receipt.ready || receipt.availability !== 'ready') throw staleSnapshot();
+    };
+    return Object.freeze({ assertCurrent, commit: () => {
+      // The native/authority producer called assertCurrent adjoining its real
+      // terminal publication. This is private bookkeeping only: no callbacks,
+      // native readbacks, active-attempt guard or deadline can reject afterwards.
+      value.active = false;
+      if (value.record.attempt !== attempt) return;
+      delete value.record.attempt;
+      if (value.record.revision !== revision) { value.record.phase = value.record.fault?.availability ?? 'unavailable'; return; }
+      delete value.record.fault; delete value.record.recoveryError;
+      value.record.receipt = receipt; value.record.phase = 'ready'; this.increment(value.record);
+    } });
   }
   failRecovery(attempt: RecoveryAttempt, reason: string): void {
     const value = this.attempts.get(attempt);
