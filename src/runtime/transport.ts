@@ -177,8 +177,8 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
   const fatal = () => {
     sealed = true; admission = false;
     if (fatalLatched) return; fatalLatched = true;
-    if (protectedPort) for (const stop of [...connections]) stop();
     try { dispatch.fatal(); } catch { /* local admission is sealed; real native fatal remains armed */ }
+    finally { if (protectedPort) for (const stop of [...connections]) stop(); }
   };
   function accepted(socket: Socket, endpoint: Endpoint): void {
     let context: ConnectionContext | undefined, dead = false, handshaking = true;
@@ -353,7 +353,10 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
       await location.assert();
       const path = endpoint === 'agent' ? location.agent : location.management;
       const server = createServer(socket => accepted(socket, endpoint)); servers.push(server);
-      server.on('error', () => { admission = false; for (const stop of [...connections]) stop(); fatal(); });
+      server.on('error', () => {
+        if (protectedPort) { fatal(); return; }
+        admission = false; for (const stop of [...connections]) stop(); fatal();
+      });
       await new Promise<void>((resolve, reject) => {
         server.once('error', reject); server.listen(path, () => { server.removeListener('error', reject); resolve(); });
       });
