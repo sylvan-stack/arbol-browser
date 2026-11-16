@@ -243,6 +243,9 @@ export class HostDocuments implements DocumentAuthority {
     if (record.current) {
       const frames = physicalFrames(record.page), before = record.current.frames;
       if (frames.length !== before.length || frames.some((value, index) => !before[index] || !sameFrame(value, before[index]!))) {
+        // A stale heartbeat/read can race the quarantined native commit. It
+        // gets no document, but cannot claim or revoke that command's result.
+        if (record.ticket) throw staleSnapshot();
         this.suspend(record); this.capture(record); this.schedule(record);
       }
     }
