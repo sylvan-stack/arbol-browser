@@ -8,6 +8,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { inventoryDigest, sourceInventory } from './package-base.mjs';
+import { nativeCompilerPolicy } from './compile-native.mjs';
 import { nativeConsumer, verifiedConsumer } from '../tests/support/native.mjs';
 
 const repository = fileURLToPath(new URL('../', import.meta.url));
@@ -26,19 +27,20 @@ const selection = [
   ['nativeInstallPoison', 'boundary', ['resolver-control', 'pre-commit-poison', 'rollback-confirmed', 'rollback-unconfirmed']],
   ['nativeBindingLifetime', 'concurrency', ['stale-nonce', 'stale-contents', 'stale-revision', 'detached-view',
     'ambiguous-creation', 'reentrant-creation', 'retired-replacement']],
-  ['nativeCachedRouteBoundary', 'concurrency', ['matched-focus-and-renderer-swap']],
+  ['nativeCachedRouteBoundary', 'concurrency', ['matched-focus-and-renderer-swap', 'cached-custom-ax-attached-retirement']],
   ['nativeConcurrentResponder', 'concurrency', ['native-responder-and-trusted-input']],
   ['nativeRetirementBoundary', 'recovery', ['success', 'detach-throws', 'destroy-missing', 'native-detach-blocked']],
   ['nativeStartupCustodyBoundary', 'recovery', ['startup-descriptors', 'bootstrap-identity-refused', 'late-readiness',
     'primary-producer-lost', 'custody-producer-lost', 'custody-withholds-c', 'custody-withholds-g', 'primary-withholds-j']],
   ['nativeFailureCustodyBoundary', 'recovery', ['heartbeat-silence', 'ack-silence', 'eof', 'malformed', 'out-of-order',
     'integrity-refused', 'cleanup-blocked', 'exit-blocked', 'fatal-shortening']],
-  ['nativeMonitorLossBoundary', 'recovery', ['primary-lost', 'primary-hung', 'custody-lost', 'custody-hung', 'both-lost', 'custody-consent']],
+  ['nativeMonitorLossBoundary', 'recovery', ['primary-lost', 'primary-hung', 'primary-timeout', 'custody-lost', 'custody-hung', 'both-lost', 'custody-consent']],
+  ['nativeHelperExitBoundary', 'recovery', ['kernel-helper-exit-controls', 'signed-supported-helper-exit']],
 ].map(([id, group, scenarios]) => [id, 'tests/top/test_native_' + group + '.mjs', scenarios]);
 const allCases = [...foundationSelection, ...selection];
 const foundationSupport = ['tests/support/foundation.mjs', 'tests/support/foundation-deadlines.mjs', 'tests/support/foundation-startup-deadlines.mjs'];
 const nativeSupport = ['tests/support/native.mjs', 'tests/support/native-entry.mjs', 'tests/support/native-callbacks.mm',
-  'tests/support/native-observer.mm', 'tests/support/native-launch.mm', 'scripts/compile-native.mjs', 'scripts/package-base.mjs'];
+  'tests/support/native-observer.mm', 'tests/support/native-census.mm', 'tests/support/native-launch.mm', 'scripts/compile-native.mjs', 'scripts/package-base.mjs'];
 const boundFiles = ['test-tiers.json', 'scripts/top-gate.mjs', 'arbol-build.json'];
 const sourceFiles = (cases, support) => [...new Set([...boundFiles, ...support, ...cases.map(([, file]) => file)])].sort();
 const snapshot = (files) => Promise.all(files.map(async file => [file, hash(await readFile(join(repository, file)))])).then(Object.fromEntries);
@@ -160,9 +162,36 @@ if (!embedded) {
           for (const path of ['scripts/compile-native.mjs', 'scripts/package-base.mjs'])
             assert.equal(fixture.callback.policySources[path], gate.harness[path]);
           assert.equal(hash(await readFile(fixture.callback.path)), fixture.callback.signedDigest);
+          assert.deepEqual(fixture.callback.headerHashes, nativeCompilerPolicy.headerHashes);
+          for (const [header, digest] of Object.entries(nativeCompilerPolicy.headerHashes))
+            assert.equal(hash(await readFile(join(fixture.callback.headers, header))), digest, 'Effective callback header drift');
         }
         for (const name of ['native-launch', 'native-observer'])
           assert.equal(hash(await readFile(join(destination, 'fixtures', name))), fixture.binaries[name]);
+        if (id === 'nativeHelperExitBoundary') {
+          const record = row.scenarios.find(item => item.id === 'kernel-helper-exit-controls').record;
+          const census = await readJson(record);
+          assert.equal(census.passed, true);
+          assert.deepEqual(census.consumerManifest, nativeConsumer);
+          assert.equal(census.sourceCommit, native.commit);
+          assert.equal(census.predecessorCommit, null);
+          assert.deepEqual(census.sourceReview, native.sourceReviewManifest);
+          const review = await readJson(native.sourceReviewManifest.path);
+          assert.deepEqual(census.sourceRecord, review.sourceRecord);
+          assert.equal(hash(await readFile(census.sourceRecord.path)), census.sourceRecord.sha256);
+          const source = await readJson(census.sourceRecord.path);
+          assert.deepEqual(census.inputs.header, census.inputs.acceptedHeader);
+          assert.equal(census.inputs.header.path, join(review.frozenSource, 'watchdog/boundary.hpp'));
+          assert.equal(census.inputs.header.sha256, source.sources['watchdog/boundary.hpp']);
+          assert.equal(census.inputs.driver.path, join(repository, 'tests/support/native-census.mm'));
+          assert.equal(census.inputs.driver.sha256, gate.harness['tests/support/native-census.mm']);
+          for (const input of [census.inputs.driver, census.inputs.header, census.binary])
+            assert.equal(hash(await readFile(input.path)), input.sha256, 'Effective census input or binary drift');
+          assert.ok(census.arguments.includes(`-DARBOL_CENSUS_HEADER="${census.inputs.header.path}"`));
+          assert.ok(census.arguments.includes(census.inputs.driver.path) && census.arguments.includes(census.binary.path));
+          assert.equal(census.scenarios.length, 9);
+          row.census = { record, sha256: hash(await readFile(record)), inputs: census.inputs, binary: census.binary };
+        }
         row.status = 'passed';
         console.log('PASS ' + id);
       } catch (error) {
