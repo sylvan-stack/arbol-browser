@@ -56,7 +56,9 @@ function tabId(exhausted: () => never): string {
 export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
   const tabs = new Map<string, TabTarget>(), closing = new Set<TabTarget>();
   const selection = new Map<WindowHost, TabTarget>();
-  const retirements = new WeakMap<TabTarget, { generation: number; promise: Promise<void> }>();
+  interface PendingRetirement { generation: number; promise: Promise<void>; ready: Promise<void>; start(): void }
+  const retirements = new WeakMap<TabTarget, PendingRetirement>();
+  const registered = new WeakSet<TabTarget>();
   const windowClosures = new WeakMap<WindowHost, Promise<void>>();
   interface PopupBudget { count: number; client: string; active: boolean }
   const actions = new Map<TabTarget, { generation: number; budget: PopupBudget }>();
@@ -72,42 +74,49 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
   const generation = (target: TabTarget, expected: number) => {
     const value = state(target); if (value.generation !== expected) throw refused('control_changed'); return value;
   };
-  function retire(target: TabTarget): Promise<void> {
+  function prepareRetirement(target: TabTarget): PendingRetirement {
     const pending = retirements.get(target);
-    if (pending) return pending.promise;
+    if (pending) return pending;
     if (tabs.get(target.id) !== target) throw refused('tab_not_found');
-    // A failed initial register still needs its actually bound target retired.
-    let currentGeneration = 1;
-    try { currentGeneration = lifecycle.state(target).generation; } catch { /* cleanup retains native exclusion */ }
-    let resolve!: () => void, reject!: (reason: unknown) => void;
-    const promise = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
-    retirements.set(target, { generation: currentGeneration, promise });
-    closing.add(target); actions.delete(target);
-    // Both guards exist before invalidate/removed/changed can synchronously re-enter.
     const window = target.page.window;
-    let failed = false, transitionError: unknown;
-    try {
+    let currentGeneration = 1;
+    if (registered.has(target)) window.guardRetirementTransition(() => { currentGeneration = lifecycle.state(target).generation; });
+    let resolve!: () => void, reject!: (reason: unknown) => void, prepared!: () => void;
+    const promise = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
+    const ready = new Promise<void>(yes => { prepared = yes; });
+    let started = false;
+    const record: PendingRetirement = { generation: currentGeneration, promise, ready,
+      start() {
+        if (started) return; started = true;
+        void ready.then(() => {
+          // This remains the one exact Native provider, after synchronous authority closure.
+          void target.page.retire().then(() => {
+            window.guardRetirementTransition(() => {
+              tabs.delete(target.id); closing.delete(target); registered.delete(target);
+              lifecycle.removed(target); lifecycle.changed();
+            });
+            resolve();
+          }, reject);
+        });
+      },
+    };
+    retirements.set(target, record);
+    closing.add(target); actions.delete(target);
+    // Publish guards/promises before any callback can re-enter. No native detach/close here.
+    window.guardRetirementTransition(() => {
       target.page.setNativeBlocked(true);
       if (selection.get(window) === target) {
         selection.delete(window);
         const next = [...tabs.values()].find(tab => tab.page.window === window && !closing.has(tab));
         if (!windowClosures.has(window) && next) { window.select(next.page); selection.set(window, next); }
-        else target.page.present(false);
+        else window.clearSelection(target.page);
       }
-    } catch (error) { failed = true; transitionError = error; }
-    // Starting the exact native retirement also prevents a resize from presenting
-    // an empty-fallback retired page again before the lifecycle callbacks below.
-    let nativeRetirement: Promise<void>;
-    try { nativeRetirement = target.page.retire(); } catch (error) { reject(error); return promise; }
-    try { lifecycle.invalidate(target); } catch (error) { failed = true; transitionError = error; }
-    const complete = () => {
-      tabs.delete(target.id); closing.delete(target);
-      lifecycle.removed(target); lifecycle.changed();
-      if (failed) throw transitionError;
-    };
-    try { void nativeRetirement.then(() => { try { complete(); resolve(); } catch (error) { reject(error); } }, reject); }
-    catch (error) { reject(error); }
-    return promise;
+      lifecycle.invalidate(target);
+    });
+    prepared(); return record;
+  }
+  function retire(target: TabTarget): Promise<void> {
+    const pending = prepareRetirement(target); pending.start(); return pending.promise;
   }
   async function open(window: WindowHost, url: string, creator?: Contract<'browser.ClientIdentity'>,
     inherited?: TabState, inheritedBudget?: PopupBudget, background = false): Promise<TabTarget> {
@@ -128,6 +137,7 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
       // First/foreground presentation precedes register, which may publish synchronously.
       if (!background && (!creator || !selection.has(window))) { selection.set(window, target); window.select(target.page); }
       lifecycle.register(target, initial);
+      registered.add(target);
       if (budget) actions.set(target, { generation: 1, budget });
       target.page.view.webContents.setWindowOpenHandler(details => {
         // Always deny the engine route: frameName is never used to retarget an existing tab.
@@ -194,8 +204,13 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
       const promise = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
       windowClosures.set(window, promise); // precedes every invalidation/native callback
       try {
-        const pendingTabs = [...tabs.values()].filter(target => target.page.window === window).map(retire);
-        void Promise.all(pendingTabs).then(() => { selection.delete(window); return window.close(); }).then(resolve, reject);
+        const pendingTabs = [...tabs.values()].filter(target => target.page.window === window).map(prepareRetirement);
+        // Reentrant close can join a record still inside invalidate. Await every
+        // synchronous preparation before the first new native detach/close.
+        void Promise.all(pendingTabs.map(target => target.ready)).then(() => {
+          for (const target of pendingTabs) target.start();
+          return Promise.all(pendingTabs.map(target => target.promise));
+        }).then(() => { selection.delete(window); return window.close(); }).then(resolve, reject);
       } catch (error) { reject(error); }
       return promise;
     },

@@ -28,6 +28,8 @@ export interface WindowHost {
   createPage(): PageSurface;
   assertHealthy(): void;
   select(page: PageSurface): void;
+  clearSelection(page: PageSurface): void;
+  guardRetirementTransition(operation: () => void): void;
   close(): Promise<void>;
 }
 const hosts = new WeakSet<object>(), surfaces = new WeakSet<object>();
@@ -67,9 +69,12 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
   const pages = new Set<PageSurface>();
   let selected: PageSurface | undefined, closing = false;
   const layout = () => {
-    const { width, height } = window.getContentBounds();
-    shell.setBounds({ x: 0, y: 0, width, height: Math.min(272, height) });
-    for (const page of pages) page.present(page === selected);
+    if (closing || window.isDestroyed()) return;
+    try {
+      const { width, height } = window.getContentBounds();
+      shell.setBounds({ x: 0, y: 0, width, height: Math.min(272, height) });
+      for (const page of pages) page.present(page === selected);
+    } catch { return boundary.fatal.fail('native_retirement_unavailable'); }
   };
   const host: WindowHost = Object.freeze({ window, shell, origin: shellURL,
     assertHealthy() { assertWindowHost(host); boundary.fatal.assertHealthy(); boundary.native.assertIntegrity(); },
@@ -122,6 +127,20 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
       assertPageSurface(page);
       if (closing || page.window !== host || !pages.has(page)) throw unavailable('browser');
       selected = page; layout();
+    },
+    clearSelection(page: PageSurface) {
+      assertPageSurface(page);
+      if (page.window !== host || !pages.has(page)) throw unavailable('browser');
+      try { if (selected === page) selected = undefined; page.present(false); }
+      catch { return boundary.fatal.fail('native_retirement_unavailable'); }
+    },
+    guardRetirementTransition(operation: () => void) {
+      try {
+        assertWindowHost(host); boundary.fatal.assertHealthy(); boundary.native.assertIntegrity();
+        const result: unknown = operation();
+        if (result !== undefined) return boundary.fatal.fail('native_retirement_unavailable');
+        boundary.fatal.assertHealthy(); boundary.native.assertIntegrity();
+      } catch { return boundary.fatal.fail('native_retirement_unavailable'); }
     },
     async close() {
       if (closing) throw unavailable('browser'); closing = true;
