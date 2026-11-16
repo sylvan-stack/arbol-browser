@@ -6,6 +6,40 @@ export interface BuildSelection {
   readonly build: string; readonly explicit: boolean;
   readonly directory: string; readonly guard: string;
 }
+/** One production layout. Paths are structural identities, not signature proof.
+ * The registry owns buildRoot; every executable and metadata input is sealed
+ * inside its single outer application. Foundation-only packages stay distinct. */
+export interface PackagedLayout {
+  readonly build: string; readonly buildRoot: string; readonly bundle: string;
+  readonly payload: string; readonly launcher: string; readonly engine: string;
+  readonly cliEntry: string; readonly hostEntry: string;
+}
+export function packagedLayout(build: string, payload: string): PackagedLayout {
+  if (!validator('browser.Build')(build) || !isAbsolute(payload) || resolve(payload) !== payload ||
+      basename(payload) !== 'browser' || basename(dirname(payload)) !== 'Resources' ||
+      basename(dirname(dirname(payload))) !== 'Contents') throw unavailable('browser');
+  const bundle = dirname(dirname(dirname(payload))), buildRoot = dirname(bundle);
+  if (basename(bundle) !== 'ArbolBrowser.app' || basename(buildRoot) !== build ||
+      basename(dirname(buildRoot)) !== 'arbol-browser') throw unavailable('browser');
+  return Object.freeze({ build, buildRoot, bundle, payload,
+    launcher: join(payload, 'native/host-launch'),
+    engine: join(payload, 'runtime/Electron.app/Contents/MacOS/Electron'),
+    cliEntry: join(payload, 'lib/cli/main.mjs'), hostEntry: join(payload, 'lib/host/main.mjs') });
+}
+export function selectedLayout(selection: BuildSelection, payload: string): PackagedLayout {
+  const layout = packagedLayout(selection.build, payload);
+  if (selection.directory !== layout.buildRoot ||
+      selection.guard !== join(dirname(layout.buildRoot), '.uses', selection.build)) throw unavailable('browser');
+  return layout;
+}
+/** The physical CLI lives below Contents/Resources/browser, not at Build root.
+ * A launcher hint can neither relocate that payload nor select its older base. */
+export function consumePackagedSelection(build: string, payload: string,
+  environment: NodeJS.ProcessEnv = process.env): BuildSelection {
+  const layout = packagedLayout(build, payload);
+  const selection = consumeSelection(build, layout.buildRoot, environment);
+  selectedLayout(selection, payload); return selection;
+}
 /** Private launcher input is a selection hint, never signature/native authority.
  * Consume once and erase before spawning anything. Direct isolated candidates
  * have no launcher context and cannot acquire a production Build-use lease. */
