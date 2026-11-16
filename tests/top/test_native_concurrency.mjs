@@ -106,6 +106,42 @@ function assertBindingScenario(id, report) {
   }
 }
 
+async function observeInputTrial(fixtures, scenario, { folder, recordName, readinessStage, mode, bindingScenario }, verify) {
+  let lastError;
+  for (let number = 1; number <= 3; number++) {
+    const output = join(fixtures.directory, number === 1 ? folder : folder + '-' + number);
+    const attempt = { number, status: 'failed', launch: join(output, 'launch-result.json'), record: join(output, recordName) };
+    scenario.attempts.push(attempt);
+    try {
+      const launch = await launchNativeFixture(fixtures, { mode, bindingScenario, output });
+      const events = launch.stdout.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+      const unavailable = events.find(event => event.stage === 'unavailable' || event.stage.endsWith('-unavailable'));
+      assert.equal(unavailable, undefined, unavailable?.error);
+      assert.equal(launch.timedOut, false);
+      assert.equal(launch.signal, 'SIGKILL');
+      assert.equal(launch.candidate, fixtures.consumer.candidate);
+      assert.ok(events.some(event => event.stage === 'armed'));
+      assert.ok(events.some(event => event.stage === 'installed' && event.status.phase === 'ready'));
+      requireNativeLaunch(launch, events);
+      const ready = events.find(event => event.stage === readinessStage);
+      if (!ready) {
+        await requirePreTrialExit(launch, events, attempt.record);
+        attempt.status = 'unavailable';
+        throw new Error('The signed process exited before ' + readinessStage);
+      }
+      if (bindingScenario) assert.equal(ready.scenario, bindingScenario);
+      verify(JSON.parse(await readFile(attempt.record, 'utf8')));
+      attempt.status = 'passed';
+    } catch (error) {
+      lastError = error;
+      attempt.error = String(error.stack ?? error);
+    }
+    scenario.status = attempt.status;
+    if (scenario.status !== 'unavailable') break;
+  }
+  if (scenario.status !== 'passed') throw lastError;
+}
+
 export async function nativeBindingLifetime({ output }) {
   const destination = await createNativeOutput(output);
   const bodyPath = fileURLToPath(import.meta.url), sourceBodyDigest = digest(await readFile(bodyPath));
@@ -115,23 +151,12 @@ export async function nativeBindingLifetime({ output }) {
     unavailable: ['binding identifier/revision/lifetime exhaustion has no bounded trigger on the signed ABI'] };
   const errors = [];
   for (const id of bindingScenarios) {
-    const output = join(fixtures.directory, id);
-    const observation = { id, status: 'unavailable', launch: join(output, 'launch-result.json'), record: join(output, 'binding-lifetime.json') };
-    result.scenarios.push(observation);
+    const scenario = { id, status: 'unavailable', attempts: [] };
+    result.scenarios.push(scenario);
     try {
-      const launch = await launchNativeFixture(fixtures, { mode: 'binding-lifetime', bindingScenario: id, output });
-      assert.equal(launch.timedOut, false);
-      assert.equal(launch.candidate, fixtures.consumer.candidate);
-      const events = launch.stdout.trim().split('\n').map(line => JSON.parse(line));
-      assert.ok(events.some(event => event.stage === 'armed'));
-      assert.ok(events.some(event => event.stage === 'installed' && event.status.phase === 'ready'));
-      assert.equal(launch.signal, 'SIGKILL');
-      const unavailable = events.find(event => event.stage === 'binding-unavailable');
-      assert.equal(unavailable, undefined, unavailable?.error);
-      assertBindingScenario(id, JSON.parse(await readFile(observation.record, 'utf8')));
-      observation.status = 'passed';
+      await observeInputTrial(fixtures, scenario, { folder: id, recordName: 'binding-lifetime.json',
+        readinessStage: 'binding-started', mode: 'binding-lifetime', bindingScenario: id }, report => assertBindingScenario(id, report));
     } catch (error) {
-      observation.error = String(error.stack ?? error);
       errors.push(error);
     }
   }
@@ -420,37 +445,8 @@ export async function nativeConcurrentResponder({ output }) {
     const fixtures = await prepareNativeFixtures(join(destination, 'fixtures'), { callbacks: true });
     const scenario = { id: 'native-responder-and-trusted-input', status: 'unavailable', attempts: [] };
     result.scenarios.push(scenario);
-    let lastError;
-    for (let number = 1; number <= 3; number++) {
-      const output = join(fixtures.directory, number === 1 ? 'responders' : 'responders-' + number);
-      const attempt = { number, status: 'failed', launch: join(output, 'launch-result.json'), record: join(output, 'concurrent-responder.json') };
-      scenario.attempts.push(attempt);
-      try {
-        const launch = await launchNativeFixture(fixtures, { mode: 'concurrent-responder', output });
-        const events = launch.stdout.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
-        const unavailable = events.find(event => ['unavailable', 'concurrent-responder-unavailable'].includes(event.stage));
-        assert.equal(unavailable, undefined, unavailable?.error);
-        assert.equal(launch.timedOut, false);
-        assert.equal(launch.signal, 'SIGKILL');
-        assert.equal(launch.candidate, fixtures.consumer.candidate);
-        assert.ok(events.some(event => event.stage === 'armed'));
-        assert.ok(events.some(event => event.stage === 'installed' && event.status.phase === 'ready'));
-        requireNativeLaunch(launch, events);
-        if (!events.some(event => event.stage === 'concurrent-window-shown')) {
-          await requirePreTrialExit(launch, events, attempt.record);
-          attempt.status = 'unavailable';
-          throw new Error('The signed process exited before the concurrent responder trial');
-        }
-        assertConcurrentResponder(JSON.parse(await readFile(attempt.record, 'utf8')));
-        attempt.status = 'passed';
-      } catch (error) {
-        lastError = error;
-        attempt.error = String(error.stack ?? error);
-      }
-      scenario.status = attempt.status;
-      if (scenario.status !== 'unavailable') break;
-    }
-    if (scenario.status !== 'passed') throw lastError;
+    await observeInputTrial(fixtures, scenario, { folder: 'responders', recordName: 'concurrent-responder.json',
+      readinessStage: 'concurrent-window-shown', mode: 'concurrent-responder' }, assertConcurrentResponder);
     result.status = 'passed';
   } catch (error) { failure = error; result.error = String(error.stack ?? error); }
   assert.equal(digest(await readFile(bodyPath)), sourceBodyDigest);
