@@ -69,7 +69,7 @@ assert.equal(args[0], '--candidate'); assert.equal(args[2], '--out');
 assert.ok(args[1] && args[3] && isAbsolute(args[1]) && isAbsolute(args[3]));
 if (args.length === 6) {
   assert.equal(args[4], '--native-consumer');
-  assert.equal(args[5], nativeConsumer.manifest, 'Only the pinned ABR-42 manifest can qualify this gate');
+  assert.equal(args[5], nativeConsumer.manifest, 'Only the pinned ABR-46 manifest can qualify this gate');
 }
 const candidate = await realpath(args[1]), output = resolve(args[3]);
 const protectedRoots = [resolve(repository), candidate, dirname(nativeConsumer.manifest), '/Users/msix/Artifacts'];
@@ -89,11 +89,11 @@ if (!embedded) {
     gate.harnessCommit = execFileSync('/usr/bin/git', ['-C', repository, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
     const nativeModules = await verifyExports(selection);
     const native = await verifiedConsumer();
-    gate.nativeConsumer = { pin: nativeConsumer, candidate: native.candidate, codeCommit: native.codeCommit,
+    gate.nativeConsumer = { pin: nativeConsumer, candidate: native.candidate, codeCommit: native.commit,
       sourceDigest: native.sourceDigest, bundle: native.bundle, manifest: native.manifest, sourceReviewManifest: native.sourceReviewManifest };
     const { nativeConsumer: admitted } = inventory;
     assert.deepEqual(admitted, { manifest: nativeConsumer.manifest, digest: nativeConsumer.digest,
-      codeCommit: native.codeCommit, sourceDigest: native.sourceDigest, compatibilityDigest: native.manifest.sha256 });
+      codeCommit: native.commit, sourceDigest: native.sourceDigest, compatibilityDigest: native.manifest.sha256 });
     const foundationSource = inventoryDigest(await sourceInventory());
     const foundationOutput = join(output, 'foundation'), home = join(foundationOutput, 'runtime-home');
     await mkdir(foundationOutput, { mode: 0o700 });

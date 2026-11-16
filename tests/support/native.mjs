@@ -8,8 +8,8 @@ import { dirname, isAbsolute, join, resolve, sep, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 const root = resolve(fileURLToPath(new URL('../../', import.meta.url)));
 export const nativeConsumer = Object.freeze({
-  manifest: '/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-42-20261115/consumer-manifest.json',
-  digest: 'cb041c3918bba14ccd5ea299cbd0b6c4159e3d97b169138c96ed70397f57601f',
+  manifest: '/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-46-20261116-6df9y348/consumer-manifest.json',
+  digest: '25fe40877f7c3415bc5c5cce034320440bdfbb287170e30c9cb319728ca9490e',
 });
 const hash = value => createHash('sha256').update(value).digest('hex');
 const run = (file, args, timeout = 30000) => execFileSync(file, args, { encoding: 'utf8', timeout,
@@ -94,8 +94,10 @@ export async function verifiedConsumer() {
   assert.equal(hash(await readFile(value.manifest.path)), value.manifest.sha256);
   const sourceReview = JSON.parse(await readFile(value.sourceReviewManifest.path));
   assert.equal(hash(await readFile(value.sourceReviewManifest.path)), value.sourceReviewManifest.sha256);
-  const sourceRecord = JSON.parse(await readFile(join(sourceReview.frozenSource, '../source-before.json')));
-  assert.equal(hash(await readFile(join(sourceReview.frozenSource, '../source-before.json'))), sourceReview.records['source-checkpoint-35c9560/source-before.json']);
+  const sourceBytes = await readFile(sourceReview.sourceRecord.path);
+  assert.equal(hash(sourceBytes), sourceReview.sourceRecord.sha256);
+  assert.deepEqual(sourceReview.sourceRecord, value.sourceRecord);
+  const sourceRecord = JSON.parse(sourceBytes);
   for (const [file, digest] of Object.entries(sourceRecord.sources))
     assert.equal(hash(await readFile(join(sourceReview.frozenSource, file))), digest, 'Frozen accepted source drift');
   for (const [file, digest] of Object.entries(sourceReview.compiledInventory))
@@ -132,7 +134,7 @@ export async function prepareNativeFixtures(output, { callbacks = false } = {}) 
     '-framework', 'Foundation', '-o', join(destination, file)]);
   let callback;
   if (callbacks) {
-    const headers = '/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-5-20261114/inputs/node_headers/include/node';
+    const headers = '/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-46-20261116-6df9y348/headers/node_headers/include/node';
     const { nativeCompilerPolicy } = await import('../../scripts/compile-native.mjs');
     for (const [file, digest] of Object.entries(nativeCompilerPolicy.headerHashes))
       assert.equal(hash(await readFile(join(headers, file))), digest, 'Pinned callback header drift');
