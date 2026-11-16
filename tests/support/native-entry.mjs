@@ -21,6 +21,7 @@ const startupCustodyMode = 'startup-custody';
 const failureCustodyMode = 'failure-custody';
 const monitorCustodyMode = 'monitor-loss';
 const helperExitMode = 'helper-exit';
+const customAXMode = 'custom-ax';
 const viewOptions = { webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } };
 const bindingKey = ({ id, nonce, webContentsId, revision }) => ({ id, nonce, webContentsId, revision });
 let eventWrite = Promise.resolve();
@@ -512,7 +513,6 @@ async function observeCachedRoutes(bridge) {
   await settle();
   const cleared = await composition(compositionUser);
   const liveUnmark = { prime, primed, beforeUnmark, deniedUnmark, afterUnmark, allowedUnmark, cleared };
-  const custom = invoke(original.token, 'custom');
   const resigned = invoke(original.token, 'resignFocus');
   const navigationBlocked = ownership.mark(bindingKey(compositionUser), true);
   await event('cached-route-navigating', { originalFrame, navigationBlocked });
@@ -526,11 +526,64 @@ async function observeCachedRoutes(bridge) {
   const replacementPositive = await matrix('user-after-frame-swap', replacement.token, axRoutes);
   await new Promise((accept, reject) => server.close(error => error ? reject(error) : accept()));
   const report = { created, initialUser, original, originalFrame, originalState, focus, user, contexts, beforeContexts, afterContexts, resigned,
-    blockedBinding, blocked, restored, resumedBinding, resumed, liveUnmark, compositionBlocked, compositionUser, custom, navigationBlocked, replacementFrame, replacement,
+    blockedBinding, blocked, restored, resumedBinding, resumed, liveUnmark, compositionBlocked, compositionUser, navigationBlocked, replacementFrame, replacement,
     replacementBlocked, oldStateAfterNavigation, replacementState, afterNavigation, replacementUser, replacementPositive,
     status: boundary.native.assertIntegrity() };
   writeFileSync(join(config.output, 'cached-routes.json'), JSON.stringify(report) + '\n', { mode: 0o600, flag: 'wx' });
   watchdog.terminate();
+}
+async function observeCustomAX(bridge) {
+  app.setAccessibilitySupportEnabled(true);
+  const window = new BaseWindow({ width: 640, height: 360, show: false });
+  const ownership = boundary.native.ownership, handle = window.getNativeWindowHandle();
+  const html = `<!doctype html><div role="tablist"><div role="tab" tabindex="0" aria-label="Custom action tab" aria-actions="counter">Tab</div></div>
+    <button id="counter">Counter action</button><input aria-label="Custom fixture field">
+    <script>globalThis.clicks=[];counter.addEventListener('click',e=>clicks.push({trusted:e.isTrusted,target:e.target.id}));</script>`;
+  const attach = async () => {
+    const view = new WebContentsView(viewOptions), contents = view.webContents;
+    const binding = ownership.bind(handle, contents.id, () => window.contentView.addChildView(view));
+    view.setBounds({ x: 0, y: 0, width: 640, height: 360 });
+    const user = ownership.mark(bindingKey(binding), false);
+    await contents.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
+    window.show(); window.focus(); contents.focus();
+    const client = await waitForObservation(() => {
+      const value = JSON.parse(bridge.capture(handle));
+      if (!value.cachedHandler) bridge.releaseClients(value.token);
+      return value;
+    }, value => value.cachedHandler, 'No positive target-specific aria-actions handler');
+    return { view, contents, binding, user, client };
+  };
+  const sample = async (page, phase) => {
+    await page.contents.executeJavaScript('clicks.length=0');
+    const state = () => page.contents.executeJavaScript('({clicks:[...clicks],tabAttached:document.querySelector("[role=tab]").isConnected})');
+    const before = await state(), nativeBefore = JSON.parse(bridge.state(page.client.token));
+    const dispatched = JSON.parse(bridge.invoke(page.client.token, 'custom'));
+    await new Promise(accept => setTimeout(accept, 180));
+    return { phase, token: page.client.token, origin: page.client.actionOriginIdentity, before, nativeBefore, dispatched,
+      after: await state(), nativeAfter: JSON.parse(bridge.state(page.client.token)) };
+  };
+  const original = await attach();
+  const allowed = await sample(original, 'allowed');
+  const blockedBinding = ownership.mark(bindingKey(original.user), true);
+  const blocked = await sample(original, 'blocked');
+  const resumedBinding = ownership.mark(bindingKey(blockedBinding), false);
+  const resumed = await sample(original, 'resumed');
+  const retiredBinding = ownership.retire(bindingKey(resumedBinding));
+  // Deliberately leave the exact originating AX tab and native page attached.
+  // This exercises the tombstone with a live weak-reference target.
+  const retired = await sample(original, 'retired-attached');
+  window.contentView.removeChildView(original.view);
+  original.contents.close({ waitForBeforeUnload: false });
+  await waitForObservation(() => original.contents.isDestroyed(), Boolean, 'Original custom AX page did not close');
+  const fresh = await attach(), freshAllowed = await sample(fresh, 'fresh-allowed');
+  const report = { html, original: original.client, blockedBinding, resumedBinding, retiredBinding,
+    allowed, blocked, resumed, retired, fresh: fresh.client, freshBinding: fresh.user, freshAllowed,
+    inventory: prepared.trust.manifest.nativeABI,
+    installedRoutes: JSON.parse(bridge.auditMethods(Object.keys(prepared.trust.manifest.nativeABI.methods))),
+    features: { disabled: app.commandLine.getSwitchValue('disable-features'), sitePerProcess: app.commandLine.hasSwitch('site-per-process') },
+    status: boundary.native.assertIntegrity() };
+  writeFileSync(join(config.output, 'custom-ax.json'), JSON.stringify(report) + '\n', { mode: 0o600, flag: 'wx' });
+  await event('custom-ax-complete');watchdog.terminate();
 }
 async function observeConcurrentResponder(bridge) {
   app.setAccessibilitySupportEnabled(true);
@@ -813,7 +866,7 @@ try {
   assert.ok(stat.isFile() && stat.uid === process.getuid() && (stat.mode & 0o7777) === 0o600 && stat.nlink === 1 && stat.size <= 16384);
   config = JSON.parse(await readFile(path, 'utf8'));
   assert.equal(config.format, 1); assert.ok(['boundary', 'callbacks', 'frozen-trust', 'frozen-trust-restored', 'provider-mismatch', resolverMode, poisonMode, bindingMode,
-    cachedRoutesMode, concurrentResponderMode, retirementMode, startupCustodyMode, failureCustodyMode, monitorCustodyMode, helperExitMode].includes(config.mode));
+    cachedRoutesMode, concurrentResponderMode, retirementMode, startupCustodyMode, failureCustodyMode, monitorCustodyMode, helperExitMode, customAXMode].includes(config.mode));
   const startupScenarios = ['startup-descriptors', 'bootstrap-identity-refused', 'late-readiness',
     'primary-producer-lost', 'custody-producer-lost', 'custody-withholds-c', 'custody-withholds-g', 'primary-withholds-j'];
   assert.equal(config.mode === startupCustodyMode, startupScenarios.includes(config.startupScenario));
@@ -980,7 +1033,7 @@ try {
   } else boundary = await bootstrap.installNativeBoundary(prepared, watchdog, effects);
   assert.equal(boundary.pageAdmission, false);
   await event('installed', { status: boundary.native.assertIntegrity(), admission: admissionObservation(), appReady: app.isReady() });
-  if ([bindingMode, cachedRoutesMode, concurrentResponderMode, retirementMode, failureCustodyMode, monitorCustodyMode, helperExitMode].includes(config.mode)) {
+  if ([bindingMode, cachedRoutesMode, concurrentResponderMode, retirementMode, failureCustodyMode, monitorCustodyMode, helperExitMode, customAXMode].includes(config.mode)) {
     assert.ok(config.callback && await realpath(config.callback) === config.callback);
     const require = createRequire(import.meta.url);
     const bridge = require(config.callback);
@@ -993,12 +1046,13 @@ try {
       [failureCustodyMode]: () => observeFailure(bridge, loadAddon()),
       [monitorCustodyMode]: () => observeFailure(bridge, loadAddon()),
       [helperExitMode]: () => observeHelperExit(),
+      [customAXMode]: () => observeCustomAX(bridge),
     }[config.mode];
     // Electron's entry must resolve before its application-ready event.
     app.whenReady().then(run).catch(async error => {
       const stage = { [bindingMode]: 'binding-unavailable', [cachedRoutesMode]: 'cached-route-unavailable',
         [concurrentResponderMode]: 'concurrent-responder-unavailable', [retirementMode]: 'retirement-unavailable',
-        [failureCustodyMode]: 'failure-custody-unavailable', [monitorCustodyMode]: 'monitor-loss-unavailable', [helperExitMode]: 'helper-exit-unavailable' }[config.mode];
+        [failureCustodyMode]: 'failure-custody-unavailable', [monitorCustodyMode]: 'monitor-loss-unavailable', [helperExitMode]: 'helper-exit-unavailable', [customAXMode]: 'custom-ax-unavailable' }[config.mode];
       await event(stage, { error: String(error.stack ?? error) });
       watchdog.terminate();
     });

@@ -228,7 +228,6 @@ export async function nativeCachedRouteBoundary({ output }) {
   const result = { format: 1, case: 'nativeCachedRouteBoundary', status: 'incomplete', sourceBodyDigest, nativeConsumer,
     scope: 'pinned-consumer native observations', representatives: cachedRoutes,
     complementaryRoutes: {
-      'cached custom action handler': 'no positive handler exposed by the controlled renderer',
       'AX action forwarding, attribute value, focus and selected text/range': 'separate from cached press and setAccessibilityValue:',
       'insertText: forwarding, undo/redo/paste and paste-and-match-style': 'separate from the direct insertion and command representatives',
       'generated editing selectors': 'deleteBackward: and selectAll: only, other selectors require their own evidence',
@@ -294,7 +293,6 @@ export async function nativeCachedRouteBoundary({ output }) {
     assert.equal(report.contexts[1].threw, false);
     assert.equal(report.contexts[2].nestedCalls, 1);
     assert.equal(report.contexts[2].nestedResult, false);
-    assert.deepEqual(report.custom, { error: 'fixture_missing_handler' });
     assert.equal(report.originalFrame.frameTreeNodeId, report.replacementFrame.frameTreeNodeId);
     assert.ok(report.originalFrame.osProcessId > 0 && report.replacementFrame.osProcessId > 0);
     assert.notEqual(report.originalFrame.osProcessId, report.replacementFrame.osProcessId);
@@ -315,6 +313,38 @@ export async function nativeCachedRouteBoundary({ output }) {
     assert.deepEqual(report.replacementUser, { ...report.replacementBlocked, revision: 7, blocked: false });
     assert.equal(report.status.phase, 'ready');
     assert.equal(report.status.liveBindings, 1);
+    result.scenarios = [{ id: 'matched-focus-and-renderer-swap', status: 'passed', record: result.record, launch: result.launch }];
+    const customOutput = join(fixtures.directory, 'custom-ax');
+    const custom = await launchNativeFixture(fixtures, { mode: 'custom-ax', output: customOutput });
+    const row = { id: 'cached-custom-ax-attached-retirement', status: 'failed', record: join(customOutput, 'custom-ax.json'), launch: join(customOutput, 'launch-result.json') };
+    result.scenarios.push(row);
+    assert.equal(custom.timedOut, false);
+    const customEvents = custom.stdout.trim().split('\n').map(JSON.parse);
+    assert.ok(customEvents.some(event => event.stage === 'custom-ax-complete'), customEvents.find(event => event.stage === 'custom-ax-unavailable')?.error);
+    const ax = JSON.parse(await readFile(row.record, 'utf8'));
+    assert.equal(ax.original.cachedHandler, true); assert.equal(ax.original.actionName, 'Counter action');
+    for (const phase of ['allowed', 'blocked', 'resumed', 'retired', 'freshAllowed']) {
+      const sample = ax[phase], denied = ['blocked', 'retired'].includes(phase);
+      assert.equal(sample.dispatched.returned, !denied);
+      assert.deepEqual(sample.before, { clicks: [], tabAttached: true });
+      assert.deepEqual(sample.after, { clicks: denied ? [] : [{ trusted: true, target: 'counter' }], tabAttached: true });
+      for (const state of [sample.nativeBefore, sample.nativeAfter]) {
+        for (const key of ['actionOriginAlive', 'actionOriginAttached', 'weakRootAlive', 'weakWidgetAlive', 'attached', 'cachedHandler']) assert.equal(state[key], true, phase + ' ' + key);
+        assert.equal(state.actionOriginIdentity, sample.origin);
+      }
+      if (phase !== 'freshAllowed') { assert.equal(sample.token, ax.original.token); assert.equal(sample.origin, ax.original.actionOriginIdentity); }
+    }
+    assert.equal(ax.retiredBinding.blocked, true); assert.equal(ax.retiredBinding.retired, true);
+    assert.notEqual(ax.freshBinding.id, ax.retiredBinding.id); assert.notEqual(ax.fresh.token, ax.original.token);
+    assert.deepEqual(ax.features, { disabled: 'MacAccessibilityTextOperation', sitePerProcess: true });
+    const compatibility = JSON.parse(await readFile(fixtures.consumer.manifest.path, 'utf8'));
+    assert.deepEqual(ax.inventory, compatibility.nativeABI);
+    assert.deepEqual(Object.keys(ax.installedRoutes).sort(), Object.keys(ax.inventory.methods).sort());
+    for (const [key, method] of Object.entries(ax.inventory.methods)) {
+      if (method === '<absent>') assert.equal(ax.installedRoutes[key], '<absent>');
+      else assert.equal(ax.installedRoutes[key].image, image, 'Actual guard missing for ' + key);
+    }
+    row.status = 'passed';
     result.status = 'passed';
   } catch (error) { failure = error; result.error = String(error.stack ?? error); }
   assert.equal(digest(await readFile(bodyPath)), sourceBodyDigest);

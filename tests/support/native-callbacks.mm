@@ -19,6 +19,8 @@
 @property(nonatomic,strong) id button;
 @property(nonatomic,strong) id field;
 @property(nonatomic,copy) BOOL (^action)(void);
+@property(nonatomic,strong) id actionOrigin;
+@property(nonatomic,copy) NSString* actionName;
 @end
 @implementation QualificationRoutes
 @end
@@ -129,13 +131,18 @@ static napi_value capturePage(napi_env env,napi_value handle,NSString* identity)
       NSString* role=[element respondsToSelector:@selector(accessibilityRole)]?[element accessibilityRole]:@"";
       if([role isEqualToString:@"AXButton"]&&!row.button) row.button=element;
       if([role isEqualToString:@"AXTextField"]&&!row.field) row.field=element;
-      if(!row.action&&[element respondsToSelector:@selector(accessibilityCustomActions)]) {
-        for(NSAccessibilityCustomAction* action in [element accessibilityCustomActions]) if(action.handler) { row.action=action.handler;break; }
+      NSString* label=[element respondsToSelector:@selector(accessibilityLabel)]?[element accessibilityLabel]:nil;
+      NSString* title=[element respondsToSelector:@selector(accessibilityTitle)]?[element accessibilityTitle]:nil;
+      if(!row.action&&([label isEqual:@"Custom action tab"]||[title isEqual:@"Custom action tab"])&&[element respondsToSelector:@selector(accessibilityCustomActions)]) {
+        for(NSAccessibilityCustomAction* action in [element accessibilityCustomActions]) if(action.handler&&[action.name isEqual:@"Counter action"]) {
+          row.action=action.handler;row.actionOrigin=element;row.actionName=action.name;break;
+        }
       }
     }
     if(!routes) routes=[NSMutableDictionary new];NSString* token=NSUUID.UUID.UUIDString.lowercaseString;routes[token]=row;
     return reply(env,@{@"token":token,@"root":[NSString stringWithFormat:@"%p",root],@"widget":[NSString stringWithFormat:@"%p",row.widget],
       @"buttonIdentity":[NSString stringWithFormat:@"%p",row.button],
+      @"actionOriginIdentity":[NSString stringWithFormat:@"%p",row.actionOrigin],@"actionName":row.actionName?:@"",
       @"axNodes":@(elements.count),@"button":@(row.button!=nil),@"field":@(row.field!=nil),@"cachedHandler":@(row.action!=nil)});
   } @catch(NSException*) { return fail(env,"fixture_capture_exception"); }
 }
@@ -152,7 +159,15 @@ static napi_value captureRoot(napi_env env,napi_callback_info info) {
 static napi_value state(napi_env env,napi_callback_info info) {
   napi_value value;if(!args(env,info,1,&value)) return nullptr;QualificationRoutes* row=routes[string(env,value)];
   if(!row) return fail(env,"fixture_unknown_token");NSView* root=row.root;NSView* widget=row.widget;
+  bool originAttached=false;id parent=row.actionOrigin;std::set<void*> seen;
+  for(unsigned depth=0;parent&&depth<128&&seen.insert((__bridge void*)parent).second;++depth) {
+    if(parent==widget||parent==root) { originAttached=true;break; }
+    if(![parent respondsToSelector:@selector(accessibilityParent)]) break;
+    parent=[parent accessibilityParent];
+  }
   return reply(env,@{@"weakRootAlive":@(root!=nil),@"weakWidgetAlive":@(widget!=nil),@"attached":@(root&&root.superview!=nil),
+    @"actionOriginAlive":@(row.actionOrigin!=nil),@"actionOriginAttached":@(originAttached),
+    @"actionOriginIdentity":[NSString stringWithFormat:@"%p",row.actionOrigin],@"actionName":row.actionName?:@"",
     @"rootHidden":@(root&&[root isHiddenOrHasHiddenAncestor]),@"widgetHidden":@(widget&&[widget isHiddenOrHasHiddenAncestor]),
     @"windowVisible":@(widget.window.isVisible),@"windowKey":@(widget.window.isKeyWindow),
     @"firstResponder":@(widget&&widget.window.firstResponder==widget),@"cachedButton":@(row.button!=nil),@"cachedHandler":@(row.action!=nil)});
@@ -161,7 +176,7 @@ static napi_value state(napi_env env,napi_callback_info info) {
 static napi_value releaseClients(napi_env env,napi_callback_info info) {
   napi_value value;if(!args(env,info,1,&value)) return nullptr;NSString* token=string(env,value);
   if(!token||!routes[token]) return fail(env,"fixture_unknown_token");
-  QualificationRoutes* row=routes[token];row.button=nil;row.field=nil;row.action=nil;
+  QualificationRoutes* row=routes[token];row.button=nil;row.field=nil;row.action=nil;row.actionOrigin=nil;row.actionName=nil;
   return reply(env,@{@"token":token,@"fixtureClientsReleased":@YES});
 }
 static napi_value invoke(napi_env env,napi_callback_info info) {

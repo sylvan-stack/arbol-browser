@@ -396,7 +396,7 @@ async function observeWithMarker(fixtures, directory, command, request, markerNa
 export async function launchNativeFixture(fixtures, {
   mode = 'boundary', callback = fixtures.record.callback?.path, output, variant, poisonScenario, bindingScenario, retirementScenario, startupScenario, failureScenario, monitorScenario,
 }) {
-  const callbackModes = ['callbacks', 'resolver-control', 'install-poison', 'binding-lifetime', 'cached-routes', 'concurrent-responder', 'retirement', 'startup-custody', 'failure-custody', 'monitor-loss', 'helper-exit'];
+  const callbackModes = ['callbacks', 'resolver-control', 'install-poison', 'binding-lifetime', 'cached-routes', 'concurrent-responder', 'retirement', 'startup-custody', 'failure-custody', 'monitor-loss', 'helper-exit', 'custom-ax'];
   assert.ok(['boundary', 'frozen-trust', 'frozen-trust-restored', 'provider-mismatch', ...callbackModes].includes(mode));
   assert.ok(callback || !callbackModes.includes(mode));
   assert.equal(mode === 'install-poison', installPoisonScenarios.has(poisonScenario));
