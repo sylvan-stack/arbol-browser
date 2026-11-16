@@ -3,7 +3,8 @@ import { createHash } from 'node:crypto';
 import { setTimeout as pause } from 'node:timers/promises';
 import type { Contract } from '../contracts/generated.js';
 import { bindingKey } from '../native/retirement.js';
-import { TabAuthority, type DocumentReceipt } from './authority.js';
+import { TabAuthority, type DocumentReceipt, type RecoveryTransition } from './authority.js';
+import type { DocumentFault } from './documents.js';
 import { refused, userURL, assertTabRegistry, type AgentOpenScope, type TabLifecycle, type TabRegistry, type TabState, type TabTarget } from './tabs.js';
 import { assertPageRetirement, assertPageSurface, assertWindowHost, type PageRetirement, type PageSurface, type WindowHost } from './windows.js';
 import { ActionQueue, type ActionExecution } from './actions.js';
@@ -112,12 +113,13 @@ export class HandoffController {
     // This is genuine same-original Close, not a successful old Take reply.
     throw refused('control_changed');
   }
-  take(target: TabTarget, expected: number): Promise<HandoffResult> {
+  take(target: TabTarget, expected: number, fault?: DocumentFault): Promise<HandoffResult> {
     this.authority.assertAdmission();
     if (this.authority.wasClosed(target)) throw refused('tab_not_found');
     const existing = this.pending.get(target);
     if (existing) {
       if (expected !== existing.expected && expected !== existing.expected + 1) throw refused('control_changed');
+      if (fault) this.authority.pageFailed(target, fault);
       return existing.promise;
     }
     const before = this.authority.expected(target, expected);
@@ -127,7 +129,7 @@ export class HandoffController {
     // Record before invalidators, native calls or state publication can reenter.
     this.pending.set(target, { expected, promise, page: target.page });
     try {
-      this.authority.beginTake(target, expected);
+      this.authority.beginTake(target, expected, fault);
       this.synchronous(() => this.operations.stop(target));
       if (!this.authority.wasClosed(target)) this.mark(target, true);
       this.authority.changed();
@@ -180,6 +182,17 @@ export class HandoffController {
   }
   release(target: TabTarget, recipient: string, expected: number): Promise<HandoffResult> {
     this.authority.owner(target, recipient, expected); return this.take(target, expected);
+  }
+  failure(target: TabTarget, fault: DocumentFault): Promise<void> {
+    if (this.authority.wasClosed(target)) return Promise.resolve();
+    const state = this.authority.state(target), page = fault.page;
+    if (state.controller.kind === 'agent' || state.handoff === 'taking')
+      return this.take(target, state.generation, fault).then(() => {});
+    this.authority.pageFailed(target, fault);
+    if (target.page !== page) throw refused('control_changed');
+    const retired = page.retirement();
+    if (retired) return this.waitRetirement(target, page).then(() => { this.retired(target); });
+    this.mark(target, true); this.authority.changed(); return Promise.resolve();
   }
   /** Cleanup, unlike an old public Take reply, may join a verified Close that
    * superseded this exact target without making normal close profile-fatal. */
@@ -253,7 +266,9 @@ export interface OwnershipHost {
   bind(tabs: TabRegistry, host: WindowHost, registration: ShellRegistration): void;
   bindRuntime(runtime: HostLifecycle): void;
   runEnd(attachment: string): void;
-  healthFailure(target: TabTarget): Promise<void>;
+  healthFailure(target: TabTarget, fault: DocumentFault): Promise<void>;
+  /** Only the exact successful recovery producer can publish this fresh user page. */
+  recovered(transition: RecoveryTransition, receipt: DocumentReceipt): void;
 }
 interface ScopedTarget { page: PageSurface; generation: number; grantEpoch: number | undefined; parent?: TabTarget }
 interface PendingOpen {
@@ -267,7 +282,7 @@ interface StagedProof { proof: DeliveryProof; invalidated: boolean; listDigest?:
 export function createOwnershipHost(boundary: NativeFailureBoundary, documents: import('./authority.js').DocumentAuthority,
   operations: OwnershipOperations): OwnershipHost {
   assertNativeFailureBoundary(boundary);
-  for (const method of ['current', 'assertCurrent', 'prepare', 'assertSuccessor'] as const)
+  for (const method of ['current', 'assertCurrent', 'assertFault', 'prepare', 'assertSuccessor'] as const)
     if (typeof documents[method] !== 'function') throw unavailable('browser');
   for (const method of ['info', 'agent', 'user', 'recover', 'invalidate', 'leaveAgentMode'] as const)
     if (typeof operations[method] !== 'function') throw unavailable('browser');
@@ -788,10 +803,20 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
       if (everBound && control.windowCount() === 0) runtime.lastWindowClosed();
     },
     runEnd(id) { const context = contexts.get(id); if (context && runtime) runtime.disconnect(context); else disconnect(id); },
-    async healthFailure(target) {
-      live(); const state = authority.state(target); authority.refreshDocument(target);
-      if (state.controller.kind === 'agent') await handoff.take(target, state.generation);
-      else { authority.invalidate(target); authority.changed(); }
+    healthFailure(target, fault) {
+      live(); return handoff.failure(target, fault);
+    },
+    recovered(transition, receipt) {
+      live(); authority.assertRecovery(transition); authority.assertDocument(transition.target, receipt);
+      const page = transition.target.page;
+      if (page !== receipt.page || page === transition.original || !receipt.ready || receipt.availability !== 'ready') throw refused('control_refused');
+      page.window.guardRetirementTransition(() => {
+        const before = page.binding(), after = page.setNativeBlocked(false);
+        if (authority.wasClosed(transition.target)) return;
+        if (!before.blocked || after.blocked || after.retired || after.id !== before.id || after.nonce !== before.nonce ||
+            after.webContentsId !== before.webContentsId || after.revision !== before.revision + 1) return authority.exhausted();
+      });
+      authority.assertRecovery(transition); authority.finishRecovery(transition, receipt);
     },
   });
 }

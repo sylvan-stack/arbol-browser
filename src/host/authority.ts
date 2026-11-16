@@ -5,7 +5,8 @@ import { BrowserFailure, unavailable } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
 import type { NativeFailureBoundary } from '../runtime/bootstrap.js';
 import { assertCandidateTrust } from '../native/manifest.js';
-import { assertPageRetirement, type PageSurface } from './windows.js';
+import { assertPageRetirement, assertPageSurface, type PageSurface } from './windows.js';
+import type { DocumentFault } from './documents.js';
 import { refused, type TabState, type TabTarget } from './tabs.js';
 
 /** Supplied by the current-document producer (ABR-11), never a renderer claim.
@@ -24,6 +25,8 @@ export interface DocumentReceipt {
 export interface DocumentAuthority {
   current(target: TabTarget): DocumentReceipt;
   assertCurrent(target: TabTarget, receipt: DocumentReceipt): void;
+  /** Branded original fault evidence remains authentic without a live frame. */
+  assertFault(target: TabTarget, fault: DocumentFault): void;
   /** The real producer fences every command and continuation to this job and
    * its current physical document/readiness epoch, including own navigation. */
   prepare(target: TabTarget, url: string, context: { readonly signal: AbortSignal; assertCurrent(): void }): Promise<void>;
@@ -72,6 +75,16 @@ interface Entry {
   document?: DocumentReceipt;
   closed: boolean;
   retired: boolean;
+  fault?: Contract<'browser.Availability'>;
+}
+export interface RecoveryTransition {
+  readonly target: TabTarget;
+  readonly original: PageSurface;
+  readonly generation: number;
+}
+interface RecoveryState {
+  entry: Entry; availability: Contract<'browser.Availability'>;
+  phase: 'retiring' | 'rebound' | 'complete' | 'failed' | 'cancelled'; replacement?: PageSurface;
 }
 interface Connection { identity: Readonly<Contract<'browser.ClientIdentity'>>; signal: AbortSignal }
 interface Snapshot { stamp: AuthorityStamp; expires: number; delivered: boolean }
@@ -92,6 +105,8 @@ export class TabAuthority {
   private readonly admissions = new WeakMap<TabTarget, Map<string, number>>();
   private readonly takes = new WeakMap<TabTarget, { owner: string; from: number; to: number; recipientEpoch: number }>();
   private readonly closes = new WeakMap<TabTarget, { owner?: string; from: number; to: number }>();
+  private readonly recoveries = new WeakMap<RecoveryTransition, RecoveryState>();
+  private readonly activeRecoveries = new WeakMap<TabTarget, RecoveryTransition>();
   private sealed = false;
   constructor(readonly boundary: NativeFailureBoundary, readonly documents: DocumentAuthority) {
     assertCandidateTrust(boundary.native.trust); this.assertHealthy();
@@ -180,7 +195,7 @@ export class TabAuthority {
     this.assertHealthy(); const entry = this.entry(target);
     return Object.freeze({ tab: target.id, generation: entry.generation, controller: Object.freeze({ ...entry.controller }),
       visibleTo: Object.freeze([...entry.grants].filter(id => this.connected(id))) as unknown as string[],
-      handoff: entry.handoff, inputReady: !entry.closed && entry.ready && entry.handoff === 'idle',
+      handoff: entry.handoff, inputReady: !entry.closed && !entry.fault && entry.ready && entry.handoff === 'idle',
       observationSuspended: entry.controller.kind === 'user', pageAvailability: entry.availability,
       ...(entry.document ? { navigation: entry.document.navigation } : {}) });
   }
@@ -232,9 +247,10 @@ export class TabAuthority {
   revoke(target: TabTarget, recipient: string): void {
     this.entry(target).grants.delete(recipient); this.invalidate(target, recipient);
   }
-  beginTake(target: TabTarget, expected: number): void {
+  beginTake(target: TabTarget, expected: number, fault?: DocumentFault): void {
     this.expected(target, expected); const entry = this.entry(target);
     if (entry.handoff !== 'idle' || entry.controller.kind !== 'agent') throw refused('control_refused');
+    if (fault) this.latchFault(target, fault);
     this.takes.set(target, { owner: entry.controller.client, from: entry.generation, to: this.increment(entry.generation),
       recipientEpoch: entry.recipients.get(entry.controller.client) ?? 0 });
     entry.generation = this.increment(entry.generation); entry.controller = { kind: 'user' };
@@ -245,10 +261,80 @@ export class TabAuthority {
     if (entry.closed || entry.controller.kind !== 'user' || entry.handoff !== 'taking') return this.exhausted();
     entry.retired = retired; entry.ready = ready && !retired; entry.handoff = 'idle';
     if (ready && !retired) {
+      if (entry.fault) return this.exhausted();
       if (!receipt || receipt.page !== target.page || !receipt.ready || receipt.availability !== 'ready') return this.exhausted();
       entry.document = receipt; entry.availability = 'ready';
     }
-    if (retired) { entry.availability = 'unavailable'; delete entry.document; }
+    if (retired) { entry.availability = entry.fault ?? 'unavailable'; delete entry.document; }
+  }
+  private latchFault(target: TabTarget, fault: DocumentFault): void {
+    const checked: unknown = this.documents.assertFault(target, fault);
+    if (checked !== undefined) return this.exhausted();
+    const entry = this.entry(target);
+    if (fault.page !== target.page) throw staleSnapshot();
+    if (entry.closed) return;
+    if (entry.fault !== 'crashed' || fault.availability === 'crashed') entry.fault = fault.availability;
+    entry.ready = false; entry.availability = entry.fault;
+  }
+  pageFailed(target: TabTarget, fault: DocumentFault): void {
+    this.latchFault(target, fault); if (!this.entry(target).closed) this.invalidate(target);
+  }
+  beginRecovery(target: TabTarget, expected: number): RecoveryTransition {
+    const state = this.expected(target, expected), entry = this.entry(target);
+    if (state.controller.kind !== 'user' || state.handoff !== 'idle' || state.inputReady || state.pageAvailability === 'ready' ||
+        this.activeRecoveries.has(target)) throw refused('control_refused');
+    const transition = Object.freeze({ target, original: target.page, generation: this.increment(entry.generation) });
+    this.recoveries.set(transition, { entry, availability: entry.fault ?? entry.availability, phase: 'retiring' });
+    this.activeRecoveries.set(target, transition);
+    entry.generation = transition.generation; entry.ready = false; entry.retired = true; entry.availability = 'unavailable';
+    this.invalidate(target); return transition;
+  }
+  private recovery(transition: RecoveryTransition): RecoveryState {
+    this.assertAdmission();
+    const record = this.recoveries.get(transition), entry = this.entry(transition.target);
+    if (!record || record.entry !== entry || this.activeRecoveries.get(transition.target) !== transition || entry.closed ||
+        entry.generation !== transition.generation || entry.controller.kind !== 'user' || entry.handoff !== 'idle' ||
+        !['retiring', 'rebound'].includes(record.phase)) throw staleSnapshot();
+    return record;
+  }
+  assertRecovery(transition: RecoveryTransition): void {
+    const record = this.recovery(transition);
+    if (transition.target.page !== (record.replacement ?? transition.original)) throw staleSnapshot();
+  }
+  rebindRecovery(transition: RecoveryTransition, replacement: PageSurface): void {
+    const record = this.recovery(transition), original = transition.original;
+    assertPageSurface(replacement);
+    const retired = original.retirement();
+    if (record.phase !== 'retiring' || !retired || transition.target.page !== replacement || replacement === original ||
+        replacement.window !== original.window || replacement.session !== original.session || replacement.retirement()) throw staleSnapshot();
+    assertPageRetirement(original, retired); if (retired.phase !== 'retired') throw staleSnapshot();
+    const binding = replacement.binding();
+    if (!binding.blocked || binding.retired || binding.webContentsId !== replacement.identity.webContentsId ||
+        binding.id === original.identity.id || binding.nonce === original.identity.nonce) return this.exhausted();
+    record.phase = 'rebound'; record.replacement = replacement;
+    record.entry.retired = false; record.entry.ready = false; record.entry.availability = 'unavailable'; delete record.entry.document;
+  }
+  finishRecovery(transition: RecoveryTransition, receipt: DocumentReceipt): void {
+    const record = this.recovery(transition); this.assertRecovery(transition); this.assertDocument(transition.target, receipt);
+    const page = transition.target.page;
+    if (record.phase !== 'rebound' || record.replacement !== page || receipt.page !== page || !receipt.ready || receipt.availability !== 'ready')
+      throw staleSnapshot();
+    const binding = page.binding();
+    if (binding.blocked || binding.retired || binding.webContentsId !== page.identity.webContentsId) return this.exhausted();
+    delete record.entry.fault; record.entry.document = receipt; record.entry.ready = true; record.entry.retired = false;
+    record.entry.availability = 'ready'; record.phase = 'complete'; this.activeRecoveries.delete(transition.target);
+  }
+  failRecovery(transition: RecoveryTransition): void {
+    const record = this.recoveries.get(transition);
+    if (!record || !['retiring', 'rebound', 'cancelled'].includes(record.phase)) return;
+    if (!record.entry.closed && record.entry.generation === transition.generation &&
+        this.activeRecoveries.get(transition.target) === transition && transition.target.page === (record.replacement ?? transition.original)) {
+      record.entry.ready = false; record.entry.retired = true;
+      record.entry.fault = record.availability === 'ready' ? 'unavailable' : record.availability;
+      record.entry.availability = record.entry.fault; this.invalidate(transition.target);
+    }
+    record.phase = 'failed';
+    if (this.activeRecoveries.get(transition.target) === transition) this.activeRecoveries.delete(transition.target);
   }
   publishReturn(target: TabTarget, recipient: string, expected: number, document: DocumentReceipt): void {
     const state = this.expected(target, expected); this.attachment(recipient); this.assertDocument(target, document);
@@ -266,6 +352,8 @@ export class TabAuthority {
     this.closes.set(target, { ...(entry.controller.kind === 'agent' ? { owner: entry.controller.client } : {}),
       from: entry.generation, to: this.increment(entry.generation) });
     this.closedTargets.add(target);
+    const recovery = this.activeRecoveries.get(target);
+    if (recovery) { this.recoveries.get(recovery)!.phase = 'cancelled'; this.activeRecoveries.delete(target); }
     entry.closed = true; entry.ready = false; entry.grants.clear(); entry.generation = this.increment(entry.generation);
     entry.controller = { kind: 'user' }; this.invalidate(target);
   }
@@ -436,7 +524,7 @@ export class TabAuthority {
   /** Only the verified native/readiness adapter may publish initial readiness. */
   prepared(target: TabTarget, receipt: DocumentReceipt): void {
     this.assertDocument(target, receipt); const entry = this.entry(target);
-    if (receipt !== this.document(target) || entry.closed || entry.handoff !== 'idle') throw refused('control_changed');
+    if (receipt !== this.document(target) || entry.closed || entry.fault || entry.handoff !== 'idle' || this.activeRecoveries.has(target)) throw refused('control_changed');
     entry.document = receipt; entry.ready = true; entry.availability = 'ready';
   }
   capture(target: TabTarget, recipient: string, generation?: number, mutation = false): AuthorityStamp {
