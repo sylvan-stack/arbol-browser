@@ -147,7 +147,7 @@ export async function prepareNativeFixtures(output, { callbacks = false } = {}) 
   return Object.freeze({ directory: destination, consumer, record });
 }
 export function observeNative(fixtures, kind, value) {
-  assert.ok(['process', 'group', 'contend', 'custody'].includes(kind));
+  assert.ok(['process', 'group', 'contend', 'custody', 'startup-slots'].includes(kind));
   return JSON.parse(run(join(fixtures.directory, 'native-observer'), [kind, String(value)]));
 }
 async function observeFrozenTrust(variant, output, onStage) {
@@ -170,15 +170,17 @@ const installPoisonScenarios = new Set(['pre-commit-poison', 'rollback-confirmed
 export const bindingScenarios = Object.freeze(['stale-nonce', 'stale-contents', 'stale-revision', 'detached-view',
   'ambiguous-creation', 'reentrant-creation', 'retired-replacement']);
 export const retirementScenarios = Object.freeze(['success', 'detach-throws', 'destroy-missing', 'native-detach-blocked']);
+export const startupScenarios = Object.freeze(['startup-descriptors', 'bootstrap-identity-refused']);
 export async function launchNativeFixture(fixtures, {
-  mode = 'boundary', callback = fixtures.record.callback?.path, output, variant, poisonScenario, bindingScenario, retirementScenario,
+  mode = 'boundary', callback = fixtures.record.callback?.path, output, variant, poisonScenario, bindingScenario, retirementScenario, startupScenario,
 }) {
-  const callbackModes = ['callbacks', 'resolver-control', 'install-poison', 'binding-lifetime', 'cached-routes', 'concurrent-responder', 'retirement'];
+  const callbackModes = ['callbacks', 'resolver-control', 'install-poison', 'binding-lifetime', 'cached-routes', 'concurrent-responder', 'retirement', 'startup-custody'];
   assert.ok(['boundary', 'frozen-trust', 'provider-mismatch', ...callbackModes].includes(mode));
   assert.ok(callback || !callbackModes.includes(mode));
   assert.equal(mode === 'install-poison', installPoisonScenarios.has(poisonScenario));
   assert.equal(mode === 'binding-lifetime', bindingScenarios.includes(bindingScenario));
   assert.equal(mode === 'retirement', retirementScenarios.includes(retirementScenario));
+  assert.equal(mode === 'startup-custody', startupScenarios.includes(startupScenario));
   assert.equal(mode === 'frozen-trust', variant?.kind === 'frozen-trust');
   assert.equal(mode === 'provider-mismatch', variant?.kind === 'provider-mismatch');
   const consumer = await verifiedConsumer(); assert.equal(consumer.candidate, fixtures.consumer.candidate);
@@ -199,7 +201,7 @@ export async function launchNativeFixture(fixtures, {
   for (const name of ['app-data', 'session-data']) await mkdir(join(home, name), { mode: 0o700 });
   if (callback) { assert.equal(callback, fixtures.record.callback?.path); assert.equal(hash(await readFile(callback)), fixtures.record.callback.signedDigest); }
   const config = { format: 1, mode, bundle: variant?.candidate ?? fixtures.consumer.candidate, output: directory, home, trustProbe: Boolean(variant),
-    providerMethod: variant?.providerChange?.method, poisonScenario, bindingScenario, retirementScenario,
+    providerMethod: variant?.providerChange?.method, poisonScenario, bindingScenario, retirementScenario, startupScenario,
     owner: join(directory, 'owner.lock'), build: join(directory, 'build.lock'), callback };
   const request = join(directory, 'request.json');
   await writeFile(request, JSON.stringify(config) + '\n', { mode: 0o600, flag: 'wx' });
@@ -209,6 +211,7 @@ export async function launchNativeFixture(fixtures, {
   });
   let stdout = '', stderr = '', timedOut = false;
   const observations = [], tracked = new Map();
+  const startupSlots = [];
   child.stdout.on('data', bytes => { stdout += bytes; }); child.stderr.on('data', bytes => { stderr += bytes; });
   const started = performance.now();
   function sample() {
@@ -229,6 +232,12 @@ export async function launchNativeFixture(fixtures, {
       let current, locks = {}, ordered;
       const published = stdout.split('\n').flatMap(line => { try { const value = JSON.parse(line); return value.stage === 'locks' ? [value] : []; } catch { return []; } }).at(-1);
       const originals = [...tracked.values()].filter(value => value.executable.startsWith(config.bundle + sep));
+      if (startupScenario === 'startup-descriptors' && startupSlots.length === 0 && stdout.includes('"stage":"startup-descriptors"')) {
+        const monitors = originals.filter(value => value.executable === join(config.bundle, 'Contents/Resources/browser/native/watchdog'));
+        const anchor = monitors.find(value => value.group === child.pid && value.parent !== child.pid);
+        const primary = monitors.find(value => value.pid === anchor?.parent && value.startId === anchor.parentStartId);
+        if (anchor && primary) startupSlots.push(...[primary, anchor].map(expected => ({ expected, ...observeNative(fixtures, 'startup-slots', expected.pid) })));
+      }
       if (published && originals.length) {
         const anchor = originals.find(value => value.executable === join(config.bundle, 'Contents/Resources/browser/native/watchdog') && value.group === child.pid && value.parent !== child.pid) ?? null;
         ordered = observeNative(fixtures, 'custody', JSON.stringify({ format: 1, group: child.pid, anchor, processes: originals,
@@ -268,7 +277,7 @@ export async function launchNativeFixture(fixtures, {
   const record = { format: 1, mode, candidate: config.bundle, consumerManifest: nativeConsumer, derivation: variant ?? null,
     consumerRole: variant ? 'immutable baseline only; executing copy is explicitly derived' : 'exact executing consumer', pid: child.pid,
     elapsedMs: performance.now() - started, ...outcome, timedOut, stdout, stderr, observations,
-    frozenTrust: await trustProbe,
+    frozenTrust: await trustProbe, startupSlots: mode === 'startup-custody' ? startupSlots : undefined,
     qualification: 'fixture feasibility only; no complete gate/native qualification result' };
   await writeFile(join(directory, 'launch-result.json'), JSON.stringify(record, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
   return record;

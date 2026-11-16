@@ -44,6 +44,23 @@ static bool originalMatches(NSDictionary* expected,NSDictionary* current) {
     if(![expected[key] isEqual:current[key]]) return false;
   return [current[@"status"] isEqual:@"alive"];
 }
+static NSDictionary* startupSlots(pid_t pid) {
+  NSDictionary* before=process(pid);
+  if(![before[@"status"] isEqual:@"alive"]) return @{@"before":before};
+  NSMutableArray* slots=[NSMutableArray new];
+  for(int fd : {3,4,5}) {
+    struct vnode_fdinfo info{};
+    errno=0;
+    int size=proc_pidfdinfo(pid,fd,PROC_PIDFDVNODEINFO,&info,sizeof(info));
+    if(size!=sizeof(info)) { [slots addObject:@{@"fd":@(fd),@"unavailable":@(errno),@"size":@(size)}]; continue; }
+    const auto& stat=info.pvi.vi_stat;
+    [slots addObject:@{@"fd":@(fd),@"device":[NSString stringWithFormat:@"%llu",(uint64_t)stat.vst_dev],
+      @"inode":[NSString stringWithFormat:@"%llu",stat.vst_ino],@"uid":@(stat.vst_uid),@"mode":@(stat.vst_mode&07777),
+      @"links":@(stat.vst_nlink),@"flags":@(info.pfi.fi_openflags),@"regular":@(S_ISREG(stat.vst_mode))}];
+  }
+  NSDictionary* after=process(pid);
+  return @{@"before":before,@"after":after,@"identityMatches":@(originalMatches(before,after)),@"slots":slots};
+}
 static NSArray* originals(NSArray* expected) {
   NSMutableArray* result=[NSMutableArray new];
   for(NSDictionary* original in expected) {
@@ -110,6 +127,7 @@ int main(int argc,const char* argv[]) {
   @autoreleasepool {
     if(argc!=3) return 64; id result=nil; int value=0;
     if(!strcmp(argv[1],"process")&&positive(argv[2],value)) result=process(value);
+    else if(!strcmp(argv[1],"startup-slots")&&positive(argv[2],value)) result=startupSlots(value);
     else if(!strcmp(argv[1],"group")&&positive(argv[2],value)) {
       result=group(value);if(!result)return 70;
     } else if(!strcmp(argv[1],"custody")) {

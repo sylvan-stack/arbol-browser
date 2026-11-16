@@ -16,6 +16,7 @@ const bindingMode = 'binding-lifetime';
 const cachedRoutesMode = 'cached-routes';
 const concurrentResponderMode = 'concurrent-responder';
 const retirementMode = 'retirement';
+const startupCustodyMode = 'startup-custody';
 const viewOptions = { webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } };
 const bindingKey = ({ id, nonce, webContentsId, revision }) => ({ id, nonce, webContentsId, revision });
 let eventWrite = Promise.resolve();
@@ -591,7 +592,8 @@ try {
   assert.ok(stat.isFile() && stat.uid === process.getuid() && (stat.mode & 0o7777) === 0o600 && stat.nlink === 1 && stat.size <= 16384);
   config = JSON.parse(await readFile(path, 'utf8'));
   assert.equal(config.format, 1); assert.ok(['boundary', 'callbacks', 'frozen-trust', 'provider-mismatch', resolverMode, poisonMode, bindingMode,
-    cachedRoutesMode, concurrentResponderMode, retirementMode].includes(config.mode));
+    cachedRoutesMode, concurrentResponderMode, retirementMode, startupCustodyMode].includes(config.mode));
+  assert.equal(config.mode === startupCustodyMode, ['startup-descriptors', 'bootstrap-identity-refused'].includes(config.startupScenario));
   assert.equal(await realpath(config.home), config.home); assert.equal(process.env.HOME, config.home);
   app.setPath('userData', join(config.home, 'app-data')); app.setPath('sessionData', join(config.home, 'session-data'));
   await event('entry', { pid: process.pid, appReady: app.isReady(), argv: process.argv, runtime: process.versions });
@@ -640,8 +642,31 @@ try {
   const owner = prepared.platform.tryLock(config.owner), build = prepared.platform.trySharedLock(config.build); assert.ok(owner && build);
   globalThis.qualificationOriginalLocks = { owner, build }; // strong originals, never finally-release
   await event('locks', { owner: owner.assertIdentity(), build: build.assertIdentity() });
+  if (config.startupScenario === 'bootstrap-identity-refused') {
+    const original = process.env.ARBOL_BROWSER_BOOTSTRAP;
+    const [version, pid, start, group, session, uid] = original.split(':');
+    assert.equal(pid, String(process.pid));
+    const changed = [version, pid, String(BigInt(start) + 1n), group, session, uid].join(':');
+    process.env.ARBOL_BROWSER_BOOTSTRAP = changed;
+    try { await assert.rejects(prepared.arm(owner, build)); }
+    finally { process.env.ARBOL_BROWSER_BOOTSTRAP = original; }
+    await assert.rejects(prepared.arm(owner, build)); // A real retry with the correct launch value also refuses.
+    await event('startup-identity-refused', { original, changed, retryRefused: true, admission: admissionObservation(),
+      owner: owner.assertIdentity(), build: build.assertIdentity() });
+    await new Promise(accept => setTimeout(accept, 350));
+    app.exit(0);
+    await new Promise(() => {});
+  }
   watchdog = await prepared.arm(owner, build); watchdog.assertArmed(prepared.trust);
   await event('armed', { descriptors: watchdog.custody.descriptors, startupDescriptor: watchdog.custody.startupDescriptor, appReady: app.isReady() });
+  if (config.startupScenario === 'startup-descriptors') {
+    assert.ok(config.callback && await realpath(config.callback) === config.callback);
+    const bridge = createRequire(import.meta.url)(config.callback);
+    const descriptor = fd => JSON.parse(bridge.descriptor(fd));
+    await event('startup-descriptors', { capsule: descriptor(watchdog.custody.startupDescriptor),
+      owner: descriptor(watchdog.custody.descriptors[0]), build: descriptor(watchdog.custody.descriptors[1]), admission: admissionObservation() });
+    await new Promise(accept => setTimeout(accept, 350));
+  }
   if (config.mode === poisonMode) await observeInstallPoison(bootstrapURL);
   let resolver;
   if (config.mode === resolverMode) {

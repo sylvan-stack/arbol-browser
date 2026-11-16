@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { launchNativeFixture, nativeConsumer, prepareNativeFixtures, retirementScenarios } from '../support/native.mjs';
+import { launchNativeFixture, nativeConsumer, prepareNativeFixtures, retirementScenarios, startupScenarios } from '../support/native.mjs';
 
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const jsonLines = text => text.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
@@ -128,6 +128,130 @@ export async function nativeRetirementBoundary({ output }) {
       } catch (error) { failure ??= error; entry.error = String(error.stack ?? error); }
     }
     if (!failure) result.status = 'passed';
+  } catch (error) { failure = error; result.error = String(error.stack ?? error); }
+  assert.equal(digest(await readFile(bodyPath)), sourceBodyDigest);
+  await writeFile(join(destination, 'case-result.json'), JSON.stringify(result, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+  if (failure) throw failure;
+  return result;
+}
+
+function assertStartupDescriptors(launch, events) {
+  const started = events.find(event => event.stage === 'startup-descriptors');
+  assert.ok(started, 'The signed process did not publish its real startup descriptors');
+  assert.ok(events.some(event => event.stage === 'installed' && event.status.phase === 'ready'));
+  assert.ok(events.some(event => event.stage === 'sealed'));
+  const original = events.find(event => event.stage === 'launcher');
+  const { capsule, owner, build, admission } = started;
+  const armed = events.find(event => event.stage === 'armed');
+  assert.deepEqual(armed.descriptors, [owner.fd, build.fd]);
+  assert.equal(armed.startupDescriptor, capsule.fd);
+  assert.deepEqual(admission.windows, []);
+  assert.deepEqual(admission.webContents, []);
+  assert.ok(!admission.nativeImages.some(path => path.endsWith('/ownership.node')));
+  assert.equal(capsule.links, 0);
+  assert.equal(capsule.mode, 0o600);
+  assert.equal(capsule.accessMode, 0);
+  assert.ok(capsule.size > 0 && capsule.size <= 16384);
+  const value = capsule.capsule;
+  assert.equal(value.format, 2);
+  assert.equal(value.mode, 'primary');
+  assert.equal(value.producerRole, 'main');
+  assert.equal(value.bundle, launch.candidate);
+  assert.equal(value.candidateSnapshotDigest, events.find(event => event.stage === 'prepared').snapshotDigest);
+  const executing = launch.observations.map(sample => sample.identity).find(identity => identity?.pid === original.pid &&
+    identity.executable === join(launch.candidate, 'Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron'));
+  assert.ok(executing, 'The observer did not identify the post-exec Electron process');
+  for (const field of ['pid', 'startId', 'uid', 'group', 'session']) assert.equal(executing[field], original[field]);
+  // exec can change pidVersion. The capsule must name the executing image.
+  const main = Object.fromEntries(['pid', 'startId', 'pidVersion', 'uid', 'group', 'session'].map(field => [field, executing[field]]));
+  assert.deepEqual(value.main, main);
+  const { session, ...producer } = main;
+  assert.deepEqual(value.producer, producer);
+  assert.equal(capsule.uid, main.uid);
+  assert.notDeepEqual([owner.device, owner.inode], [build.device, build.inode]);
+  assert.equal(value.locks.owner.heldMode, 2); // Darwin LOCK_EX
+  assert.equal(value.locks.build.heldMode, 1); // Darwin LOCK_SH
+  const locks = events.find(event => event.stage === 'locks');
+  for (const [name, descriptor] of [['owner', owner], ['build', build]]) {
+    for (const field of ['device', 'inode', 'uid', 'mode']) {
+      assert.equal(descriptor[field], value.locks[name][field]);
+    }
+    for (const field of ['device', 'inode', 'uid']) assert.equal(descriptor[field], locks[name][field]);
+    assert.equal(descriptor.mode, 0o600);
+    assert.equal(descriptor.links, 1);
+  }
+  assert.equal(launch.startupSlots.length, 2, 'The external observer missed the two running monitors');
+  const [primary, custody] = launch.startupSlots;
+  assert.equal(primary.before.group, primary.before.pid);
+  assert.equal(primary.before.parent, main.pid);
+  assert.equal(primary.before.originalParentVersion, main.pidVersion);
+  assert.equal(custody.before.group, main.group);
+  assert.equal(custody.before.parent, primary.before.pid);
+  assert.equal(custody.before.originalParentVersion, primary.before.pidVersion);
+  for (const monitor of [primary, custody]) {
+    assert.equal(monitor.identityMatches, true);
+    assert.equal(monitor.before.session, session);
+    assert.equal(monitor.before.group, monitor.after.group);
+    for (const key of ['pid', 'startId', 'pidVersion', 'uid', 'executable']) assert.equal(monitor.before[key], monitor.expected[key]);
+    assert.deepEqual(monitor.slots.map(slot => slot.fd), [3, 4, 5]);
+    for (const [index, original] of [owner, build].entries()) {
+      const slot = monitor.slots[index];
+      assert.equal(slot.regular, true);
+      for (const key of ['device', 'inode', 'uid', 'mode', 'links']) assert.equal(slot[key], original[key]);
+    }
+    // The real helpers close the input capsule while reading it at startup.
+    // The raw slot-5 result remains in the observer record.
+  }
+  assert.ok(launch.observations.some(sample => sample.locks.owner?.acquired === false && sample.locks.build?.acquired === false &&
+    sample.current.some(row => row.identityMatches && row.original.pid === custody.before.pid)));
+}
+
+function assertStartupIdentityRefusal(launch, events) {
+  assert.equal(launch.code, 0);
+  assert.equal(launch.signal, null);
+  const actual = events.find(event => event.stage === 'launcher');
+  const refusal = events.find(event => event.stage === 'startup-identity-refused');
+  assert.ok(refusal);
+  assert.equal(refusal.original, ['1', actual.pid, actual.startId, actual.group, actual.session, actual.uid].join(':'));
+  assert.equal(refusal.changed, ['1', actual.pid, String(BigInt(actual.startId) + 1n), actual.group, actual.session, actual.uid].join(':'));
+  assert.equal(refusal.retryRefused, true);
+  assert.deepEqual(refusal.admission.windows, []);
+  assert.deepEqual(refusal.admission.webContents, []);
+  assert.ok(!refusal.admission.nativeImages.some(path => path.endsWith('/ownership.node')));
+  assert.ok(!events.some(event => event.stage === 'armed' || event.stage === 'installed'));
+  assert.ok(launch.observations.some(sample => sample.locks.owner?.acquired === false && sample.locks.build?.acquired === false));
+  assert.ok(!launch.observations.some(sample => sample.current?.some(row => row.original.executable.endsWith('/native/watchdog'))));
+}
+
+// The reviewed startup case needs all of its adverse transfer phases. This
+// standalone probe records the subset with an observable trigger and result.
+export async function observeNativeStartupCustody({ output }) {
+  const destination = resolve(output);
+  assert.ok(destination.startsWith('/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-8-20261115/'));
+  await mkdir(destination, { mode: 0o700 });
+  const bodyPath = fileURLToPath(import.meta.url), sourceBodyDigest = digest(await readFile(bodyPath));
+  const result = { format: 1, case: 'nativeStartupCustodyBoundary', status: 'incomplete', sourceBodyDigest, nativeConsumer, scenarios: [],
+    unavailable: ['Direct helper FD 5 observation before startup closes it', 'Continuous original-group census',
+      'Independent phase-specific producer death and C/G/J transfer refusal', 'An independently observed late R before install'] };
+  let failure;
+  try {
+    const fixtures = await prepareNativeFixtures(join(destination, 'fixtures'), { callbacks: true });
+    for (const scenario of startupScenarios) {
+      const output = join(fixtures.directory, scenario);
+      const entry = { scenario, status: 'incomplete', launch: join(output, 'launch-result.json') };
+      result.scenarios.push(entry);
+      try {
+        const launch = await launchNativeFixture(fixtures, { mode: 'startup-custody', output, startupScenario: scenario });
+        const events = jsonLines(launch.stdout);
+        const unavailable = events.find(event => event.stage === 'unavailable');
+        assert.equal(unavailable, undefined, unavailable?.error);
+        assert.equal(launch.timedOut, false);
+        assert.equal(launch.candidate, fixtures.consumer.candidate);
+        if (scenario === 'startup-descriptors') assertStartupDescriptors(launch, events);
+        else assertStartupIdentityRefusal(launch, events);
+        entry.status = 'observed';
+      } catch (error) { failure ??= error; entry.error = String(error.stack ?? error); }
+    }
   } catch (error) { failure = error; result.error = String(error.stack ?? error); }
   assert.equal(digest(await readFile(bodyPath)), sourceBodyDigest);
   await writeFile(join(destination, 'case-result.json'), JSON.stringify(result, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
