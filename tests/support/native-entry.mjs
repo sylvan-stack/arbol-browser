@@ -19,6 +19,7 @@ const concurrentResponderMode = 'concurrent-responder';
 const retirementMode = 'retirement';
 const startupCustodyMode = 'startup-custody';
 const failureCustodyMode = 'failure-custody';
+const monitorCustodyMode = 'monitor-loss';
 const viewOptions = { webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } };
 const bindingKey = ({ id, nonce, webContentsId, revision }) => ({ id, nonce, webContentsId, revision });
 let eventWrite = Promise.resolve();
@@ -59,7 +60,7 @@ function armWithWatchdogWitness(owner, build) {
     const spawnReturned = performance.now();
     assert.ok(this.pid > 1 && this.stdout);
     witnessed = true;
-    if (config.mode === failureCustodyMode) {
+    if ([failureCustodyMode, monitorCustodyMode].includes(config.mode)) {
       captureFailureStreams(this);
       return result;
     }
@@ -125,7 +126,8 @@ function captureFailureStreams(child) {
 }
 
 async function observeFailure(bridge, addon) {
-  const scenario = config.failureScenario;
+  const monitor = config.mode === monitorCustodyMode;
+  const scenario = monitor ? config.monitorScenario : config.failureScenario;
   const protocol = failureProtocol;
   const { child, log } = protocol;
   const window = new BaseWindow({ width: 320, height: 200, show: false });
@@ -152,11 +154,16 @@ async function observeFailure(bridge, addon) {
       native: JSON.parse(addon.status()), visible: window.isVisible() });
     if (name === 'pages-hidden' && scenario === 'cleanup-blocked') block('cleanup');
   };
-  await event('failure-observer-waiting', { scenario, renderer, binding });
-  await waitForFixtureMarker('failure-observer-ready');
+  await event(monitor ? 'monitor-observer-waiting' : 'failure-observer-waiting', { scenario, renderer, binding });
+  await waitForFixtureMarker(monitor ? 'monitor-observer-ready' : 'failure-observer-ready');
   const previousAck = protocol.ack;
   await waitForObservation(() => protocol.ack, ack => ack && ack !== previousAck, 'No fresh signed watchdog acknowledgement');
   watchdog.assertArmed(prepared.trust);
+  if (monitor) {
+    log('monitor-armed', { scenario, renderer, acknowledgement: protocol.ack, native: JSON.parse(addon.status()) });
+    await writeFile(join(config.output, 'monitor-trigger'), 'ready\n', { mode: 0o600, flag: 'wx' });
+    return;
+  }
   log('fault', { scenario, renderer, acknowledgement: protocol.ack, native: JSON.parse(addon.status()), visible: window.isVisible() });
   if (scenario === 'heartbeat-silence') block('running-main');
   else if (scenario === 'ack-silence') protocol.withhold = true;
@@ -741,13 +748,15 @@ try {
   assert.ok(stat.isFile() && stat.uid === process.getuid() && (stat.mode & 0o7777) === 0o600 && stat.nlink === 1 && stat.size <= 16384);
   config = JSON.parse(await readFile(path, 'utf8'));
   assert.equal(config.format, 1); assert.ok(['boundary', 'callbacks', 'frozen-trust', 'provider-mismatch', resolverMode, poisonMode, bindingMode,
-    cachedRoutesMode, concurrentResponderMode, retirementMode, startupCustodyMode, failureCustodyMode].includes(config.mode));
+    cachedRoutesMode, concurrentResponderMode, retirementMode, startupCustodyMode, failureCustodyMode, monitorCustodyMode].includes(config.mode));
   const startupScenarios = ['startup-descriptors', 'bootstrap-identity-refused', 'late-readiness',
     'primary-producer-lost', 'custody-producer-lost', 'custody-withholds-c', 'custody-withholds-g', 'primary-withholds-j'];
   assert.equal(config.mode === startupCustodyMode, startupScenarios.includes(config.startupScenario));
   const failureScenarios = ['heartbeat-silence', 'ack-silence', 'eof', 'malformed', 'out-of-order',
     'integrity-refused', 'cleanup-blocked', 'exit-blocked', 'fatal-shortening'];
   assert.equal(config.mode === failureCustodyMode, failureScenarios.includes(config.failureScenario));
+  const monitorScenarios = ['primary-lost', 'primary-hung', 'custody-lost', 'custody-hung', 'both-lost', 'custody-consent'];
+  assert.equal(config.mode === monitorCustodyMode, monitorScenarios.includes(config.monitorScenario));
   assert.equal(await realpath(config.home), config.home); assert.equal(process.env.HOME, config.home);
   app.setPath('userData', join(config.home, 'app-data')); app.setPath('sessionData', join(config.home, 'session-data'));
   await event('entry', { pid: process.pid, appReady: app.isReady(), argv: process.argv, runtime: process.versions });
@@ -815,8 +824,9 @@ try {
     await event('startup-observer-waiting');
     await waitForFixtureMarker('startup-observer-ready');
   }
-  if (config.mode === failureCustodyMode) assert.ok(config.callback && await realpath(config.callback) === config.callback);
-  watchdog = await ([startupCustodyMode, failureCustodyMode].includes(config.mode) ? armWithWatchdogWitness(owner, build) : prepared.arm(owner, build));
+  const observesProtocol = [failureCustodyMode, monitorCustodyMode].includes(config.mode);
+  if (observesProtocol) assert.ok(config.callback && await realpath(config.callback) === config.callback);
+  watchdog = await (observesProtocol || config.mode === startupCustodyMode ? armWithWatchdogWitness(owner, build) : prepared.arm(owner, build));
   watchdog.assertArmed(prepared.trust);
   await event('armed', { descriptors: watchdog.custody.descriptors, startupDescriptor: watchdog.custody.startupDescriptor, appReady: app.isReady() });
   if (config.startupScenario === 'startup-descriptors') {
@@ -898,7 +908,7 @@ try {
   } else boundary = await bootstrap.installNativeBoundary(prepared, watchdog, effects);
   assert.equal(boundary.pageAdmission, false);
   await event('installed', { status: boundary.native.assertIntegrity(), admission: admissionObservation(), appReady: app.isReady() });
-  if ([bindingMode, cachedRoutesMode, concurrentResponderMode, retirementMode, failureCustodyMode].includes(config.mode)) {
+  if ([bindingMode, cachedRoutesMode, concurrentResponderMode, retirementMode, failureCustodyMode, monitorCustodyMode].includes(config.mode)) {
     assert.ok(config.callback && await realpath(config.callback) === config.callback);
     const require = createRequire(import.meta.url);
     const bridge = require(config.callback);
@@ -909,12 +919,13 @@ try {
       [concurrentResponderMode]: () => observeConcurrentResponder(bridge),
       [retirementMode]: () => observeRetirement(bridge, loadAddon()),
       [failureCustodyMode]: () => observeFailure(bridge, loadAddon()),
+      [monitorCustodyMode]: () => observeFailure(bridge, loadAddon()),
     }[config.mode];
     // Electron's entry must resolve before its application-ready event.
     app.whenReady().then(run).catch(async error => {
       const stage = { [bindingMode]: 'binding-unavailable', [cachedRoutesMode]: 'cached-route-unavailable',
         [concurrentResponderMode]: 'concurrent-responder-unavailable', [retirementMode]: 'retirement-unavailable',
-        [failureCustodyMode]: 'failure-custody-unavailable' }[config.mode];
+        [failureCustodyMode]: 'failure-custody-unavailable', [monitorCustodyMode]: 'monitor-loss-unavailable' }[config.mode];
       await event(stage, { error: String(error.stack ?? error) });
       watchdog.terminate();
     });

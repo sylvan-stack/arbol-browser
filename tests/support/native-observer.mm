@@ -4,9 +4,12 @@
 #include <bsm/libbsm.h>
 #include <libproc.h>
 #include <sys/file.h>
+#include <sys/event.h>
 #include <sys/proc.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <signal.h>
+#include <poll.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <cerrno>
@@ -337,7 +340,142 @@ static NSDictionary* custody(const char* input) {
   return @{@"format":@1,@"expected":request,@"locks":locks,@"heldThroughNanos":heldThrough,@"order":order,
     @"limit":@"ordered observations only; individual kernel reads and census are not atomic; unseen family members remain unavailable"};
 }
-static NSDictionary* observeFailure(const char* input) {
+static bool waitForTrigger(NSString* path) {
+  if(![path isKindOfClass:NSString.class]||!path.isAbsolutePath) return false;
+  const uint64_t deadline=clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)+3000000000ULL;
+  while(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)<deadline) {
+    struct stat info{};
+    if(!lstat(path.fileSystemRepresentation,&info))
+      return S_ISREG(info.st_mode)&&info.st_uid==geteuid()&&info.st_nlink==1&&(info.st_mode&07777)==0600;
+    if(errno!=ENOENT) return false;
+    usleep(1000);
+  }
+  return false;
+}
+struct MonitorTrial {
+  NSDictionary *main=nil,*primary=nil,*anchor=nil,*sentinel=nil,*target=nil;
+  NSString* mode=nil;
+  ResumeOriginal releaseMain{nil}, releaseTarget{nil};
+  NSMutableDictionary* events=[NSMutableDictionary new];
+  int exitEvents=-1;
+  bool hangs=false, consent=false;
+  ~MonitorTrial() { if(exitEvents>=0) close(exitEvents); }
+  void registerExitObservations() {
+    exitEvents=kqueue();
+    if(exitEvents<0) { events[@"exitObservationError"]=@(errno); return; }
+    struct kevent registrations[2];
+    EV_SET(&registrations[0],[primary[@"pid"] unsignedIntValue],EVFILT_PROC,EV_ADD|EV_ENABLE|EV_ONESHOT,NOTE_EXIT|NOTE_EXITSTATUS,0,nullptr);
+    EV_SET(&registrations[1],[anchor[@"pid"] unsignedIntValue],EVFILT_PROC,EV_ADD|EV_ENABLE|EV_ONESHOT,NOTE_EXIT|NOTE_EXITSTATUS,0,nullptr);
+    if(kevent(exitEvents,registrations,2,nullptr,0,nullptr)<0) { events[@"exitObservationError"]=@(errno); close(exitEvents); exitEvents=-1; }
+  }
+  void readExitObservations() {
+    if(exitEvents<0) return;
+    struct kevent notifications[2]; const struct timespec now{};
+    const int count=kevent(exitEvents,nullptr,0,notifications,2,&now);
+    if(count<0) { if(errno!=EINTR) events[@"exitObservationError"]=@(errno); return; }
+    for(int i=0;i<count;++i) {
+      const auto& note=notifications[i];
+      if(!(note.fflags&NOTE_EXIT)||(note.flags&EV_ERROR)) continue;
+      NSMutableDictionary* event=[@{@"pid":@(note.ident),@"observedAtNanos":monotonic(),@"flags":@(note.fflags)} mutableCopy];
+      if(note.fflags&NOTE_EXITSTATUS) {
+        int status=(int)note.data;
+        event[@"status"]=@(status);
+        if(WIFSIGNALED(status)) event[@"signal"]=@(WTERMSIG(status));
+        else if(WIFEXITED(status)) event[@"code"]=@(WEXITSTATUS(status));
+      }
+      if(!events[@"exitNotes"]) events[@"exitNotes"]=[NSMutableArray new];
+      [events[@"exitNotes"] addObject:event];
+    }
+  }
+  NSString* impose(NSDictionary* scenario,NSDictionary* baseline) {
+    mode=scenario[@"mode"];
+    if(![mode isKindOfClass:NSString.class]||![@[@"primary-lost",@"primary-hung",@"custody-lost",@"custody-hung",@"both-lost",@"custody-consent"] containsObject:mode])
+      return @"unknown-monitor-fault";
+    NSDictionary* expected=baseline[@"expected"];
+    NSArray* originals=expected[@"processes"];
+    anchor=expected[@"anchor"];
+    for(NSDictionary* original in originals) {
+      if([original[@"pid"] isEqual:expected[@"group"]]) main=original;
+      if([original[@"pid"] isEqual:anchor[@"parent"]]) primary=original;
+    }
+    sentinel=scenario[@"sentinel"];
+    if(!main||!primary||!anchor||![anchor[@"executable"] isEqual:primary[@"executable"]]||
+       ![anchor[@"group"] isEqual:main[@"group"]]||![primary[@"group"] isEqual:primary[@"pid"]]||
+       ![primary[@"originalParentVersion"] isEqual:main[@"pidVersion"]]||![anchor[@"originalParentVersion"] isEqual:primary[@"pidVersion"]]||
+       ![sentinel isKindOfClass:NSDictionary.class]||[sentinel[@"group"] isEqual:main[@"group"]]||[sentinel[@"group"] isEqual:primary[@"group"]]||
+       !originalMatches(sentinel,process([sentinel[@"pid"] intValue]))) return @"monitor-family-identity";
+    if(!waitForTrigger(scenario[@"trigger"])) return @"monitor-trigger-unavailable";
+    registerExitObservations();
+    const bool both=[mode isEqual:@"both-lost"];
+    consent=[mode isEqual:@"custody-consent"];
+    hangs=consent||[mode hasSuffix:@"-hung"];
+    target=[mode hasPrefix:@"primary-"]?primary:anchor;
+    NSDictionary* active=process([main[@"pid"] intValue]);
+    if(!originalMatches(main,active)||[active[@"stopped"] boolValue]) return @"main-not-responsive-at-trigger";
+    events[@"responsiveMain"]=active;
+    if(!both) {
+      if(signalOriginal(main,SIGSTOP)) return @"main-stop-refused";
+      releaseMain.target=main;
+      NSDictionary* stopped=stoppedProcess(main);
+      if(![stopped[@"group"] isEqual:main[@"group"]]) return @"main-stop-unobserved";
+      events[@"stoppedMain"]=stopped;
+    }
+    if(hangs) {
+      // No new heartbeat is possible with main stopped. Let the last
+      // acknowledged work drain before recording the retirement pipes.
+      NSDictionary* queues=nil;
+      for(unsigned attempt=0;attempt<40;attempt++) {
+        queues=startupQueues(primary,anchor);
+        if(queues&&[queues[@"forwardBytes"] intValue]==0&&[queues[@"reverseBytes"] intValue]==0) break;
+        usleep(1000);
+      }
+      if(!queues||[queues[@"forwardBytes"] intValue]||[queues[@"reverseBytes"] intValue]) return @"retirement-pipes-not-empty";
+      if(signalOriginal(target,SIGSTOP)) return @"monitor-stop-refused";
+      releaseTarget.target=target;
+      NSDictionary* stopped=stoppedProcess(target);
+      queues=startupQueues(primary,anchor);
+      if(!stopped||!queues||[queues[@"forwardBytes"] intValue]||[queues[@"reverseBytes"] intValue]) return @"monitor-stop-unobserved";
+      events[@"stoppedMonitor"]=stopped;
+      events[@"emptyQueues"]=queues;
+    } else {
+      NSArray* losses=both?@[anchor,primary]:@[target];
+      NSMutableArray* signals=[NSMutableArray new]; events[@"lossSignals"]=signals;
+      for(NSDictionary* original in losses) {
+        if(signalOriginal(original,SIGKILL)) return @"monitor-loss-signal-refused";
+        [signals addObject:@{@"nanos":monotonic(),@"original":original}];
+      }
+    }
+    events[@"triggeredAtNanos"]=monotonic();
+    return nil;
+  }
+  void sampleRetirement(NSDictionary* sample) {
+    if(!hangs||(!consent&&events[@"retirementOffer"])||events[@"retirementConsent"]) return;
+    auto quiescent=[&](NSArray* rows) {
+      for(NSDictionary* row in rows) {
+        NSDictionary* original=row[@"original"];
+        if(![original[@"pid"] isEqual:primary[@"pid"]]&&![original[@"pid"] isEqual:anchor[@"pid"]]&&
+           ![row[@"current"][@"status"] isEqual:@"gone"]) return false;
+      }
+      return true;
+    };
+    if(!quiescent([sample[@"order"] lastObject][@"processes"])) return;
+    NSDictionary* queues=startupQueues(primary,anchor);
+    if(!queues) return;
+    if(events[@"retirementOffer"]) {
+      if([queues[@"forwardBytes"] intValue]==0&&[queues[@"reverseBytes"] intValue]==4)
+        events[@"retirementConsent"]=@{@"nanos":monotonic(),@"queues":queues,@"sample":sample};
+      return;
+    }
+    const bool primaryStopped=[target[@"pid"] isEqual:primary[@"pid"]];
+    if(!transferPending(queues,!primaryStopped)||![queues[primaryStopped?@"primary":@"anchorAfter"][@"stopped"] boolValue]) return;
+    events[@"retirementOffer"]=@{@"nanos":monotonic(),@"queues":queues,@"sample":sample};
+    if(consent&&!signalOriginal(target,SIGCONT)) {
+      events[@"resumedForConsent"]=monotonic();
+      releaseTarget.target=nil;
+    }
+  }
+};
+static NSDictionary* observeFailure(const char* input,NSDictionary* monitor=nil) {
   auto readSample=[&]() { return custody(input); };
   NSDictionary* baseline=readSample();
   if(!baseline[@"order"]) return @{@"unavailable":@"initial-lock-sample",@"baseline":baseline?:@{}};
@@ -355,6 +493,11 @@ static NSDictionary* observeFailure(const char* input) {
   for(NSDictionary* row in initial[@"processes"]) if(![row[@"identityMatches"] boolValue])
     return @{@"unavailable":@"original-not-alive-before-fault",@"baseline":baseline};
   if(fputs("{\"stage\":\"watch-ready\"}\n",stdout)==EOF||fflush(stdout)) return nil;
+  MonitorTrial trial;
+  if(monitor) {
+    NSString* unavailable=trial.impose(monitor,baseline);
+    if(unavailable) return @{@"unavailable":unavailable,@"monitor":trial.events,@"baseline":baseline};
+  }
   uint64_t deadline=clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)+8000000000ULL;
   NSMutableArray* observations=[NSMutableArray arrayWithObject:baseline];
   NSArray* previous=identityState(baseline);
@@ -370,6 +513,7 @@ static NSDictionary* observeFailure(const char* input) {
         if(observations.count>=128) return @{@"unavailable":@"observation-bound",@"observations":observations};
         [observations addObject:sample]; previous=state;
       }
+      if(monitor) { trial.readExitObservations(); trial.sampleRetirement(sample); }
       bool gone=true;
       for(NSDictionary* row in sample[@"order"]) {
         if([row[@"stage"] isEqual:@"before-close"]) {
@@ -386,12 +530,37 @@ static NSDictionary* observeFailure(const char* input) {
           if(!known&&![seen containsObject:key]) { [seen addObject:key]; [unexpected addObject:member]; }
         }
       }
-      if(gone&&[sample[@"locks"][@"owner"][@"acquired"] boolValue]&&[sample[@"locks"][@"build"][@"acquired"] boolValue])
-        return @{@"observations":observations,@"unexpected":unexpected,@"complete":@YES};
+      if(gone&&[sample[@"locks"][@"owner"][@"acquired"] boolValue]&&[sample[@"locks"][@"build"][@"acquired"] boolValue]) {
+        if(monitor) trial.events[@"sentinelAfter"]=process([trial.sentinel[@"pid"] intValue]);
+        return @{@"observations":observations,@"unexpected":unexpected,@"complete":@YES,@"monitor":trial.events};
+      }
     }
     if(!retiring) usleep(250);
   }
-  return @{@"unavailable":@"retirement-observation-deadline",@"observations":observations,@"unexpected":unexpected};
+  return @{@"unavailable":@"retirement-observation-deadline",@"observations":observations,@"unexpected":unexpected,@"monitor":trial.events};
+}
+static NSDictionary* observeMonitorLoss(const char* input) {
+  size_t size=strlen(input);
+  if(!size||size>65536) return nil;
+  NSData* json=[NSData dataWithBytes:input length:size];
+  NSDictionary* request=[NSJSONSerialization JSONObjectWithData:json options:0 error:nil];
+  if(![request isKindOfClass:NSDictionary.class]||![request[@"custody"] isKindOfClass:NSDictionary.class]) return nil;
+  NSData* encoded=[NSJSONSerialization dataWithJSONObject:request[@"custody"] options:0 error:nil];
+  NSString* text=encoded?[[NSString alloc] initWithData:encoded encoding:NSUTF8StringEncoding]:nil;
+  return text?observeFailure(text.UTF8String,request):nil;
+}
+static int sentinel(const char* output) {
+  char canonical[PATH_MAX]; struct stat info{};
+  if(output[0]!='/'||!realpath(output,canonical)||strcmp(output,canonical)||lstat(output,&info)||
+     !S_ISDIR(info.st_mode)||info.st_uid!=geteuid()||(info.st_mode&07777)!=0700||getpgrp()!=getpid()) return 65;
+  for(NSString* name in @[@"owner.lock",@"build.lock"]) {
+    NSString* path=[@(output) stringByAppendingPathComponent:name];
+    int fd=open(path.fileSystemRepresentation,O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600);
+    if(fd<0||flock(fd,LOCK_EX|LOCK_NB)) return 70;
+  }
+  if(fputs("ready\n",stdout)==EOF||fflush(stdout)) return 70;
+  struct pollfd pipe{STDIN_FILENO,POLLIN,0};
+  return poll(&pipe,1,25000)>0?0:70; // both locks are held for this process lifetime
 }
 static bool positive(const char* text,int& value) { char* end=nullptr; errno=0; long n=strtol(text,&end,10); if(errno||!end||*end||n<2||n>INT_MAX) return false; value=(int)n; return true; }
 int main(int argc,const char* argv[]) {
@@ -401,6 +570,8 @@ int main(int argc,const char* argv[]) {
     else if(!strcmp(argv[1],"startup-slots")&&positive(argv[2],value)) result=startupSlots(value);
     else if(!strcmp(argv[1],"startup-births")) result=observeBirths(argv[2]);
     else if(!strcmp(argv[1],"failure-custody")) result=observeFailure(argv[2]);
+    else if(!strcmp(argv[1],"monitor-loss")) result=observeMonitorLoss(argv[2]);
+    else if(!strcmp(argv[1],"sentinel")) return sentinel(argv[2]);
     else if(!strcmp(argv[1],"group")&&positive(argv[2],value)) {
       result=group(value);if(!result)return 70;
     } else if(!strcmp(argv[1],"custody")) {

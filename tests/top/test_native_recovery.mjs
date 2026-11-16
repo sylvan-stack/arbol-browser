@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { failureScenarios, launchNativeFixture, nativeConsumer, prepareNativeFixtures, retirementScenarios, startupScenarios } from '../support/native.mjs';
+import { failureScenarios, launchNativeFixture, monitorScenarios, nativeConsumer, prepareNativeFixtures, retirementScenarios, startupScenarios } from '../support/native.mjs';
 
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const jsonLines = text => text.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
@@ -397,7 +397,7 @@ export async function nativeStartupCustodyBoundary({ output }) {
   return result;
 }
 
-function assertFailureCustody(launch, fault) {
+function assertFailureCustody(launch, fault, { requireFinalHolderSample = true } = {}) {
   const trace = launch.failureCustody;
   assert.ok(trace?.complete, trace?.unavailable ?? 'No complete independent custody observation');
   assert.deepEqual(trace.unexpected, [], 'A process joined the original group after the initial census');
@@ -427,7 +427,7 @@ function assertFailureCustody(launch, fault) {
       teardownBeforeFinalHolder = true;
     }
   }
-  if (!teardownBeforeFinalHolder) throw Object.assign(
+  if (requireFinalHolderSample && !teardownBeforeFinalHolder) throw Object.assign(
     new Error('Observer missed the final surviving holder after engine and peer disappearance'), { code: 'fixture_observation_unavailable' });
   const final = trace.observations.at(-1);
   assert.ok(rows(final, 'before-close').every(row => row.current.status === 'gone'));
@@ -534,6 +534,160 @@ export async function nativeFailureCustodyBoundary({ output }) {
         failure ??= error;
         entry.error = String(error.stack ?? error);
       }
+    }
+    if (!failure) result.status = 'passed';
+  } catch (error) { failure = error; result.error = String(error.stack ?? error); }
+  assert.equal(digest(await readFile(bodyPath)), sourceBodyDigest);
+  await writeFile(join(destination, 'case-result.json'), JSON.stringify(result, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+  if (failure) throw failure;
+  return result;
+}
+
+function requireMonitorWitness(value, message) {
+  if (!value) throw Object.assign(new Error(message), { code: 'fixture_observation_unavailable' });
+  return value;
+}
+
+function assertMonitorFault(launch, records, scenario) {
+  const armed = requireMonitorWitness(records.find(record => record.stage === 'monitor-armed'), 'The main process exited before the monitor fault');
+  const ready = records.find(record => record.stage === 'primary-frame' && record.frame === `R 1 ${launch.pid}\n`);
+  assert.ok(ready);
+  assert.equal(armed.scenario, scenario);
+  assert.equal(armed.native.phase, 'ready');
+  assert.equal(armed.native.liveBindings, 1);
+  assert.ok(records.some(record => record.stage === 'primary-frame' && record.frame === armed.acknowledgement));
+  assert.ok(records.some(record => record.stage === 'host-frame' && record.frame === armed.acknowledgement.replace(/^A /, 'H ')));
+  const trace = requireMonitorWitness(launch.failureCustody?.complete && launch.failureCustody, launch.failureCustody?.unavailable ?? 'No full monitor trace');
+  const fault = trace.monitor;
+  requireMonitorWitness(fault?.triggeredAtNanos, 'The external observer did not trigger the requested monitor fault');
+  assert.ok(BigInt(fault.triggeredAtNanos) > BigInt(armed.nanos));
+  assertFailureCustody(launch, armed, { requireFinalHolderSample: false });
+
+  const original = trace.observations[0].expected;
+  const main = original.processes.find(member => member.pid === launch.pid);
+  const custody = original.anchor;
+  const primary = original.processes.find(member => member.pid === custody.parent);
+  const survivor = scenario.startsWith('primary-') ? custody : primary;
+  const target = survivor === primary ? custody : primary;
+  const compare = (actual, expected) => {
+    assert.equal(actual.status, 'alive');
+    for (const key of ['pid', 'startId', 'pidVersion', 'group', 'uid', 'executable', 'session']) assert.equal(actual[key], expected[key]);
+  };
+  compare(fault.responsiveMain, main);
+  assert.equal(fault.responsiveMain.stopped, false);
+  const both = scenario === 'both-lost';
+  if (both) {
+    assert.equal(fault.stoppedMain, undefined);
+    assert.deepEqual(fault.lossSignals.map(signal => signal.original), [custody, primary]);
+  } else {
+    compare(fault.stoppedMain, main);
+    assert.equal(fault.stoppedMain.stopped, true);
+    assert.ok(!records.some(record => record.stage === 'host-frame' && BigInt(record.nanos) > BigInt(fault.triggeredAtNanos)));
+  }
+  const rows = (sample, stage) => sample.order.find(row => row.stage === stage).processes;
+  const processRow = (sample, stage, expected) => rows(sample, stage).find(row => row.original.pid === expected.pid);
+  const heldAfterPeerLoss = expect => trace.observations.some(sample => ['owner', 'build'].every(lock => !sample.locks[lock].acquired &&
+    [`before-${lock}`, `after-${lock}`].every(stage => expect(sample, stage))));
+  if (both) {
+    requireMonitorWitness(heldAfterPeerLoss((sample, stage) => [custody, primary].every(monitor => processRow(sample, stage, monitor).current.status === 'gone') &&
+      processRow(sample, stage, main).identityMatches && !processRow(sample, stage, main).current.stopped),
+    'Observer missed the responsive main holding both locks after both monitors disappeared');
+  } else if (scenario.endsWith('-lost')) {
+    assert.deepEqual(fault.lossSignals.map(signal => signal.original), [target]);
+    requireMonitorWitness(heldAfterPeerLoss((sample, stage) => processRow(sample, stage, target).current.status === 'gone' &&
+      processRow(sample, stage, survivor).identityMatches && !processRow(sample, stage, survivor).current.stopped),
+    'Observer missed the executing monitor after the signalled peer disappeared');
+  } else {
+    compare(fault.stoppedMonitor, target);
+    assert.equal(fault.stoppedMonitor.stopped, true);
+    assert.equal(fault.lossSignals, undefined);
+    assert.deepEqual([fault.emptyQueues.forwardBytes, fault.emptyQueues.reverseBytes], [0, 0]);
+    const targetExit = fault.exitNotes?.find(note => note.pid === target.pid);
+    const offer = requireMonitorWitness(fault.retirementOffer,
+      `Observer missed the real post-quiescence retirement frame (target exit signal ${targetExit?.signal ?? 'unobserved'})`);
+    const pending = target === primary ? [0, 4] : [4, 0];
+    assert.deepEqual([offer.queues.forwardBytes, offer.queues.reverseBytes], pending);
+    for (const lock of ['owner', 'build']) {
+      assert.equal(offer.sample.locks[lock].acquired, false);
+      for (const stage of [`before-${lock}`, `after-${lock}`]) {
+        const stopped = processRow(offer.sample, stage, target);
+        const running = processRow(offer.sample, stage, survivor);
+        requireMonitorWitness(stopped.identityMatches && stopped.current.stopped && running.identityMatches && !running.current.stopped,
+          `Observer missed contention on ${lock} with the stopped peer and surviving monitor`);
+        requireMonitorWitness(rows(offer.sample, stage).filter(row => ![primary.pid, custody.pid].includes(row.original.pid))
+          .every(row => row.current.status === 'gone'), `Observer missed engine exit before contention on ${lock}`);
+      }
+    }
+    const stop = target === primary ? offer.queues.primary : offer.queues.anchorAfter;
+    assert.equal(stop.stopped, true);
+    if (scenario === 'custody-consent') {
+      const consent = requireMonitorWitness(fault.retirementConsent, 'Observer missed the real reverse queue after custody consumed the retirement request');
+      assert.ok(BigInt(offer.nanos) < BigInt(fault.resumedForConsent) && BigInt(fault.resumedForConsent) < BigInt(consent.nanos));
+      assert.deepEqual([consent.queues.forwardBytes, consent.queues.reverseBytes], [0, 4]);
+      compare(consent.queues.anchorAfter, custody);
+      assert.equal(consent.queues.anchorAfter.stopped, false);
+      assert.ok(!consent.sample.locks.owner.acquired && !consent.sample.locks.build.acquired);
+    }
+  }
+  const sentinel = trace.sentinel;
+  compare(sentinel.after.process, sentinel.before.process);
+  compare(fault.sentinelAfter, sentinel.before.process);
+  for (const name of ['owner', 'build']) {
+    assert.equal(sentinel.before.locks[name].acquired, false);
+    assert.deepEqual(sentinel.after.locks[name], sentinel.before.locks[name]);
+    assert.notDeepEqual([sentinel.before.locks[name].device, sentinel.before.locks[name].inode],
+      [original.locks[name].device, original.locks[name].inode]);
+  }
+  assert.ok(original.processes.every(member => member.group !== sentinel.before.process.group));
+  assert.equal(sentinel.exit.code, 0);
+  assert.equal(sentinel.exit.signal, null);
+  assert.equal(sentinel.exit.inputError, undefined);
+}
+
+export async function nativeMonitorLossBoundary({ output }) {
+  const destination = resolve(output);
+  assert.ok(destination.startsWith('/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-8-20261115/'));
+  await mkdir(destination, { mode: 0o700 });
+  const bodyPath = fileURLToPath(import.meta.url), sourceBodyDigest = digest(await readFile(bodyPath));
+  const result = { format: 1, case: 'nativeMonitorLossBoundary', status: 'incomplete', sourceBodyDigest, nativeConsumer,
+    gateAdmission: 'pending independent actual-body review', scenarios: [],
+    limits: ['The observer sampled the identified family and its original lock inodes.',
+      'Retirement frames are inferred from queue lengths and the exact signed monitor source.',
+      'An unavailable observation can use up to three fresh launches. Observed failures end the scenario.'],
+    unsupported: ['Loss of both independent monitors while the main cannot execute.'] };
+  let failure;
+  try {
+    const fixtures = await prepareNativeFixtures(join(destination, 'fixtures'), { callbacks: true });
+    for (const scenario of monitorScenarios) {
+      const entry = { scenario, status: 'unavailable', attempts: [] };
+      result.scenarios.push(entry);
+      let lastError;
+      for (let number = 1; number <= 3; number++) {
+        const output = join(fixtures.directory, number === 1 ? scenario : `${scenario}-${number}`);
+        const attempt = { number, status: 'unavailable', launch: join(output, 'launch-result.json'), record: join(output, 'failure.jsonl') };
+        entry.attempts.push(attempt);
+        try {
+          const launch = await launchNativeFixture(fixtures, { mode: 'monitor-loss', output, monitorScenario: scenario });
+          if (launch.timedOut || launch.failureCustody?.monitor?.triggeredAtNanos) attempt.status = 'failed';
+          const events = jsonLines(launch.stdout);
+          const unavailable = events.find(event => ['unavailable', 'monitor-loss-unavailable'].includes(event.stage));
+          assert.equal(unavailable, undefined, unavailable?.error);
+          assert.equal(launch.timedOut, false);
+          assert.equal(launch.candidate, fixtures.consumer.candidate);
+          assert.ok(events.some(event => event.stage === 'armed'));
+          assert.ok(events.some(event => event.stage === 'installed' && event.status.phase === 'ready'));
+          assert.equal(launch.signal, 'SIGKILL');
+          assertMonitorFault(launch, jsonLines(await readFile(attempt.record, 'utf8')), scenario);
+          attempt.status = 'passed';
+        } catch (error) {
+          if (error.code === 'fixture_observation_unavailable') attempt.status = 'unavailable';
+          lastError = error;
+          attempt.error = String(error.stack ?? error);
+        }
+        entry.status = attempt.status;
+        if (attempt.status !== 'unavailable') break;
+      }
+      if (entry.status !== 'passed') failure ??= lastError;
     }
     if (!failure) result.status = 'passed';
   } catch (error) { failure = error; result.error = String(error.stack ?? error); }

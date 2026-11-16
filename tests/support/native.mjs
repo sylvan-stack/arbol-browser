@@ -174,6 +174,7 @@ export const startupScenarios = Object.freeze(['startup-descriptors', 'bootstrap
   'primary-producer-lost', 'custody-producer-lost', 'custody-withholds-c', 'custody-withholds-g', 'primary-withholds-j']);
 export const failureScenarios = Object.freeze(['heartbeat-silence', 'ack-silence', 'eof', 'malformed', 'out-of-order',
   'integrity-refused', 'cleanup-blocked', 'exit-blocked', 'fatal-shortening']);
+export const monitorScenarios = Object.freeze(['primary-lost', 'primary-hung', 'custody-lost', 'custody-hung', 'both-lost', 'custody-consent']);
 
 async function observeStartupBirths(fixtures, directory, pid, mode, waitForStage) {
   const published = await waitForStage('locks');
@@ -185,9 +186,9 @@ async function observeStartupBirths(fixtures, directory, pid, mode, waitForStage
   return observeWithMarker(fixtures, directory, 'startup-births', { main, helper, mode, locks }, 'startup-observer-ready');
 }
 
-async function observeFailureCustody(fixtures, directory, pid, waitForStage) {
+async function observeFailureCustody(fixtures, directory, pid, waitForStage, monitorScenario) {
   const published = await waitForStage('locks');
-  const ready = await waitForStage('failure-observer-waiting');
+  const ready = await waitForStage(monitorScenario ? 'monitor-observer-waiting' : 'failure-observer-waiting');
   const browser = join(fixtures.consumer.candidate, 'Contents/Resources/browser');
   const engine = join(browser, 'runtime/Electron.app/Contents');
   const helper = join(browser, 'native/watchdog');
@@ -208,8 +209,43 @@ async function observeFailureCustody(fixtures, directory, pid, waitForStage) {
   `Unclassified process ${member.pid} in the original group`);
   assert.ok(family.some(member => member.pid === ready.renderer && member.executable === engineHelpers[1]), 'No actual fixture renderer');
   const locks = { owner: { path: join(directory, 'owner.lock'), ...published.owner }, build: { path: join(directory, 'build.lock'), ...published.build } };
-  return observeWithMarker(fixtures, directory, 'failure-custody', { format: 1, group: pid, anchor,
-    processes: [...family, primary], locks }, 'failure-observer-ready');
+  const request = { format: 1, group: pid, anchor, processes: [...family, primary], locks };
+  if (!monitorScenario) return observeWithMarker(fixtures, directory, 'failure-custody', request, 'failure-observer-ready');
+  return observeWithSentinel(fixtures, directory, request, monitorScenario);
+}
+
+async function observeWithSentinel(fixtures, directory, custody, mode) {
+  const profile = join(directory, 'sentinel');
+  await mkdir(profile, { mode: 0o700 });
+  const child = spawn(join(fixtures.directory, 'native-observer'), ['sentinel', profile], {
+    detached: true, stdio: ['pipe', 'pipe', 'pipe'], env: { PATH: '/usr/bin:/bin' },
+  });
+  let inputError;
+  child.stdin.on('error', error => { inputError = String(error); });
+  const done = new Promise(accept => { child.once('close', (code, signal) => accept({ code, signal })); });
+  const sample = () => ({ process: observeNative(fixtures, 'process', child.pid),
+    locks: Object.fromEntries(['owner', 'build'].map(name => [name, observeNative(fixtures, 'contend', join(profile, `${name}.lock`))])) });
+  let result;
+  try {
+    await new Promise((accept, reject) => {
+      child.once('error', reject);
+      child.once('close', () => reject(new Error('The sentinel exited before readiness')));
+      let ready = '';
+      child.stdout.on('data', bytes => { ready += bytes; if (ready === 'ready\n') accept(); });
+    });
+    const before = sample();
+    assert.equal(before.process.group, child.pid);
+    assert.notEqual(before.process.group, custody.group);
+    assert.ok(Object.values(before.locks).every(lock => !lock.acquired));
+    const request = { custody, mode, sentinel: before.process, trigger: join(directory, 'monitor-trigger') };
+    result = await observeWithMarker(fixtures, directory, 'monitor-loss', request, 'monitor-observer-ready');
+    result.sentinel = { before, after: sample() };
+  } finally {
+    child.stdin.end();
+    const exit = await done;
+    if (result?.sentinel) result.sentinel.exit = { ...exit, inputError };
+  }
+  return result;
 }
 
 async function observeWithMarker(fixtures, directory, command, request, markerName) {
@@ -238,9 +274,9 @@ async function observeWithMarker(fixtures, directory, command, request, markerNa
 }
 
 export async function launchNativeFixture(fixtures, {
-  mode = 'boundary', callback = fixtures.record.callback?.path, output, variant, poisonScenario, bindingScenario, retirementScenario, startupScenario, failureScenario,
+  mode = 'boundary', callback = fixtures.record.callback?.path, output, variant, poisonScenario, bindingScenario, retirementScenario, startupScenario, failureScenario, monitorScenario,
 }) {
-  const callbackModes = ['callbacks', 'resolver-control', 'install-poison', 'binding-lifetime', 'cached-routes', 'concurrent-responder', 'retirement', 'startup-custody', 'failure-custody'];
+  const callbackModes = ['callbacks', 'resolver-control', 'install-poison', 'binding-lifetime', 'cached-routes', 'concurrent-responder', 'retirement', 'startup-custody', 'failure-custody', 'monitor-loss'];
   assert.ok(['boundary', 'frozen-trust', 'provider-mismatch', ...callbackModes].includes(mode));
   assert.ok(callback || !callbackModes.includes(mode));
   assert.equal(mode === 'install-poison', installPoisonScenarios.has(poisonScenario));
@@ -248,6 +284,7 @@ export async function launchNativeFixture(fixtures, {
   assert.equal(mode === 'retirement', retirementScenarios.includes(retirementScenario));
   assert.equal(mode === 'startup-custody', startupScenarios.includes(startupScenario));
   assert.equal(mode === 'failure-custody', failureScenarios.includes(failureScenario));
+  assert.equal(mode === 'monitor-loss', monitorScenarios.includes(monitorScenario));
   assert.equal(mode === 'frozen-trust', variant?.kind === 'frozen-trust');
   assert.equal(mode === 'provider-mismatch', variant?.kind === 'provider-mismatch');
   const consumer = await verifiedConsumer(); assert.equal(consumer.candidate, fixtures.consumer.candidate);
@@ -268,7 +305,7 @@ export async function launchNativeFixture(fixtures, {
   for (const name of ['app-data', 'session-data']) await mkdir(join(home, name), { mode: 0o700 });
   if (callback) { assert.equal(callback, fixtures.record.callback?.path); assert.equal(hash(await readFile(callback)), fixtures.record.callback.signedDigest); }
   const config = { format: 1, mode, bundle: variant?.candidate ?? fixtures.consumer.candidate, output: directory, home, trustProbe: Boolean(variant),
-    providerMethod: variant?.providerChange?.method, poisonScenario, bindingScenario, retirementScenario, startupScenario, failureScenario,
+    providerMethod: variant?.providerChange?.method, poisonScenario, bindingScenario, retirementScenario, startupScenario, failureScenario, monitorScenario,
     owner: join(directory, 'owner.lock'), build: join(directory, 'build.lock'), callback };
   const request = join(directory, 'request.json');
   await writeFile(request, JSON.stringify(config) + '\n', { mode: 0o600, flag: 'wx' });
@@ -337,7 +374,7 @@ export async function launchNativeFixture(fixtures, {
   const watchBirths = mode === 'startup-custody' && !['bootstrap-identity-refused', 'late-readiness'].includes(startupScenario);
   const startupBirths = watchBirths ? observeStartupBirths(fixtures, directory, child.pid, startupScenario, waitForStage)
     .catch(error => ({ unavailable: String(error.message ?? error) })) : undefined;
-  const failureCustody = mode === 'failure-custody' ? observeFailureCustody(fixtures, directory, child.pid, waitForStage)
+  const failureCustody = ['failure-custody', 'monitor-loss'].includes(mode) ? observeFailureCustody(fixtures, directory, child.pid, waitForStage, monitorScenario)
     .catch(error => ({ unavailable: String(error.message ?? error) })) : undefined;
   // Timeout teardown is explicitly not production enforcement evidence.
   const deadline = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, 90000);
