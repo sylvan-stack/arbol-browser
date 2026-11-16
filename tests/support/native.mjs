@@ -31,7 +31,11 @@ async function physicalInventory(directory) {
   await walk(directory); return actual;
 }
 const trustVariants = new WeakSet(); // Fixture provenance only; never a product capability.
-export async function prepareNativeTrustVariant(fixtures, destination) {
+const trustResource = 'Contents/Resources/browser/metadata.json';
+export const trustProviderMethod = 'NSWindow#makeFirstResponder:';
+const compatibilityResource = 'Contents/Resources/native-compatibility.json';
+export async function prepareNativeTrustVariant(fixtures, destination, { kind = 'sealed-resource' } = {}) {
+  assert.ok(['sealed-resource', 'frozen-trust', 'provider-mismatch'].includes(kind));
   const consumer = await verifiedConsumer(), candidate = resolve(destination);
   assert.ok(candidate.startsWith(fixtures.directory + sep) && candidate.endsWith('.app'));
   const baseBytes = await readFile(consumer.bundle.inventory.path);
@@ -41,15 +45,36 @@ export async function prepareNativeTrustVariant(fixtures, destination) {
     force: false, errorOnExist: true, mode: constants.COPYFILE_FICLONE });
   assert.deepEqual(await physicalInventory(candidate), original, 'Trust copy does not match immutable baseline');
   run('/usr/bin/codesign', ['--verify', '--strict', '--deep', '-R', '=anchor apple generic and certificate leaf[subject.OU] = "7V372XL59S" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists', candidate]);
-  const resource = 'Contents/Resources/browser/metadata.json';
-  await appendFile(join(candidate, resource), '\n'); // One inert sealed resource, no signature/code edit or re-signing.
+  let providerChange;
+  if (kind === 'sealed-resource') await appendFile(join(candidate, trustResource), '\n');
+  if (kind === 'provider-mismatch') {
+    const path = join(candidate, compatibilityResource);
+    const compatibility = JSON.parse(await readFile(path, 'utf8'));
+    const method = compatibility.nativeABI.methods[trustProviderMethod];
+    assert.equal(method.provider, 'AppKit');
+    providerChange = { method: trustProviderMethod, before: method.provider, after: 'Electron Framework' };
+    method.provider = providerChange.after;
+    await writeFile(path, JSON.stringify(compatibility, null, 2) + '\n');
+    // Re-sign only the disposable outer bundle; the executing Electron,
+    // ownership addon and all packaged resources beneath browser stay frozen.
+    run('/usr/bin/codesign', ['--force', '--sign', 'F1B6782A3BACC18E73FE08CA424C0A81450A982C',
+      '--preserve-metadata=identifier,entitlements,flags,runtime', '--timestamp', candidate]);
+    run('/usr/bin/codesign', ['--verify', '--strict', '--deep', '-R',
+      '=anchor apple generic and certificate leaf[subject.OU] = "7V372XL59S" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists', candidate]);
+  }
   const files = await physicalInventory(candidate);
   const differences = [...new Set([...Object.keys(original), ...Object.keys(files)])].filter(key => original[key] !== files[key]);
-  assert.deepEqual(differences, [resource]);
-  const record = { format: 1, scope: 'disposable sealed-resource variant; never exact accepted consumer',
+  if (kind === 'provider-mismatch') {
+    assert.ok(differences.includes(compatibilityResource));
+    assert.ok(differences.every(path => [compatibilityResource, 'Contents/MacOS/arbol-browser-native',
+      'Contents/_CodeSignature/CodeResources'].includes(path)));
+  } else assert.deepEqual(differences, kind === 'frozen-trust' ? [] : [trustResource]);
+  const record = { format: 1, scope: 'disposable trust variant; never exact accepted consumer', kind,
     candidate, baseCandidate: consumer.candidate, baseConsumerManifest: nativeConsumer,
-    changedResource: { path: resource, before: original[resource], after: files[resource] }, files, preCorruptionSignatureVerified: true,
-    signatureBytes: 'all copied signature and executable file bytes match the immutable baseline; no signing operation' };
+    changedResource: kind === 'sealed-resource' ? { path: trustResource, before: original[trustResource], after: files[trustResource] } : null,
+    providerChange, differences, files, preCorruptionSignatureVerified: true,
+    signatureBytes: kind === 'provider-mismatch' ? 'outer disposable bundle only was re-signed; all executing runtime/addon bytes unchanged'
+      : 'all copied signature and executable file bytes match the immutable baseline; no signing operation' };
   const path = candidate + '.variant.json', bytes = JSON.stringify(record, null, 2) + '\n';
   await writeFile(path, bytes, { mode: 0o600, flag: 'wx' });
   const variant = Object.freeze({ ...record, manifest: { path, sha256: hash(bytes) } });
@@ -125,8 +150,26 @@ export function observeNative(fixtures, kind, value) {
   assert.ok(['process', 'group', 'contend', 'custody'].includes(kind));
   return JSON.parse(run(join(fixtures.directory, 'native-observer'), [kind, String(value)]));
 }
+async function observeFrozenTrust(variant, output, onStage) {
+  const resourcePath = join(variant.candidate, trustResource);
+  const original = await readFile(resourcePath);
+  assert.equal(hash(original), variant.files[trustResource]);
+  await onStage('frozen-trust-ready');
+  await appendFile(resourcePath, '\n');
+  const altered = hash(await readFile(resourcePath));
+  assert.notEqual(altered, hash(original));
+  await writeFile(join(output, 'drift-ready'), 'ready\n', { mode: 0o600, flag: 'wx' });
+  await onStage('frozen-trust-drift-refused');
+  await writeFile(resourcePath, original);
+  assert.deepEqual(await physicalInventory(variant.candidate), variant.files);
+  await writeFile(join(output, 'restore-ready'), 'ready\n', { mode: 0o600, flag: 'wx' });
+  await onStage('frozen-trust-restored-refused');
+  return { before: hash(original), altered, restored: hash(await readFile(resourcePath)) };
+}
 export async function launchNativeFixture(fixtures, { mode = 'boundary', callback = fixtures.record.callback?.path, output, variant = undefined }) {
-  assert.ok(['boundary', 'callbacks'].includes(mode)); assert.ok(mode !== 'callbacks' || callback);
+  assert.ok(['boundary', 'callbacks', 'frozen-trust', 'provider-mismatch'].includes(mode)); assert.ok(mode !== 'callbacks' || callback);
+  assert.equal(mode === 'frozen-trust', variant?.kind === 'frozen-trust');
+  assert.equal(mode === 'provider-mismatch', variant?.kind === 'provider-mismatch');
   const consumer = await verifiedConsumer(); assert.equal(consumer.candidate, fixtures.consumer.candidate);
   for (const [file, digest] of Object.entries(fixtures.record.binaries))
     assert.equal(hash(await readFile(join(fixtures.directory, file))), digest, 'Prepared observer/launcher binary drift');
@@ -145,6 +188,7 @@ export async function launchNativeFixture(fixtures, { mode = 'boundary', callbac
   for (const name of ['app-data', 'session-data']) await mkdir(join(home, name), { mode: 0o700 });
   if (callback) { assert.equal(callback, fixtures.record.callback?.path); assert.equal(hash(await readFile(callback)), fixtures.record.callback.signedDigest); }
   const config = { format: 1, mode, bundle: variant?.candidate ?? fixtures.consumer.candidate, output: directory, home, trustProbe: Boolean(variant),
+    providerMethod: variant?.providerChange?.method,
     owner: join(directory, 'owner.lock'), build: join(directory, 'build.lock'), callback };
   const request = join(directory, 'request.json');
   await writeFile(request, JSON.stringify(config) + '\n', { mode: 0o600, flag: 'wx' });
@@ -191,6 +235,15 @@ export async function launchNativeFixture(fixtures, { mode = 'boundary', callbac
     } catch (error) { const value = { elapsedMs: performance.now() - started, unavailable: String(error) }; observations.push(value); return value; }
   }
   const timer = setInterval(sample, 100);
+  const trustProbe = mode === 'frozen-trust' ? observeFrozenTrust(variant, directory, async stage => {
+    const deadline = performance.now() + 15000;
+    const marker = `"stage":"${stage}"`;
+    while (!stdout.split('\n').slice(0, -1).some(line => line.startsWith('{' + marker))) {
+      assert.ok(child.exitCode === null && child.signalCode === null && performance.now() < deadline,
+        `Missing signed-copy observation ${stage}`);
+      await new Promise(accept => setTimeout(accept, 25));
+    }
+  }).catch(error => ({ unavailable: String(error.message ?? error) })) : undefined;
   // Timeout teardown is explicitly not production enforcement evidence.
   const deadline = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, 90000);
   const outcome = await new Promise((accept, reject) => { child.once('error', reject); child.once('exit', (code, signal) => accept({ code, signal })); })
@@ -204,6 +257,7 @@ export async function launchNativeFixture(fixtures, { mode = 'boundary', callbac
   const record = { format: 1, mode, candidate: config.bundle, consumerManifest: nativeConsumer, derivation: variant ?? null,
     consumerRole: variant ? 'immutable baseline only; executing copy is explicitly derived' : 'exact executing consumer', pid: child.pid,
     elapsedMs: performance.now() - started, ...outcome, timedOut, stdout, stderr, observations,
+    frozenTrust: await trustProbe,
     qualification: 'fixture feasibility only; no complete gate/native qualification result' };
   await writeFile(join(directory, 'launch-result.json'), JSON.stringify(record, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
   return record;

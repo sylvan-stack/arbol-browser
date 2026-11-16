@@ -2,6 +2,7 @@
 import { app, BaseWindow, WebContentsView, webContents } from 'electron';
 import { createRequire } from 'node:module';
 import assert from 'node:assert/strict';
+import { writeFileSync } from 'node:fs';
 import { readFile, writeFile, realpath, lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -24,13 +25,22 @@ function admissionObservation() {
   return { nativeImages: report.sharedObjects.filter(path => /\/(?:platform|ownership)\.node$/.test(path)),
     windows: BaseWindow.getAllWindows().map(value => value.id), webContents: webContents.getAllWebContents().map(value => value.id), appReady: app.isReady() };
 }
+async function waitForFixtureMarker(name) {
+  const deadline = performance.now() + 15000;
+  for (;;) {
+    try { assert.equal(await readFile(join(config.output, name), 'utf8'), 'ready\n'); return; }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    assert.ok(performance.now() < deadline, 'External fixture marker did not arrive');
+    await new Promise(accept => setTimeout(accept, 25));
+  }
+}
 try {
   const path = process.env.ARBOL_BROWSER_QUALIFICATION_REQUEST;
   assert.ok(path && await realpath(path) === path);
   const stat = await lstat(path);
   assert.ok(stat.isFile() && stat.uid === process.getuid() && (stat.mode & 0o7777) === 0o600 && stat.nlink === 1 && stat.size <= 16384);
   config = JSON.parse(await readFile(path, 'utf8'));
-  assert.equal(config.format, 1); assert.ok(['boundary', 'callbacks'].includes(config.mode));
+  assert.equal(config.format, 1); assert.ok(['boundary', 'callbacks', 'frozen-trust', 'provider-mismatch'].includes(config.mode));
   assert.equal(await realpath(config.home), config.home); assert.equal(process.env.HOME, config.home);
   app.setPath('userData', join(config.home, 'app-data')); app.setPath('sessionData', join(config.home, 'session-data'));
   await event('entry', { pid: process.pid, appReady: app.isReady(), argv: process.argv, runtime: process.versions });
@@ -52,14 +62,50 @@ try {
   let counterfeitRefused = false;
   try { bootstrap.assertNativeBoundaryPreparation({ ...prepared }); } catch { counterfeitRefused = true; }
   assert.ok(counterfeitRefused);
-  await event('prepared', { snapshotDigest: prepared.trust.snapshotDigest, counterfeitRefused, appReady: app.isReady() });
+  const otherBootstrap = await import(bootstrapURL + '?qualification-instance');
+  assert.notEqual(otherBootstrap, bootstrap);
+  assert.throws(() => otherBootstrap.assertNativeBoundaryPreparation(prepared));
+  await assert.rejects(() => bootstrap.prepareNativeBoundary(config.bundle));
+  bootstrap.assertNativeBoundaryPreparation(prepared);
+  await event('prepared', { snapshotDigest: prepared.trust.snapshotDigest, counterfeitRefused,
+    crossModuleRefused: true, repeatPreparationRefused: true, appReady: app.isReady() });
+
+  if (config.mode === 'frozen-trust') {
+    const manifestModule = await import(new URL('../native/manifest.js', bootstrapURL));
+    manifestModule.assertCandidateTrust(prepared.trust);
+    assert.ok(Object.isFrozen(prepared.trust.manifest) && Object.isFrozen(prepared.trust.manifest.files));
+    await event('frozen-trust-ready', { admission: admissionObservation() });
+    await waitForFixtureMarker('drift-ready');
+    assert.throws(() => manifestModule.assertCandidateTrust(prepared.trust), /native_candidate_unavailable/);
+    await event('frozen-trust-drift-refused', { admission: admissionObservation() });
+    await waitForFixtureMarker('restore-ready');
+    assert.throws(() => manifestModule.assertCandidateTrust(prepared.trust), /native_candidate_unavailable/);
+    assert.throws(() => manifestModule.verifyNativeCandidate(config.bundle), /native_candidate_unavailable/);
+    await event('frozen-trust-restored-refused', { admission: admissionObservation() });
+    app.exit(0);
+    await new Promise(() => {});
+  }
+
   const owner = prepared.platform.tryLock(config.owner), build = prepared.platform.trySharedLock(config.build); assert.ok(owner && build);
   globalThis.qualificationOriginalLocks = { owner, build }; // strong originals, never finally-release
   await event('locks', { owner: owner.assertIdentity(), build: build.assertIdentity() });
   watchdog = await prepared.arm(owner, build); watchdog.assertArmed(prepared.trust);
   await event('armed', { descriptors: watchdog.custody.descriptors, startupDescriptor: watchdog.custody.startupDescriptor, appReady: app.isReady() });
   boundary = await bootstrap.installNativeBoundary(prepared, watchdog, {
-    closeAdmission() { void event('admission-closed'); },
+    closeAdmission() {
+      if (config.mode === 'provider-mismatch') {
+        const addonPath = join(config.bundle, 'Contents/Resources/browser/native/ownership.node');
+        const admission = admissionObservation();
+        assert.ok(admission.nativeImages.includes(addonPath), 'Preflight did not reach the actual ownership addon');
+        const addon = createRequire(import.meta.url)(addonPath);
+        const actual = JSON.parse(addon.getABI()).methods[config.providerMethod];
+        const expected = prepared.trust.manifest.nativeABI.methods[config.providerMethod];
+        const observation = { admission, actual, expected, status: JSON.parse(addon.status()) };
+        writeFileSync(join(config.output, 'provider-refusal.json'), JSON.stringify(observation) + '\n',
+          { mode: 0o600, flag: 'wx' });
+      }
+      void event('admission-closed');
+    },
     invalidate() { void event('authority-invalidated'); },
     hidePages() { void event('pages-hidden'); },
   });
