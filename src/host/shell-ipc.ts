@@ -44,6 +44,7 @@ function authenticated(event: IpcMainInvokeEvent): Registration {
   const { host, authority } = current;
   assertWindowHost(host); host.assertHealthy(); authority.assertReady();
   const contents = host.shell.webContents, frame = event.senderFrame;
+  if (!host.presentationStable()) throw refused('control_refused');
   // file: origins serialize as null. Exact canonical URL and actual frame object are mandatory.
   if (contents.isDestroyed() || event.sender !== contents || !frame || frame !== contents.mainFrame || frame.parent !== null ||
       frame.url !== shellURL || contents.getURL() !== shellURL || host.origin !== shellURL ||
@@ -161,20 +162,23 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
       host.window.show();
     },
     publish() {
+      if (!host.presentationStable()) return; // a real placement co-commit will notify the consistent state
       assertShellRegistration(registration, host);
       const value = snapshot();
       if (loaded && host.shell.webContents.getURL() === shellURL) host.shell.webContents.send('browser-shell:state', value);
     },
     dispose() {
       if (disposed) return; disposed = true;
-      unsubscribe(); senders.delete(host.shell.webContents); registrations.delete(registration);
+      unsubscribe(); presentation(); senders.delete(host.shell.webContents); registrations.delete(registration);
     },
   });
   installTransport(); senders.set(host.shell.webContents, current); registrations.set(registration, current);
   let unsubscribe: () => void = () => {};
+  let presentation: () => void = () => {};
   try {
     snapshot();
     unsubscribe = authority.subscribe(() => registration.publish());
+    presentation = host.onPresentation(() => {}, () => { if (!disposed) registration.publish(); });
     host.shell.webContents.once('destroyed', () => registration.dispose());
     return registration;
   } catch (error) { registration.dispose(); throw error; }

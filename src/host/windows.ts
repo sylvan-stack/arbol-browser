@@ -36,10 +36,13 @@ export interface WindowHost {
   readonly origin: string;
   createPage(): PageSurface;
   assertHealthy(): void;
-  select(page: PageSurface): void;
+  select(page: PageSurface, commit?: () => void): void;
   /** Physical selection, independent of a logical tab retaining a retired page. */
   selected(): PageSurface | undefined;
-  clearSelection(page: PageSurface): void;
+  clearSelection(page: PageSurface, commit?: () => void): void;
+  owns(page: PageSurface): boolean;
+  presentationStable(): boolean;
+  onPresentation(fence: (pages: readonly PageSurface[]) => void, changed: (pages: readonly PageSurface[]) => void): () => void;
   guardRetirementTransition(operation: () => void): void;
   close(): Promise<void>;
 }
@@ -84,18 +87,53 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
   shell.webContents.on('will-attach-webview', event => event.preventDefault());
   const pages = new Set<PageSurface>();
   let selected: PageSurface | undefined, closing = false;
-  const presentSelection = (next: PageSurface | undefined) => {
-    for (const page of pages) if (!page.retirement()) page.present(page === next);
+  let placementDepth = 0, placementVersion = 0;
+  const pendingPresentation = new Set<PageSurface>(), categories = new Map<PageSurface, string>();
+  const observers = new Set<{ fence: (pages: readonly PageSurface[]) => void; changed: (pages: readonly PageSurface[]) => void }>();
+  const category = (page: PageSurface) => `${selected === page}:${page.view.getVisible()}:${window.isVisible() && !window.isMinimized()}`;
+  const synchronous = (work: () => void) => {
+    const result: unknown = work(); if (result !== undefined) return boundary.fatal.fail('native_retirement_unavailable');
   };
-  const selectPhysical = (next: PageSurface | undefined) => {
-    const previous = selected;
-    try { presentSelection(next); }
+  const observe = (work: () => void) => {
+    try { synchronous(work); } catch { return boundary.fatal.fail('native_retirement_unavailable'); }
+  };
+  const presentSelection = (next: PageSurface | undefined, owns = () => true) => {
+    for (const page of pages) if (!page.retirement()) {
+      if (!owns()) throw unavailable('browser'); page.present(page === next);
+      if (!owns()) throw unavailable('browser');
+    }
+  };
+  const selectPhysical = (next: PageSurface | undefined, commit: () => void = () => {}, explicit?: readonly PageSurface[]) => {
+    if (placementVersion >= Number.MAX_SAFE_INTEGER) return boundary.fatal.fail('native_retirement_unavailable');
+    const previous = selected, version = ++placementVersion;
+    const affected = Object.freeze(explicit ?? (previous === next ? [] : [previous, next].filter((page): page is PageSurface => Boolean(page))));
+    placementDepth++;
+    for (const page of affected) pendingPresentation.add(page);
+    try {
+      for (const observer of observers) observe(() => observer.fence(affected));
+      if (version !== placementVersion) throw unavailable('browser');
+      selected = next;
+      presentSelection(next, () => version === placementVersion);
+      if (version !== placementVersion) throw unavailable('browser');
+      synchronous(commit); // actual registry selection/binding co-commit, while publication is deferred
+      if (version !== placementVersion) throw unavailable('browser');
+    }
     catch (error) {
-      try { presentSelection(previous); }
+      if (version === placementVersion) selected = previous;
+      // A newer genuine Close/selection owns both maps. Reconcile its actual
+      // placement, never clear it by selecting the retired original.
+      const winner = placementVersion;
+      try { presentSelection(selected, () => placementVersion === winner); }
       catch { return boundary.fatal.fail('native_retirement_unavailable'); }
       throw error;
+    } finally {
+      placementDepth--;
+      if (placementDepth === 0) {
+        const affected = Object.freeze([...pendingPresentation]); pendingPresentation.clear();
+        for (const page of affected) if (pages.has(page) && !page.retirement()) categories.set(page, category(page));
+        for (const observer of observers) observe(() => observer.changed(affected));
+      }
     }
-    selected = next;
   };
   const layout = () => {
     if (closing || window.isDestroyed()) return;
@@ -159,7 +197,8 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
           void (async () => {
             current = await boundary.retire(bindingKey(current), window.contentView, view);
             window.contentView.removeChildView(shield);
-            pages.delete(page); if (selected === page) selected = undefined;
+            if (selected === page) selectPhysical(undefined);
+            pages.delete(page); categories.delete(page);
             phase = 'retired';
           })().then(resolve, error => {
             phase = 'failed'; reject(error);
@@ -168,30 +207,43 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
           return completion;
         },
       });
-      surfaces.add(page); pages.add(page); page.present(false); return page;
+      surfaces.add(page); pages.add(page); page.present(false); categories.set(page, category(page)); return page;
     },
-    select(page: PageSurface) {
+    select(page: PageSurface, commit: () => void = () => {}) {
       assertPageSurface(page);
       if (closing || page.window !== host) throw unavailable('browser');
       const retired = page.retirement();
       if (retired) {
         assertPageRetirement(page, retired);
         // The logical tab may still be selected, but never its retired surface.
-        selectPhysical(undefined); return;
+        selectPhysical(undefined, commit); return;
       }
       if (!pages.has(page)) throw unavailable('browser');
-      selectPhysical(page);
+      selectPhysical(page, commit);
     },
     selected() { assertWindowHost(host); return selected; },
-    clearSelection(page: PageSurface) {
+    owns(page: PageSurface) { return page.window === host && pages.has(page) && !page.retirement(); },
+    presentationStable: () => !closing && placementDepth === 0,
+    onPresentation(fence: (pages: readonly PageSurface[]) => void, changed: (pages: readonly PageSurface[]) => void) {
+      assertWindowHost(host); const observer = { fence, changed }; observers.add(observer);
+      return () => { observers.delete(observer); };
+    },
+    clearSelection(page: PageSurface, commit: () => void = () => {}) {
       assertPageSurface(page);
       const retirement = page.retirement();
       if (page.window !== host || (!pages.has(page) && !retirement)) throw unavailable('browser');
+      if (retirement) observe(() => assertPageRetirement(page, retirement));
+      const before = placementVersion;
       try {
-        if (retirement) assertPageRetirement(page, retirement);
-        if (selected === page) selectPhysical(undefined);
+        if (selected === page) selectPhysical(undefined, commit);
+        else synchronous(commit);
       }
-      catch { return boundary.fatal.fail('native_retirement_unavailable'); }
+      catch {
+        // A proven newer placement owns its consistent selection. The stale
+        // retiring caller must not clear it or claim a physical failure.
+        if (selected !== page && placementVersion > before + 1) return;
+        return boundary.fatal.fail('native_retirement_unavailable');
+      }
     },
     guardRetirementTransition(operation: () => void) {
       try {
@@ -210,6 +262,13 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
   });
   hosts.add(host);
   window.on('resize', layout);
+  const windowPresentation = () => {
+    if (closing || window.isDestroyed()) return;
+    const affected = [...pages].filter(page => !page.retirement() && categories.get(page) !== category(page));
+    if (affected.length) selectPhysical(selected, () => {}, affected);
+  };
+  window.on('show', windowPresentation); window.on('hide', windowPresentation);
+  window.on('minimize', windowPresentation); window.on('restore', windowPresentation);
   window.on('close', event => { event.preventDefault(); if (!closing) onCloseRequested(); });
   layout(); return host;
 }

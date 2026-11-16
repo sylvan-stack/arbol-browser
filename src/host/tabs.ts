@@ -54,6 +54,8 @@ export interface TabRegistry {
   beginPopupAction(target: TabTarget, generation: number): () => void;
 }
 const registries = new WeakSet<object>();
+const assignedPages = new WeakSet<PageSurface>();
+const replacementReservations = new WeakMap<PageSurface, object>();
 export function assertTabRegistry(value: TabRegistry): void {
   if (!registries.has(value)) throw unavailable('browser');
 }
@@ -119,10 +121,9 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
       if (originalRetirement) assertPageRetirement(page, originalRetirement);
       else page.setNativeBlocked(true);
       if (selection.get(window) === target) {
-        selection.delete(window);
         const next = [...tabs.values()].find(tab => tab.page.window === window && !closing.has(tab) && !tab.page.retirement());
-        if (!windowClosures.has(window) && next) { window.select(next.page); selection.set(window, next); }
-        else window.clearSelection(page);
+        if (!windowClosures.has(window) && next) window.select(next.page, () => { selection.set(window, next); });
+        else window.clearSelection(page, () => { if (selection.get(window) === target) selection.delete(window); });
       }
       return lifecycle.invalidate(target);
     });
@@ -167,21 +168,35 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
     const physical = { page: window.createPage() };
     const target: TabTarget = Object.freeze({ id: tabId(() => lifecycle.exhausted()), get page() { return physical.page; } });
     bindings.set(target, physical);
+    assignedPages.add(physical.page);
     const initial: TabState = { tab: target.id, generation: 1, controller: creator
       ? { kind: 'agent', client: creator.id, label: creator.label } : { kind: 'user' },
       visibleTo: creator ? [...(inherited?.visibleTo ?? [creator.id])].filter(id => lifecycle.connected(id)) : [],
       handoff: 'idle', inputReady: false, observationSuspended: !creator, pageAvailability: 'unavailable' };
     tabs.set(target.id, target);
     try {
-      // First/foreground presentation precedes register, which may publish synchronously.
-      if (!background && (!creator || !selection.has(window))) { window.select(target.page); selection.set(window, target); }
-      lifecycle.register(target, initial);
-      registered.add(target);
-      if (budget?.scope) {
-        const result: unknown = budget.scope.registered(target, opener);
-        if (result !== undefined) return lifecycle.exhausted();
-        scopeCurrent(target);
-      }
+      const register = () => {
+        lifecycle.register(target, initial); registered.add(target);
+        if (budget?.scope) {
+          const result: unknown = budget.scope.registered(target, opener);
+          if (result !== undefined) return lifecycle.exhausted(); scopeCurrent(target);
+        }
+      };
+      // Register before placement notifications can publish this new target.
+      // Unregistered tentative records are never in the external registry view.
+      if (!background && (!creator || !selection.has(window))) {
+        const previous = selection.get(window);
+        window.select(physical.page, () => {
+          if (tabs.get(target.id) !== target || closing.has(target) || windowClosures.has(window) || target.page !== physical.page)
+            throw refused('control_changed');
+          selection.set(window, target);
+          try { register(); }
+          catch (error) {
+            if (selection.get(window) === target) { if (previous) selection.set(window, previous); else selection.delete(window); }
+            throw error;
+          }
+        });
+      } else register();
       if (budget) actions.set(target, { generation: 1, budget });
       installPageEvents(target, physical.page);
       await lifecycle.prepare(target, url);
@@ -210,14 +225,16 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
     return open(opener.page.window, url, { id: action.budget.client, label: before.controller.label }, before, action.budget, false, undefined, opener);
   }
   const registry: TabRegistry = Object.freeze({
-    all: () => [...tabs.values()].filter(target => !closing.has(target) && !windowClosures.has(target.page.window)),
-    get(id: string) { const target = tabs.get(id); if (!target) throw refused('tab_not_found'); assertTarget(target); return target; },
+    all: () => [...tabs.values()].filter(target => registered.has(target) && !closing.has(target) && !windowClosures.has(target.page.window)),
+    get(id: string) { const target = tabs.get(id); if (!target || !registered.has(target)) throw refused('tab_not_found'); assertTarget(target); return target; },
     state,
     openUser: (window: WindowHost, url = 'about:blank') => open(window, url),
     openAgent: (window: WindowHost, client: string, label: string, url: string, scope: AgentOpenScope) => open(window, url, { id: client, label }, undefined, undefined, false, scope),
     select(window: WindowHost, id: string) {
       const target = registry.get(id); if (target.page.window !== window) throw refused('tab_not_found');
-      window.select(target.page); selection.set(window, target); return target;
+      const page = target.page;
+      window.select(page, () => { assertTarget(target); if (target.page !== page) throw refused('control_changed'); selection.set(window, target); });
+      return target;
     },
     selected: (window: WindowHost) => selection.get(window),
     replace(target: TabTarget, original: PageSurface, replacement: PageSurface, assertCurrent: () => void, publish: () => void) {
@@ -229,20 +246,33 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
           replacement.window !== original.window || replacement.session !== original.session || replacement.retirement() ||
           state.controller.kind !== 'user' || state.handoff !== 'idle') throw refused('control_changed');
       assertPageRetirement(original, retired);
-      if (retired.phase !== 'retired' || !original.view.webContents.isDestroyed()) throw refused('control_refused');
+      // The authentic receipt already owns original destroyed/detached proof.
+      // Pinned WebContentsView clears its getter after destruction.
+      if (retired.phase !== 'retired') throw refused('control_refused');
+      if (assignedPages.has(replacement) || replacementReservations.has(replacement) || !original.window.owns(replacement))
+        throw refused('control_refused');
+      const reservation = Object.freeze({ target, original, replacement }); replacementReservations.set(replacement, reservation);
       const binding = replacement.binding();
       if (!binding.blocked || binding.retired || binding.webContentsId !== replacement.view.webContents.id ||
           binding.id === original.identity.id || binding.nonce === original.identity.nonce)
         return lifecycle.exhausted();
       installPageEvents(target, replacement); check();
       const window = original.window, selected = selection.get(window) === target;
-      if (selected) window.select(replacement);
-      try { check(); }
-      catch (error) { if (selected) window.select(original); throw error; }
-      physical.page = replacement; actions.delete(target);
-      // Physical/authority publication is synchronous while the fresh page is
-      // still blocked and unprepared. Uncertain publication is profile-fatal.
-      window.guardRetirementTransition(publish);
+      const commit = () => {
+        check();
+        if (tabs.get(target.id) !== target || closing.has(target) || windowClosures.has(window) || physical.page !== original ||
+            replacementReservations.get(replacement) !== reservation || !window.owns(replacement) || assignedPages.has(replacement) ||
+            (selection.get(window) === target) !== selected || (selected && window.selected() !== replacement)) throw refused('control_changed');
+        const state = lifecycle.state(target);
+        if (state.controller.kind !== 'user' || state.handoff !== 'idle') throw refused('control_changed');
+        physical.page = replacement; assignedPages.add(replacement); replacementReservations.delete(replacement); actions.delete(target);
+        // After publication starts, uncertainty is fatal rather than rollback.
+        window.guardRetirementTransition(publish);
+      };
+      if (selected) window.select(replacement, commit);
+      else commit();
+      // A failed candidate stays reserved until authentic retirement/collection;
+      // it can never be reused as another tab's fresh replacement.
     },
     closeUser(window: WindowHost, id: string, expected: number) {
       const target = tabs.get(id); if (!target || target.page.window !== window) throw refused('tab_not_found');

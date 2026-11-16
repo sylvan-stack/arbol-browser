@@ -62,6 +62,8 @@ interface PageRecord {
   fault?: DocumentFault; stopped?: Readonly<{ page: PageSurface; renderer: HostDocument['renderer']; reason: string }>;
   listeners: (() => void)[];
   presentation: string;
+  presentationPending?: boolean;
+  barrierDeadline?: number;
 }
 function navigationFailed(): BrowserFailure {
   return new BrowserFailure({ code: 'navigation_failed', message: 'The page did not complete its current navigation.', retryable: true,
@@ -149,6 +151,7 @@ export class HostDocuments implements DocumentAuthority {
     const navigation = `nav_${randomBytes(16).toString('base64url')}`;
     if (this.issued.size >= 1000000 || this.issued.has(navigation)) return this.authority().exhausted(); this.issued.add(navigation);
     const state: EpochState = { valid: true, ready: false, availability: record.fault?.availability ?? 'unavailable' };
+    delete record.barrierDeadline; // A genuinely new logical document owns a new bounded barrier.
     const receipt: HostDocument = Object.freeze({ page: record.page, binding: record.page.identity, frame, frames,
       renderer: Object.freeze({ process: frame.process, osProcess: frame.osProcess }), document: Object.freeze({}),
       epoch, navigation, channel: record.channel,
@@ -248,6 +251,7 @@ export class HostDocuments implements DocumentAuthority {
   current(target: TabTarget): HostDocument {
     const record = this.records.get(target);
     if (!record || !this.alive(record) || record.fault) throw staleSnapshot();
+    if (!record.page.window.presentationStable()) throw staleSnapshot();
     if (record.current) {
       const frames = physicalFrames(record.page), before = record.current.frames;
       if (frames.length !== before.length || frames.some((value, index) => !before[index] || !sameFrame(value, before[index]!))) {
@@ -271,7 +275,8 @@ export class HostDocuments implements DocumentAuthority {
     if (!this.alive(record) || record.fault || !record.current || !record.committed || !record.mainDOM || record.ticket || record.barrier) return;
     const receipt = record.current, generation = this.authority().state(record.target).generation;
     const job: Job = { active: true, controller: new AbortController() }; record.barrier = job;
-    const deadline = performance.now() + 2000;
+    const deadline = record.barrierDeadline ?? performance.now() + 2000;
+    record.barrierDeadline = deadline;
     const guard = () => {
       if (!job.active || job.controller.signal.aborted || record.barrier !== job || performance.now() >= deadline || record.fault)
         throw staleSnapshot();
@@ -435,14 +440,21 @@ export class HostDocuments implements DocumentAuthority {
     for (const record of this.records.values()) if (record.page === page && record.channel === channel && this.alive(record))
       this.failPage(record.target, page, 'unavailable', 'debugger_detached');
   }
-  presentationChanged(page: PageSurface): void {
+  fencePresentation(page: PageSurface): void {
     for (const record of this.records.values()) if (record.page === page && this.alive(record) && !record.fault) {
-      const category = presentationCategory(page);
-      if (category === record.presentation) return;
-      record.presentation = category;
-      // The actual WindowHost placement producer calls before shell state can
-      // advertise readiness. A protected navigation keeps only its own slot.
-      this.suspend(record, Boolean(record.ticket)); this.schedule(record);
+      // Only a completed real proof can open a fresh presentation budget.
+      // Repeated in-flight category changes retain the original absolute time.
+      if (record.state?.ready) delete record.barrierDeadline;
+      record.presentationPending = true;
+      const jobs = this.poisonEpoch(record);
+      if (!record.ticket) this.authority().suspendDocument(record.target);
+      this.abortJobs(jobs); // no changed/state publication inside placement
+    }
+  }
+  presentationChanged(page: PageSurface): void {
+    for (const record of this.records.values()) if (record.page === page && this.alive(record) && !record.fault && record.presentationPending) {
+      record.presentationPending = false; record.presentation = presentationCategory(page);
+      this.emit(record, 'changed'); this.authority().changed(); this.schedule(record);
     }
   }
   failure(target: TabTarget): DocumentFault | undefined { return this.records.get(target)?.fault; }
