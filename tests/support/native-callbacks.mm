@@ -33,7 +33,35 @@
   return nil;
 }
 @end
+// Supplies only fictional data to the native destination callbacks.
+// This is a destination probe, with no OS drag source session.
+@interface QualificationDrop : NSObject<NSDraggingInfo>
+@property(nonatomic,weak) NSWindow* draggingDestinationWindow;
+@property(nonatomic,strong) NSPasteboard* draggingPasteboard;
+@property(nonatomic) NSPoint draggingLocation;
+@property NSDraggingFormation draggingFormation;
+@property BOOL animatesToDestination;
+@property NSInteger numberOfValidItemsForDrop;
+@end
+@implementation QualificationDrop
+- (NSDragOperation)draggingSourceOperationMask { return NSDragOperationCopy; }
+- (NSPoint)draggedImageLocation { return self.draggingLocation; }
+- (NSImage*)draggedImage { return nil; }
+- (id)draggingSource { return nil; }
+- (NSInteger)draggingSequenceNumber { return 1; }
+- (void)slideDraggedImageTo:(NSPoint)point { (void)point; }
+- (NSArray<NSString*>*)namesOfPromisedFilesDroppedAtDestination:(NSURL*)destination { (void)destination; return nil; }
+- (void)enumerateDraggingItemsWithOptions:(NSDraggingItemEnumerationOptions)options forView:(NSView*)view
+  classes:(NSArray<Class>*)classes searchOptions:(NSDictionary<NSPasteboardReadingOptionKey,id>*)searchOptions
+  usingBlock:(void (^)(NSDraggingItem*,NSInteger,BOOL*))block {
+  (void)options; (void)view; (void)classes; (void)searchOptions; (void)block;
+}
+- (NSSpringLoadingHighlight)springLoadingHighlight { return NSSpringLoadingHighlightNone; }
+- (void)resetSpringLoading {}
+@end
 static NSMutableDictionary<NSString*,QualificationRoutes*>* routes;
+static QualificationDrop* destinationDrag;
+static __weak NSView* dragRoot;
 static napi_value fail(napi_env env,const char* reason) { napi_throw_error(env,nullptr,reason); return nullptr; }
 static bool args(napi_env env,napi_callback_info info,size_t expected,napi_value* values) {
   size_t count=3; napi_value actual[3];
@@ -80,12 +108,17 @@ static napi_value windowPages(napi_env env,napi_callback_info info) {
   for(NSView* root in roots) [identities addObject:[NSString stringWithFormat:@"%p",root]];
   return reply(env,identities);
 }
-static napi_value capture(napi_env env,napi_callback_info info) {
-  napi_value value; if(!args(env,info,1,&value)) return nullptr;
+static napi_value capturePage(napi_env env,napi_value handle,NSString* identity) {
   @try {
-    NSWindow* window=findWindow(env,value);
+    NSWindow* window=findWindow(env,handle);
     if(!window) return fail(env,"fixture_unknown_window");
     NSMutableArray* roots=[NSMutableArray new];views(window.contentView,@"WebContentsViewCocoa",roots);
+    if(identity) {
+      NSIndexSet* other=[roots indexesOfObjectsPassingTest:^BOOL(NSView* root, NSUInteger, BOOL*) {
+        return ![[NSString stringWithFormat:@"%p",root] isEqualToString:identity];
+      }];
+      [roots removeObjectsAtIndexes:other];
+    }
     if(roots.count!=1) return fail(env,"fixture_requires_one_actual_page");
     NSView* root=roots[0];NSMutableArray* widgets=[NSMutableArray new];views(root,@"RenderWidgetHostViewCocoa",widgets);
     if(widgets.count!=1) return fail(env,"fixture_requires_one_actual_widget");
@@ -104,6 +137,16 @@ static napi_value capture(napi_env env,napi_callback_info info) {
       @"buttonIdentity":[NSString stringWithFormat:@"%p",row.button],
       @"axNodes":@(elements.count),@"button":@(row.button!=nil),@"field":@(row.field!=nil),@"cachedHandler":@(row.action!=nil)});
   } @catch(NSException*) { return fail(env,"fixture_capture_exception"); }
+}
+static napi_value capture(napi_env env,napi_callback_info info) {
+  napi_value value;if(!args(env,info,1,&value)) return nullptr;
+  return capturePage(env,value,nil);
+}
+static napi_value captureRoot(napi_env env,napi_callback_info info) {
+  napi_value values[2];if(!args(env,info,2,values)) return nullptr;
+  NSString* identity=string(env,values[1]);
+  if(!identity) return fail(env,"fixture_root_identity_required");
+  return capturePage(env,values[0],identity);
 }
 static napi_value state(napi_env env,napi_callback_info info) {
   napi_value value;if(!args(env,info,1,&value)) return nullptr;QualificationRoutes* row=routes[string(env,value)];
@@ -145,6 +188,68 @@ static napi_value invoke(napi_env env,napi_callback_info info) {
     }
     return reply(env,@{@"route":route,@"returned":@(result)});
   } @catch(NSException*) { return fail(env,"fixture_callback_exception"); }
+}
+// Deliver only closed, fictional events to the fixture window through AppKit.
+// Keyboard delivery uses the current responder, so an unintended focus change
+// cannot be concealed by addressing the expected widget directly.
+static napi_value windowInput(napi_env env,napi_callback_info info) {
+  napi_value values[2];if(!args(env,info,2,values)) return nullptr;
+  QualificationRoutes* row=routes[string(env,values[0])];
+  NSString* action=string(env,values[1]);
+  NSView* widget=row.widget;
+  NSWindow* window=widget.window;
+  if(!window.isKeyWindow||!window.isVisible||[widget isHiddenOrHasHiddenAncestor]) return fail(env,"fixture_input_window_unavailable");
+  @try {
+    NSResponder* before=window.firstResponder;
+    if([action isEqualToString:@"b"]||[action isEqualToString:@"z"]) {
+      unsigned short code=[action isEqualToString:@"b"] ? 11 : 6;
+      for(NSEventType type : {NSEventTypeKeyDown,NSEventTypeKeyUp}) {
+        NSEvent* ev=[NSEvent keyEventWithType:type location:NSZeroPoint modifierFlags:0 timestamp:NSProcessInfo.processInfo.systemUptime
+          windowNumber:window.windowNumber context:nil characters:action charactersIgnoringModifiers:action isARepeat:NO keyCode:code];
+        if(!ev) return fail(env,"fixture_key_event_unavailable");
+        [window sendEvent:ev];
+      }
+    } else if([action isEqualToString:@"down"]||[action isEqualToString:@"up"]) {
+      NSEventType type=[action isEqualToString:@"down"] ? NSEventTypeLeftMouseDown : NSEventTypeLeftMouseUp;
+      NSPoint local=NSMakePoint(24,widget.isFlipped ? 110 : NSHeight(widget.bounds)-110);
+      NSEvent* ev=[NSEvent mouseEventWithType:type location:[widget convertPoint:local toView:nil] modifierFlags:0
+        timestamp:NSProcessInfo.processInfo.systemUptime windowNumber:window.windowNumber context:nil eventNumber:0 clickCount:1
+        pressure:type==NSEventTypeLeftMouseDown ? 1.0 : 0.0];
+      if(!ev) return fail(env,"fixture_pointer_event_unavailable");
+      [window sendEvent:ev];
+    } else return fail(env,"fixture_unknown_input");
+    return reply(env,@{@"action":action,@"windowNumber":@(window.windowNumber),@"firstResponderBefore":@(before==widget),
+      @"firstResponderAfter":@(window.firstResponder==widget)});
+  } @catch(NSException*) { return fail(env,"fixture_window_input_exception"); }
+}
+static napi_value destinationInput(napi_env env,napi_callback_info info) {
+  napi_value values[2];if(!args(env,info,2,values)) return nullptr;
+  NSView* root=routes[string(env,values[0])].root;
+  NSString* action=string(env,values[1]);
+  if(!root.window.isKeyWindow||[root isHiddenOrHasHiddenAncestor]) return fail(env,"fixture_drop_window_unavailable");
+  @try {
+    if([action isEqualToString:@"enter"] && !destinationDrag) {
+      QualificationDrop* drag=[QualificationDrop new];
+      drag.draggingDestinationWindow=root.window;
+      drag.draggingLocation=[root convertPoint:NSMakePoint(24,root.isFlipped ? 180 : NSHeight(root.bounds)-180) toView:nil];
+      drag.draggingPasteboard=[NSPasteboard pasteboardWithUniqueName];
+      [drag.draggingPasteboard declareTypes:@[NSPasteboardTypeString] owner:nil];
+      if(![drag.draggingPasteboard setString:@"fixture drag" forType:NSPasteboardTypeString]) {
+        [drag.draggingPasteboard releaseGlobally];
+        return fail(env,"fixture_drag_pasteboard_unavailable");
+      }
+      destinationDrag=drag; dragRoot=root;
+      NSDragOperation operation=((NSDragOperation(*)(id,SEL,id))objc_msgSend)(root,@selector(draggingEntered:),drag);
+      return reply(env,@{@"action":action,@"operation":@(operation)});
+    }
+    if([action isEqualToString:@"exit"] && destinationDrag && dragRoot==root) {
+      ((void(*)(id,SEL,id))objc_msgSend)(root,@selector(draggingExited:),destinationDrag);
+      [destinationDrag.draggingPasteboard releaseGlobally];
+      destinationDrag=nil; dragRoot=nil;
+      return reply(env,@{@"action":action});
+    }
+    return fail(env,"fixture_destination_drag_sequence");
+  } @catch(NSException*) { return fail(env,"fixture_destination_drag_exception"); }
 }
 static napi_value descriptor(napi_env env,napi_callback_info info) {
   napi_value value;int32_t fd=0;if(!args(env,info,1,&value)||napi_get_value_int32(env,value,&fd)!=napi_ok||fd<3) return fail(env,"fixture_descriptor_argument");
@@ -451,6 +556,9 @@ NAPI_MODULE_INIT() {
     {"armInstallPoison",nullptr,armInstallPoison,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"finishInstallPoison",nullptr,finishInstallPoison,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"windowPages",nullptr,windowPages,nullptr,nullptr,nullptr,napi_default,nullptr},
-    {"invokePressContext",nullptr,invokePressContext,nullptr,nullptr,nullptr,napi_default,nullptr}};
+    {"invokePressContext",nullptr,invokePressContext,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"captureRoot",nullptr,captureRoot,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"destinationInput",nullptr,destinationInput,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"windowInput",nullptr,windowInput,nullptr,nullptr,nullptr,napi_default,nullptr}};
   if(napi_define_properties(env,exports,sizeof(exportsList)/sizeof(exportsList[0]),exportsList)!=napi_ok) return nullptr;return exports;
 }

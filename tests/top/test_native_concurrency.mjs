@@ -269,3 +269,143 @@ export async function nativeCachedRouteBoundary({ output }) {
   if (failure) throw failure;
   return result;
 }
+
+function assertConcurrentResponder(report) {
+  const { agent, user, shell, unknown } = report.targets;
+  assert.equal(new Set([agent, user, shell, unknown].map(target => target.root)).size, 4);
+  assert.equal(new Set([agent, user, shell, unknown].map(target => target.webContentsId)).size, 4);
+  for (const target of [agent, user, shell, unknown]) {
+    assert.equal(target.sameURL, true);
+    assert.equal(target.title, shell.title);
+    assert.equal(target.root, target.client.root);
+    assert.equal(target.native.attached, true);
+    assert.equal(target.native.rootHidden, false);
+  }
+  for (const target of [agent, user, shell]) {
+    assertCreated(target.created, { ...target.created, webContentsId: target.webContentsId });
+    assert.deepEqual(target.binding, target === agent ? target.created : { ...target.created, revision: 1, blocked: false });
+    assert.deepEqual(target.finalBinding, target.binding);
+  }
+  assert.equal(new Set([agent, user, shell].map(target => target.created.id)).size, 3);
+  assert.equal(unknown.created, null);
+  assert.equal(unknown.finalBinding, null);
+  assert.equal(report.status.phase, 'ready');
+  assert.equal(report.status.liveBindings, 3);
+  assert.equal(report.focus.returned, true);
+  assert.equal(report.before.text, '');
+  assert.equal(report.before.focused, true);
+  assert.equal(report.nativeBefore.firstResponder, true);
+  assert.equal(report.firstKey.firstResponderBefore, true);
+  assert.equal(report.firstKey.firstResponderAfter, true);
+  assert.equal(report.typedBefore.text, 'b');
+  assert.deepEqual(report.trace.map(({ point, method }) => [point, method ?? null]), [
+    ['request', 'Input.dispatchMouseEvent'], ['reply', 'Input.dispatchMouseEvent'],
+    ['request', 'Input.dispatchMouseEvent'], ['reply', 'Input.dispatchMouseEvent'],
+    ['request', 'Input.insertText'], ['appkit-key', null], ['reply', 'Input.insertText'],
+  ]);
+  for (const point of report.trace) {
+    assert.equal(point.user.windowKey, true);
+    assert.equal(point.user.firstResponder, true);
+    assert.equal(point.agent.firstResponder, false);
+  }
+  const during = report.trace[5];
+  assert.ok(report.trace[4].at < during.at && during.at < report.trace[6].at);
+  assert.equal(during.key.firstResponderBefore, true);
+  assert.equal(during.key.firstResponderAfter, true);
+  assert.equal(report.agentAfter.text, 'agent');
+  assert.equal(report.agentAfter.focused, true);
+  assert.deepEqual(report.agentAfter.records.map(({ type, trusted, data }) => [type, trusted, data]), [['input', true, 'agent']]);
+  assert.equal(report.userAfter.text, 'bz');
+  assert.equal(report.userAfter.focused, true);
+  assert.deepEqual(report.userAfter.records.filter(event => event.type === 'keydown').map(({ key, trusted }) => [key, trusted]),
+    [['b', true], ['z', true]]);
+  assert.deepEqual(report.userAfter.records.filter(event => event.type === 'input').map(({ data, trusted }) => [data, trusted]),
+    [['b', true], ['z', true]]);
+  for (const name of ['shell', 'user']) {
+    const { before, press, after } = report.ax[name];
+    assert.equal(press.returned, true);
+    assert.equal(after.button, before.button + 1);
+    assert.deepEqual(after.records.slice(before.records.length).map(({ type, trusted }) => [type, trusted]), [['click', true]]);
+  }
+  assert.equal(report.ax.agent.press.returned, false);
+  assert.deepEqual(report.ax.agent.after, report.ax.agent.before);
+  assert.equal(unknown.client.axNodes, 1); // Native widget only, with no exposed AX children.
+  assert.equal(unknown.client.button, false);
+  assert.equal(unknown.client.field, false);
+  assert.deepEqual(report.ax.unknown.press, { error: 'fixture_missing_button' });
+  assert.deepEqual(report.ax.unknown.after, report.ax.unknown.before);
+  assert.equal(report.refocus.returned, true);
+  assert.equal(report.unknownFocus.returned, false);
+  assert.equal(report.userAfterUnknown.windowKey, true);
+  assert.equal(report.userAfterUnknown.firstResponder, true);
+  assert.equal(report.unknownAfter.firstResponder, false);
+  const { idle, held, heldAgain, released } = report.pointer;
+  const { marked, markedAgain, unmarked } = report.composition;
+  const { drag, dragAgain, exited } = report.destination;
+  for (const point of [idle, held, heldAgain, released, marked, markedAgain, unmarked, drag, dragAgain, exited])
+    assert.deepEqual(point.binding, user.binding);
+  for (const point of [held, heldAgain]) {
+    assert.equal(point.native.busy, true);
+    assert.equal(point.native.buttons, 1);
+    assert.equal(point.native.pressedButtons, 1);
+    assert.equal(point.page.capture, true);
+  }
+  for (const point of [idle, released, unmarked, exited]) {
+    assert.equal(point.native.busy, false);
+    assert.equal(point.native.buttons, 0);
+    assert.equal(point.page.capture, false);
+  }
+  for (const type of ['pointerdown', 'pointerup', 'gotpointercapture', 'lostpointercapture'])
+    assert.ok(released.page.records.some(event => event.type === type && event.trusted === true), `Missing trusted ${type}`);
+  for (const point of [marked, markedAgain]) {
+    assert.equal(point.native.busy, true);
+    assert.equal(point.native.marked, true);
+    assert.ok(point.page.records.some(event => event.type === 'compositionupdate' && event.trusted === true && event.data === 'M'));
+  }
+  assert.equal(unmarked.native.marked, false);
+  assert.ok(unmarked.page.records.some(event => event.type === 'compositionend'));
+  for (const point of [drag, dragAgain]) {
+    assert.equal(point.native.busy, true);
+    assert.equal(point.native.htmlTarget, true);
+    assert.equal(point.native.htmlSource, false);
+    assert.ok(point.page.records.some(event => event.type === 'dragenter' && event.trusted === true));
+  }
+  assert.equal(exited.native.htmlTarget, false);
+  assert.equal(exited.native.drops, unmarked.native.drops);
+  assert.ok(exited.page.records.some(event => event.type === 'dragleave' && event.trusted === true));
+  assert.ok(!exited.page.records.some(event => event.type === 'drop'));
+}
+
+export async function nativeConcurrentResponder({ output }) {
+  const destination = resolve(output);
+  assert.ok(destination.startsWith('/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-8-20261115/'));
+  await mkdir(destination, { mode: 0o700 });
+  const bodyPath = fileURLToPath(import.meta.url), sourceBodyDigest = digest(await readFile(bodyPath));
+  const result = { format: 1, case: 'nativeConcurrentResponder', status: 'incomplete', sourceBodyDigest, nativeConsumer,
+    gateAdmission: 'pending independent actual-body review',
+    limits: ['Window-local AppKit events exercise the native dispatcher without physical input.',
+      'Interaction state is a snapshot. Controller and generation changes, Take/Return and operation settlement are outside this case.',
+      'The destination callback uses fictional NSDraggingInfo and a unique pasteboard. Physical OS source drag and trackpad momentum are unobserved.'] };
+  let failure;
+  try {
+    const fixtures = await prepareNativeFixtures(join(destination, 'fixtures'), { callbacks: true });
+    const output = join(fixtures.directory, 'responders');
+    result.launch = join(output, 'launch-result.json');
+    result.record = join(output, 'concurrent-responder.json');
+    const launch = await launchNativeFixture(fixtures, { mode: 'concurrent-responder', output });
+    const events = launch.stdout.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+    const unavailable = events.find(event => ['unavailable', 'concurrent-responder-unavailable'].includes(event.stage));
+    assert.equal(unavailable, undefined, unavailable?.error);
+    assert.equal(launch.timedOut, false);
+    assert.equal(launch.signal, 'SIGKILL');
+    assert.equal(launch.candidate, fixtures.consumer.candidate);
+    assert.ok(events.some(event => event.stage === 'armed'));
+    assert.ok(events.some(event => event.stage === 'installed' && event.status.phase === 'ready'));
+    assertConcurrentResponder(JSON.parse(await readFile(result.record, 'utf8')));
+    result.status = 'passed';
+  } catch (error) { failure = error; result.error = String(error.stack ?? error); }
+  assert.equal(digest(await readFile(bodyPath)), sourceBodyDigest);
+  await writeFile(join(destination, 'case-result.json'), JSON.stringify(result, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+  if (failure) throw failure;
+  return result;
+}

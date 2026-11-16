@@ -172,8 +172,9 @@ export const bindingScenarios = Object.freeze(['stale-nonce', 'stale-contents', 
 export async function launchNativeFixture(fixtures, {
   mode = 'boundary', callback = fixtures.record.callback?.path, output, variant, poisonScenario, bindingScenario,
 }) {
-  assert.ok(['boundary', 'callbacks', 'frozen-trust', 'provider-mismatch', 'resolver-control', 'install-poison', 'binding-lifetime', 'cached-routes'].includes(mode));
-  assert.ok(callback || !['callbacks', 'resolver-control', 'install-poison', 'binding-lifetime', 'cached-routes'].includes(mode));
+  const callbackModes = ['callbacks', 'resolver-control', 'install-poison', 'binding-lifetime', 'cached-routes', 'concurrent-responder'];
+  assert.ok(['boundary', 'frozen-trust', 'provider-mismatch', ...callbackModes].includes(mode));
+  assert.ok(callback || !callbackModes.includes(mode));
   assert.equal(mode === 'install-poison', installPoisonScenarios.has(poisonScenario));
   assert.equal(mode === 'binding-lifetime', bindingScenarios.includes(bindingScenario));
   assert.equal(mode === 'frozen-trust', variant?.kind === 'frozen-trust');

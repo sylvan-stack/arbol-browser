@@ -14,6 +14,7 @@ const resolverMode = 'resolver-control';
 const poisonMode = 'install-poison';
 const bindingMode = 'binding-lifetime';
 const cachedRoutesMode = 'cached-routes';
+const concurrentResponderMode = 'concurrent-responder';
 const viewOptions = { webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } };
 const bindingKey = ({ id, nonce, webContentsId, revision }) => ({ id, nonce, webContentsId, revision });
 let eventWrite = Promise.resolve();
@@ -311,6 +312,168 @@ async function observeCachedRoutes(bridge) {
   writeFileSync(join(config.output, 'cached-routes.json'), JSON.stringify(report) + '\n', { mode: 0o600, flag: 'wx' });
   watchdog.terminate();
 }
+async function observeConcurrentResponder(bridge) {
+  app.setAccessibilitySupportEnabled(true);
+  const window = new BaseWindow({ width: 720, height: 340, show: false });
+  const handle = window.getNativeWindowHandle();
+  const { ownership } = boundary.native;
+  const pages = () => JSON.parse(bridge.windowPages(handle));
+  const html = `<!doctype html><meta charset="utf-8"><title>Arbol fixture shell</title>
+    <style>body{margin:0}input,button,#pointer,#drop{position:absolute;left:8px}
+      input{top:10px;width:136px}button{top:49px}#pointer{top:90px;width:125px;height:50px;background:#ddd}
+      #drop{top:160px;width:125px;height:50px;background:#eee}</style>
+    <input id="field" aria-label="Fixture text"><button id="button" aria-label="Fixture activation">0</button>
+    <div id="pointer">Pointer target</div><div id="drop">Drop target</div>
+    <script>
+      globalThis.records = [];
+      globalThis.held = null;
+      const record = e => records.push({type:e.type, trusted:e.isTrusted, key:e.key, data:e.data,
+        pointerId:e.pointerId, buttons:e.buttons});
+      for (const name of ['keydown','keyup','input','compositionstart','compositionupdate','compositionend'])
+        field.addEventListener(name, record);
+      for (const name of ['pointerdown','pointerup','gotpointercapture','lostpointercapture'])
+        pointer.addEventListener(name, record);
+      pointer.addEventListener('pointerdown', e => { held=e.pointerId; pointer.setPointerCapture(e.pointerId); });
+      for (const name of ['dragenter','dragover','dragleave','drop']) drop.addEventListener(name, e => {
+        record(e); e.preventDefault();
+      });
+      button.addEventListener('click', e => { button.textContent=Number(button.textContent)+1; record(e); });
+    </script>`;
+  // All four pages deliberately have the same URL, title, and native classes.
+  const url = 'data:text/html;charset=utf-8,' + encodeURIComponent(html);
+  async function page(kind, index) {
+    const previous = pages();
+    const view = new WebContentsView(viewOptions), contents = view.webContents;
+    const attach = () => { window.contentView.addChildView(view); };
+    const created = kind === 'unknown' ? (attach(), null) : ownership.bind(handle, contents.id, attach);
+    const binding = created && kind !== 'agent' ? ownership.mark(bindingKey(created), false) : created;
+    const roots = pages().filter(root => !previous.includes(root));
+    assert.equal(roots.length, 1);
+    view.setBounds({ x: index * 175, y: 0, width: 175, height: 300 });
+    await contents.loadURL(url);
+    return { kind, contents, webContentsId: contents.id, created, binding, root: roots[0], title: contents.getTitle(), sameURL: contents.getURL() === url };
+  }
+  const agent = await page('agent', 0), shell = await page('shell', 1), user = await page('user', 2);
+  const unknown = await page('unknown', 3);
+  const targets = { agent, shell, user, unknown };
+  window.show(); window.focus(); user.contents.focus();
+  await event('concurrent-window-shown', { pages: pages(), windows: BaseWindow.getAllWindows().length });
+  for (const target of Object.values(targets)) {
+    target.client = await waitForObservation(() => {
+      try {
+        const client = JSON.parse(bridge.captureRoot(handle, target.root));
+        if (target.kind === 'unknown' || (client.button && client.field)) return client;
+        bridge.releaseClients(client.token);
+      } catch (error) {
+        if (error.message !== 'fixture_requires_one_actual_widget') throw error;
+      }
+      return undefined;
+    }, Boolean, `Native accessibility clients unavailable for ${target.kind}`);
+  }
+  const read = target => target.contents.executeJavaScript(`({ text:field.value, button:Number(button.textContent),
+    focused:document.activeElement===field, capture:held!==null&&pointer.hasPointerCapture(held), records:[...records] })`);
+  const native = target => JSON.parse(bridge.state(target.client.token));
+  const invoke = (target, route) => JSON.parse(bridge.invoke(target.client.token, route));
+  const input = action => JSON.parse(bridge.windowInput(user.client.token, action));
+  const focusField = target => target.contents.executeJavaScript('field.focus()');
+  const focus = invoke(user, 'focus');
+  await focusField(user);
+  const before = await read(user);
+  const nativeBefore = native(user);
+  const firstKey = input('b');
+  const typedBefore = await waitForObservation(() => read(user), value => value.text === 'b', 'AppKit key did not reach selected page');
+  const debugger_ = agent.contents.debugger;
+  debugger_.attach('1.3');
+  const trace = [];
+  const cdp = async (method, params) => {
+    trace.push({ point: 'request', method, at: performance.now(), user: native(user), agent: native(agent) });
+    const reply = await debugger_.sendCommand(method, params);
+    trace.push({ point: 'reply', method, at: performance.now(), user: native(user), agent: native(agent) });
+    return reply;
+  };
+  let keyDuring, agentAfter, userAfter;
+  try {
+    const mouse = { x: 36, y: 22, button: 'left', clickCount: 1 };
+    await cdp('Input.dispatchMouseEvent', { ...mouse, type: 'mousePressed', buttons: 1 });
+    await cdp('Input.dispatchMouseEvent', { ...mouse, type: 'mouseReleased', buttons: 0 });
+    const pending = cdp('Input.insertText', { text: 'agent' });
+    keyDuring = input('z');
+    trace.push({ point: 'appkit-key', at: performance.now(), user: native(user), agent: native(agent), key: keyDuring });
+    await pending;
+    [agentAfter, userAfter] = await Promise.all([
+      waitForObservation(() => read(agent), value => value.text === 'agent', 'Background CDP did not reach agent page'),
+      waitForObservation(() => read(user), value => value.text === 'bz', 'AppKit key did not reach user page during CDP'),
+    ]);
+  } finally { debugger_.detach(); }
+  await event('concurrent-input-observed', { focus, nativeBefore, before, firstKey, typedBefore, trace, agentAfter, userAfter });
+  const ax = {};
+  for (const target of [shell, user, agent, unknown]) {
+    const before = await read(target);
+    const press = target === unknown ? observeCall(() => invoke(target, 'press')) : invoke(target, 'press');
+    const after = target === shell || target === user
+      ? await waitForObservation(() => read(target), value => value.button === before.button + 1, `Native AX press had no effect for ${target.kind}`)
+      : await read(target);
+    ax[target.kind] = { before, press, after };
+  }
+  window.focus();
+  await waitForObservation(() => native(user), state => state.windowKey, 'Disposable window did not regain key status');
+  const refocus = invoke(user, 'focus');
+  await focusField(user);
+  const unknownFocus = invoke(unknown, 'focus');
+  const userAfterUnknown = native(user), unknownAfter = native(unknown);
+  await event('concurrent-ax-observed', { ax, refocus, unknownFocus, userAfterUnknown, unknownAfter });
+
+  const interaction = () => ({ native: ownership.interactionState(bindingKey(user.binding)),
+    binding: ownership.bindingInfo(bindingKey(user.binding)) });
+  const sample = async () => ({ ...interaction(), page: await read(user) });
+  const idle = await sample();
+  const down = input('down');
+  await event('concurrent-pointer-down', { idle, down, after: await sample() });
+  const held = await waitForObservation(sample, value => value.page.capture, 'Native pointer did not capture in the renderer');
+  const heldAgain = await sample();
+  const up = input('up');
+  const released = await waitForObservation(sample, value => !value.page.capture &&
+    value.page.records.some(event => event.type === 'lostpointercapture'), 'Native pointer capture did not release');
+  await event('concurrent-pointer-observed', { idle, down, held, heldAgain, up, released });
+
+  window.focus();
+  await waitForObservation(() => native(user), state => state.windowKey, 'Disposable window lost key status before composition');
+  invoke(user, 'focus');
+  await focusField(user);
+  const mark = invoke(user, 'mark');
+  const marked = await waitForObservation(sample, value => value.page.records.some(event => event.type === 'compositionupdate'),
+    'Native marked composition did not reach the renderer');
+  const markedAgain = await sample();
+  const unmark = invoke(user, 'unmark');
+  const unmarked = await waitForObservation(sample, value => value.page.records.some(event => event.type === 'compositionend'),
+    'Native composition did not end');
+  await event('concurrent-marked-observed', { mark, marked, markedAgain, unmark, unmarked });
+
+  const destinationInput = action => JSON.parse(bridge.destinationInput(user.client.token, action));
+  const enter = destinationInput('enter');
+  let drag, dragAgain, exit;
+  try {
+    drag = await waitForObservation(sample, value => value.page.records.some(event => event.type === 'dragenter'),
+      'Native destination callback did not reach the renderer');
+    dragAgain = await sample();
+  } finally { exit = destinationInput('exit'); }
+  const exited = await waitForObservation(sample, value => value.page.records.some(event => event.type === 'dragleave'),
+    'Native destination exit did not reach the renderer');
+  await event('concurrent-drag-observed', { enter, drag, dragAgain, exit, exited });
+
+  const report = {
+    targets: Object.fromEntries(Object.entries(targets).map(([name, { contents, ...target }]) => [name, {
+      ...target, native: native(target), finalBinding: target.binding && ownership.bindingInfo(bindingKey(target.binding)),
+    }])),
+    focus, nativeBefore, before, firstKey, typedBefore, trace, agentAfter, userAfter, ax, refocus, unknownFocus, userAfterUnknown, unknownAfter,
+    pointer: { idle, down, held, heldAgain, up, released }, composition: { mark, marked, markedAgain, unmark, unmarked },
+    destination: { enter, drag, dragAgain, exit, exited },
+    status: boundary.native.assertIntegrity(),
+  };
+  writeFileSync(join(config.output, 'concurrent-responder.json'), JSON.stringify(report) + '\n', { mode: 0o600, flag: 'wx' });
+  watchdog.terminate();
+}
+
 async function observeInstallPoison(bootstrapURL) {
   const features = await import(new URL('../native/features.js', bootstrapURL));
   features.configureNativeFeatures();
@@ -356,7 +519,8 @@ try {
   const stat = await lstat(path);
   assert.ok(stat.isFile() && stat.uid === process.getuid() && (stat.mode & 0o7777) === 0o600 && stat.nlink === 1 && stat.size <= 16384);
   config = JSON.parse(await readFile(path, 'utf8'));
-  assert.equal(config.format, 1); assert.ok(['boundary', 'callbacks', 'frozen-trust', 'provider-mismatch', resolverMode, poisonMode, bindingMode, cachedRoutesMode].includes(config.mode));
+  assert.equal(config.format, 1); assert.ok(['boundary', 'callbacks', 'frozen-trust', 'provider-mismatch', resolverMode, poisonMode, bindingMode,
+    cachedRoutesMode, concurrentResponderMode].includes(config.mode));
   assert.equal(await realpath(config.home), config.home); assert.equal(process.env.HOME, config.home);
   app.setPath('userData', join(config.home, 'app-data')); app.setPath('sessionData', join(config.home, 'session-data'));
   await event('entry', { pid: process.pid, appReady: app.isReady(), argv: process.argv, runtime: process.versions });
@@ -476,23 +640,25 @@ try {
   } else boundary = await bootstrap.installNativeBoundary(prepared, watchdog, effects);
   assert.equal(boundary.pageAdmission, false);
   await event('installed', { status: boundary.native.assertIntegrity(), admission: admissionObservation(), appReady: app.isReady() });
-  if (config.mode === bindingMode || config.mode === cachedRoutesMode) {
+  if ([bindingMode, cachedRoutesMode, concurrentResponderMode].includes(config.mode)) {
     assert.ok(config.callback && await realpath(config.callback) === config.callback);
     const require = createRequire(import.meta.url);
     const bridge = require(config.callback);
     const run = config.mode === bindingMode
       ? () => observeBindingLifetime(bridge, require(join(config.bundle, 'Contents/Resources/browser/native/ownership.node')))
-      : () => observeCachedRoutes(bridge);
+      : config.mode === cachedRoutesMode ? () => observeCachedRoutes(bridge) : () => observeConcurrentResponder(bridge);
     // Electron's entry must resolve before its application-ready event.
     app.whenReady().then(run).catch(async error => {
-      await event(config.mode === bindingMode ? 'binding-unavailable' : 'cached-route-unavailable', { error: String(error.stack ?? error) });
+      const stage = { [bindingMode]: 'binding-unavailable', [cachedRoutesMode]: 'cached-route-unavailable',
+        [concurrentResponderMode]: 'concurrent-responder-unavailable' }[config.mode];
+      await event(stage, { error: String(error.stack ?? error) });
       watchdog.terminate();
     });
   } else if (config.mode === 'callbacks') {
     assert.ok(config.callback && await realpath(config.callback) === config.callback);
     const bridge = createRequire(import.meta.url)(config.callback);
-    assert.deepEqual(Object.getOwnPropertyNames(bridge).sort(), ['armInstallPoison', 'auditMethods', 'block', 'capture', 'descriptor', 'finishInstallPoison', 'invoke', 'invokePressContext',
-      'releaseClients', 'resolverControlObservation', 'resolverDispatch', 'startResolverControl', 'state', 'stopResolverControl', 'windowPages']);
+    assert.deepEqual(Object.getOwnPropertyNames(bridge).sort(), ['armInstallPoison', 'auditMethods', 'block', 'capture', 'captureRoot', 'descriptor', 'destinationInput', 'finishInstallPoison', 'invoke', 'invokePressContext',
+      'releaseClients', 'resolverControlObservation', 'resolverDispatch', 'startResolverControl', 'state', 'stopResolverControl', 'windowInput', 'windowPages']);
     await event('callback-loaded', { path: config.callback,
       capsule: JSON.parse(bridge.descriptor(watchdog.custody.startupDescriptor)),
       owner: JSON.parse(bridge.descriptor(watchdog.custody.descriptors[0])),
