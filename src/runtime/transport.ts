@@ -88,6 +88,7 @@ function writeFrame(socket: Socket, bytes: Buffer, maximum = 8 * 1024 * 1024, gu
   if (bytes.length - 1 > maximum || socket.destroyed || socket.writableLength + bytes.length > 8 * 1024 * 1024)
     throw unavailable('browser');
   if (guard) { const result: unknown = guard(); if (result !== undefined) throw unavailable('browser'); }
+  if (socket.destroyed) throw unavailable('browser');
   // No serialization, provider callback or await after this exact-byte guard.
   socket.write(bytes);
 }
@@ -172,7 +173,13 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
   dispatch: DispatchPort | ProtectedDispatchPort, protectedPort?: ProtectedDispatchPort): Promise<TransportServer> {
   let admission = false, sealed = false, agents = 0, management = 0;
   const connections = new Set<() => void>(), servers: Server[] = [], scheduler = new Scheduler();
-  const fatal = () => { try { dispatch.fatal(); } catch { /* admission stays sealed; independent native fatal path remains armed */ } };
+  let fatalLatched = false;
+  const fatal = () => {
+    sealed = true; admission = false;
+    if (fatalLatched) return; fatalLatched = true;
+    if (protectedPort) for (const stop of [...connections]) stop();
+    try { dispatch.fatal(); } catch { /* local admission is sealed; real native fatal remains armed */ }
+  };
   function accepted(socket: Socket, endpoint: Endpoint): void {
     let context: ConnectionContext | undefined, dead = false, handshaking = true;
     let identity: ProcessIdentity;
@@ -204,15 +211,24 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
       if (!protectedPort) { write(socket, value); return; }
       if (!context) throw unavailable('browser');
       const captured = context, bytes = Buffer.from(JSON.stringify(value) + '\n', 'utf8');
-      writeFrame(socket, bytes, 8 * 1024 * 1024, () => { checkPeer(); return protectedPort.guardControl(captured, kind, bytes); });
+      writeFrame(socket, bytes, 8 * 1024 * 1024, () => {
+        checkPeer(); const returned: unknown = protectedPort.guardControl(captured, kind, bytes);
+        if (returned !== undefined) { fatal(); throw unavailable('browser'); }
+        if (dead || sealed || !admission || captured.signal.aborted || socket.destroyed) { stop(); throw unavailable('browser'); }
+      });
     }
     function response(id: string, value: unknown, kind: 'pong' | 'cancel') { control({ wire: 1, id, ok: true, result: value }, kind); }
-    function failure(captured: ConnectionContext, request: Request, error: unknown): void {
+    function failure(captured: ConnectionContext, request: Request, error: unknown, deadline?: number): void {
       if (!protectedPort) { write(socket, { wire: 1, id: request.id, ok: false, error: publicFailure(error).detail }); return; }
       const detail = protectedPort.redactedFailure(captured, request, error);
       if (!validator('browser.BrowserError')(detail)) throw unavailable('browser');
       const bytes = Buffer.from(JSON.stringify({ wire: 1, id: request.id, ok: false, error: detail }) + '\n', 'utf8');
-      writeFrame(socket, bytes, 8 * 1024 * 1024, () => { checkPeer(); return protectedPort.commitResponse(captured, request, false, bytes); });
+      writeFrame(socket, bytes, 8 * 1024 * 1024, () => {
+        checkPeer(); const returned: unknown = protectedPort.commitResponse(captured, request, false, bytes);
+        if (returned !== undefined) { fatal(); throw unavailable('browser'); }
+        if (dead || sealed || !admission || captured.signal.aborted || active.get(request.id)?.signal.aborted || socket.destroyed ||
+            (deadline !== undefined && now() >= deadline)) { stop(); throw unavailable('browser'); }
+      });
     }
     function checkPeer() { if (!sameProcess(identity, peer(socket, platform))) throw unavailable('browser'); }
     helloTimer = setTimeout(stop, 5000);
@@ -232,7 +248,7 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
           if (endpoint === 'agent') ++agents; else ++management;
           if (protectedPort) {
             const enrolled: unknown = protectedPort.enroll(context);
-            if (enrolled !== undefined) throw unavailable('browser');
+            if (enrolled !== undefined) { fatal(); throw unavailable('browser'); }
           }
           const reply: Contract<'wire.HelloResult'> = { wire: 1, id: value.id, ok: true,
             result: { instance: record.instance, nonce: record.nonce, profile: record.profile,
@@ -265,7 +281,7 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
           const target = active.get(request.params.request);
           if (target) {
             const returned: unknown = dispatch.cancel(context, request.params.request);
-            if (protectedPort && returned !== undefined) throw unavailable('browser'); target.abort();
+            if (protectedPort && returned !== undefined) { fatal(); throw unavailable('browser'); } target.abort();
           }
           response(request.id, { request: request.params.request, found: Boolean(target) }, 'cancel'); return;
         }
@@ -280,6 +296,7 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
         // A timeout closes transport/admission and delegates actual drain/retire;
         // it never emits a synthetic successful cancellation or action outcome.
         const timer = setTimeout(() => {
+          if (protectedPort) { stop(); return; }
           try { const returned: unknown = dispatch.cancel(captured, request.id); if (protectedPort && returned !== undefined) fatal(); } catch { fatal(); }
           controller.abort(); stop();
         }, Math.max(1, deadline - now()));
@@ -287,9 +304,10 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
           let committed = false;
           try {
             const authorized: unknown = dispatch.authorize(captured, request);
-            if (protectedPort && authorized !== undefined) throw unavailable('browser');
+            if (protectedPort && authorized !== undefined) { fatal(); throw unavailable('browser'); }
             const result = await (protectedPort ? dispatch.execute(captured, request, deadline, controller.signal)
               : scheduler.run(request, controller.signal, () => dispatch.execute(captured, request, deadline, controller.signal)));
+            if (protectedPort && now() >= deadline) { stop(); return; }
             if (dead || controller.signal.aborted || now() >= deadline) return;
             if (!resultValidator(request)(result)) {
               // Mismatched success is an internal protocol failure: close the
@@ -301,7 +319,11 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
               const bytes = Buffer.from(JSON.stringify({ wire: 1, id: request.id, ok: true, result }) + '\n', 'utf8');
               writeFrame(socket, bytes, 8 * 1024 * 1024, () => {
                 checkPeer(); const returned: unknown = protectedPort.commitResponse(captured, request, true, bytes);
-                if (returned !== undefined) throw unavailable('browser'); committed = true;
+                if (returned !== undefined) { fatal(); throw unavailable('browser'); }
+                if (dead || sealed || !admission || captured.signal.aborted || controller.signal.aborted || socket.destroyed || now() >= deadline) {
+                  stop(); throw unavailable('browser');
+                }
+                committed = true;
               });
             } else {
               checkPeer(); (dispatch as DispatchPort).commit(captured, request);
@@ -311,13 +333,16 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
             // A write after final commitment may have reached the OS. Do not
             // manufacture another result; disconnect means uncertain delivery.
             if (protectedPort && committed) { stop(); return; }
+            if (protectedPort && now() >= deadline) { stop(); return; }
             if (!dead && !controller.signal.aborted) {
-              try { failure(captured, request, error); }
+              try { failure(captured, request, error, deadline); }
               catch { stop(); }
             }
           } finally {
             clearTimeout(timer); active.delete(request.id); connection.signal.removeEventListener('abort', abort);
-            if (protectedPort) { try { protectedPort.forget(captured, request); } catch { fatal(); stop(); } }
+            if (protectedPort) { try {
+              const returned: unknown = protectedPort.forget(captured, request); if (returned !== undefined) { fatal(); stop(); }
+            } catch { fatal(); stop(); } }
           }
         })();
       } catch { stop(); }
