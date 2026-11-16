@@ -201,6 +201,7 @@ export class RendererHealth {
   private close(record: HealthRecord): void {
     record.phase = 'closed'; this.cancelHeartbeat(record); clearInterval(record.interval); this.increment(record);
     if (record.attempt) { const attempt = this.attempts.get(record.attempt); if (attempt) attempt.active = false; delete record.attempt; }
+    if (this.records.get(record.target) === record) this.records.delete(record.target);
   }
   closeAll(): void {
     if (this.closed) return; this.closed = true; this.unsubscribe(); for (const record of this.records.values()) this.close(record);
