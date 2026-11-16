@@ -46,6 +46,10 @@ export interface DocumentEvent {
 }
 /** Ordinary selection can supersede a presentation job without a renderer fault. */
 export class PresentationSuperseded extends Error {}
+export function presentationCategory(page: PageSurface): string {
+  const host = page.window;
+  return `${host.selected() === page}:${page.view.getVisible()}:${host.window.isVisible() && !host.window.isMinimized()}`;
+}
 interface EpochState { valid: boolean; ready: boolean; availability: Contract<'browser.Availability'> }
 interface Job { active: boolean; controller: AbortController }
 interface Ticket {
@@ -57,6 +61,7 @@ interface PageRecord {
   committed: boolean; mainDOM: boolean; lastSafeURL: string; startHTTPS: boolean; redirects: number;
   fault?: DocumentFault; stopped?: Readonly<{ page: PageSurface; renderer: HostDocument['renderer']; reason: string }>;
   listeners: (() => void)[];
+  presentation: string;
 }
 function navigationFailed(): BrowserFailure {
   return new BrowserFailure({ code: 'navigation_failed', message: 'The page did not complete its current navigation.', retryable: true,
@@ -163,7 +168,8 @@ export class HostDocuments implements DocumentAuthority {
     if (previous) this.close(target, previous.page);
     const page = target.page, contents = page.view.webContents;
     const record: PageRecord = { target, page, contents, use: Object.freeze({}), channel: this.preparation!.channel(page), closed: false,
-      committed: false, mainDOM: false, lastSafeURL: previous?.lastSafeURL ?? 'about:blank', startHTTPS: false, redirects: 0, listeners: [] };
+      committed: false, mainDOM: false, lastSafeURL: previous?.lastSafeURL ?? 'about:blank', startHTTPS: false, redirects: 0,
+      listeners: [], presentation: presentationCategory(page) };
     this.records.set(target, record);
     const on = <K extends string>(name: K, receive: (...args: any[]) => void) => {
       contents.on(name as never, receive); record.listeners.push(() => contents.removeListener(name as never, receive));
@@ -280,7 +286,7 @@ export class HostDocuments implements DocumentAuthority {
     }, error => {
       const current = job.active && record.barrier === job && this.alive(record) && record.current === receipt;
       job.active = false; if (record.barrier === job) delete record.barrier;
-      if (error instanceof PresentationSuperseded) { if (current) this.schedule(record); return; }
+      if (error instanceof PresentationSuperseded) return;
       if (current) {
         try { this.authority().expected(record.target, generation); } catch { return; }
         this.failPage(record.target, record.page, 'unavailable', 'readiness_failed');
@@ -431,6 +437,9 @@ export class HostDocuments implements DocumentAuthority {
   }
   presentationChanged(page: PageSurface): void {
     for (const record of this.records.values()) if (record.page === page && this.alive(record) && !record.fault) {
+      const category = presentationCategory(page);
+      if (category === record.presentation) return;
+      record.presentation = category;
       // The actual WindowHost placement producer calls before shell state can
       // advertise readiness. A protected navigation keeps only its own slot.
       this.suspend(record, Boolean(record.ticket)); this.schedule(record);

@@ -5,7 +5,7 @@ import { unavailable } from '../contracts/errors.js';
 import { bindingKey } from '../native/retirement.js';
 import type { DocumentReceipt } from './authority.js';
 import type { HostDocuments, HostDocument, DocumentPreparation } from './documents.js';
-import { PresentationSuperseded } from './documents.js';
+import { PresentationSuperseded, presentationCategory } from './documents.js';
 import { staleSnapshot } from './authority.js';
 import { assertPageSurface, type PageSurface } from './windows.js';
 import type { TabTarget } from './tabs.js';
@@ -17,6 +17,7 @@ interface Channel {
   readonly identity: object;
   active: boolean;
   interception: 'unknown' | 'enabled' | 'disabled';
+  interceptionInFlight?: object;
 }
 function emptyAck(value: unknown): void {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length) throw staleSnapshot();
@@ -66,13 +67,23 @@ export class PageReadiness implements DocumentPreparation {
   async command(page: PageSurface, assertCurrent: () => void, method: string, params?: object): Promise<unknown> {
     const channel = this.owned(page);
     const check = () => { this.synchronous(assertCurrent); this.assertChannel(channel); };
-    check(); const result: unknown = await channel.debugger.sendCommand(method, params); check();
-    if (method === 'Input.setInterceptDrags') {
-      const enabled = (params as { enabled?: unknown } | undefined)?.enabled;
-      if (typeof enabled !== 'boolean') throw staleSnapshot(); emptyAck(result);
-      channel.interception = enabled ? 'enabled' : 'disabled';
+    check(); if (channel.interceptionInFlight) throw staleSnapshot();
+    const intercept = method === 'Input.setInterceptDrags', token = Object.freeze({});
+    const enabled = (params as { enabled?: unknown } | undefined)?.enabled;
+    if (intercept) {
+      if (typeof enabled !== 'boolean') throw staleSnapshot();
+      // The engine may apply this before a stale/failed reply. Never retain a
+      // prior disabled acknowledgement across an ambiguous opposite effect.
+      channel.interception = 'unknown'; channel.interceptionInFlight = token;
     }
-    return result;
+    try {
+      check(); const result: unknown = await channel.debugger.sendCommand(method, params); check();
+      if (intercept) {
+        if (channel.interceptionInFlight !== token) throw staleSnapshot(); emptyAck(result);
+        channel.interception = enabled ? 'enabled' : 'disabled';
+      }
+      return result;
+    } finally { if (channel.interceptionInFlight === token) delete channel.interceptionInFlight; }
   }
   private async deadline<T>(deadline: number, assertCurrent: () => void, work: (check: () => void) => Promise<T>): Promise<T> {
     let active = true, timer: ReturnType<typeof setTimeout> | undefined;
@@ -101,39 +112,48 @@ export class PageReadiness implements DocumentPreparation {
     }));
     check();
   }
+  private async observe(receipt: HostDocument, check: () => void): Promise<void> {
+    const page = receipt.page, channel = this.owned(page), host = page.window;
+    const category = presentationCategory(page), selected = host.selected() === page, visible = page.view.getVisible();
+    const presented = selected && visible && host.window.isVisible() && !host.window.isMinimized();
+    const guard = () => {
+      check(); this.documents.target(receipt); this.assertChannel(channel);
+      if (channel.identity !== receipt.channel) throw staleSnapshot();
+      if (presentationCategory(page) !== category) throw new PresentationSuperseded();
+    };
+    guard();
+    if (presented) {
+      const before = page.binding(); page.restorePresentation(); const after = page.binding(); guard();
+      if (before.id !== after.id || before.nonce !== after.nonce || before.revision !== after.revision ||
+          before.blocked !== after.blocked || after.retired) return this.boundary.fatal.fail('native_boundary_unavailable');
+    } else if (!selected && visible) throw staleSnapshot(); // Never expose an inactive view to repair it.
+    emptyAck(await this.command(page, guard, 'Emulation.setFocusEmulationEnabled', { enabled: true }));
+    if (channel.interception === 'unknown')
+      await this.command(page, guard, 'Input.setInterceptDrags', { enabled: false });
+    guard(); await this.ping(receipt, guard); guard();
+    // A separate isolated world cannot use a website-replaced RAF/readiness
+    // function. Native DOM events schedule this; actual current DOM readiness
+    // and two frame callbacks independently confirm the current document.
+    const result: unknown = await channel.contents.executeJavaScriptInIsolatedWorld(999, [{ code:
+      'new Promise((resolve,reject)=>{if(document.readyState==="loading"){reject(new Error("loading"));return;}requestAnimationFrame(()=>requestAnimationFrame(()=>resolve(0)));})' }], false);
+    guard(); if (result !== 0) throw staleSnapshot();
+    const image = await channel.contents.capturePage(undefined, { stayHidden: true, stayAwake: false });
+    guard(); const size = image.getSize();
+    if (image.isEmpty() || size.width <= 0 || size.height <= 0) throw staleSnapshot();
+    // Native policy/readiness remain separate. This queries the exact owned
+    // binding; it neither fabricates quiescence nor unlocks an active gesture.
+    const binding = page.binding();
+    this.boundary.native.ownership.interactionState(bindingKey(binding)); guard();
+  }
   async barrier(receipt: HostDocument, deadline: number, assertCurrent: () => void): Promise<void> {
     await this.deadline(Math.min(deadline, performance.now() + 2000), assertCurrent, async check => {
-      const page = receipt.page, channel = this.owned(page), host = page.window;
-      const selection = host.selected(), visible = page.view.getVisible();
-      const guard = () => {
-        check(); this.documents.target(receipt); this.assertChannel(channel);
-        if (channel.identity !== receipt.channel) throw staleSnapshot();
-        if (host.selected() !== selection || page.view.getVisible() !== visible) throw new PresentationSuperseded();
-      };
-      guard();
-      if (selection === page) {
-        if (!visible || !host.window.isVisible()) throw staleSnapshot();
-        const before = page.binding(); page.restorePresentation(); const after = page.binding(); guard();
-        if (before.id !== after.id || before.nonce !== after.nonce || before.revision !== after.revision ||
-            before.blocked !== after.blocked || after.retired) return this.boundary.fatal.fail('native_boundary_unavailable');
-      } else if (visible) throw staleSnapshot(); // A background probe never repairs visibility by exposing it.
-      emptyAck(await this.command(page, guard, 'Emulation.setFocusEmulationEnabled', { enabled: true }));
-      if (channel.interception === 'unknown')
-        await this.command(page, guard, 'Input.setInterceptDrags', { enabled: false });
-      guard(); await this.ping(receipt, guard); guard();
-      // A separate isolated world cannot use a website-replaced RAF/readiness
-      // function. Native DOM events schedule this; actual current DOM readiness
-      // and two frame callbacks independently confirm the current document.
-      const result: unknown = await channel.contents.executeJavaScriptInIsolatedWorld(999, [{ code:
-        'new Promise((resolve,reject)=>{if(document.readyState==="loading"){reject(new Error("loading"));return;}requestAnimationFrame(()=>requestAnimationFrame(()=>resolve(0)));})' }], false);
-      guard(); if (result !== 0) throw staleSnapshot();
-      const image = await channel.contents.capturePage(undefined, { stayHidden: true, stayAwake: false });
-      guard(); const size = image.getSize();
-      if (image.isEmpty() || size.width <= 0 || size.height <= 0) throw staleSnapshot();
-      // Native policy/readiness remain separate. This queries the exact owned
-      // binding; it neither fabricates quiescence nor unlocks an active gesture.
-      const binding = page.binding();
-      this.boundary.native.ownership.interactionState(bindingKey(binding)); guard();
+      for (;;) {
+        try { await this.observe(receipt, check); return; }
+        catch (error) {
+          if (!(error instanceof PresentationSuperseded)) throw error;
+          check(); // A fresh category observation stays inside this same 2 s job.
+        }
+      }
     });
   }
   async leaveAgentMode(target: TabTarget, document: DocumentReceipt, deadline: number, assertCurrent: () => void): Promise<void> {
