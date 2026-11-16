@@ -119,14 +119,18 @@ export class HostDocuments implements DocumentAuthority {
   private alive(record: PageRecord): boolean {
     return this.isOriginal(record) && !record.page.retirement() && !record.page.view.webContents.isDestroyed();
   }
-  private stopJob(job: Job | undefined): void { if (job) { job.active = false; job.controller.abort(); } }
-  private poisonEpoch(record: PageRecord): void {
-    this.stopJob(record.barrier); delete record.barrier;
+  private poisonEpoch(record: PageRecord): readonly Job[] {
+    // Reentrant AbortSignal listeners are notified only after authority closes.
     if (record.state) { record.state.ready = false; record.state.availability = record.fault?.availability ?? 'unavailable'; }
+    const jobs = record.barrier ? [record.barrier] : [];
+    for (const job of jobs) job.active = false;
+    delete record.barrier; return jobs;
   }
+  private abortJobs(jobs: readonly Job[]): void { for (const job of jobs) job.controller.abort(); }
   private suspend(record: PageRecord, preserve = false): void {
-    this.poisonEpoch(record);
+    const jobs = this.poisonEpoch(record);
     if (!preserve) { delete record.ticket; this.authority().suspendDocument(record.target); }
+    this.abortJobs(jobs);
     this.emit(record, 'changed'); this.authority().changed();
   }
   private capture(record: PageRecord): HostDocument {
@@ -165,11 +169,14 @@ export class HostDocuments implements DocumentAuthority {
     const committed = (process: number, routing: number, main: boolean, address: string, sameDocument: boolean) => {
       if (!this.frameEvent(record, process, routing) || record.fault) return;
       let safe: string; try { safe = userURL(address); } catch { this.failPage(target, page, 'unavailable', 'navigation_policy'); return; }
-      this.poisonEpoch(record);
+      const jobs = this.poisonEpoch(record);
       if (main) { record.committed = true; if (sameDocument) record.mainDOM = true; record.lastSafeURL = safe; }
       const receipt = this.capture(record), ticket = record.ticket;
-      if (ticket && main && !sameDocument && ++ticket.commits === 1) ticket.candidate = receipt;
+      if (ticket && !sameDocument && ticket.commits === 0) {
+        if (main) { ticket.commits++; ticket.candidate = receipt; }
+      }
       else { delete record.ticket; this.authority().suspendDocument(target); this.authority().refreshDocument(target); }
+      this.abortJobs(jobs);
       this.emit(record, 'changed'); this.authority().changed();
       if (!record.ticket) this.schedule(record);
     };
@@ -182,7 +189,8 @@ export class HostDocuments implements DocumentAuthority {
         if (!details.isSameDocument) { record.committed = false; record.mainDOM = false; }
       }
       const ticket = record.ticket;
-      const preserve = Boolean(details.isMainFrame && !details.isSameDocument && ticket && ticket.commits === 0 && ++ticket.starts === 1);
+      const preserve = Boolean(!details.isSameDocument && ticket && ticket.commits === 0 &&
+        (details.isMainFrame ? ++ticket.starts === 1 : details.frame && webContents.fromFrame(details.frame) === contents));
       this.suspend(record, preserve);
     });
     on('did-frame-navigate', (_event: unknown, address: string, _code: number, _text: string, main: boolean, process: number, routing: number) =>
@@ -197,7 +205,7 @@ export class HostDocuments implements DocumentAuthority {
       const frame = details.frame;
       if (!this.alive(record) || !frame || frame.isDestroyed() || frame.detached || webContents.fromFrame(frame) !== contents) return;
       // A new child/RFH is a reference boundary. Its wrapper may later retarget.
-      const preserve = Boolean(frame.parent === null && record.ticket && record.ticket.commits === 0);
+      const preserve = Boolean(record.ticket && record.ticket.commits === 0);
       this.suspend(record, preserve); try { this.capture(record); } catch { return; }
       this.schedule(record);
     });
@@ -327,16 +335,21 @@ export class HostDocuments implements DocumentAuthority {
     if (!record || record.ticket || execution.stamp.document !== original) throw staleSnapshot();
     return execution.dispatch(async () => {
       const issued = issuedNavigation(execution, owner), ticket: Ticket = { issued, original, execution, commits: 0, starts: 0 };
-      issued.assertCurrent(); record.ticket = ticket; this.poisonEpoch(record);
+      issued.assertCurrent(); record.ticket = ticket; const jobs = this.poisonEpoch(record);
       owner.provisionalNavigation(issued.token, issued.command);
+      this.abortJobs(jobs);
       const guard = () => { issued.assertCurrent(); if (!this.alive(record) || record.ticket !== ticket || record.fault) throw staleSnapshot(); };
       try {
         guard();
         const result = await this.preparation!.command(record.page, guard, 'Page.navigate', { url: address }) as { frameId?: string; loaderId?: string; errorText?: string; isDownload?: boolean };
         guard();
-        if (!result.loaderId || !result.frameId || result.errorText || result.isDownload || ticket.commits !== 1 || !ticket.candidate)
+        if (!result.loaderId || !result.frameId || result.errorText || result.isDownload)
           throw navigationFailed();
+        // Pinned transport can deliver the response before or after the native
+        // commit. Keep the same genuine issued slot until both are available.
+        await this.waitCandidate(record, ticket, guard);
         const candidate = ticket.candidate;
+        if (!candidate || ticket.commits !== 1) throw navigationFailed();
         const tree = await this.preparation!.command(record.page, guard, 'Page.getFrameTree') as { frameTree?: { frame?: { id?: string; loaderId?: string } } };
         guard(); this.assertCurrent(target, candidate);
         if (tree.frameTree?.frame?.id !== result.frameId || tree.frameTree?.frame?.loaderId !== result.loaderId) throw staleSnapshot();
@@ -349,6 +362,20 @@ export class HostDocuments implements DocumentAuthority {
         throw error;
       }
     });
+  }
+  private async waitCandidate(record: PageRecord, ticket: Ticket, guard: () => void): Promise<void> {
+    let remove = () => {}, timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      guard(); if (ticket.candidate) return;
+      await new Promise<void>((resolve, reject) => {
+        const inspect = () => {
+          try { guard(); if (ticket.candidate && ticket.commits === 1) resolve(); } catch (error) { reject(error); }
+        };
+        remove = this.subscribe(event => { if (event.target === record.target) inspect(); });
+        timer = setTimeout(() => reject(staleSnapshot()), Math.max(1, ticket.execution.deadline - performance.now())); inspect();
+      });
+      guard();
+    } finally { remove(); if (timer) clearTimeout(timer); }
   }
   async waitReady(target: TabTarget, receipt: HostDocument, signal: AbortSignal, deadline: number, assertJob: () => void): Promise<void> {
     let remove = () => {}, abort = () => {}, timer: ReturnType<typeof setTimeout> | undefined;
@@ -378,9 +405,11 @@ export class HostDocuments implements DocumentAuthority {
     if (!record || record.page !== page || !this.isOriginal(record)) return;
     if (record.fault?.availability === 'crashed' || (record.fault && availability !== 'crashed')) return record.fault;
     const fault = Object.freeze({ target, page, availability, reason }); record.fault = fault; this.faults.set(fault, record);
-    this.stopJob(record.load); this.poisonEpoch(record); delete record.ticket;
+    const jobs = [...this.poisonEpoch(record), ...(record.load ? [record.load] : [])];
+    for (const job of jobs) job.active = false;
+    delete record.ticket;
     // No live-frame access is needed to poison a genuinely vanished original.
-    this.synchronous(() => this.onFault!(fault)); this.emit(record, 'changed'); return fault;
+    this.synchronous(() => this.onFault!(fault)); this.abortJobs(jobs); this.emit(record, 'changed'); return fault;
   }
   assertFault(target: TabTarget, fault: DocumentFault): void {
     const record = this.faults.get(fault);
@@ -393,8 +422,11 @@ export class HostDocuments implements DocumentAuthority {
   }
   close(target: TabTarget, page: PageSurface): void {
     const record = this.records.get(target); if (!record || record.page !== page || record.closed) return;
-    record.closed = true; this.stopJob(record.load); this.poisonEpoch(record);
+    record.closed = true;
+    const jobs = [...this.poisonEpoch(record), ...(record.load ? [record.load] : [])];
+    for (const job of jobs) job.active = false;
     if (record.state) record.state.valid = false; delete record.ticket;
+    this.abortJobs(jobs);
     for (const remove of record.listeners.splice(0)) remove();
     this.preparation!.close(page); this.emit(record, 'closed');
   }

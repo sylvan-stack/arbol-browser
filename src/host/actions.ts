@@ -118,10 +118,11 @@ export class ActionQueue implements HandoffOperations {
         if (task.mutation && !task.navigation) task.navigation = this.authority.beginContinuation(stamp, task.action!, operation);
         // Publish an issued slot before the command can synchronously reenter.
         let issuedResolve!: () => void;
-        const issued = new Promise<void>(yes => { issuedResolve = yes; }); task.issued.add(issued); task.dispatched = true;
+        const issued = new Promise<void>(yes => { issuedResolve = yes; }); task.issued.add(issued);
         let promise: Promise<U>;
         try {
           if (task.navigation) this.authority.issuedNavigation(task.navigation, task.command);
+          task.dispatched = true;
           promise = Promise.resolve(command());
         }
         catch (error) { promise = Promise.reject(error); }
