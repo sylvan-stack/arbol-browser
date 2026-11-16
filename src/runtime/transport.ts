@@ -291,7 +291,12 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
             const result = await (protectedPort ? dispatch.execute(captured, request, deadline, controller.signal)
               : scheduler.run(request, controller.signal, () => dispatch.execute(captured, request, deadline, controller.signal)));
             if (dead || controller.signal.aborted || now() >= deadline) return;
-            if (!resultValidator(request)(result)) throw unavailable('browser');
+            if (!resultValidator(request)(result)) {
+              // Mismatched success is an internal protocol failure: close the
+              // adapter and safely release, rather than forwarding an envelope.
+              if (protectedPort) { stop(); return; }
+              throw unavailable('browser');
+            }
             if (protectedPort) {
               const bytes = Buffer.from(JSON.stringify({ wire: 1, id: request.id, ok: true, result }) + '\n', 'utf8');
               writeFrame(socket, bytes, 8 * 1024 * 1024, () => {
