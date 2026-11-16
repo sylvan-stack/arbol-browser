@@ -6,7 +6,7 @@ import { BrowserFailure, unavailable } from '../contracts/errors.js';
 import { assertNativeFailureBoundary, type NativeFailureBoundary } from '../runtime/bootstrap.js';
 import { TabAuthority, staleSnapshot, type DocumentAuthority, type DocumentReceipt } from './authority.js';
 import { issuedNavigation, type ActionExecution, type IssuedNavigation } from './actions.js';
-import { assertPageSurface, type PageSurface } from './windows.js';
+import { assertPageSurface, assertWindowHost, type PageSurface, type WindowHost } from './windows.js';
 import { refused, userURL, type TabTarget } from './tabs.js';
 
 export interface PhysicalFrame {
@@ -99,6 +99,7 @@ export class HostDocuments implements DocumentAuthority {
   private owner?: TabAuthority;
   private preparation?: DocumentPreparation;
   private onFault?: (fault: DocumentFault) => void;
+  private readonly windows = new Map<WindowHost, () => void>();
   private readonly records = new Map<TabTarget, PageRecord>();
   private readonly receipts = new WeakMap<DocumentReceipt, { record: PageRecord; state: EpochState }>();
   private readonly faults = new WeakMap<DocumentFault, PageRecord>();
@@ -111,6 +112,16 @@ export class HostDocuments implements DocumentAuthority {
     if (this.owner || owner.documents !== this) throw unavailable('browser');
     assertNativeFailureBoundary(this.boundary);
     this.owner = owner; this.preparation = preparation; this.onFault = onFault;
+  }
+  /** Must precede page creation/load: actual placement is the readiness boundary. */
+  bindWindow(host: WindowHost): void {
+    this.authority(); assertWindowHost(host);
+    if (this.windows.has(host)) throw unavailable('browser');
+    const remove = host.onPresentation(
+      pages => { for (const page of pages) this.fencePresentation(page); },
+      pages => { for (const page of pages) this.presentationChanged(page); });
+    this.windows.set(host, remove);
+    host.window.once('closed', () => { remove(); this.windows.delete(host); });
   }
   private authority(): TabAuthority { if (!this.owner || !this.preparation || !this.onFault) throw unavailable('browser'); return this.owner; }
   private synchronous(work: () => void): void {
@@ -173,6 +184,7 @@ export class HostDocuments implements DocumentAuthority {
   }
   watch(target: TabTarget, holdReadiness = false): void {
     this.authority(); assertPageSurface(target.page);
+    if (!this.windows.has(target.page.window)) throw unavailable('browser');
     const previous = this.records.get(target);
     if (previous?.page === target.page && !previous.closed) return;
     if (previous) this.close(target, previous.page);
@@ -508,5 +520,8 @@ export class HostDocuments implements DocumentAuthority {
     for (const remove of record.listeners.splice(0)) remove();
     this.preparation!.close(page); this.emit(record, 'closed');
   }
-  closeAll(): void { for (const record of this.records.values()) this.close(record.target, record.page); this.records.clear(); }
+  closeAll(): void {
+    for (const remove of this.windows.values()) remove(); this.windows.clear();
+    for (const record of this.records.values()) this.close(record.target, record.page); this.records.clear();
+  }
 }

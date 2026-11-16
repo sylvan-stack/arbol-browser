@@ -271,11 +271,12 @@ export interface HostJob {
  * and operation-specific trusted input/settlement. Every asynchronous provider
  * must call the supplied guard before each engine issue or host mutation. */
 export interface OwnershipOperations {
-  info(): Contract<'browser.BrowserInfo'>;
+  info(): Readonly<Omit<Contract<'browser.BrowserInfo'>, 'client'>>;
   agent(request: AgentRequest, execution: ActionExecution, inspectionIdentity?: string): Promise<unknown>;
   user(request: UserRequest, target: TabTarget, job: HostJob): Promise<void>;
   recover(target: TabTarget, expected: number, job: { readonly deadline: number; assertCurrent(): void }): Promise<void>;
   invalidate(target: TabTarget, recipient?: string): void;
+  shutdown(): void;
   leaveAgentMode(target: TabTarget, document: DocumentReceipt, deadline: number,
     job: { readonly generation: number; assertCurrent(): void }): Promise<void>;
 }
@@ -290,7 +291,8 @@ export interface OwnershipHost {
   runEnd(attachment: string): void;
   healthFailure(target: TabTarget, fault: DocumentFault): Promise<void>;
   /** Only the exact successful recovery producer can publish this fresh user page. */
-  recovered(transition: RecoveryTransition, receipt: DocumentReceipt): void;
+  recovered(transition: RecoveryTransition, receipt: DocumentReceipt, assertCurrent: () => void): void;
+  documentReady(target: TabTarget, receipt: DocumentReceipt): void;
 }
 interface ScopedTarget { page: PageSurface; generation: number; grantEpoch: number | undefined; parent?: TabTarget }
 interface PendingOpen {
@@ -306,7 +308,7 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
   assertNativeFailureBoundary(boundary);
   for (const method of ['current', 'assertCurrent', 'assertFault', 'prepare', 'assertSuccessor'] as const)
     if (typeof documents[method] !== 'function') throw unavailable('browser');
-  for (const method of ['info', 'agent', 'user', 'recover', 'invalidate', 'leaveAgentMode'] as const)
+  for (const method of ['info', 'agent', 'user', 'recover', 'invalidate', 'shutdown', 'leaveAgentMode'] as const)
     if (typeof operations[method] !== 'function') throw unavailable('browser');
   const authority = new TabAuthority(boundary, documents);
   let phase: 'prepared' | 'live' | 'closed' = 'prepared';
@@ -377,17 +379,37 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
   };
   const markPrepared = (target: TabTarget, generation: number, receipt: DocumentReceipt) => {
     const beforeState = authority.expected(target, generation); authority.assertDocument(target, receipt);
-    if (!receipt.ready || receipt.availability !== 'ready') throw refused('control_refused');
+    if (!receipt.ready || receipt.availability !== 'ready' || authority.faultAvailability(target) || beforeState.handoff !== 'idle')
+      throw refused('control_refused');
+    if (beforeState.inputReady && beforeState.pageAvailability === 'ready' && authority.document(target) === receipt) return;
     if (beforeState.controller.kind === 'agent') authority.owner(target, beforeState.controller.client, generation);
-    target.page.window.guardRetirementTransition(() => {
-      const before = target.page.binding(), blocked = beforeState.controller.kind === 'agent', after = target.page.setNativeBlocked(blocked);
-      if (authority.wasClosed(target)) return;
-      if (after.id !== before.id || after.nonce !== before.nonce || after.webContentsId !== before.webContentsId ||
-          after.webContentsId !== target.page.view.webContents.id || after.revision !== before.revision + 1 || after.retired || after.blocked !== blocked)
-        return authority.exhausted();
-    });
-    authority.expected(target, generation); authority.assertDocument(target, receipt);
-    authority.prepared(target, receipt);
+    const page = target.page;
+    const block = () => {
+      if (authority.wasClosed(target) || target.page !== page || page.retirement()) return;
+      page.window.guardRetirementTransition(() => {
+        const before = page.binding(); if (before.blocked) return;
+        const after = page.setNativeBlocked(true);
+        if (authority.wasClosed(target) || page.retirement()) return;
+        if (after.id !== before.id || after.nonce !== before.nonce || after.webContentsId !== before.webContentsId ||
+            after.revision !== before.revision + 1 || after.retired || !after.blocked) return authority.exhausted();
+      });
+    };
+    try {
+      page.window.guardRetirementTransition(() => {
+        const before = page.binding(), blocked = beforeState.controller.kind === 'agent', after = page.setNativeBlocked(blocked);
+        if (authority.wasClosed(target) || page.retirement()) return;
+        if (!receipt.ready || receipt.availability !== 'ready' || authority.faultAvailability(target)) {
+          const actual = page.binding();
+          if (actual.id !== before.id || actual.nonce !== before.nonce || actual.webContentsId !== before.webContentsId ||
+              actual.revision < before.revision + 1 || actual.retired) return authority.exhausted();
+          return; // soft currentness refusal/reblock occurs outside the fatal wrapper
+        }
+        if (after.id !== before.id || after.nonce !== before.nonce || after.webContentsId !== before.webContentsId ||
+            after.revision !== before.revision + 1 || after.retired || after.blocked !== blocked) return authority.exhausted();
+      });
+      authority.expected(target, generation); authority.assertDocument(target, receipt);
+      authority.prepared(target, receipt);
+    } catch (error) { authority.assertHealthy(); block(); throw error; }
   };
   const lifecycle = Object.freeze<TabLifecycle>({
     assertAdmission: live, connected: id => authority.connected(id),
@@ -551,7 +573,10 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
       phase = 'live';
       for (const [host, registration] of windows) { live(); assertShellRegistration(registration, host); registration.show(); }
     },
-    closeAdmission() { phase = 'closed'; authority.closeAdmission(); }, disconnect,
+    closeAdmission() {
+      if (phase === 'closed') return;
+      phase = 'closed'; authority.closeAdmission(); synchronous(() => operations.shutdown());
+    }, disconnect,
     async settleDisconnect(id, deadline) {
       const cleanup = cleanups.get(id), pending = [...(tentativeWork.get(id) ?? [])];
       await bounded(deadline, () => Promise.all([...(cleanup ? [cleanup] : []), ...pending]).then(() => {}));
@@ -649,7 +674,7 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
           proof = { kind: 'management', method: 'open' };
         } else {
           const recipient = client(context), params = request.params;
-          if (params.name === 'browser_info') { value = operations.info(); proof = { kind: 'info' }; }
+          if (params.name === 'browser_info') { value = { ...operations.info(), client: authority.attachment(recipient) }; proof = { kind: 'info' }; }
           else if (params.name === 'browser_tabs_list') {
             value = projectAgentTabs(tabs(), recipient, id => authority.connected(id)); proof = { kind: 'tabs', recipient };
           } else if (params.name === 'browser_tab_open') {
@@ -828,17 +853,50 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
     healthFailure(target, fault) {
       live(); return handoff.failure(target, fault);
     },
-    recovered(transition, receipt) {
-      live(); authority.assertRecovery(transition); authority.assertDocument(transition.target, receipt);
-      const page = transition.target.page;
-      if (page !== receipt.page || page === transition.original || !receipt.ready || receipt.availability !== 'ready') throw refused('control_refused');
-      page.window.guardRetirementTransition(() => {
-        const before = page.binding(), after = page.setNativeBlocked(false);
-        if (authority.wasClosed(transition.target)) return;
-        if (!before.blocked || after.blocked || after.retired || after.id !== before.id || after.nonce !== before.nonce ||
-            after.webContentsId !== before.webContentsId || after.revision !== before.revision + 1) return authority.exhausted();
-      });
-      authority.assertRecovery(transition); authority.finishRecovery(transition, receipt);
+    documentReady(target, receipt) {
+      live(); const state = authority.state(target);
+      if (state.handoff !== 'idle' || authority.faultAvailability(target)) return;
+      markPrepared(target, state.generation, receipt); authority.changed();
+    },
+    recovered(transition, receipt, assertCurrent) {
+      const guard = () => {
+        const result: unknown = assertCurrent(); if (result !== undefined) return authority.exhausted();
+        live(); authority.assertRecovery(transition); authority.assertDocument(transition.target, receipt);
+        if (!receipt.ready || receipt.availability !== 'ready') throw refused('control_changed');
+      };
+      guard(); const target = transition.target, page = target.page;
+      if (page !== receipt.page || page === transition.original) throw refused('control_refused');
+      try {
+        page.window.guardRetirementTransition(() => {
+          const before = page.binding(), after = page.setNativeBlocked(false);
+          if (authority.wasClosed(target) || page.retirement()) return;
+          if (!receipt.ready || receipt.availability !== 'ready') {
+            // Genuine document/fault callbacks may already have reblocked this
+            // exact binding. The native wrapper checked its own original ack.
+            let actual = page.binding(); if (!actual.blocked) actual = page.setNativeBlocked(true);
+            if (actual.retired || actual.id !== before.id || actual.nonce !== before.nonce ||
+                actual.webContentsId !== before.webContentsId || !actual.blocked || actual.revision < before.revision + 1)
+              return authority.exhausted();
+            return;
+          }
+          if (!before.blocked || after.blocked || after.retired || after.id !== before.id || after.nonce !== before.nonce ||
+              after.webContentsId !== before.webContentsId || after.revision !== before.revision + 1) return authority.exhausted();
+        });
+        guard(); authority.finishRecovery(transition, receipt);
+        // Terminal publication: no fallible guard/readback is allowed after it.
+      } catch (error) {
+        authority.assertHealthy();
+        if (!authority.wasClosed(target) && target.page === page && !page.retirement()) {
+          page.window.guardRetirementTransition(() => {
+            const before = page.binding(); if (before.blocked) return;
+            const after = page.setNativeBlocked(true);
+            if (authority.wasClosed(target) || page.retirement()) return;
+            if (after.retired || !after.blocked || after.id !== before.id || after.nonce !== before.nonce ||
+                after.webContentsId !== before.webContentsId || after.revision !== before.revision + 1) return authority.exhausted();
+          });
+        }
+        throw error;
+      }
     },
   });
 }

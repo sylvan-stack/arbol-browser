@@ -261,3 +261,22 @@ export async function integrateTrustedShell(port: NativeShellPort, prepared: Hos
       agentTabs: (recipient: string) => modules.projections.projectAgentTabs(tabs, recipient, client => lifecycle.connected(client)) });
   } catch { return boundary.fatal.fail('native_boundary_unavailable'); }
 }
+
+/** ABR-11's real control-only producers, loaded in the same physical graph as
+ * installed Native and lifecycle brands. ABR-29 still owns complete qualified
+ * assembly and initial admission; ordinary entry remains closed above. */
+export async function prepareRendererControl(boundary: NativeFailureBoundary, prepared: HostPreparation,
+  selection: BuildSelection): Promise<import('../host/recovery.js').RendererControl> {
+  const custody = handovers.get(boundary.watchdog);
+  if (!installedBoundaries.has(boundary) || !custody) throw unavailable('browser');
+  await prepared.instance.owner.assert(); await prepared.buildGuard.assert(); await prepared.engine.assertReady();
+  await assertHeldPath(prepared.instance.owner.profile.paths.owner, custody.owner);
+  if (!selection.guard || prepared.instance.record.build !== selection.build) throw unavailable('browser');
+  await assertHeldPath(selection.guard, custody.build);
+  assertNativeFailureBoundary(boundary);
+  const moduleURL = new URL('../host/recovery.js', import.meta.url).href;
+  const control = await import(moduleURL) as typeof import('../host/recovery.js');
+  assertNativeFailureBoundary(boundary);
+  return control.createRendererControl(boundary, Object.freeze({ contract: 1,
+    profile: prepared.instance.record.profile, instance: prepared.instance.record.instance, build: prepared.instance.record.build }));
+}

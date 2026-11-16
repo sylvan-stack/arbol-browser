@@ -1,13 +1,17 @@
 import { webFrameMain, type WebContents } from 'electron';
 import { performance } from 'node:perf_hooks';
 import { setTimeout as pause } from 'node:timers/promises';
-import { BrowserFailure } from '../contracts/errors.js';
-import { assertNativeFailureBoundary } from '../runtime/bootstrap.js';
+import type { Contract } from '../contracts/generated.js';
+import { validator } from '../contracts/schema.js';
+import { BrowserFailure, unavailable } from '../contracts/errors.js';
+import { assertNativeFailureBoundary, type NativeFailureBoundary } from '../runtime/bootstrap.js';
 import { staleSnapshot, type RecoveryTransition } from './authority.js';
-import { bounded, type OwnershipHost } from './handoff.js';
-import { physicalFrames, type HostDocument, type HostDocuments, type PhysicalFrame } from './documents.js';
-import type { RendererHealth, RecoveryAttempt } from './health.js';
-import { assertPageRetirement, type PageSurface } from './windows.js';
+import { bounded, createOwnershipHost, type OwnershipHost } from './handoff.js';
+import { physicalFrames, HostDocuments, type HostDocument, type PhysicalFrame } from './documents.js';
+import { RendererHealth, type RecoveryAttempt } from './health.js';
+import { assertPageRetirement, type PageSurface, type WindowHost } from './windows.js';
+import { PageReadiness } from './readiness.js';
+import type { ShellRegistration } from './shell-ipc.js';
 import { assertTabRegistry, refused, userURL, type TabRegistry, type TabTarget } from './tabs.js';
 
 export interface RecoveryReport {
@@ -276,4 +280,74 @@ export class PageRecovery {
       if (owner.wasClosed(target)) this.reports.delete(target);
     }
   }
+}
+
+export type ControlIdentity = Readonly<Omit<Contract<'browser.BrowserInfo'>, 'client'>>;
+export interface RendererControl {
+  readonly pageAdmission: false;
+  readonly ownership: OwnershipHost;
+  readonly documents: HostDocuments;
+  readonly readiness: PageReadiness;
+  readonly health: RendererHealth;
+  readonly recovery: PageRecovery;
+  /** Bind actual hidden shell resources before registration.load or page load. */
+  bind(tabs: TabRegistry, host: WindowHost, registration: ShellRegistration): void;
+}
+/** Executable control-only contribution. The caller supplies genuine installed
+ * Native custody and owned metadata. There is no EngineAuthority, normal launch
+ * path, permissive engine operation or dependency on a later Tools adapter. */
+export function createRendererControl(boundary: NativeFailureBoundary, identity: ControlIdentity): RendererControl {
+  assertNativeFailureBoundary(boundary);
+  if (identity.contract !== 1 || !validator('browser.ProfileId')(identity.profile) ||
+      !validator('browser.InstanceId')(identity.instance) || !validator('browser.Build')(identity.build) ||
+      Object.keys(identity).sort().join(',') !== 'build,contract,instance,profile') throw unavailable('browser');
+  const info = Object.freeze({ contract: 1 as const, profile: identity.profile, instance: identity.instance, build: identity.build });
+  const documents = new HostDocuments(boundary), readiness = new PageReadiness(boundary, documents);
+  const registrations = new Map<WindowHost, ShellRegistration>();
+  let ownership!: OwnershipHost, recovery!: PageRecovery, health!: RendererHealth, removeReady = () => {};
+  ownership = createOwnershipHost(boundary, documents, {
+    info: () => info,
+    async agent() {
+      // Classified inspection/input/ref/settlement belongs to the actual Tools
+      // producer. Refuse before issuing a command; never return fabricated work.
+      throw unavailable('browser');
+    },
+    async user(request, target, job) {
+      await documents.navigateUser(target, request.method === 'user_navigate' ? request.params.url : request.method, job);
+    },
+    recover: (target, expected, job) => recovery.recover(target, expected, job),
+    leaveAgentMode: (target, document, deadline, job) => readiness.leaveAgentMode(target, document, deadline, job.assertCurrent),
+    invalidate(target) {
+      // Document/recipient invalidation fences authority, not the physical
+      // debugger channel. Only terminal logical Close tears down producers.
+      if (ownership.authority.wasClosed(target)) { recovery.cancel(target); documents.forget(target, target.page); }
+    },
+    shutdown() {
+      // Authority is already sealed. Remove real shell observers before native
+      // retirement can publish a selection event into closed admission.
+      for (const registration of registrations.values()) registration.dispose(); registrations.clear();
+      recovery.closeAll(); documents.closeAll(); health.closeAll(); removeReady();
+    },
+  });
+  health = new RendererHealth(documents, readiness, ownership.authority, fault => ownership.healthFailure(fault.target, fault));
+  recovery = new PageRecovery(ownership, documents, health, (transition, receipt, guard) => ownership.recovered(transition, receipt, guard));
+  documents.bind(ownership.authority, readiness, fault => health.failed(fault));
+  removeReady = documents.subscribe(event => {
+    if (event.kind !== 'ready' || !event.receipt || event.target.page !== event.page ||
+        ownership.authority.wasClosed(event.target) || health.recovering(event.target)) return;
+    try { ownership.documentReady(event.target, event.receipt); }
+    catch (error) {
+      ownership.authority.assertHealthy();
+      // An actual Close, handoff, navigation or presentation event may supersede
+      // readiness synchronously. Expected refusal cannot turn into profile fatal.
+      if (!(error instanceof BrowserFailure)) return ownership.authority.exhausted();
+    }
+  });
+  return Object.freeze({ pageAdmission: false as const, ownership, documents, readiness, health, recovery,
+    bind(tabs: TabRegistry, host: WindowHost, registration: ShellRegistration) {
+      ownership.bind(tabs, host, registration); documents.bindWindow(host); recovery.bind(tabs);
+      registrations.set(host, registration);
+      host.window.once('closed', () => { registrations.delete(host); });
+    },
+  });
 }

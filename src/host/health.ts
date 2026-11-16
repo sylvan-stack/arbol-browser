@@ -191,6 +191,8 @@ export class RendererHealth {
       this.assertAttempt(attempt); this.documents.assertCurrent(attempt.target, receipt);
       if (value.record.revision !== revision || !receipt.ready || receipt.availability !== 'ready') throw staleSnapshot();
     };
+    if (revision >= Number.MAX_SAFE_INTEGER) return this.owner.exhausted();
+    const completedRevision = revision + 1;
     return Object.freeze({ assertCurrent, commit: () => {
       // The native/authority producer called assertCurrent adjoining its real
       // terminal publication. This is private bookkeeping only: no callbacks,
@@ -200,7 +202,7 @@ export class RendererHealth {
       delete value.record.attempt;
       if (value.record.revision !== revision) { value.record.phase = value.record.fault?.availability ?? 'unavailable'; return; }
       delete value.record.fault; delete value.record.recoveryError;
-      value.record.receipt = receipt; value.record.phase = 'ready'; this.increment(value.record);
+      value.record.receipt = receipt; value.record.phase = 'ready'; value.record.revision = completedRevision;
     } });
   }
   failRecovery(attempt: RecoveryAttempt, reason: string): void {
