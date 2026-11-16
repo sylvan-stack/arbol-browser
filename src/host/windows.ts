@@ -14,6 +14,8 @@ const preloadPath = fileURLToPath(new URL('../shell/preload.cjs', import.meta.ur
 export interface PageSurface {
   readonly view: WebContentsView;
   readonly window: WindowHost;
+  readonly session: Session;
+  readonly identity: Readonly<Pick<Binding, 'id' | 'nonce' | 'webContentsId'>>;
   binding(): Binding;
   setNativeBlocked(blocked: boolean): Binding;
   restorePresentation(): void;
@@ -35,6 +37,8 @@ export interface WindowHost {
   createPage(): PageSurface;
   assertHealthy(): void;
   select(page: PageSurface): void;
+  /** Physical selection, independent of a logical tab retaining a retired page. */
+  selected(): PageSurface | undefined;
   clearSelection(page: PageSurface): void;
   guardRetirementTransition(operation: () => void): void;
   close(): Promise<void>;
@@ -80,12 +84,25 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
   shell.webContents.on('will-attach-webview', event => event.preventDefault());
   const pages = new Set<PageSurface>();
   let selected: PageSurface | undefined, closing = false;
+  const presentSelection = (next: PageSurface | undefined) => {
+    for (const page of pages) if (!page.retirement()) page.present(page === next);
+  };
+  const selectPhysical = (next: PageSurface | undefined) => {
+    const previous = selected;
+    try { presentSelection(next); }
+    catch (error) {
+      try { presentSelection(previous); }
+      catch { return boundary.fatal.fail('native_retirement_unavailable'); }
+      throw error;
+    }
+    selected = next;
+  };
   const layout = () => {
     if (closing || window.isDestroyed()) return;
     try {
       const { width, height } = window.getContentBounds();
       shell.setBounds({ x: 0, y: 0, width, height: Math.min(272, height) });
-      for (const page of pages) page.present(page === selected);
+      presentSelection(selected);
     } catch { return boundary.fatal.fail('native_retirement_unavailable'); }
   };
   const host: WindowHost = Object.freeze({ window, shell, origin: shellURL,
@@ -106,7 +123,8 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
       view.webContents.on('will-attach-webview', event => event.preventDefault());
       // The default popup route never permits Electron to create/retarget a window.
       view.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-      const page: PageSurface = Object.freeze({ view, window: host,
+      const identity = Object.freeze({ id: current.id, nonce: current.nonce, webContentsId: current.webContentsId });
+      const page: PageSurface = Object.freeze({ view, window: host, session: sessions.website, identity,
         binding() { if (retired) throw unavailable('browser');
           current = boundary.native.ownership.bindingInfo(bindingKey(current)); return current; },
         setNativeBlocked(blocked: boolean) {
@@ -115,7 +133,8 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
           shield.setVisible(selected === page && current.blocked); return current;
         },
         restorePresentation() {
-          if (retired) throw unavailable('browser');
+          // restore unhides native subviews. It is never a background probe.
+          if (retired || selected !== page || !view.getVisible() || !window.isVisible()) throw unavailable('browser');
           current = boundary.native.ownership.restore(bindingKey(current));
         },
         present(active: boolean) {
@@ -153,17 +172,24 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
     },
     select(page: PageSurface) {
       assertPageSurface(page);
-      if (closing || page.window !== host || !pages.has(page) || page.retirement()) throw unavailable('browser');
-      selected = page; layout();
+      if (closing || page.window !== host) throw unavailable('browser');
+      const retired = page.retirement();
+      if (retired) {
+        assertPageRetirement(page, retired);
+        // The logical tab may still be selected, but never its retired surface.
+        selectPhysical(undefined); return;
+      }
+      if (!pages.has(page)) throw unavailable('browser');
+      selectPhysical(page);
     },
+    selected() { assertWindowHost(host); return selected; },
     clearSelection(page: PageSurface) {
       assertPageSurface(page);
       const retirement = page.retirement();
       if (page.window !== host || (!pages.has(page) && !retirement)) throw unavailable('browser');
       try {
         if (retirement) assertPageRetirement(page, retirement);
-        if (selected === page) selected = undefined;
-        if (!retirement) page.present(false);
+        if (selected === page) selectPhysical(undefined);
       }
       catch { return boundary.fatal.fail('native_retirement_unavailable'); }
     },

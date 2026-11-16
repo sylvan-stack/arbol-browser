@@ -45,6 +45,9 @@ export interface TabRegistry {
   openAgent(window: WindowHost, client: string, label: string, url: string, scope: AgentOpenScope): Promise<TabTarget>;
   select(window: WindowHost, id: string): TabTarget;
   selected(window: WindowHost): TabTarget | undefined;
+  /** Only explicit recovery may publish a fresh physical page on this logical tab. */
+  replace(target: TabTarget, original: PageSurface, replacement: PageSurface,
+    assertCurrent: () => void, publish: () => void): void;
   closeUser(window: WindowHost, id: string, generation: number): Promise<void>;
   closeAgent(client: string, id: string, generation: number): Promise<void>;
   closeWindow(window: WindowHost): Promise<void>;
@@ -62,6 +65,7 @@ function tabId(exhausted: () => never): string {
 }
 export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
   const tabs = new Map<string, TabTarget>(), closing = new Set<TabTarget>();
+  const bindings = new WeakMap<TabTarget, { page: PageSurface }>();
   const selection = new Map<WindowHost, TabTarget>();
   interface PendingRetirement { generation: number; promise: Promise<void>; ready: Promise<void>; start(): void }
   const retirements = new WeakMap<TabTarget, PendingRetirement>();
@@ -85,7 +89,7 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
     const pending = retirements.get(target);
     if (pending) return pending;
     if (tabs.get(target.id) !== target) throw refused('tab_not_found');
-    const window = target.page.window;
+    const page = target.page, window = page.window;
     let currentGeneration = 1;
     if (registered.has(target)) window.guardRetirementTransition(() => { currentGeneration = lifecycle.state(target).generation; });
     let resolve!: () => void, reject!: (reason: unknown) => void, prepared!: () => void;
@@ -97,7 +101,7 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
         if (started) return; started = true;
         void ready.then(() => {
           // This remains the one exact Native provider, after synchronous authority closure.
-          void target.page.retire().then(() => {
+          void page.retire().then(() => {
             window.guardRetirementTransition(() => {
               tabs.delete(target.id); closing.delete(target); registered.delete(target);
               lifecycle.removed(target); lifecycle.changed();
@@ -111,14 +115,14 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
     closing.add(target); actions.delete(target);
     // Publish guards/promises before any callback can re-enter. No native detach/close here.
     window.guardRetirementTransition(() => {
-      const originalRetirement = target.page.retirement();
-      if (originalRetirement) assertPageRetirement(target.page, originalRetirement);
-      else target.page.setNativeBlocked(true);
+      const originalRetirement = page.retirement();
+      if (originalRetirement) assertPageRetirement(page, originalRetirement);
+      else page.setNativeBlocked(true);
       if (selection.get(window) === target) {
         selection.delete(window);
         const next = [...tabs.values()].find(tab => tab.page.window === window && !closing.has(tab) && !tab.page.retirement());
         if (!windowClosures.has(window) && next) { window.select(next.page); selection.set(window, next); }
-        else window.clearSelection(target.page);
+        else window.clearSelection(page);
       }
       return lifecycle.invalidate(target);
     });
@@ -126,6 +130,25 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
   }
   function retire(target: TabTarget): Promise<void> {
     const pending = prepareRetirement(target); pending.start(); return pending.promise;
+  }
+  function installPageEvents(target: TabTarget, page: PageSurface) {
+    // Closures keep the originating page. A stale event cannot resolve the
+    // logical target's newer page and acquire its authority or popup budget.
+    const current = () => tabs.get(target.id) === target && target.page === page && !closing.has(target) &&
+      !windowClosures.has(page.window) && !page.retirement();
+    page.view.webContents.setWindowOpenHandler(details => {
+      if (current()) void popup(target, page, details.url).catch(() => {});
+      return { action: 'deny' };
+    });
+    page.view.webContents.on('will-navigate', event => {
+      try { if (!current()) throw refused('control_changed'); userURL(event.url); lifecycle.assertAdmission(); }
+      catch { event.preventDefault(); }
+    });
+    page.view.webContents.on('will-redirect', (event, address) => {
+      try { if (!current()) throw refused('control_changed'); userURL(address); lifecycle.assertAdmission(); }
+      catch { event.preventDefault(); }
+    });
+    page.view.webContents.on('will-prevent-unload', event => event.preventDefault());
   }
   async function open(window: WindowHost, url: string, creator?: Contract<'browser.ClientIdentity'>,
     inherited?: TabState, inheritedBudget?: PopupBudget, background = false, scope?: AgentOpenScope, opener?: TabTarget): Promise<TabTarget> {
@@ -141,7 +164,9 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
     if (budget && (!budget.active || budget.count >= 10 || budget.client !== creator?.id)) throw refused('control_refused');
     scopeCurrent();
     if (budget) budget.count++; // shared by every descendant; includes the initial agent-open tab
-    const target = Object.freeze({ id: tabId(() => lifecycle.exhausted()), page: window.createPage() });
+    const physical = { page: window.createPage() };
+    const target: TabTarget = Object.freeze({ id: tabId(() => lifecycle.exhausted()), get page() { return physical.page; } });
+    bindings.set(target, physical);
     const initial: TabState = { tab: target.id, generation: 1, controller: creator
       ? { kind: 'agent', client: creator.id, label: creator.label } : { kind: 'user' },
       visibleTo: creator ? [...(inherited?.visibleTo ?? [creator.id])].filter(id => lifecycle.connected(id)) : [],
@@ -149,7 +174,7 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
     tabs.set(target.id, target);
     try {
       // First/foreground presentation precedes register, which may publish synchronously.
-      if (!background && (!creator || !selection.has(window))) { selection.set(window, target); window.select(target.page); }
+      if (!background && (!creator || !selection.has(window))) { window.select(target.page); selection.set(window, target); }
       lifecycle.register(target, initial);
       registered.add(target);
       if (budget?.scope) {
@@ -158,18 +183,7 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
         scopeCurrent(target);
       }
       if (budget) actions.set(target, { generation: 1, budget });
-      target.page.view.webContents.setWindowOpenHandler(details => {
-        // Always deny the engine route: frameName is never used to retarget an existing tab.
-        void popup(target, details.url).catch(() => { /* redacted refusal; no content diagnostics */ });
-        return { action: 'deny' };
-      });
-      target.page.view.webContents.on('will-navigate', event => {
-        try { userURL(event.url); lifecycle.assertAdmission(); } catch { event.preventDefault(); }
-      });
-      target.page.view.webContents.on('will-redirect', (event, address) => {
-        try { userURL(address); lifecycle.assertAdmission(); } catch { event.preventDefault(); }
-      });
-      target.page.view.webContents.on('will-prevent-unload', event => event.preventDefault());
+      installPageEvents(target, physical.page);
       await lifecycle.prepare(target, url);
       scopeCurrent(target);
       assertTarget(target);
@@ -184,7 +198,8 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
       if (budget && !inheritedBudget) finishBudget(budget);
     }
   }
-  async function popup(opener: TabTarget, url: string) {
+  async function popup(opener: TabTarget, page: PageSurface, url: string) {
+    if (opener.page !== page || page.retirement()) throw refused('control_changed');
     const before = state(opener); userURL(url);
     if (before.handoff !== 'idle') throw refused('control_refused');
     // Popup creation does not silently change the shell's selected tab.
@@ -202,9 +217,33 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
     openAgent: (window: WindowHost, client: string, label: string, url: string, scope: AgentOpenScope) => open(window, url, { id: client, label }, undefined, undefined, false, scope),
     select(window: WindowHost, id: string) {
       const target = registry.get(id); if (target.page.window !== window) throw refused('tab_not_found');
-      selection.set(window, target); window.select(target.page); return target;
+      window.select(target.page); selection.set(window, target); return target;
     },
     selected: (window: WindowHost) => selection.get(window),
+    replace(target: TabTarget, original: PageSurface, replacement: PageSurface, assertCurrent: () => void, publish: () => void) {
+      assertTarget(target); assertPageSurface(replacement);
+      const check = () => { const value: unknown = assertCurrent(); if (value !== undefined) return lifecycle.exhausted(); };
+      check();
+      const physical = bindings.get(target), retired = original.retirement(), state = lifecycle.state(target);
+      if (!physical || physical.page !== original || original === replacement || !retired || closing.has(target) ||
+          replacement.window !== original.window || replacement.session !== original.session || replacement.retirement() ||
+          state.controller.kind !== 'user' || state.handoff !== 'idle') throw refused('control_changed');
+      assertPageRetirement(original, retired);
+      if (retired.phase !== 'retired' || !original.view.webContents.isDestroyed()) throw refused('control_refused');
+      const binding = replacement.binding();
+      if (!binding.blocked || binding.retired || binding.webContentsId !== replacement.view.webContents.id ||
+          binding.id === original.identity.id || binding.nonce === original.identity.nonce)
+        return lifecycle.exhausted();
+      installPageEvents(target, replacement); check();
+      const window = original.window, selected = selection.get(window) === target;
+      if (selected) window.select(replacement);
+      try { check(); }
+      catch (error) { if (selected) window.select(original); throw error; }
+      physical.page = replacement; actions.delete(target);
+      // Physical/authority publication is synchronous while the fresh page is
+      // still blocked and unprepared. Uncertain publication is profile-fatal.
+      window.guardRetirementTransition(publish);
+    },
     closeUser(window: WindowHost, id: string, expected: number) {
       const target = tabs.get(id); if (!target || target.page.window !== window) throw refused('tab_not_found');
       const pending = retirements.get(target);
