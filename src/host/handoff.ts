@@ -169,9 +169,13 @@ export class HandoffController {
     this.original(target);
     if (this.authority.wasClosed(target)) return this.superseded(target);
     this.authority.assertAdmission();
+    if (readyDocument && !this.authority.wasClosed(target) && !this.authority.faultAvailability(target)) {
+      try { this.authority.assertDocument(target, readyDocument); }
+      catch { this.authority.assertHealthy(); readyDocument = undefined; }
+    }
+    if (this.authority.wasClosed(target)) return this.superseded(target);
     let enabled = false;
-    if (readyDocument && !this.operations.unsafe(target) && !target.page.retirement()) {
-      this.authority.assertDocument(target, readyDocument);
+    if (readyDocument && !this.authority.faultAvailability(target) && !this.operations.unsafe(target) && !target.page.retirement()) {
       if (this.authority.wasClosed(target)) return this.superseded(target);
       this.original(target);
       if (this.operations.unsafe(target) || page.retirement()) return this.authority.exhausted();
