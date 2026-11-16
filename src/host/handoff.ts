@@ -1,9 +1,10 @@
 import { performance } from 'node:perf_hooks';
+import { setTimeout as pause } from 'node:timers/promises';
 import type { Contract } from '../contracts/generated.js';
 import { bindingKey } from '../native/retirement.js';
 import { TabAuthority, type DocumentReceipt } from './authority.js';
 import { refused, type TabState, type TabTarget } from './tabs.js';
-import { assertPageRetirement } from './windows.js';
+import { assertPageRetirement, type PageRetirement, type PageSurface } from './windows.js';
 
 export interface HandoffResult { readonly state: TabState; readonly settledAction?: Contract<'browser.SettledAction'> }
 /** Actual admitted engine work and unfinished sequence tracking, supplied by
@@ -17,7 +18,7 @@ export interface HandoffOperations {
   leaveAgentMode(target: TabTarget, document: DocumentReceipt, deadline: number): Promise<void>;
   retired(target: TabTarget): void;
 }
-interface PendingTake { expected: number; promise: Promise<HandoffResult> }
+interface PendingTake { expected: number; promise: Promise<HandoffResult>; page: PageSurface }
 /** A local wait expiring says nothing about the original operation's safety. */
 export async function bounded<T>(deadline: number, work: () => Promise<T>): Promise<T> {
   if (performance.now() >= deadline) throw refused('control_refused');
@@ -32,6 +33,8 @@ export async function bounded<T>(deadline: number, work: () => Promise<T>): Prom
 /** The one host Take path. No default operation, native or readiness provider. */
 export class HandoffController {
   private readonly pending = new Map<TabTarget, PendingTake>();
+  private readonly notified = new WeakMap<PageSurface, PageRetirement>();
+  private readonly retirementWaits = new WeakMap<PageSurface, { deadline: number; receipt?: PageRetirement; complete: boolean }>();
   constructor(readonly authority: TabAuthority, readonly operations: HandoffOperations,
     readonly selected: (target: TabTarget) => boolean) {}
   private synchronous(operation: () => void): void {
@@ -42,20 +45,58 @@ export class HandoffController {
   private mark(target: TabTarget, blocked: boolean): void {
     target.page.window.guardRetirementTransition(() => {
       const before = target.page.binding(), after = target.page.setNativeBlocked(blocked);
+      // The real native wrapper already checked its mark acknowledgement before
+      // shield/presentation callbacks. A genuine same-target Close may now have
+      // advanced that binding again; its exact destruction proof governs next.
+      if (this.authority.wasClosed(target)) return;
       if (before.retired || after.retired || after.id !== before.id || after.nonce !== before.nonce ||
           after.webContentsId !== before.webContentsId || after.webContentsId !== target.page.view.webContents.id ||
           after.revision !== before.revision + 1 || after.blocked !== blocked) return this.authority.exhausted();
     });
   }
-  private async superseded(target: TabTarget): Promise<never> {
+  private original(target: TabTarget): PageSurface {
+    const page = this.pending.get(target)?.page;
+    if (!page || page !== target.page) return this.authority.exhausted(); return page;
+  }
+  private async waitRetirement(target: TabTarget, page: PageSurface): Promise<PageRetirement> {
+    let wait = this.retirementWaits.get(page);
+    if (!wait) { wait = { deadline: performance.now() + 1000, complete: false }; this.retirementWaits.set(page, wait); }
+    try {
+      if (page !== target.page) return this.authority.exhausted();
+      if (wait.complete && wait.receipt) { assertPageRetirement(page, wait.receipt); return wait.receipt; }
+      // Logical close is synchronous; registry/native start may follow an
+      // awaited instance phase or all-window preparation. Absence is no proof.
+      let receipt = page.retirement();
+      while (!receipt) {
+        if (!this.authority.wasClosed(target) || performance.now() >= wait.deadline) return this.authority.exhausted();
+        await pause(Math.max(1, Math.min(10, wait.deadline - performance.now())));
+        if (page !== target.page) return this.authority.exhausted(); receipt = page.retirement();
+      }
+      assertPageRetirement(page, receipt);
+      if (wait.receipt && wait.receipt !== receipt) return this.authority.exhausted(); wait.receipt = receipt;
+      await bounded(wait.deadline, () => receipt.completion);
+      assertPageRetirement(page, receipt);
+      if (page !== target.page || receipt.phase !== 'retired') return this.authority.exhausted();
+      wait.complete = true; return receipt;
+    } catch { return this.authority.exhausted(); }
+  }
+  /** Registry removal and Take share this once-only genuine settlement. */
+  retired(target: TabTarget): void {
     const receipt = target.page.retirement();
     try {
-      if (!this.authority.wasClosed(target) || !receipt) return this.authority.exhausted();
-      assertPageRetirement(target.page, receipt);
-      await bounded(performance.now() + 1000, () => receipt.completion);
+      if (!receipt) return this.authority.exhausted();
       assertPageRetirement(target.page, receipt);
       if (receipt.phase !== 'retired') return this.authority.exhausted();
+      const previous = this.notified.get(target.page);
+      if (previous) { if (previous !== receipt) return this.authority.exhausted(); return; }
+      this.notified.set(target.page, receipt); // before callback reentry
       this.synchronous(() => this.operations.retired(target));
+    } catch { return this.authority.exhausted(); }
+  }
+  private async superseded(target: TabTarget): Promise<never> {
+    try {
+      if (!this.authority.wasClosed(target)) return this.authority.exhausted();
+      await this.waitRetirement(target, this.original(target)); this.retired(target);
     } catch { return this.authority.exhausted(); }
     // This is genuine same-original Close, not a successful old Take reply.
     throw refused('control_changed');
@@ -73,7 +114,7 @@ export class HandoffController {
     let resolve!: (value: HandoffResult) => void, reject!: (error: unknown) => void;
     const promise = new Promise<HandoffResult>((yes, no) => { resolve = yes; reject = no; });
     // Record before invalidators, native calls or state publication can reenter.
-    this.pending.set(target, { expected, promise });
+    this.pending.set(target, { expected, promise, page: target.page });
     try {
       this.authority.beginTake(target, expected);
       this.synchronous(() => this.operations.stop(target));
@@ -86,6 +127,7 @@ export class HandoffController {
     return promise;
   }
   private async finish(target: TabTarget, deadline: number): Promise<HandoffResult> {
+    const page = this.original(target);
     let settledAction: Contract<'browser.SettledAction'> | undefined;
     let readyDocument: DocumentReceipt | undefined;
     try {
@@ -97,22 +139,23 @@ export class HandoffController {
         if (!this.operations.unsafe(target) && this.authority.document(target) === document) readyDocument = document;
       }
     } catch { this.authority.assertHealthy(); }
+    this.original(target);
     if (this.authority.wasClosed(target)) return this.superseded(target);
     this.authority.assertAdmission();
     if (readyDocument && !this.operations.unsafe(target) && !target.page.retirement()) {
       this.authority.documents.assertCurrent(target, readyDocument);
       this.mark(target, false);
+      if (this.authority.wasClosed(target)) return this.superseded(target);
       this.authority.finishTake(target, true, false);
     } else {
       const known = this.operations.outcome(target);
       if (known) settledAction = { action: known.action, status: known.status === 'not_dispatched' ? 'not_dispatched' : 'outcome_unknown' };
       try {
-        await bounded(performance.now() + 1000, () => target.page.retire());
-        const receipt = target.page.retirement();
-        if (!receipt) return this.authority.exhausted();
-        assertPageRetirement(target.page, receipt);
-        if (receipt.phase !== 'retired') return this.authority.exhausted();
-        this.synchronous(() => this.operations.retired(target));
+        // Start the one exact retirement before awaiting its existing receipt.
+        // Repeated/superseding callers share the same wait and deadline.
+        if (!this.retirementWaits.has(page)) this.retirementWaits.set(page, { deadline: performance.now() + 1000, complete: false });
+        void page.retire().catch(() => this.authority.exhausted());
+        await this.waitRetirement(target, page); this.retired(target);
       } catch { return this.authority.exhausted(); }
       if (this.authority.wasClosed(target)) return this.superseded(target);
       this.authority.finishTake(target, false, true);
