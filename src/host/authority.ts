@@ -5,7 +5,7 @@ import { BrowserFailure, unavailable } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
 import type { NativeFailureBoundary } from '../runtime/bootstrap.js';
 import { assertCandidateTrust } from '../native/manifest.js';
-import type { PageSurface } from './windows.js';
+import { assertPageRetirement, type PageSurface } from './windows.js';
 import { refused, type TabState, type TabTarget } from './tabs.js';
 
 /** Supplied by the current-document producer (ABR-11), never a renderer claim.
@@ -35,6 +35,13 @@ export interface DocumentAuthority {
 export interface NavigationContinuation { readonly target: TabTarget; readonly action: string }
 interface ContinuationState {
   stamp: AuthorityStamp; operation: string; valid: boolean; used: boolean; successor?: DocumentReceipt; successorEpoch?: number;
+}
+/** Opaque by identity as well as fields; only completed actual host transitions
+ * can mint these. They are never accepted from an agent or renderer. */
+export interface CompletedTransition {
+  readonly kind: 'open' | 'release' | 'close'; readonly target: TabTarget;
+  readonly recipient: string; readonly request: string; readonly action: string;
+  readonly fromGeneration: number; readonly generation: number;
 }
 export interface AuthorityStamp {
   readonly target: TabTarget;
@@ -78,6 +85,10 @@ export class TabAuthority {
   private readonly closedTargets = new WeakSet<TabTarget>();
   private readonly continuations = new WeakMap<NavigationContinuation, ContinuationState>();
   private readonly activeContinuations = new Map<TabTarget, NavigationContinuation>();
+  private readonly receipts = new WeakSet<CompletedTransition>();
+  private readonly creators = new WeakMap<TabTarget, string>();
+  private readonly takes = new WeakMap<TabTarget, { owner: string; from: number; to: number }>();
+  private readonly closes = new WeakMap<TabTarget, { owner?: string; from: number; to: number }>();
   private sealed = false;
   constructor(readonly boundary: NativeFailureBoundary, readonly documents: DocumentAuthority) {
     assertCandidateTrust(boundary.native.trust); this.assertHealthy();
@@ -97,6 +108,7 @@ export class TabAuthority {
     if (this.issued.size >= 1000000 || this.issued.has(id)) return this.exhausted();
     this.issued.add(id); return id;
   }
+  knowsAction(action: string): boolean { return this.issued.has(action) && validator('browser.ActionId')(action); }
   /** Called once by authenticated transport hello; reconnect must use a new id. */
   connect(identity: Readonly<Contract<'browser.ClientIdentity'>>, signal: AbortSignal): void {
     this.assertAdmission();
@@ -140,6 +152,7 @@ export class TabAuthority {
     this.issued.add(target.id); this.ids.set(target.id, target);
     this.entries.set(target, { target, generation: 1, epoch: 1, controller: { ...initial.controller }, grants,
       recipients: new Map(), handoff: 'idle', ready: false, availability: 'unavailable', closed: false, retired: false });
+    if (initial.controller.kind === 'agent') this.creators.set(target, initial.controller.client);
   }
   state(target: TabTarget): TabState {
     this.assertHealthy(); const entry = this.entry(target);
@@ -199,6 +212,7 @@ export class TabAuthority {
   beginTake(target: TabTarget, expected: number): void {
     this.expected(target, expected); const entry = this.entry(target);
     if (entry.handoff !== 'idle' || entry.controller.kind !== 'agent') throw refused('control_refused');
+    this.takes.set(target, { owner: entry.controller.client, from: entry.generation, to: this.increment(entry.generation) });
     entry.generation = this.increment(entry.generation); entry.controller = { kind: 'user' };
     entry.ready = false; entry.handoff = 'taking'; this.invalidate(target);
   }
@@ -219,6 +233,8 @@ export class TabAuthority {
   /** Close visibility synchronously before ABR-9 starts actual native retirement. */
   closeTab(target: TabTarget): void {
     const entry = this.entry(target); if (entry.closed) return;
+    this.closes.set(target, { ...(entry.controller.kind === 'agent' ? { owner: entry.controller.client } : {}),
+      from: entry.generation, to: this.increment(entry.generation) });
     this.closedTargets.add(target);
     entry.closed = true; entry.ready = false; entry.grants.clear(); entry.generation = this.increment(entry.generation);
     entry.controller = { kind: 'user' }; this.invalidate(target);
@@ -229,6 +245,51 @@ export class TabAuthority {
   }
   /** Retained exact identity, including after the registry removes its record. */
   wasClosed(target: TabTarget): boolean { return this.closedTargets.has(target); }
+  private mint(kind: CompletedTransition['kind'], target: TabTarget, recipient: string, request: string,
+    action: string, fromGeneration: number, generation: number): CompletedTransition {
+    this.assertAdmission(); this.attachment(recipient);
+    if (!this.knowsAction(action) || !validator('browser.RequestId')(request)) throw refused('control_refused');
+    const receipt = Object.freeze({ kind, target, recipient, request, action, fromGeneration, generation });
+    this.receipts.add(receipt); return receipt;
+  }
+  completedOpen(target: TabTarget, recipient: string, request: string, action: string): CompletedTransition {
+    this.capture(target, recipient, 1, true);
+    if (this.creators.get(target) !== recipient) throw refused('control_changed');
+    return this.mint('open', target, recipient, request, action, 0, 1);
+  }
+  completedRelease(target: TabTarget, recipient: string, request: string, action: string, from: number): CompletedTransition {
+    const transition = this.takes.get(target), state = this.state(target);
+    if (!transition || transition.owner !== recipient || transition.from !== from || transition.to !== state.generation ||
+        state.controller.kind !== 'user' || state.handoff !== 'idle' || this.wasClosed(target)) throw refused('control_changed');
+    const retired = target.page.retirement();
+    if (retired) { assertPageRetirement(target.page, retired); if (retired.phase !== 'retired') throw refused('control_changed'); }
+    else if (!state.inputReady || target.page.binding().blocked) throw refused('control_changed');
+    return this.mint('release', target, recipient, request, action, from, state.generation);
+  }
+  completedClose(target: TabTarget, recipient: string, request: string, action: string, from: number): CompletedTransition {
+    const transition = this.closes.get(target), retired = target.page.retirement();
+    if (!transition || transition.owner !== recipient || transition.from !== from || !this.wasClosed(target) ||
+        this.entries.has(target) || !retired) throw refused('control_changed');
+    assertPageRetirement(target.page, retired); if (retired.phase !== 'retired') throw refused('control_changed');
+    return this.mint('close', target, recipient, request, action, from, transition.to);
+  }
+  verifyTransition(receipt: CompletedTransition, kind: CompletedTransition['kind'], recipient: string,
+    request: string, tab?: string, generation?: number): void {
+    this.assertAdmission();
+    if (!this.receipts.has(receipt) || receipt.kind !== kind || receipt.recipient !== recipient || receipt.request !== request ||
+        (tab !== undefined && receipt.target.id !== tab) || (generation !== undefined && receipt.fromGeneration !== generation))
+      throw refused('control_changed');
+    if (kind === 'close') {
+      const retired = receipt.target.page.retirement();
+      if (!this.wasClosed(receipt.target) || this.entries.has(receipt.target) || !retired) throw refused('control_changed');
+      assertPageRetirement(receipt.target.page, retired); if (retired.phase !== 'retired') throw refused('control_changed');
+    } else if (kind === 'open') this.owner(receipt.target, recipient, receipt.generation);
+    else {
+      const state = this.state(receipt.target);
+      if (this.wasClosed(receipt.target) || state.generation !== receipt.generation || state.controller.kind !== 'user' || state.handoff !== 'idle')
+        throw refused('control_changed');
+    }
+  }
   closeAdmission(): void {
     this.sealed = true;
     for (const entry of this.entries.values()) this.closeTab(entry.target);
