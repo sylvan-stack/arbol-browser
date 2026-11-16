@@ -19,7 +19,14 @@ export interface PageSurface {
   restorePresentation(): void;
   /** Presentation restores never change input policy. */
   present(selected: boolean): void;
+  /** Authentic original retirement; never inferred from a missing native view. */
+  retirement(): PageRetirement | undefined;
   retire(): Promise<void>;
+}
+export interface PageRetirement {
+  readonly page: PageSurface;
+  readonly completion: Promise<void>;
+  readonly phase: 'retiring' | 'retired' | 'failed';
 }
 export interface WindowHost {
   readonly window: BaseWindow;
@@ -33,6 +40,11 @@ export interface WindowHost {
   close(): Promise<void>;
 }
 const hosts = new WeakSet<object>(), surfaces = new WeakSet<object>();
+const retirementRecords = new WeakMap<PageSurface, PageRetirement>();
+export function assertPageRetirement(page: PageSurface, receipt: PageRetirement): void {
+  if (!surfaces.has(page) || retirementRecords.get(page) !== receipt || receipt.page !== page || receipt.phase === 'failed')
+    throw unavailable('browser');
+}
 export function assertWindowHost(host: WindowHost): void {
   if (!hosts.has(host) || host.window.isDestroyed()) throw unavailable('browser');
 }
@@ -113,25 +125,46 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
           view.setBounds({ x: 0, y: 272, width, height: Math.max(0, height - 272) });
           shield.setBounds(view.getBounds()); shield.setVisible(active && current.blocked);
         },
-        async retire() {
-          if (retired) throw unavailable('browser');
-          retired = true;
-          current = await boundary.retire(bindingKey(current), window.contentView, view);
-          window.contentView.removeChildView(shield);
-          pages.delete(page); if (selected === page) selected = undefined;
+        retirement: () => retirementRecords.get(page),
+        retire() {
+          const existing = retirementRecords.get(page);
+          if (existing) { assertPageRetirement(page, existing); return existing.completion; }
+          if (retired) return boundary.fatal.fail('native_retirement_unavailable');
+          let resolve!: () => void, reject!: (reason: unknown) => void;
+          let phase: PageRetirement['phase'] = 'retiring';
+          const completion = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
+          const receipt: PageRetirement = Object.freeze({ page, completion, get phase() { return phase; } });
+          // Publish the exact join handle before native/callback reentry. No
+          // second mark/detach/close may be issued against this original page.
+          retirementRecords.set(page, receipt); retired = true;
+          void (async () => {
+            current = await boundary.retire(bindingKey(current), window.contentView, view);
+            window.contentView.removeChildView(shield);
+            pages.delete(page); if (selected === page) selected = undefined;
+            phase = 'retired';
+          })().then(resolve, error => {
+            phase = 'failed'; reject(error);
+            return boundary.fatal.fail('native_retirement_unavailable');
+          });
+          return completion;
         },
       });
       surfaces.add(page); pages.add(page); page.present(false); return page;
     },
     select(page: PageSurface) {
       assertPageSurface(page);
-      if (closing || page.window !== host || !pages.has(page)) throw unavailable('browser');
+      if (closing || page.window !== host || !pages.has(page) || page.retirement()) throw unavailable('browser');
       selected = page; layout();
     },
     clearSelection(page: PageSurface) {
       assertPageSurface(page);
-      if (page.window !== host || !pages.has(page)) throw unavailable('browser');
-      try { if (selected === page) selected = undefined; page.present(false); }
+      const retirement = page.retirement();
+      if (page.window !== host || (!pages.has(page) && !retirement)) throw unavailable('browser');
+      try {
+        if (retirement) assertPageRetirement(page, retirement);
+        if (selected === page) selected = undefined;
+        if (!retirement) page.present(false);
+      }
       catch { return boundary.fatal.fail('native_retirement_unavailable'); }
     },
     guardRetirementTransition(operation: () => void) {

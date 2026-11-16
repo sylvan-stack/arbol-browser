@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import type { Contract } from '../contracts/generated.js';
 import { BrowserFailure, invalidInput, unavailable } from '../contracts/errors.js';
-import { assertPageSurface, assertWindowHost, type PageSurface, type WindowHost } from './windows.js';
+import { assertPageRetirement, assertPageSurface, assertWindowHost, type PageSurface, type WindowHost } from './windows.js';
 
 export type TabState = Readonly<Contract<'browser.ShellTab'>>;
 export interface TabTarget { readonly id: string; readonly page: PageSurface }
@@ -104,10 +104,12 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
     closing.add(target); actions.delete(target);
     // Publish guards/promises before any callback can re-enter. No native detach/close here.
     window.guardRetirementTransition(() => {
-      target.page.setNativeBlocked(true);
+      const originalRetirement = target.page.retirement();
+      if (originalRetirement) assertPageRetirement(target.page, originalRetirement);
+      else target.page.setNativeBlocked(true);
       if (selection.get(window) === target) {
         selection.delete(window);
-        const next = [...tabs.values()].find(tab => tab.page.window === window && !closing.has(tab));
+        const next = [...tabs.values()].find(tab => tab.page.window === window && !closing.has(tab) && !tab.page.retirement());
         if (!windowClosures.has(window) && next) { window.select(next.page); selection.set(window, next); }
         else window.clearSelection(target.page);
       }
