@@ -64,6 +64,7 @@ export class TabAuthority {
   private readonly listeners = new Set<() => void>();
   private readonly invalidators = new Set<(event: Invalidation) => void>();
   private readonly snapshots = new Map<string, Snapshot>();
+  private readonly closedTargets = new WeakSet<TabTarget>();
   private sealed = false;
   constructor(readonly boundary: NativeFailureBoundary, readonly documents: DocumentAuthority) {
     assertCandidateTrust(boundary.native.trust); this.assertHealthy();
@@ -201,6 +202,7 @@ export class TabAuthority {
   /** Close visibility synchronously before ABR-9 starts actual native retirement. */
   closeTab(target: TabTarget): void {
     const entry = this.entry(target); if (entry.closed) return;
+    this.closedTargets.add(target);
     entry.closed = true; entry.ready = false; entry.grants.clear(); entry.generation = this.increment(entry.generation);
     entry.controller = { kind: 'user' }; this.invalidate(target);
   }
@@ -208,6 +210,8 @@ export class TabAuthority {
     const entry = this.entry(target); if (!entry.closed) return this.exhausted();
     this.entries.delete(target); this.ids.delete(target.id);
   }
+  /** Retained exact identity, including after the registry removes its record. */
+  wasClosed(target: TabTarget): boolean { return this.closedTargets.has(target); }
   closeAdmission(): void {
     this.sealed = true;
     for (const entry of this.entries.values()) this.closeTab(entry.target);
