@@ -1,7 +1,7 @@
 import { performance } from 'node:perf_hooks';
 import type { Contract } from '../contracts/generated.js';
 import { BrowserFailure, type ErrorCode } from '../contracts/errors.js';
-import { TabAuthority, type AuthorityStamp, type DocumentReceipt, type Invalidation } from './authority.js';
+import { TabAuthority, type AuthorityStamp, type DocumentReceipt, type Invalidation, type NavigationContinuation } from './authority.js';
 import type { HandoffOperations } from './handoff.js';
 import { refused, type TabTarget } from './tabs.js';
 
@@ -16,12 +16,15 @@ export interface OperationSettlement {
   readonly current: DocumentReceipt;
   readonly delivered: true;
   readonly quiescent: true;
+  readonly command: number;
 }
 export interface ActionExecution {
   readonly action: string | undefined;
   readonly stamp: AuthorityStamp;
   readonly signal: AbortSignal;
   readonly deadline: number;
+  readonly command: number;
+  readonly navigation: NavigationContinuation | undefined;
   /** Every actual engine command is admitted here immediately before issue. */
   dispatch<T>(command: () => Promise<T>): Promise<T>;
   beginSequence(sequence: Sequence): void;
@@ -33,15 +36,21 @@ interface Task {
   action?: string; controller: AbortController; deadline: number;
   dispatched: boolean; settled: boolean; retired: boolean; started: boolean; workDone: boolean; countedRead: boolean;
   resultStamp?: AuthorityStamp;
+  navigation?: NavigationContinuation;
+  command: number; terminal: boolean;
   sequences: Set<Sequence>; issued: Set<Promise<void>>; safe: Promise<void>; safeResolve(): void;
   start(): void; reject(error: unknown): void; cleanup(): void;
 }
 interface Slot { active?: Task; waiting: Task[] }
+interface Preparation {
+  target: TabTarget; generation: number; controller: AbortController; completion: Promise<void>; retired: boolean;
+}
 /** One profile-wide owner for real mutation queues and original issued work. */
 export class ActionQueue implements HandoffOperations {
   private readonly slots = new Map<TabTarget, Slot>();
   private readonly tasks = new Set<Task>();
-  private readonly interrupted = new Map<TabTarget, Task | undefined>();
+  private readonly interrupted = new WeakMap<TabTarget, Task | undefined>();
+  private readonly preparations = new Set<Preparation>();
   private reads = 0;
   private screenshots = 0;
   constructor(readonly authority: TabAuthority,
@@ -55,7 +64,7 @@ export class ActionQueue implements HandoffOperations {
   }
   private check(task: Task): void {
     this.authority.check(task.stamp, task.mutation);
-    if (task.retired || task.controller.signal.aborted || performance.now() >= task.deadline) throw this.failure(task, 'control_refused');
+    if (task.terminal || task.retired || task.controller.signal.aborted || performance.now() >= task.deadline) throw this.failure(task, 'control_refused');
     if (task.mutation) this.authority.requireSnapshot(task.snapshot!, task.stamp);
   }
   private safe(task: Task): void {
@@ -81,15 +90,20 @@ export class ActionQueue implements HandoffOperations {
     const task: Task = { stamp, request: options.request, operation, mutation: options.mutation, screenshot: options.screenshot ?? false,
       ...(options.snapshot ? { snapshot: options.snapshot } : {}), ...(options.mutation ? { action: this.authority.opaque('act') } : {}),
       controller: new AbortController(), deadline: options.deadline, dispatched: false, settled: false, retired: false,
-      started: false, workDone: false, countedRead: false, sequences: new Set(), issued: new Set(), safe, safeResolve, reject,
+      started: false, workDone: false, countedRead: false, command: 0, terminal: false,
+      sequences: new Set(), issued: new Set(), safe, safeResolve, reject,
       cleanup: () => options.signal.removeEventListener('abort', abort),
       start: () => { void execute(); } };
     this.tasks.add(task);
     const abort = () => this.cancelTask(task, 'control_refused');
     options.signal.addEventListener('abort', abort, { once: true });
     const execution: ActionExecution = Object.freeze({ action: task.action, stamp, signal: task.controller.signal, deadline: task.deadline,
+      get command() { return task.command; }, get navigation() { return task.navigation; },
       dispatch: <U>(command: () => Promise<U>): Promise<U> => {
         this.check(task);
+        if (task.command >= Number.MAX_SAFE_INTEGER) return this.authority.exhausted();
+        ++task.command;
+        if (task.mutation && !task.navigation) task.navigation = this.authority.beginContinuation(stamp, task.action!, operation);
         // Publish an issued slot before the command can synchronously reenter.
         let issuedResolve!: () => void;
         const issued = new Promise<void>(yes => { issuedResolve = yes; }); task.issued.add(issued); task.dispatched = true;
@@ -101,20 +115,19 @@ export class ActionQueue implements HandoffOperations {
       beginSequence: (sequence: Sequence) => { this.check(task); if (!task.mutation || task.sequences.has(sequence)) throw this.failure(task);
         task.sequences.add(sequence); },
       settle: (proof: OperationSettlement) => {
-        if (!task.mutation || task.retired || !task.dispatched || task.issued.size !== 0 || proof.action !== task.action ||
-            proof.operation !== operation || proof.original !== stamp.document || !proof.delivered || !proof.quiescent)
+        if (!task.mutation || task.terminal || !task.started || task.workDone || task.retired) throw this.failure(task, 'control_refused');
+        task.terminal = true;
+        if (!task.dispatched ||
+            !task.navigation || task.issued.size !== 0 || proof.action !== task.action || proof.command !== task.command ||
+            task.command < 1 || performance.now() >= task.deadline || proof.operation !== operation ||
+            proof.original !== stamp.document || !proof.delivered || !proof.quiescent)
           throw this.failure(task, 'control_refused');
-        this.authority.assertHealthy(); this.authority.documents.assertCurrent(stamp.target, proof.current);
+        // Terminal before providers can reenter; failed/late proof never sets
+        // settled and can neither issue more input nor retry this attestation.
+        const current = this.authority.settleContinuation(task.navigation, proof.original, proof.current);
+        if (performance.now() >= task.deadline || task.retired) throw this.failure(task, 'control_refused');
+        if (current) task.resultStamp = current;
         task.settled = true; task.sequences.clear();
-        // Navigation may legitimately replace the original document. It cannot
-        // replace recipient/grant/generation authority; no old action is issued
-        // against the new document by this context.
-        try {
-          const current = this.authority.capture(stamp.target, stamp.attachment.id, stamp.generation, true);
-          if (current.attachment !== stamp.attachment || current.recipientEpoch !== stamp.recipientEpoch || current.document !== proof.current)
-            throw this.failure(task);
-          task.resultStamp = current;
-        } catch { /* Genuine old work may settle during private Take; no result lease. */ }
         this.safe(task);
       },
     });
@@ -165,7 +178,34 @@ export class ActionQueue implements HandoffOperations {
   }
   private invalidate(event: Invalidation): void {
     for (const task of [...this.tasks]) if (task.stamp.target === event.target &&
-        (event.recipient === undefined || task.stamp.attachment.id === event.recipient)) this.cancelTask(task, 'control_changed');
+        (event.recipient === undefined || task.stamp.attachment.id === event.recipient)) {
+      // Only the already-issued exact navigation keeps a result/settlement
+      // continuation. Its raw dispatch remains fenced to the original stamp.
+      if (event.continuation && task.navigation === event.continuation && task.started && task.dispatched && !task.terminal && !task.retired) continue;
+      this.cancelTask(task, 'control_changed');
+    }
+    for (const preparation of this.preparations) if (preparation.target === event.target &&
+        (this.authority.wasClosed(event.target) || this.authority.state(event.target).generation !== preparation.generation))
+      preparation.controller.abort();
+  }
+  /** Real initial/readiness work is tracked even before a content stamp exists.
+   * The document producer additionally fences its own physical epoch/job on
+   * every continuation, including navigation it initiated itself. */
+  prepare(target: TabTarget, generation: number, work: (signal: AbortSignal, assertCurrent: () => void) => Promise<void>): Promise<void> {
+    this.authority.expected(target, generation);
+    if ([...this.preparations].some(value => value.target === target)) throw refused('control_refused');
+    let resolve!: () => void, reject!: (error: unknown) => void;
+    const completion = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
+    const preparation: Preparation = { target, generation, controller: new AbortController(), completion, retired: false };
+    this.preparations.add(preparation);
+    const assertCurrent = () => {
+      this.authority.expected(target, generation);
+      if (preparation.retired || preparation.controller.signal.aborted || !this.preparations.has(preparation) || target.page.retirement())
+        throw refused('control_changed');
+    };
+    void (async () => { assertCurrent(); await work(preparation.controller.signal, assertCurrent); assertCurrent(); })()
+      .then(resolve, reject).finally(() => { this.preparations.delete(preparation); }).catch(() => {});
+    return completion;
   }
   status(recipient: string, request: string): Readonly<{ target: TabTarget; mutation: boolean; action?: string;
     dispatchOutcome: Contract<'browser.Outcome'> }> | undefined {
@@ -184,11 +224,13 @@ export class ActionQueue implements HandoffOperations {
     this.invalidate({ target });
   }
   unsafe(target: TabTarget): boolean {
-    return [...this.tasks].some(task => task.stamp.target === target && !task.retired &&
+    return [...this.preparations].some(value => value.target === target && !value.retired) ||
+      [...this.tasks].some(task => task.stamp.target === target && !task.retired &&
       (task.issued.size !== 0 || task.sequences.size !== 0 || (task.dispatched && task.mutation && !task.settled) || (task.started && !task.workDone)));
   }
   async drain(target: TabTarget, _deadline: number): Promise<Contract<'browser.SettledAction'> | undefined> {
-    await Promise.all([...this.tasks].filter(task => task.stamp.target === target).map(task => task.safe));
+    await Promise.all([...this.tasks].filter(task => task.stamp.target === target).map(task => task.safe).concat(
+      [...this.preparations].filter(value => value.target === target).map(value => value.completion.catch(() => {}))));
     return this.outcome(target);
   }
   outcome(target: TabTarget): Contract<'browser.SettledAction'> | undefined {
@@ -198,5 +240,8 @@ export class ActionQueue implements HandoffOperations {
   retired(target: TabTarget): void {
     for (const task of [...this.tasks]) if (task.stamp.target === target) { task.retired = true; this.cancelTask(task, 'control_changed'); }
     this.slots.delete(target); this.interrupted.delete(target);
+    for (const preparation of [...this.preparations]) if (preparation.target === target) {
+      preparation.retired = true; this.preparations.delete(preparation); preparation.controller.abort();
+    }
   }
 }

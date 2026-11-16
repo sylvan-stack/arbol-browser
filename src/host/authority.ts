@@ -24,7 +24,17 @@ export interface DocumentReceipt {
 export interface DocumentAuthority {
   current(target: TabTarget): DocumentReceipt;
   assertCurrent(target: TabTarget, receipt: DocumentReceipt): void;
-  prepare(target: TabTarget, url: string): Promise<void>;
+  /** The real producer fences every command and continuation to this job and
+   * its current physical document/readiness epoch, including own navigation. */
+  prepare(target: TabTarget, url: string, context: { readonly signal: AbortSignal; assertCurrent(): void }): Promise<void>;
+  /** Prove this physical navigation is the expected successor of this exact
+   * already-issued action. An unrelated navigation cannot claim its ticket. */
+  assertSuccessor(target: TabTarget, original: DocumentReceipt, successor: DocumentReceipt,
+    action: string, operation: string): void;
+}
+export interface NavigationContinuation { readonly target: TabTarget; readonly action: string }
+interface ContinuationState {
+  stamp: AuthorityStamp; operation: string; valid: boolean; used: boolean; successor?: DocumentReceipt; successorEpoch?: number;
 }
 export interface AuthorityStamp {
   readonly target: TabTarget;
@@ -38,6 +48,7 @@ export interface Invalidation {
   readonly target: TabTarget;
   /** Absent means every recipient and every operation on the tab. */
   readonly recipient?: string;
+  readonly continuation?: NavigationContinuation;
 }
 interface Entry {
   target: TabTarget;
@@ -65,6 +76,8 @@ export class TabAuthority {
   private readonly invalidators = new Set<(event: Invalidation) => void>();
   private readonly snapshots = new Map<string, Snapshot>();
   private readonly closedTargets = new WeakSet<TabTarget>();
+  private readonly continuations = new WeakMap<NavigationContinuation, ContinuationState>();
+  private readonly activeContinuations = new Map<TabTarget, NavigationContinuation>();
   private sealed = false;
   constructor(readonly boundary: NativeFailureBoundary, readonly documents: DocumentAuthority) {
     assertCandidateTrust(boundary.native.trust); this.assertHealthy();
@@ -160,14 +173,18 @@ export class TabAuthority {
     catch { return this.exhausted(); }
   }
   /** This function and all registered invalidators must actually return void. */
-  invalidate(target: TabTarget, recipient?: string): void {
+  invalidate(target: TabTarget, recipient?: string, continuation?: NavigationContinuation): void {
     const entry = this.entry(target);
+    const active = this.activeContinuations.get(target);
+    if (active && active !== continuation && (recipient === undefined || this.continuations.get(active)?.stamp.attachment.id === recipient)) {
+      this.continuations.get(active)!.valid = false; this.activeContinuations.delete(target);
+    }
     if (recipient === undefined) entry.epoch = this.increment(entry.epoch);
     else entry.recipients.set(recipient, this.increment(entry.recipients.get(recipient) ?? 0));
     for (const [id, snapshot] of this.snapshots)
       if (snapshot.stamp.target === target && (recipient === undefined || snapshot.stamp.attachment.id === recipient)) this.snapshots.delete(id);
     try {
-      const event = Object.freeze({ target, ...(recipient === undefined ? {} : { recipient }) });
+      const event = Object.freeze({ target, ...(recipient === undefined ? {} : { recipient }), ...(continuation ? { continuation } : {}) });
       for (const invalidate of this.invalidators) { const result: unknown = invalidate(event); if (result !== undefined) return this.exhausted(); }
     } catch { return this.exhausted(); }
   }
@@ -229,7 +246,58 @@ export class TabAuthority {
   refreshDocument(target: TabTarget): DocumentReceipt {
     const receipt = this.document(target, false), entry = this.entry(target);
     if (entry.document !== receipt) { entry.ready = false; this.invalidate(target); entry.document = receipt; }
+    if (!receipt.ready) entry.ready = false;
     entry.availability = receipt.availability; return receipt;
+  }
+  beginContinuation(stamp: AuthorityStamp, action: string, operation: string): NavigationContinuation {
+    this.check(stamp, true);
+    if (!this.issued.has(action) || !validator('browser.ActionId')(action) || this.activeContinuations.has(stamp.target))
+      throw refused('control_refused');
+    const token = Object.freeze({ target: stamp.target, action });
+    this.continuations.set(token, { stamp, operation, valid: true, used: false });
+    this.activeContinuations.set(stamp.target, token); return token;
+  }
+  /** Called only by the real document producer at the exact expected navigation
+   * boundary. Default refreshDocument revokes every operation, including this. */
+  acceptNavigation(token: NavigationContinuation, successor: DocumentReceipt): void {
+    const record = this.continuations.get(token), entry = this.entry(token.target);
+    if (!record || !record.valid || record.used || this.activeContinuations.get(token.target) !== token) throw staleSnapshot();
+    const stamp = record.stamp;
+    this.owner(token.target, stamp.attachment.id, stamp.generation);
+    if (this.attachment(stamp.attachment.id) !== stamp.attachment || entry.epoch !== stamp.epoch ||
+        (entry.recipients.get(stamp.attachment.id) ?? 0) !== stamp.recipientEpoch || entry.document !== stamp.document ||
+        successor.page !== token.target.page || successor === stamp.document || successor.document === stamp.document.document ||
+        successor.epoch <= stamp.document.epoch || successor.navigation === stamp.document.navigation) throw staleSnapshot();
+    const proof: unknown = this.documents.assertSuccessor(token.target, stamp.document, successor, token.action, record.operation);
+    if (proof !== undefined) return this.exhausted();
+    this.documents.assertCurrent(token.target, successor);
+    if (this.documents.current(token.target) !== successor) throw staleSnapshot();
+    this.owner(token.target, stamp.attachment.id, stamp.generation);
+    if (!record.valid || record.used || this.activeContinuations.get(token.target) !== token || entry.epoch !== stamp.epoch ||
+        (entry.recipients.get(stamp.attachment.id) ?? 0) !== stamp.recipientEpoch || entry.document !== stamp.document ||
+        this.attachment(stamp.attachment.id) !== stamp.attachment) throw staleSnapshot();
+    // Consume before any invalidation callback reenters; no second successor.
+    record.used = true; record.successor = successor;
+    entry.ready = false; entry.document = successor; entry.availability = successor.availability;
+    this.invalidate(token.target, undefined, token); record.successorEpoch = entry.epoch;
+  }
+  /** Physical settlement may be known after Take, but it never renews lost
+   * authority. A successor must have been authenticated before invalidation. */
+  settleContinuation(token: NavigationContinuation, original: DocumentReceipt, current: DocumentReceipt): AuthorityStamp | undefined {
+    const record = this.continuations.get(token);
+    if (!record || record.stamp.document !== original || current !== (record.successor ?? original)) throw staleSnapshot();
+    this.assertHealthy(); this.documents.assertCurrent(token.target, current);
+    let result: AuthorityStamp | undefined;
+    try {
+      if (!record.valid || this.activeContinuations.get(token.target) !== token) throw staleSnapshot();
+      const stamp = this.capture(token.target, record.stamp.attachment.id, record.stamp.generation, true);
+      if (stamp.attachment !== record.stamp.attachment || stamp.recipientEpoch !== record.stamp.recipientEpoch || stamp.document !== current ||
+          stamp.epoch !== (record.successorEpoch ?? record.stamp.epoch)) throw staleSnapshot();
+      result = stamp;
+    } catch { /* No result lease; actual balanced old work can still drain. */ }
+    record.valid = false;
+    if (this.activeContinuations.get(token.target) === token) this.activeContinuations.delete(token.target);
+    return result;
   }
   /** Only the verified native/readiness adapter may publish initial readiness. */
   prepared(target: TabTarget, receipt: DocumentReceipt): void {
