@@ -5,6 +5,13 @@ import { assertPageRetirement, assertPageSurface, assertWindowHost, type PageSur
 
 export type TabState = Readonly<Contract<'browser.ShellTab'>>;
 export interface TabTarget { readonly id: string; readonly page: PageSurface }
+/** Host-created pending-open transaction, carried only by the actual inherited
+ * PopupBudget. Never reconstructed by scanning a client's unrelated tabs. */
+export interface AgentOpenScope {
+  assertCurrent(source?: TabTarget): void;
+  registered(target: TabTarget, opener?: TabTarget): void;
+  failed(target: TabTarget): Promise<void>;
+}
 /** ABR-10 supplies the sole authority; ABR-11 supplies current-document preparation.
  * No default implementation can register a grant or claim a ready document. */
 export interface TabLifecycle {
@@ -35,7 +42,7 @@ export interface TabRegistry {
   get(id: string): TabTarget;
   state(target: TabTarget): TabState;
   openUser(window: WindowHost, url?: string): Promise<TabTarget>;
-  openAgent(window: WindowHost, client: string, label: string, url: string): Promise<TabTarget>;
+  openAgent(window: WindowHost, client: string, label: string, url: string, scope: AgentOpenScope): Promise<TabTarget>;
   select(window: WindowHost, id: string): TabTarget;
   selected(window: WindowHost): TabTarget | undefined;
   closeUser(window: WindowHost, id: string, generation: number): Promise<void>;
@@ -60,7 +67,7 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
   const retirements = new WeakMap<TabTarget, PendingRetirement>();
   const registered = new WeakSet<TabTarget>();
   const windowClosures = new WeakMap<WindowHost, Promise<void>>();
-  interface PopupBudget { count: number; client: string; active: boolean }
+  interface PopupBudget { count: number; client: string; active: boolean; scope?: AgentOpenScope }
   const actions = new Map<TabTarget, { generation: number; budget: PopupBudget }>();
   const finishBudget = (budget: PopupBudget) => {
     budget.active = false;
@@ -121,13 +128,18 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
     const pending = prepareRetirement(target); pending.start(); return pending.promise;
   }
   async function open(window: WindowHost, url: string, creator?: Contract<'browser.ClientIdentity'>,
-    inherited?: TabState, inheritedBudget?: PopupBudget, background = false): Promise<TabTarget> {
+    inherited?: TabState, inheritedBudget?: PopupBudget, background = false, scope?: AgentOpenScope, opener?: TabTarget): Promise<TabTarget> {
     lifecycle.assertAdmission(); assertWindowHost(window); url = userURL(url);
     if (windowClosures.has(window)) throw refused('control_refused', 'This browser window is closing.');
     if (tabs.size >= 64) throw refused('control_refused', 'Close an existing tab before opening another.');
     if (creator && !lifecycle.connected(creator.id)) throw refused('control_refused');
-    const budget = creator ? inheritedBudget ?? { count: 0, client: creator.id, active: true } : undefined;
+    if (creator && !inheritedBudget && !scope) throw refused('control_refused');
+    const budget: PopupBudget | undefined = creator ? inheritedBudget ?? { count: 0, client: creator.id, active: true, ...(scope ? { scope } : {}) } : undefined;
+    const scopeCurrent = (source: TabTarget | undefined = opener) => {
+      if (budget?.scope) { const result: unknown = budget.scope.assertCurrent(source); if (result !== undefined) return lifecycle.exhausted(); }
+    };
     if (budget && (!budget.active || budget.count >= 10 || budget.client !== creator?.id)) throw refused('control_refused');
+    scopeCurrent();
     if (budget) budget.count++; // shared by every descendant; includes the initial agent-open tab
     const target = Object.freeze({ id: tabId(() => lifecycle.exhausted()), page: window.createPage() });
     const initial: TabState = { tab: target.id, generation: 1, controller: creator
@@ -140,6 +152,11 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
       if (!background && (!creator || !selection.has(window))) { selection.set(window, target); window.select(target.page); }
       lifecycle.register(target, initial);
       registered.add(target);
+      if (budget?.scope) {
+        const result: unknown = budget.scope.registered(target, opener);
+        if (result !== undefined) return lifecycle.exhausted();
+        scopeCurrent(target);
+      }
       if (budget) actions.set(target, { generation: 1, budget });
       target.page.view.webContents.setWindowOpenHandler(details => {
         // Always deny the engine route: frameName is never used to retarget an existing tab.
@@ -154,12 +171,14 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
       });
       target.page.view.webContents.on('will-prevent-unload', event => event.preventDefault());
       await lifecycle.prepare(target, url);
+      scopeCurrent(target);
       assertTarget(target);
       if (creator && (!lifecycle.connected(creator.id) || state(target).controller.kind !== 'agent')) throw refused('control_changed');
       lifecycle.changed(); return target;
     } catch (error) {
       // No failed open may retain an unreported lease. Retirement failures remain profile-fatal.
-      if (tabs.has(target.id) && !closing.has(target)) await retire(target);
+      if (registered.has(target) && budget?.scope) await budget.scope.failed(target);
+      else if (tabs.has(target.id) && !closing.has(target)) await retire(target);
       throw error;
     } finally {
       if (budget && !inheritedBudget) finishBudget(budget);
@@ -173,14 +192,14 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
     const action = actions.get(opener);
     if (!action || action.generation !== before.generation || action.budget.client !== before.controller.client ||
         !action.budget.active || action.budget.count >= 10 || !lifecycle.connected(action.budget.client)) throw refused('control_refused');
-    return open(opener.page.window, url, { id: action.budget.client, label: before.controller.label }, before, action.budget);
+    return open(opener.page.window, url, { id: action.budget.client, label: before.controller.label }, before, action.budget, false, undefined, opener);
   }
   const registry: TabRegistry = Object.freeze({
     all: () => [...tabs.values()].filter(target => !closing.has(target) && !windowClosures.has(target.page.window)),
     get(id: string) { const target = tabs.get(id); if (!target) throw refused('tab_not_found'); assertTarget(target); return target; },
     state,
     openUser: (window: WindowHost, url = 'about:blank') => open(window, url),
-    openAgent: (window: WindowHost, client: string, label: string, url: string) => open(window, url, { id: client, label }),
+    openAgent: (window: WindowHost, client: string, label: string, url: string, scope: AgentOpenScope) => open(window, url, { id: client, label }, undefined, undefined, false, scope),
     select(window: WindowHost, id: string) {
       const target = registry.get(id); if (target.page.window !== window) throw refused('tab_not_found');
       selection.set(window, target); window.select(target.page); return target;

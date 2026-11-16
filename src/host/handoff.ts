@@ -4,7 +4,7 @@ import { setTimeout as pause } from 'node:timers/promises';
 import type { Contract } from '../contracts/generated.js';
 import { bindingKey } from '../native/retirement.js';
 import { TabAuthority, type DocumentReceipt } from './authority.js';
-import { refused, userURL, assertTabRegistry, type TabLifecycle, type TabRegistry, type TabState, type TabTarget } from './tabs.js';
+import { refused, userURL, assertTabRegistry, type AgentOpenScope, type TabLifecycle, type TabRegistry, type TabState, type TabTarget } from './tabs.js';
 import { assertPageRetirement, assertPageSurface, assertWindowHost, type PageRetirement, type PageSurface, type WindowHost } from './windows.js';
 import { ActionQueue, type ActionExecution } from './actions.js';
 import { DeliveryAuthority, responseBytes, type DeliveryProof } from './delivery.js';
@@ -255,7 +255,12 @@ export interface OwnershipHost {
   runEnd(attachment: string): void;
   healthFailure(target: TabTarget): Promise<void>;
 }
-interface PendingOpen { action: string; recipient: string; request: string; targets: Set<TabTarget>; cancelled: boolean }
+interface ScopedTarget { page: PageSurface; generation: number; grantEpoch: number | undefined; parent?: TabTarget }
+interface PendingOpen {
+  action: string; recipient: string; request: string; targets: Map<TabTarget, ScopedTarget>;
+  cancelled: boolean; committed: boolean; root?: TabTarget;
+  failedRoots: Set<TabTarget>;
+}
 interface StagedProof { proof: DeliveryProof; invalidated: boolean; listDigest?: string }
 /** Closed canonical contribution. This does not launch, install, choose a
  * profile, construct an EngineAuthority or qualify/open ordinary entry. */
@@ -268,7 +273,7 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
     if (typeof operations[method] !== 'function') throw unavailable('browser');
   const authority = new TabAuthority(boundary, documents);
   let phase: 'prepared' | 'live' | 'closed' = 'prepared';
-  let registry: TabRegistry | undefined, runtime: HostLifecycle | undefined, opening: PendingOpen | undefined, everBound = false;
+  let registry: TabRegistry | undefined, runtime: HostLifecycle | undefined, everBound = false;
   const windows = new Map<WindowHost, ShellRegistration>();
   const contexts = new Map<string, ConnectionContext>(), attempted = new WeakSet<ConnectionContext>();
   const disconnected = new WeakSet<ConnectionContext>(), cleanups = new Map<string, Promise<void>>();
@@ -276,6 +281,7 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
   const opens = new Map<ConnectionContext, Map<string, PendingOpen>>();
   const requests = new Map<ConnectionContext, Map<string, Request>>();
   const staged = new Map<ConnectionContext, Map<string, StagedProof>>();
+  const tentativeWork = new Map<string, Set<Promise<void>>>(), retiring = new WeakMap<PageSurface, Promise<void>>();
   const hash = (value: Uint8Array) => createHash('sha256').update(value).digest('hex');
   const tabs = () => { if (!registry) throw unavailable('browser'); assertTabRegistry(registry); return registry; };
   const prepared = () => { assertNativeFailureBoundary(boundary); if (phase === 'closed') throw unavailable('browser'); };
@@ -352,8 +358,9 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
       assertPageSurface(target.page);
       if (initial.has(target) || authority.knowsTarget(target)) return authority.exhausted();
       initial.set(target, { page: target.page, closed: false });
-      live(); authority.register(target, state); initial.delete(target);
-      if (opening && state.controller.kind === 'agent' && state.controller.client === opening.recipient) opening.targets.add(target);
+      live();
+      if (state.controller.kind === 'agent' && !authority.connected(state.controller.client)) throw refused('control_refused');
+      authority.register(target, state); initial.delete(target);
     },
     state: target => authority.state(target),
     invalidate(target): void {
@@ -371,29 +378,126 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
       if (!pending?.closed || pending.page !== target.page) return authority.exhausted(); initial.delete(target);
     },
     async prepare(target, url) {
-      live(); const generation = authority.state(target).generation;
+      live(); const before = authority.state(target), generation = before.generation;
       await queue.prepare(target, generation, async (signal, assertCurrent) => {
-        await documents.prepare(target, url, { signal, assertCurrent }); assertCurrent();
+        const guarded = () => {
+          assertCurrent();
+          if (before.controller.kind === 'agent') authority.owner(target, before.controller.client, generation);
+          else if (authority.state(target).controller.kind !== 'user') throw refused('control_changed');
+        };
+        await documents.prepare(target, url, { signal, assertCurrent: guarded }); guarded();
         const receipt = authority.refreshDocument(target); markPrepared(target, generation, receipt);
       });
     },
     changed: () => authority.changed(), exhausted: () => authority.exhausted(),
   });
+  const trackCleanup = (recipient: string, work: Promise<void>): Promise<void> => {
+    let pending = tentativeWork.get(recipient);
+    if (!pending) { pending = new Set(); tentativeWork.set(recipient, pending); }
+    pending.add(work);
+    void work.then(() => {}, () => boundary.fatal.fail('native_retirement_unavailable')).finally(() => {
+      pending!.delete(work); if (!pending!.size && tentativeWork.get(recipient) === pending) tentativeWork.delete(recipient);
+    }).catch(() => {});
+    return work;
+  };
+  const closeScoped = (record: PendingOpen, target: TabTarget): Promise<void> => {
+    const original = record.targets.get(target);
+    if (!original) return Promise.reject(unavailable('browser'));
+    // A later explicit Return to this recipient is independent authority. An
+    // old request may not revoke it merely because the physical page is shared.
+    if (authority.newerLease(target, record.recipient, original.generation)) return Promise.resolve();
+    const revokeResidual = () => {
+      if (original.grantEpoch !== undefined && authority.grantEpoch(target, record.recipient) === original.grantEpoch)
+        authority.revoke(target, record.recipient);
+    };
+    if (target.page !== original.page) {
+      const receipt = original.page.retirement();
+      if (!receipt) return authority.exhausted(); assertPageRetirement(original.page, receipt);
+      if (receipt.phase !== 'retired') return authority.exhausted();
+      if (authority.knowsTarget(target) && !authority.wasClosed(target)) revokeResidual();
+      return Promise.resolve();
+    }
+    if (!authority.wasClosed(target)) {
+      if (!authority.knowsTarget(target)) return authority.exhausted();
+      revokeResidual();
+      const state = authority.state(target);
+      if (state.controller.kind !== 'agent' || state.controller.client !== record.recipient || state.generation !== original.generation) {
+        // Preserve a person's Take and its genuine native drain. New grants
+        // with another epoch and another controller are never swept.
+        return state.controller.kind === 'user' && state.handoff === 'taking' && state.generation === original.generation + 1
+          ? trackCleanup(record.recipient, handoff.settleOwnership(target, original.generation)) : Promise.resolve();
+      }
+    }
+    const previous = retiring.get(original.page); if (previous) return previous;
+    let resolve!: () => void, reject!: (error: unknown) => void;
+    const completion = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
+    retiring.set(original.page, completion); // before native/selection callbacks
+    let work: Promise<void>;
+    try {
+      work = authority.wasClosed(target) ? handoff.settleOwnership(target, original.generation)
+        : tabs().closeUser(target.page.window, target.id, original.generation);
+    } catch (error) {
+      if (authority.wasClosed(target)) work = handoff.settleOwnership(target, original.generation);
+      else {
+        const state = authority.state(target);
+        if (state.generation !== original.generation || state.controller.kind !== 'agent' || state.controller.client !== record.recipient)
+          work = Promise.resolve();
+        else work = Promise.reject(error);
+      }
+    }
+    void work.then(resolve, reject);
+    return trackCleanup(record.recipient, completion);
+  };
+  const failOpen = (record: PendingOpen, failed?: TabTarget): Promise<void> => {
+    const whole = failed === undefined || failed === record.root;
+    if (whole) record.cancelled = true; // fence the real budget before callbacks
+    else if (failed) record.failedRoots.add(failed);
+    const affected = [...record.targets.keys()].filter(target => {
+      if (whole || target === failed) return true;
+      let parent = record.targets.get(target)?.parent;
+      while (parent) { if (parent === failed) return true; parent = record.targets.get(parent)?.parent; }
+      return false;
+    });
+    return Promise.all(affected.map(target => closeScoped(record, target))).then(() => {});
+  };
+  const scopeFor = (context: ConnectionContext, record: PendingOpen): AgentOpenScope => Object.freeze<AgentOpenScope>({
+    assertCurrent(source) {
+      live(); delivery.assertContext(context);
+      if (record.cancelled || context.signal.aborted || context.attachment?.id !== record.recipient ||
+          (!record.committed && opens.get(context)?.get(record.request) !== record)) throw refused('control_changed');
+      let current = source;
+      while (current) {
+        if (record.failedRoots.has(current)) throw refused('control_changed');
+        const captured = record.targets.get(current); if (!captured) return authority.exhausted(); current = captured.parent;
+      }
+    },
+    registered(target, opener) {
+      if (!authority.knowsTarget(target) || record.targets.has(target) || (opener && !record.targets.has(opener)) ||
+          (!opener && record.root !== undefined)) return authority.exhausted();
+      record.targets.set(target, { page: target.page, generation: 1, grantEpoch: authority.grantEpoch(target, record.recipient),
+        ...(opener ? { parent: opener } : {}) });
+      if (!opener) record.root = target;
+    },
+    failed: target => failOpen(record, target),
+  });
   const disconnect = (id: string): void => {
     const context = contexts.get(id);
     if (!context && !authority.connected(id)) return;
     if (context && disconnected.has(context)) return;
+    const pendingOpens = context ? [...(opens.get(context)?.values() ?? [])].filter(record => !record.committed) : [];
     if (context) {
       disconnected.add(context); delivery.disconnect(context);
-      for (const record of opens.get(context)?.values() ?? []) record.cancelled = true;
+      for (const record of pendingOpens) record.cancelled = true;
       opens.delete(context); contexts.delete(id);
       requests.delete(context);
       staged.delete(context);
     }
     const targets = authority.detach(id), pending: Promise<unknown>[] = [];
+    for (const record of pendingOpens) pending.push(failOpen(record));
     // Identity is gone before native/abort callbacks; all grants and references
     // are synchronously closed before asynchronous settlement is joined.
     for (const target of targets) {
+      if (authority.wasClosed(target)) { pending.push(handoff.settleOwnership(target, 1)); continue; }
       const state = authority.state(target);
       if (state.controller.kind === 'agent' && state.controller.client === id) pending.push(handoff.settleOwnership(target, state.generation));
       authority.revoke(target, id);
@@ -412,14 +516,17 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
     },
     closeAdmission() { phase = 'closed'; authority.closeAdmission(); }, disconnect,
     async settleDisconnect(id, deadline) {
-      const cleanup = cleanups.get(id); if (cleanup) { await bounded(deadline, () => cleanup); if (cleanups.get(id) === cleanup) cleanups.delete(id); }
+      const cleanup = cleanups.get(id), pending = [...(tentativeWork.get(id) ?? [])];
+      await bounded(deadline, () => Promise.all([...(cleanup ? [cleanup] : []), ...pending]).then(() => {}));
+      if (cleanups.get(id) === cleanup) cleanups.delete(id);
     },
     async retireAll(deadline) {
       if (!registry) {
-        if (windows.size !== 0 || initial.size !== 0) return authority.exhausted(); return;
+        if (windows.size !== 0 || initial.size !== 0 || tentativeWork.size !== 0) return authority.exhausted(); return;
       }
       const actualRegistry = tabs();
-      await bounded(deadline, () => Promise.all([...windows.keys()].map(host => actualRegistry.closeWindow(host))).then(() => {}));
+      await bounded(deadline, () => Promise.all([...windows.keys()].map(host => actualRegistry.closeWindow(host))
+        .concat([...tentativeWork.values()].flatMap(values => [...values]))).then(() => {}));
     },
     windowCount: () => [...windows.keys()].filter(host => !host.window.isDestroyed()).length,
   });
@@ -509,12 +616,11 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
           else if (params.name === 'browser_tabs_list') {
             value = projectAgentTabs(tabs(), recipient, id => authority.connected(id)); proof = { kind: 'tabs', recipient };
           } else if (params.name === 'browser_tab_open') {
-            const record: PendingOpen = { action: authority.opaque('act'), recipient, request: request.id, targets: new Set(), cancelled: false };
+            const record: PendingOpen = { action: authority.opaque('act'), recipient, request: request.id, targets: new Map(),
+              cancelled: false, committed: false, failedRoots: new Set() };
             opens.get(context)!.set(request.id, record); delivery.noteOutcome(context, request, { action: record.action, dispatchOutcome: 'not_dispatched' });
-            let pending: Promise<TabTarget>;
-            const previous = opening; opening = record;
-            try { pending = tabs().openAgent(windowForOpen(), recipient, context.attachment!.label, userURL(params.arguments.url ?? 'about:blank')); }
-            finally { opening = previous; }
+            const pending = tabs().openAgent(windowForOpen(), recipient, context.attachment!.label,
+              userURL(params.arguments.url ?? 'about:blank'), scopeFor(context, record));
             if (record.targets.size) delivery.noteOutcome(context, request, { action: record.action, dispatchOutcome: 'outcome_unknown' });
             const target = await pending;
             if (record.cancelled || signal.aborted || performance.now() >= deadline || !record.targets.has(target)) throw new BrowserFailure({
@@ -597,8 +703,17 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
       }
       delivery.assertContext(context);
     },
-    commitResponse: (context, request, success, bytes) => success ? delivery.commit(context, request, bytes) : delivery.commitFailure(context, request, bytes),
+    commitResponse(context, request, success, bytes) {
+      if (success) {
+        delivery.commit(context, request, bytes);
+        const record = opens.get(context)?.get(request.id); if (record) record.committed = true;
+      } else delivery.commitFailure(context, request, bytes);
+    },
     redactedFailure(context, request, error) {
+      // Failure disclosure does not retain an unreported lease until finally.
+      // Start exact scope closure now; forget remains a defensive backstop.
+      const open = opens.get(context)?.get(request.id);
+      if (open && !open.committed) void failOpen(open).catch(() => boundary.fatal.fail('native_retirement_unavailable'));
       let mapped = error;
       const record = staged.get(context)?.get(request.id);
       if (record && error instanceof BrowserFailure && error.detail.code === 'browser_unavailable' && request.method === 'tool') {
@@ -625,6 +740,8 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
       return delivery.redactedFailure(context, request, mapped);
     },
     forget(context, request) {
+      const record = opens.get(context)?.get(request.id);
+      if (record && !record.committed) void failOpen(record).catch(() => boundary.fatal.fail('native_retirement_unavailable'));
       delivery.forget(context, request); opens.get(context)?.delete(request.id); requests.get(context)?.delete(request.id); staged.get(context)?.delete(request.id);
     },
     disconnect(context) {
@@ -641,12 +758,7 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
       if (context.endpoint === 'management') return; // lookup ACK is not cancellation/rollback proof
       const recipient = client(context), status = queue.status(recipient, request), open = opens.get(context)?.get(request);
       if (open) {
-        open.cancelled = true;
-        for (const target of open.targets) if (authority.knowsTarget(target) && !authority.wasClosed(target)) {
-          const state = authority.state(target);
-          if (state.controller.kind === 'agent' && state.controller.client === recipient) void handoff.take(target, state.generation).catch(() => {});
-          authority.revoke(target, recipient);
-        }
+        void failOpen(open).catch(() => boundary.fatal.fail('native_retirement_unavailable'));
         authority.changed();
       }
       if (status) {

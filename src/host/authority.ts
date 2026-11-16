@@ -88,6 +88,7 @@ export class TabAuthority {
   private readonly activeContinuations = new Map<TabTarget, NavigationContinuation>();
   private readonly receipts = new WeakSet<CompletedTransition>();
   private readonly creators = new WeakMap<TabTarget, string>();
+  private readonly admissions = new WeakMap<TabTarget, Map<string, number>>();
   private readonly takes = new WeakMap<TabTarget, { owner: string; from: number; to: number; recipientEpoch: number }>();
   private readonly closes = new WeakMap<TabTarget, { owner?: string; from: number; to: number }>();
   private sealed = false;
@@ -133,6 +134,13 @@ export class TabAuthority {
   }
   targets(): readonly TabTarget[] { return [...this.entries.values()].filter(entry => !entry.closed).map(entry => entry.target); }
   knowsTarget(target: TabTarget): boolean { return this.entries.has(target) && this.ids.get(target.id) === target; }
+  grantEpoch(target: TabTarget, recipient: string): number | undefined {
+    const entry = this.entries.get(target);
+    return this.ids.get(target.id) === target && entry?.grants.has(recipient) ? entry.recipients.get(recipient) ?? 0 : undefined;
+  }
+  newerLease(target: TabTarget, recipient: string, generation: number): boolean {
+    return (this.admissions.get(target)?.get(recipient) ?? 0) > generation;
+  }
   assertDocument(target: TabTarget, receipt: DocumentReceipt): void {
     try { const result: unknown = this.documents.assertCurrent(target, receipt); if (result !== undefined) return this.exhausted(); }
     catch { this.assertHealthy(); throw staleSnapshot(); }
@@ -152,13 +160,20 @@ export class TabAuthority {
         initial.pageAvailability !== 'unavailable' || this.entries.size >= 64) return this.exhausted();
     const binding = target.page.binding();
     if (!binding.blocked || binding.retired || binding.webContentsId !== target.page.view.webContents.id) return this.exhausted();
-    const grants = new Set(initial.visibleTo);
-    if (initial.controller.kind === 'user' ? grants.size !== 0 : !grants.has(initial.controller.client) || [...grants].some(id => !this.connected(id)))
-      return this.exhausted();
+    const grants = new Set(initial.visibleTo.filter(id => this.connected(id)));
+    if (initial.controller.kind === 'user') { if (initial.visibleTo.length !== 0) return this.exhausted(); }
+    else {
+      // Native binding callbacks can synchronously disconnect the creator.
+      // This is a refused tentative open, not an uncertain native binding.
+      if (!this.connected(initial.controller.client)) throw refused('control_refused');
+      if (!grants.has(initial.controller.client)) return this.exhausted();
+    }
     this.issued.add(target.id); this.ids.set(target.id, target);
     this.entries.set(target, { target, generation: 1, epoch: 1, controller: { ...initial.controller }, grants,
       recipients: new Map(), handoff: 'idle', ready: false, availability: 'unavailable', closed: false, retired: false });
-    if (initial.controller.kind === 'agent') this.creators.set(target, initial.controller.client);
+    if (initial.controller.kind === 'agent') {
+      this.creators.set(target, initial.controller.client); this.admissions.set(target, new Map([[initial.controller.client, 1]]));
+    }
   }
   state(target: TabTarget): TabState {
     this.assertHealthy(); const entry = this.entry(target);
@@ -240,6 +255,8 @@ export class TabAuthority {
       throw refused('control_refused');
     const entry = this.entry(target); entry.generation = this.increment(entry.generation);
     entry.controller = { kind: 'agent', client: recipient, label: this.attachment(recipient).label };
+    let admissions = this.admissions.get(target); if (!admissions) { admissions = new Map(); this.admissions.set(target, admissions); }
+    admissions.set(recipient, entry.generation);
     entry.document = document; entry.ready = true; entry.availability = 'ready'; this.invalidate(target);
   }
   /** Close visibility synchronously before ABR-9 starts actual native retirement. */
