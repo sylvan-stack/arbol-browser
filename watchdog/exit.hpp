@@ -624,7 +624,7 @@ struct NativeFile {
   ~NativeFile() { if(fd>=0) close(fd); }
   bool finish() { if(fd<0) return true; int original=fd; fd=-1; return !close(original); }
 };
-inline bool readNativeFile(int directory,const std::string& name,std::string& raw,struct stat& identity,size_t limit=exitReceiptLimit) {
+inline bool readNativeFile(int directory,const std::string& name,std::string& raw,struct stat& identity,size_t limit) {
   NativeFile file; file.fd=openat(directory,name.c_str(),O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC); if(file.fd<0) return false;
   struct stat first{},named{},last{},after{}; raw.clear();
   bool ok=!fstat(file.fd,&first)&&!fstatat(directory,name.c_str(),&named,AT_SYMLINK_NOFOLLOW)&&
@@ -1139,7 +1139,7 @@ public:
     NSDictionary* cleanMarker=@{@"identity":fileIdentity(cleanIdentity),@"digest":arbol_attempt::digest(cleanRaw),@"value":clean};
     std::string actualClean,actualJournal; struct stat checkedClean{},checkedJournal{};
     if(!ordinaryCurrent(c,deadline)||!readNativeFile(root.fd,"engine.json",actualClean,checkedClean,arbol_attempt::limit)||actualClean!=cleanRaw||
-       !arbol_attempt::sameFile(cleanIdentity,checkedClean)||!readNativeFile(receipts.fd,"proof.json",actualJournal,checkedJournal)||
+       !arbol_attempt::sameFile(cleanIdentity,checkedClean)||!readNativeFile(receipts.fd,"proof.json",actualJournal,checkedJournal,exitReceiptLimit)||
        actualJournal!=journalRaw||!arbol_attempt::sameFile(journalIdentity,checkedJournal)||
        ![family_->frontierTuple() isEqual:ordinaryProof_[@"family"]]) return false;
     NSDictionary* activation=@{@"format":@1,@"kind":@"activated-exit",@"bootSession":value_[@"bootSession"],
@@ -1168,7 +1168,7 @@ public:
     std::string checkedClaim; struct stat claimIdentity{},heldClaim{},afterClaim{};
     if(finalClaim.fd<0||fstat(finalClaim.fd,&heldClaim)||!arbol_attempt::privateFile(heldClaim)||
        fsync(finalClaim.fd)||fcntl(finalClaim.fd,F_FULLFSYNC)||fsync(claim.at.directory)||
-       !readNativeFile(claim.at.directory,"claim.json",checkedClaim,claimIdentity)||checkedClaim!=closedRaw||
+       !readNativeFile(claim.at.directory,"claim.json",checkedClaim,claimIdentity,arbol_attempt::limit)||checkedClaim!=closedRaw||
        fstat(finalClaim.fd,&afterClaim)||!arbol_attempt::sameFile(heldClaim,afterClaim)||!arbol_attempt::sameFile(afterClaim,claimIdentity)||
        !arbol_attempt::unchanged(claim.at)||!ordinaryCurrent(c,deadline)||!finalClaim.finish()||!root.finish()||!receipts.finish()) return false;
     result.path=activationPath.fileSystemRepresentation; result.digest=[arbol_attempt::digest(activationRaw) UTF8String];
