@@ -2,9 +2,10 @@ import { setTimeout } from 'node:timers/promises';
 import type { Contract } from '../contracts/generated.js';
 import { unavailable, BrowserFailure } from '../contracts/errors.js';
 import { preflightPageAdmission } from './bootstrap.js';
+import { isHostCustody } from './custody.js';
 import type { PlatformPort, GroupProcess } from './platform.js';
 import type { BuildSelection } from './selection.js';
-import { connectRuntime, type RuntimeClient, type Endpoint, type TransportServer, type ConnectionContext } from './transport.js';
+import { openProtectedReady, connectRuntime, type RuntimeClient, type Endpoint, type TransportServer, type ConnectionContext } from './transport.js';
 import { runtimeLocation, readRuntime, originalAlive, now, startupDeadline, neverOpenedExit,
   token, assertTime, type RuntimeRecord, type PreviousExit } from './instance.js';
 import { assertProfile, type ProfileSnapshot } from '../profiles/records.js';
@@ -265,8 +266,13 @@ export interface HostNativeLifetime {
 }
 /** One authoritative host; no automatic restart and no saved action/lease state. */
 export function createHostLifecycle(prepared: HostPreparation, sessions: ProfileSessions, transport: TransportServer,
-  control: HostControlPort, native: HostNativeLifetime): HostLifecycle {
+  control: HostControlPort, native: HostNativeLifetime, productionDeadline?: number): HostLifecycle {
+  const production = isHostCustody(prepared.custody);
+  if (production && (productionDeadline === undefined || !Number.isFinite(productionDeadline) || now() >= productionDeadline))
+    return prepared.custody.terminate();
+  if (!production && productionDeadline !== undefined) throw unavailable('browser');
   let phase: 'starting' | 'ready' | 'closing' | 'fatal' = 'starting';
+  let admitted = false;
   let closing: Promise<void> | undefined;
   let arming: Promise<void> | undefined, readyPublication: Promise<void> | undefined;
   let readyAttempt: Promise<void> | undefined;
@@ -275,10 +281,10 @@ export function createHostLifecycle(prepared: HostPreparation, sessions: Profile
   const currentPhase = (): HostLifecycle['phase'] => phase;
   const arm = () => arming ??= Promise.resolve().then(() => native.armRetainedLifetime(prepared));
   function synchronous(work: () => void): void { const result: unknown = work(); if (result !== undefined) throw unavailable('browser'); }
-  function closeAdmission() { synchronous(() => control.closeAdmission()); synchronous(() => transport.closeAdmission()); }
+  function closeAdmission() { admitted = false; synchronous(() => control.closeAdmission()); synchronous(() => transport.closeAdmission()); }
   function fatal(): void {
     if (phase === 'fatal') return;
-    phase = 'fatal';
+    phase = 'fatal'; admitted = false;
     // Independent fatal enforcement comes first, even when control cleanup throws.
     try { native.quarantine(); } finally {
       try { synchronous(() => control.closeAdmission()); } finally { synchronous(() => transport.closeAdmission()); }
@@ -335,16 +341,31 @@ export function createHostLifecycle(prepared: HostPreparation, sessions: Profile
       // later normal close so phase writes cannot race or resurrect readiness.
       phase = 'ready'; readyPublication = prepared.instance.phase('ready'); await readyPublication;
       if (phase !== 'ready') throw unavailable('browser');
-      synchronous(() => control.openAdmission());
-      if (phase !== 'ready') throw unavailable('browser');
-      synchronous(() => transport.openAdmission());
+      if (production) {
+        if (productionDeadline === undefined) return prepared.custody.terminate();
+        assertTime(productionDeadline);
+        await prepared.custody.host.assertTrusted(productionDeadline);
+        const generation = prepared.instance.record;
+        const guard = () => {
+          assertTime(productionDeadline);
+          if (phase !== 'ready' || prepared.instance.record !== generation) return prepared.custody.terminate();
+          prepared.custody.assertRetained();
+        };
+        guard(); openProtectedReady(transport, prepared.custody, generation, guard, () => control.openAdmission());
+        admitted = true;
+      } else {
+        // Explicit Foundation infrastructure retains its existing contract.
+        synchronous(() => control.openAdmission());
+        if (phase !== 'ready') throw unavailable('browser');
+        synchronous(() => transport.openAdmission()); admitted = true;
+      }
       } catch (error) { if (currentPhase() !== 'closing') fatal(); throw error; }
     })().then(resolve, reject);
     return result;
   };
   const lifecycle: HostLifecycle = Object.freeze({
     get phase() { return phase; }, fatal, ready,
-    assertAdmission() { if (phase !== 'ready') throw unavailable('browser'); },
+    assertAdmission() { if (phase !== 'ready' || !admitted) throw unavailable('browser'); },
     disconnect(context: ConnectionContext) {
       if (!context.attachment) return;
       if (disconnected.has(context)) return; disconnected.add(context);

@@ -203,6 +203,61 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
         await setTimeout(Math.min(10, Math.max(1, deadline - now())));
       }
     },
+    async admitted(profile: ProfileSnapshot, record: RuntimeRecord, deadline: number, request?: string) {
+      const own = request ? pending.get(request) : undefined;
+      if (request && !own) throw unavailable('browser');
+      for (;;) {
+        assertTime(deadline);
+        const admitted = await withLaunchAttempt(profile, platform, deadline, transaction => {
+          const current = transaction.current;
+          if (!current || current.profileInstance !== profile.record.instance || current.profile !== profile.paths.root ||
+              current.profilePathHash !== record.profilePathHash || (own &&
+                (current.request !== own.request || current.nonce !== own.nonce || current.buildRoot !== own.buildRoot ||
+                 current.sourceDigest !== own.sourceDigest || current.productDigest !== own.productDigest ||
+                 current.candidateDigest !== own.candidateDigest))) throw unavailable('browser');
+          if (current.phase === 'cancelled' || current.phase === 'closing' || current.phase === 'closed') throw unavailable('browser');
+          if (current.phase !== 'ready') {
+            if (current.expires <= platform.continuousTime()) throw unavailable('browser');
+            return undefined;
+          }
+          if (current.stage !== 'admitted' || !current.runtime || current.runtime.phase !== 'ready' ||
+              !current.engine || !current.bootstrap ||
+              current.runtime.instance !== record.instance || current.runtime.nonce !== record.nonce || current.runtime.build !== record.build ||
+              current.runtime.pid !== record.pid || current.runtime.processStartId !== record.processStartId ||
+              current.runtime.agentSocket !== record.agentSocket || current.runtime.managementSocket !== record.managementSocket ||
+              current.build !== record.build) throw unavailable('browser');
+          const live = platform.processProvenance(record.pid);
+          if (!live || (['pid', 'uid', 'startId', 'pidVersion', 'group', 'session', 'parentStartId', 'parentPidVersion', 'executable'] as const)
+              .some(key => live[key] !== current.engine![key]) || current.engine.pid !== current.bootstrap.pid ||
+              current.engine.startId !== current.bootstrap.startId || current.engine.pidVersion === current.bootstrap.pidVersion ||
+              current.engine.executable !== join(current.buildRoot, 'ArbolBrowser.app/Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron') ||
+              current.bootstrap.executable !== join(current.buildRoot, 'ArbolBrowser.app/Contents/MacOS/arbol-browser-native')) throw unavailable('browser');
+          return current;
+        });
+        if (admitted) {
+          const selected = Object.freeze({ build: admitted.build, directory: admitted.buildRoot, guard: admitted.buildGuard, explicit: true });
+          const lease = await acquireBuildLease(selected, platform);
+          try {
+            const authorityURL = new URL('./authorities.js', import.meta.url).href;
+            const authorities = await import(authorityURL) as typeof import('./authorities.js');
+            const originalHost = own ? host : await authorities.verifyPackagedHost(selected,
+              join(admitted.buildRoot, 'ArbolBrowser.app/Contents/Resources/browser'), deadline);
+            if (originalHost.signed.snapshotDigest !== admitted.candidateDigest || originalHost.identity.sourceDigest !== admitted.sourceDigest ||
+                originalHost.identity.productDigest !== admitted.productDigest || originalHost.policy.stateRoot !== profile.paths.state)
+              throw unavailable('browser');
+            await originalHost.assertTrusted(deadline); await lease.assert(); assertTime(deadline);
+            await withLaunchAttempt(profile, platform, deadline, transaction => {
+              if (!transaction.current || JSON.stringify(transaction.current) !== JSON.stringify(admitted)) throw unavailable('browser');
+              const actual = platform.processProvenance(record.pid);
+              if (!actual || (['pid', 'uid', 'startId', 'pidVersion', 'group', 'session', 'parentStartId', 'parentPidVersion', 'executable'] as const)
+                  .some(key => actual[key] !== admitted.engine![key])) throw unavailable('browser');
+            });
+            return;
+          } finally { lease.release(); }
+        }
+        await setTimeout(Math.min(5, Math.max(1, deadline - now())));
+      }
+    },
     async cancel(profile: ProfileSnapshot, request: string, deadline: number) {
       const expected = pending.get(request);
       if (!expected) return; // reservation failed before any native write/submission

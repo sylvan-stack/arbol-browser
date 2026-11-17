@@ -29,6 +29,7 @@ export interface LaunchAttemptPort {
   reserve(profile: ProfileSnapshot, request: string, deadline: number, build?: BuildGuard): Promise<void>;
   launched(profile: ProfileSnapshot, request: string, pid: number, deadline: number): Promise<void>;
   cancel(profile: ProfileSnapshot, request: string, deadline: number): Promise<void>;
+  admitted(profile: ProfileSnapshot, record: RuntimeRecord, deadline: number, request?: string): Promise<void>;
 }
 export const launchServices: LaunchPort = Object.freeze({
   launch(selection: BuildSelection, requestPath: string, deadline: number): Promise<number> {
@@ -79,6 +80,7 @@ export function createStarter(options: { selection: BuildSelection; platform: Pl
           if (!observed || observed.instance !== current.instance || !originalAlive(observed, options.platform)) throw profileUnavailable();
           current = observed;
         }
+        await options.attempts?.admitted(profile, current, deadline);
         const client = await connectRuntime(location, current, endpoint, options.selection, options.platform, deadline, label);
         try {
           await options.authority.assertReady(profile, current); await guard.assert(); assertTime(deadline);
@@ -97,6 +99,7 @@ export function createStarter(options: { selection: BuildSelection; platform: Pl
           if (!observed || observed.instance !== current.instance || !originalAlive(observed, options.platform)) throw profileUnavailable();
           current = observed;
         }
+        await options.attempts?.admitted(profile, current, deadline);
         const client = await connectRuntime(location, current, endpoint, options.selection, options.platform, deadline, label);
         try {
           await options.authority.assertReady(profile, current); await guard.assert(); assertTime(deadline);
@@ -124,6 +127,7 @@ export function createStarter(options: { selection: BuildSelection; platform: Pl
         assertTime(admissionDeadline); await guard.assert(); startup.assertIdentity();
         const record = await readRuntime(location);
         if (record && record.phase === 'ready' && originalAlive(record, options.platform)) {
+          await options.attempts?.admitted(profile, record, admissionDeadline, request);
           const client = await connectRuntime(location, record, endpoint, options.selection, options.platform, deadline, label);
           try {
             await options.authority.assertReady(profile, record); await guard.assert(); assertTime(deadline);

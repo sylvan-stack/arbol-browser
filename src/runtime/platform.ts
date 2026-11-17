@@ -38,6 +38,7 @@ export interface WatchdogCustody {
    * These numbers are genuine pipe endpoints, never a shared-state writer. */
   spawn(): Readonly<{ pid: number; reader: number; writer: number }>;
   prepareHost(input: HostFinalizationInput): void;
+  ready(runtime: import('./instance.js').RuntimeRecord, agent: number, management: number): void;
   consumeClose(requestId: string, socketFd: number): CloseAdmission;
   localClose(): CloseAdmission;
   beginSessionUse(factory: ActualSessionFactory): SessionUsePermit;
@@ -145,6 +146,7 @@ interface NativeSupport {
   assertHostMarker(handle: object): void;
   abortHostMarkerMutation(handle: object): never;
   prepareHostFinalization(handle: object, input: string, policyDigest: string, compatibilityDigest: string): void;
+  publishHostReady(handle: object, runtime: string, agent: number, management: number): void;
   spawnWatchdog(handle: object): { pid: number; reader: number; writer: number };
   assertHostFinalization(handle: object): void;
   latchWatchdogFatal(handle: object): void;
@@ -184,7 +186,7 @@ export function loadPlatform(): PlatformPort {
   let native: NativeSupport;
   try {
     native = createRequire(import.meta.url)(fileURLToPath(new URL('../../native/platform.node', import.meta.url)));
-    for (const name of ['beginExitInspection', 'pollExitInspection', 'cancelExitInspection', 'beginHostSessionUse', 'acceptHostSessionUse', 'abortHostSessionUse', 'recordPagesRetired', 'recordDOMRequested', 'recordCookieAcknowledged', 'recordQuitIntended', 'captureCloseBudget', 'beginCloseStamp', 'pollCloseStamp', 'cancelCloseStamp', 'beginCloseRetirement', 'pollCloseRetirement', 'consumeCloseRequest', 'armLocalClose', 'beginHostMarkerMutation', 'acceptHostMarkerMutation', 'assertHostMarker', 'abortHostMarkerMutation', 'latchWatchdogFatal', 'prepareHostFinalization', 'spawnWatchdog', 'assertHostFinalization', 'adoptHostBuild', 'terminateAdoptedHost', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
+    for (const name of ['publishHostReady', 'beginExitInspection', 'pollExitInspection', 'cancelExitInspection', 'beginHostSessionUse', 'acceptHostSessionUse', 'abortHostSessionUse', 'recordPagesRetired', 'recordDOMRequested', 'recordCookieAcknowledged', 'recordQuitIntended', 'captureCloseBudget', 'beginCloseStamp', 'pollCloseStamp', 'cancelCloseStamp', 'beginCloseRetirement', 'pollCloseRetirement', 'consumeCloseRequest', 'armLocalClose', 'beginHostMarkerMutation', 'acceptHostMarkerMutation', 'assertHostMarker', 'abortHostMarkerMutation', 'latchWatchdogFatal', 'prepareHostFinalization', 'spawnWatchdog', 'assertHostFinalization', 'adoptHostBuild', 'terminateAdoptedHost', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
       if (typeof native[name] !== 'function') throw new Error('Missing process support');
   } catch { throw unavailable('profile'); }
   const call = <T>(operation: () => T): T => {
@@ -236,6 +238,10 @@ export function loadPlatform(): PlatformPort {
           const encoded = JSON.stringify({ requestPath: input.requestPath, runtime: input.runtime, prior: input.prior });
           if (!encoded || Buffer.byteLength(encoded) > 16384) throw unavailable('browser');
           call(() => native.prepareHostFinalization(handle, encoded, input.signedPolicy.policyDigest, input.signedPolicy.compatibilityDigest));
+        },
+        ready(runtime: import('./instance.js').RuntimeRecord, agent: number, management: number) {
+          if (![agent, management].every(fd => Number.isSafeInteger(fd) && fd >= 3) || agent === management) throw unavailable('browser');
+          call(() => native.publishHostReady(handle, JSON.stringify(runtime), agent, management));
         },
         consumeClose: (requestId: string, socketFd: number) => closeAdmission(call(() => native.consumeCloseRequest(handle, requestId, socketFd))),
         localClose: () => closeAdmission(call(() => native.armLocalClose(handle))),

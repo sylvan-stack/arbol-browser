@@ -140,12 +140,45 @@ interface ActualHostAssembly {
   transport?: import('./transport.js').TransportServer;
   runtime?: import('./lifecycle.js').HostLifecycle;
 }
-/** Filled by the next accepted shell/ready assembly leaf. Until then the
- * actual retained native original closes rather than granting page access. */
-async function assembleAfterReady(prepared: HostPreparation, _sessions: ProfileSessions,
-  boundary: import('./bootstrap.js').NativeFailureBoundary, _request: HostRequest,
-  _state: ActualHostAssembly, _deadline: number): Promise<void> {
-  assertOwnedHost(prepared); return boundary.fatal.fail('native_boundary_unavailable');
+/** Actual canonical ABR-11 control, hidden shell and protected transport.
+ * Bind every owner/window/registration before load, then publish native ready. */
+async function assembleAfterReady(prepared: HostPreparation, sessions: ProfileSessions,
+  boundary: import('./bootstrap.js').NativeFailureBoundary, request: HostRequest,
+  state: ActualHostAssembly, deadline: number, platform: import('./platform.js').PlatformPort): Promise<void> {
+  assertOwnedHost(prepared); assertTime(deadline);
+  const bootstrapURL = new URL('./bootstrap.js', import.meta.url).href;
+  const lifecycleURL = new URL('./lifecycle.js', import.meta.url).href;
+  const transportURL = new URL('./transport.js', import.meta.url).href;
+  const sessionsURL = new URL('../profiles/session.js', import.meta.url).href;
+  const bootstrap = await import(bootstrapURL) as typeof import('./bootstrap.js');
+  const lifecycle = await import(lifecycleURL) as typeof import('./lifecycle.js');
+  const transports = await import(transportURL) as typeof import('./transport.js');
+  const sessionModule = await import(sessionsURL) as typeof import('../profiles/session.js');
+  const current = () => {
+    assertTime(deadline); prepared.custody.assertRetained();
+    if (state.closed) return prepared.custody.terminate();
+  };
+  try {
+    current(); sessionModule.assertProductionSessions(sessions, prepared.custody);
+    const control = await bootstrap.prepareRendererControl(boundary, prepared, request.selection, deadline);
+    state.control = control; current();
+    const port = await bootstrap.prepareNativeShellPort(boundary); current();
+    const shell = await bootstrap.integrateTrustedShell(port, prepared, request.selection, sessions,
+      control.ownership.lifecycle, control.ownership.shell, deadline);
+    state.shell = shell; current();
+    // Genuine physical shell is still hidden and empty. No load/show precedes
+    // real controller/window/registration binding in the accepted graph.
+    control.bind(shell.tabs, shell.host, shell.registration);
+    const transport = await transports.listenProtectedTransport(prepared.instance.location, prepared.instance.record, platform,
+      control.ownership.dispatch);
+    state.transport = transport; current();
+    const shutdown = sessionModule.productionSessionShutdown(sessions, prepared.custody);
+    const native = bootstrap.createNativeLifetime(boundary, prepared, request.selection, () => shutdown.quit());
+    const runtime = lifecycle.createHostLifecycle(prepared, sessions, transport, control.ownership.control, native, deadline);
+    state.runtime = runtime; control.ownership.bindRuntime(runtime);
+    await shell.registration.load(); current(); shell.registration.assertLoaded();
+    await runtime.ready(); current();
+  } catch { state.closed = true; return boundary.fatal.fail('native_boundary_unavailable'); }
 }
 let entryAttempted = false;
 /** The thin packaged entry explicitly awaits ONLY this authenticated pre-ready
@@ -215,7 +248,7 @@ export async function runHostEntry(): Promise<void> {
         const sessions = await bindHostSessions(prepared);
         assertTime(deadline); prepared.custody.assertRetained();
         if (state.closed) return prepared.custody.terminate();
-        await assembleAfterReady(prepared, sessions, installed, request, state, deadline);
+        await assembleAfterReady(prepared, sessions, installed, request, state, deadline, native.platform);
       } catch { state.closed = true; return installed.fatal.fail('native_boundary_unavailable'); }
     }, () => installed.fatal.fail('native_boundary_unavailable'));
   } catch (error) {

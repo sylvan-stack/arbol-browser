@@ -17,6 +17,8 @@ export interface HostCustody {
   readonly host: VerifiedHost;
   readonly instance: InstanceOwner;
   readonly build: BuildLease;
+  readonly requestPath: string;
+  ready(runtime: import('./instance.js').RuntimeRecord, agent: number, management: number): void;
   /** Reuse the accepted canonical Native arm/hand-over route with the exact
    * already-prepared native descriptions and one-use private capability. */
   arm(prepared: NativeBoundaryPreparation, deadline: number): Promise<NativeWatchdog>;
@@ -35,6 +37,9 @@ export interface HostCustody {
 }
 const receipts = new WeakMap<HostCustody, { native: WatchdogCustody; watchdog?: NativeWatchdog }>();
 const preparations = new WeakSet<InstanceOwner>();
+export function isHostCustody(value: unknown): value is HostCustody {
+  return typeof value === 'object' && value !== null && receipts.has(value as HostCustody);
+}
 export function assertHostCustody(value: HostCustody): void {
   const actual = receipts.get(value);
   if (!actual?.watchdog) throw unavailable('browser');
@@ -118,7 +123,12 @@ export async function prepareHostCustody(host: VerifiedHost, instance: InstanceO
     }));
   assertWatchdogCustody(native);
   let attempted = false;
-  const receipt: HostCustody = Object.freeze({ host, instance, build,
+  const receipt: HostCustody = Object.freeze({ host, instance, build, requestPath: input.requestPath,
+    ready(runtime: import('./instance.js').RuntimeRecord, agent: number, management: number) {
+      assertHostCustody(receipt);
+      if (runtime !== instance.record || runtime.phase !== 'ready') return native.terminate();
+      try { native.ready(runtime, agent, management); } catch { return native.terminate(); }
+    },
     async arm(prepared: NativeBoundaryPreparation, limit: number): Promise<NativeWatchdog> {
       if (attempted) return native.terminate(); attempted = true;
       try {

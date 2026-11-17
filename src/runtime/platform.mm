@@ -582,7 +582,7 @@ struct Custody {
   int reader=-1,writer=-1; bool endpointsPublished=false;
   RetainedPipe retainedReader,retainedWriter;
   MarkerPermit* mutation=nullptr; bool markerAttempted=false;
-  SessionUseNative* sessionUse=nullptr; WebsiteSessionNative* websiteSession=nullptr; bool sessionAttempted=false;
+  SessionUseNative* sessionUse=nullptr; WebsiteSessionNative* websiteSession=nullptr; bool sessionAttempted=false,readyAttempted=false;
   std::string policyDigest,compatibilityDigest;
 };
 static std::set<Custody*> nativeCustodies;
@@ -1147,6 +1147,81 @@ static napi_value latchWatchdogFatal(napi_env env,napi_callback_info info) {
   if(!c||getpid()!=c->context.main.pid||arbol_boundary::current(c->context.main)!=1) return fail(env);
   if(c->finalization.present()) c->finalization.shared()->declareFatal();
   napi_value out; napi_get_undefined(env,&out); return out;
+}
+
+// The protected listeners and existing public record are already bound while
+// the JS admission gate is closed. This sole private producer durably writes
+// the existing native engine-ready Claim; it accepts no caller-selected role.
+static bool readyListener(int fd,NSString* expected,struct stat& named) {
+  int type=0,listening=0; socklen_t size=sizeof(type); struct stat held{};
+  return fd>=3&&!getsockopt(fd,SOL_SOCKET,SO_TYPE,&type,&size)&&size==sizeof(type)&&type==SOCK_STREAM&&
+    (size=sizeof(listening),!getsockopt(fd,SOL_SOCKET,SO_ACCEPTCONN,&listening,&size))&&size==sizeof(listening)&&listening==1&&
+    !fstat(fd,&held)&&S_ISSOCK(held.st_mode)&&managementSocketPath(fd,false,expected)&&
+    !lstat(expected.fileSystemRepresentation,&named)&&S_ISSOCK(named.st_mode)&&named.st_uid==geteuid()&&
+    named.st_nlink==1&&(named.st_mode&07777)==0600;
+}
+static napi_value publishHostReady(napi_env env,napi_callback_info info) {
+  napi_value args[4]; size_t count=4; std::string encoded; int agent,management;
+  if(napi_get_cb_info(env,info,&count,args,nullptr,nullptr)!=napi_ok||count!=4||!boundedText(env,args[1],encoded)||
+     !integer(env,args[2],&agent)||!integer(env,args[3],&management)) return fail(env);
+  auto* c=custodyArgument(env,args[0]);
+  if(!c||!c->hostRequired||!c->bound||getpid()!=c->context.main.pid||!c->finalization.present()) return fail(env);
+  auto reject=[&]() { c->finalization.shared()->declareFatal(); return fail(env); };
+  if(c->readyAttempted) return reject(); c->readyAttempted=true;
+  @autoreleasepool { @try { try {
+    auto* state=c->finalization.shared(); NSDictionary* runtime=arbol_attempt::json(encoded);
+    if(!runtime||agent==management||!c->websiteSession||c->sessionUse||c->mutation||
+       !c->finalization.ready(c->context)||!c->retainedReader.valid()||!c->retainedWriter.valid()||
+       state->fatal.load(std::memory_order_acquire)||state->enrolled.load(std::memory_order_acquire)!=7||
+       state->transfer.load(std::memory_order_acquire)!=2||state->markerBound.load(std::memory_order_acquire)!=1||
+       state->admitted.load(std::memory_order_acquire)!=1||
+       state->closeReceivedUs.load(std::memory_order_acquire)||![runtime[@"phase"] isEqual:@"ready"]) return reject();
+    double deadline=std::min([c->finalization.value()[@"attempt"][@"expires"] doubleValue],arbol_boundary::clockMs()+1000);
+    arbol_attempt::Claim claim; std::string raw; NSDictionary* current=nil;
+    if(!c->finalization.currentAttempt(c->context,claim,raw,current,deadline)||
+       ![current[@"phase"] isEqual:@"claimed"]||![current[@"stage"] isEqual:@"admitted"]||
+       !arbol_attempt::currentProcess(current[@"engine"],true)||[current[@"expires"] doubleValue]<=arbol_boundary::clockMs()||
+       !arbol_attempt::runtime(runtime,current)||!arbol_attempt::sameRuntimeBinding(current[@"runtime"],runtime)||
+       ![c->finalization.boundMarker(c->context) isEqual:c->websiteSession->marker]) return reject();
+    struct stat agentBefore{},managementBefore{},runtimeBefore{},named{},runtimeAfter{};
+    if(!readyListener(agent,runtime[@"agentSocket"],agentBefore)||!readyListener(management,runtime[@"managementSocket"],managementBefore)) return reject();
+    arbol_exit::NativeFile published; published.fd=openat(claim.at.directory,"runtime.json",O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
+    if(published.fd<0||fstat(published.fd,&runtimeBefore)||!arbol_attempt::privateFile(runtimeBefore)||
+       runtimeBefore.st_size<1||runtimeBefore.st_size>(off_t)arbol_attempt::limit||
+       fstatat(claim.at.directory,"runtime.json",&named,AT_SYMLINK_NOFOLLOW)||!arbol_attempt::sameFile(runtimeBefore,named)) return reject();
+    std::string actual((size_t)runtimeBefore.st_size+1,'\0'); size_t at=0;
+    while(at<actual.size()) {
+      if(arbol_boundary::clockMs()>=deadline) return reject();
+      ssize_t n=pread(published.fd,actual.data()+at,actual.size()-at,(off_t)at);
+      if(n>0) at+=(size_t)n; else if(n<0&&errno==EINTR) continue; else if(!n) break; else return reject();
+    }
+    if(at!=(size_t)runtimeBefore.st_size) return reject(); actual.resize(at);
+    if(![arbol_attempt::json(actual) isEqual:runtime]||fsync(published.fd)||fcntl(published.fd,F_FULLFSYNC)||fsync(claim.at.directory)||
+       fstat(published.fd,&runtimeAfter)||fstatat(claim.at.directory,"runtime.json",&named,AT_SYMLINK_NOFOLLOW)||
+       !arbol_attempt::sameFile(runtimeBefore,runtimeAfter)||!arbol_attempt::sameFile(runtimeAfter,named)||
+       !c->finalization.ready(c->context)||arbol_boundary::clockMs()>=deadline) return reject();
+    NSMutableDictionary* next=[current mutableCopy]; next[@"phase"]=@"ready"; next[@"runtime"]=runtime;
+    std::string nextRaw=arbol_attempt::bytes(next);
+    if(!arbol_attempt::transition(current,next,arbol_attempt::Role::engine)||
+       !arbol_attempt::replace(claim.at,raw,false,nextRaw)) return reject();
+    // Keep sole attestation family claim.json, and require its exact physical
+    // bytes/identity and full durable file+directory completion before return.
+    arbol_exit::NativeFile ready; ready.fd=openat(claim.at.directory,"claim.json",O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
+    struct stat first{},checked{},last{}; std::string checkedRaw; bool absent;
+    if(ready.fd<0||fstat(ready.fd,&first)||!arbol_attempt::privateFile(first)||fsync(ready.fd)||fcntl(ready.fd,F_FULLFSYNC)||fsync(claim.at.directory)||
+       !arbol_attempt::readAt(claim.at.directory,"claim.json",checkedRaw,absent)||absent||checkedRaw!=nextRaw||
+       fstat(ready.fd,&last)||fstatat(claim.at.directory,"claim.json",&checked,AT_SYMLINK_NOFOLLOW)||
+       !arbol_attempt::sameFile(first,last)||!arbol_attempt::sameFile(last,checked)||
+       fstat(published.fd,&runtimeAfter)||fstatat(claim.at.directory,"runtime.json",&named,AT_SYMLINK_NOFOLLOW)||
+       !arbol_attempt::sameFile(runtimeBefore,runtimeAfter)||!arbol_attempt::sameFile(runtimeAfter,named)) return reject();
+    struct stat agentAfter{},managementAfter{};
+    if(!readyListener(agent,runtime[@"agentSocket"],agentAfter)||!readyListener(management,runtime[@"managementSocket"],managementAfter)||
+       agentBefore.st_dev!=agentAfter.st_dev||agentBefore.st_ino!=agentAfter.st_ino||
+       managementBefore.st_dev!=managementAfter.st_dev||managementBefore.st_ino!=managementAfter.st_ino||
+       !arbol_attempt::unchanged(claim.at)||!c->finalization.ready(c->context)||state->fatal.load(std::memory_order_acquire)||
+       arbol_boundary::clockMs()>=deadline||!ready.finish()||!published.finish()) return reject();
+    napi_value out; napi_get_undefined(env,&out); return out;
+  } catch(...) { return reject(); } } @catch(NSException*) { return reject(); } }
 }
 
 // No application/native-input cleanup is entered here. Both native lock
@@ -1817,6 +1892,7 @@ static napi_value cancelExitInspection(napi_env env,napi_callback_info info) {
 
 static napi_value init(napi_env env, napi_value exports) {
   napi_property_descriptor properties[] = {
+    {"publishHostReady",nullptr,publishHostReady,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"terminateAdoptedHost",nullptr,terminateAdoptedHost,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"beginExitInspection",nullptr,beginExitInspection,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"pollExitInspection",nullptr,pollExitInspection,nullptr,nullptr,nullptr,napi_default,nullptr},

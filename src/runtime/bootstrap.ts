@@ -130,6 +130,7 @@ export async function installNativeBoundary(prepared: NativeBoundaryPreparation,
       if (custody.host.signed.bundle !== prepared.trust.bundle || custody.host.signed.snapshotDigest !== prepared.trust.snapshotDigest)
         return custody.terminate();
       const proof = await prepareArmedHostSnapshot(custody, prepared.trust, 'native-install', prepared, deadline);
+      features.authorizeHostFeatureArguments(custody);
       native = preflight.preflightArmedNative(prepared.trust, proof, prepared, reason => guard.fail(reason), watchdog);
     } else {
       // Existing explicit standalone Native keeps full legacy verification.

@@ -155,6 +155,17 @@ class Scheduler {
   }
 }
 export interface TransportServer { openAdmission(): void; closeAdmission(): void; close(): Promise<void> }
+interface ProtectedReadyServer {
+  open(custody: import('./custody.js').HostCustody, record: RuntimeRecord, guard: () => void, control: () => void): void;
+}
+const protectedReadyServers = new WeakMap<TransportServer, ProtectedReadyServer>();
+/** Actual bound protected listeners only. Native Claim commit and the guarded
+ * JS gates occur in one synchronous turn, before any peer callback can run. */
+export function openProtectedReady(server: TransportServer, custody: import('./custody.js').HostCustody,
+  record: RuntimeRecord, guard: () => void, control: () => void): void {
+  const actual = protectedReadyServers.get(server); if (!actual) return custody.terminate();
+  actual.open(custody, record, guard, control);
+}
 /** Explicit injected infrastructure compatibility. This supplies no production
  * page authority. Existing Foundation callers keep their success-only commit. */
 export function listenTransport(location: RuntimeLocation, record: RuntimeRecord, platform: PlatformPort,
@@ -366,14 +377,33 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
     admission = false; for (const stop of [...connections]) stop();
     for (const server of servers) server.close(); throw error;
   }
-  return Object.freeze({
-    openAdmission() { if (sealed) throw unavailable('browser'); admission = true; },
+  const result: TransportServer = Object.freeze({
+    openAdmission() { if (sealed || protectedPort) throw unavailable('browser'); admission = true; },
     closeAdmission() { sealed = true; admission = false; for (const stop of [...connections]) stop(); },
     async close() {
       sealed = true; admission = false; for (const stop of [...connections]) stop();
       await Promise.all(servers.map(server => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))));
     },
   });
+  if (protectedPort) protectedReadyServers.set(result, {
+    open(custody, ready, guard, control) {
+      try {
+        if (sealed || admission || servers.length !== 2 || ready.phase !== 'ready' ||
+            !sameProcess(recordProcess(ready), recordProcess(record)) || ready.instance !== record.instance || ready.nonce !== record.nonce ||
+            ready.profileInstance !== record.profileInstance || ready.profilePathHash !== record.profilePathHash || ready.build !== record.build ||
+            ready.agentSocket !== location.agent || ready.managementSocket !== location.management) return custody.terminate();
+        const handles = servers.map(server => (server as unknown as { _handle?: { fd?: number } })._handle?.fd);
+        if (handles.some(value => !Number.isSafeInteger(value) || value! < 3) || handles[0] === handles[1]) return custody.terminate();
+        if (guard() !== undefined) return custody.terminate();
+        custody.ready(ready, handles[0]!, handles[1]!);
+        // No await, event-loop return or peer dispatch between durable native
+        // attestation and this exact generation's actual gate opening.
+        if (guard() !== undefined || control() !== undefined || guard() !== undefined || sealed) return custody.terminate();
+        admission = true;
+      } catch { fatal(); return custody.terminate(); }
+    },
+  });
+  return result;
 }
 
 export interface RuntimeClient {
