@@ -71,20 +71,29 @@ export async function controlCompleteClose(c) {
     const r = await runtime(c, profile), markerPath = join(c.state, 'profiles', profile, 'engine.json');
     assert.equal(JSON.parse(await readFile(markerPath)).cleanExit, false);
     const baseline = await family(c, 'before-close');
-    const originals = baseline.map(line => Number(line.trim().split(/\s+/)[0])).map(pid => r.platform.processIdentity(pid)).filter(Boolean);
+    const originals = baseline.map(line => {
+      const pid = Number(line.trim().split(/\s+/)[0]), identity = r.platform.processIdentity(pid);
+      assert.ok(identity, 'Baseline process disappeared before exact identity was captured');
+      const role = pid === r.record.pid ? 'main' : line.includes(c.payload + '/native/watchdog') ? 'monitor' :
+        line.includes(c.payload + '/runtime/Electron.app/') ? 'engine-helper' : 'unknown';
+      assert.notEqual(role, 'unknown', 'Unclassified original cannot support complete close proof');
+      return { ...identity, role };
+    });
     assert.ok(originals.some(p => p.pid === r.record.pid)); assert.ok(originals.length > 1, 'No owned helper/monitor baseline observed');
     let done = false;
+    let observerError;
     const observer = (async () => {
       do {
         const marker = JSON.parse(await readFile(markerPath));
         const live = originals.filter(p => { const now = r.platform.processIdentity(p.pid); return now?.startId === p.startId && now.uid === p.uid; });
         const row = { monotonic: performance.now(), clean: marker.cleanExit, live }; samples.push(row);
-        if (marker.cleanExit) assert.deepEqual(live, [], 'Clean marker observed before original family disappearance');
+        if (marker.cleanExit) assert.deepEqual(live.filter(p => p.role !== 'monitor'), [], 'Clean marker observed before original main/engine helper disappearance');
         await delay(15);
       } while (!done);
-    })();
+    })().catch(error => { observerError = String(error.stack ?? error); });
     let result;
     try { result = await closes(c, profile); } finally { done = true; await observer; }
+    assert.equal(observerError, undefined, observerError);
     assert.equal(result.closed, true); assert.equal(JSON.parse(await readFile(markerPath)).cleanExit, true);
     assert.deepEqual(await family(c, 'after-close'), []);
     for (const original of originals) assert.notEqual(r.platform.processIdentity(original.pid)?.startId, original.startId);
@@ -92,7 +101,7 @@ export async function controlCompleteClose(c) {
     const restored = await until(() => page.observations.find(o => o.name === 'close-restored'));
     assert.equal(restored.stored, 'close-fictional'); assert.equal(restored.cookie, 'fictional=close-fictional');
     await save(join(c.output, 'observations.json'), { result, originals, samples, restored,
-      scope: 'Externally sampled original family plus normal native close authority; not continuous pre-baseline confinement or genuine lost-ACK proof' });
+      scope: 'Main/engine helpers must disappear before clean. Genuine final monitor may publish clean while retaining original guards, then every original must disappear before CLI success. Samples do not claim continuous pre-baseline confinement or genuine lost-ACK proof.' });
     return { boundary: 'actual normal close, sampled originals, clean publication and persistent restart', lostAcknowledgement: 'unavailable' };
   } finally { await save(join(c.output, 'close-samples.json'), samples); await page.close(); }
 }
