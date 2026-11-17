@@ -1,6 +1,7 @@
 // Private signed watchdog executable. Never loads Electron or an input addon.
 #import <Foundation/Foundation.h>
 #include "boundary.hpp"
+#include "exit.hpp"
 #include <poll.h>
 #include <spawn.h>
 #include <deque>
@@ -129,13 +130,14 @@ struct Deadline {
     usleep(5000);
   }
 }
-[[noreturn]] static void protocolLoop(Context& c,Channel& pair,bool primary,double start) {
+[[noreturn]] static void protocolLoop(Context& c,Channel& pair,bool primary,double start,arbol_exit::ExitWatch& watch) {
   Channel host(primary?0:6,primary?1:7); Deadline deadline(start);
   struct Pending { uint64_t sequence; double sent; }; std::deque<Pending> pending;
   if(primary) host.send("R 1 "+std::to_string(c.main.pid)+"\n");
   double blockedWrite=0,responseExpires=0;
   for(;;) {
     double now=clockMs();
+    if(!watch.poll()) deadline.lost(now);
     // Latch before touching traffic. Late H or a queued A cannot revive an
     // already expired window, even when this executor itself was delayed.
     if(primary&&!pending.empty()&&now-pending.front().sent>=1000) deadline.lost(now);
@@ -209,11 +211,11 @@ static Channel launchCustody(Context& c,double deadline) {
 static bool liveStart(Context& c,double deadline) {
   return clockMs()<deadline&&c.initial()&&lockIdentity(c.owner)&&lockIdentity(c.build);
 }
-static int runPrimary(Context& c,double deadline) {
+static int runPrimary(Context& c,double deadline,arbol_exit::ExitWatch& watch) {
   // authenticateBirth deliberately granted cleanup only. Live original-main
   // proof is needed before any child handover or external readiness.
   c.cleanupOnly=false;
-  if(!liveStart(c,deadline)||!c.monitor(c.primary,true)) { c.cleanupOnly=true; throw 4; }
+  if(!liveStart(c,deadline)||!c.monitor(c.primary,true)||!watch.enrolledAlive(c.main)) { c.cleanupOnly=true; throw 4; }
   Channel pair=launchCustody(c,deadline); // primary still anchors the old group
   if(!liveStart(c,deadline)||!c.monitor(c.primary,true)||!c.monitor(c.custody,true)) { c.cleanupOnly=true; throw 4; }
   // C acknowledged actual descriptors/provenance in this continuously held
@@ -227,11 +229,12 @@ static int runPrimary(Context& c,double deadline) {
     if(!lines.empty()) throw 4; usleep(1000);
   }
   if(!liveStart(c,deadline)||!c.primaryMonitor()||!c.monitor(c.custody,true)) throw 4;
-  protocolLoop(c,pair,true,deadline-1000);
+  if(!watch.enrolledAlive(c.main)) throw 4;
+  protocolLoop(c,pair,true,deadline-1000,watch);
 }
-static int runCustody(Context& c,double deadline) {
+static int runCustody(Context& c,double deadline,arbol_exit::ExitWatch& watch) {
   c.cleanupOnly=false;
-  if(!liveStart(c,deadline)||!c.monitor(c.primary,true)||!c.monitor(c.custody,true)) { c.cleanupOnly=true; throw 4; }
+  if(!liveStart(c,deadline)||!c.monitor(c.primary,true)||!c.monitor(c.custody,true)||!watch.enrolledAlive(c.main)) { c.cleanupOnly=true; throw 4; }
   Channel pair(6,7); pair.send("C 1 "+std::to_string(c.custody.pid)+" "+std::to_string(c.custody.start)+"\n");
   while(!pair.outgoing.empty()) { if(!liveStart(c,deadline)||pair.failed||!c.primaryMonitor()) throw 4; pair.flush(); usleep(1000); }
   // A producer death before G is cleanup-only, whether or not C was consumed.
@@ -245,11 +248,12 @@ static int runCustody(Context& c,double deadline) {
   if(!liveStart(c,deadline)||!c.primaryMonitor()) throw 4;
   pair.send("J 1\n");
   while(!pair.outgoing.empty()) { if(!liveStart(c,deadline)||pair.failed||!c.primaryMonitor()) throw 4; pair.flush(); usleep(1000); }
-  protocolLoop(c,pair,false,deadline-1000);
+  if(!watch.enrolledAlive(c.main)) throw 4;
+  protocolLoop(c,pair,false,deadline-1000,watch);
 }
 
 int main(int argc,const char* argv[]) {
-  signal(SIGPIPE,SIG_IGN); double deadline=clockMs()+1000; Context c; bool parsed=false;
+  signal(SIGPIPE,SIG_IGN); double deadline=clockMs()+1000; Context c; bool parsed=false; arbol_exit::ExitWatch watch;
   Identity birth; Info birthInfo{}; int birthSession=getsid(0); bool birthValid=observe(getpid(),birth,&birthInfo)==1;
   @autoreleasepool {
     @try { try {
@@ -258,7 +262,8 @@ int main(int argc,const char* argv[]) {
       if((!primary&&!custody)||!birthValid) throw 4;
       Identity producer; std::string raw=startup(deadline); c=record(raw,primary,producer); parsed=true;
       if(!c.authenticateBirth(birth,birthInfo,birthSession,producer,primary)) throw 4;
-      return primary?runPrimary(c,deadline):runCustody(c,deadline);
+      if(!watch.enroll(c.main)) throw 4;
+      return primary?runPrimary(c,deadline,watch):runCustody(c,deadline,watch);
     } catch(...) { c.cleanupOnly=true; retainedRefusal(parsed?&c:nullptr); } } @catch(NSException*) { c.cleanupOnly=true; retainedRefusal(parsed?&c:nullptr); }
   }
 }
