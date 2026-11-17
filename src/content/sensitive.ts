@@ -65,12 +65,24 @@ export class SensitiveFields {
       if (!Array.isArray(raw.strings) || !Array.isArray(raw.documents) || raw.strings.length > 1000000 || raw.documents.length > 256)
         throw classifiedRefusal();
       let bytes = 0;
+      const stringBytes: number[] = [];
       for (const value of raw.strings) {
-        if (typeof value !== 'string' || (bytes += Buffer.byteLength(value, 'utf8')) > 16 * 1024 * 1024) throw classifiedRefusal();
+        if (typeof value !== 'string') throw classifiedRefusal();
+        const size = Buffer.byteLength(value, 'utf8');
+        if ((bytes += size) > 16 * 1024 * 1024) throw classifiedRefusal(); stringBytes.push(size);
       }
-      const string = (index: number): string => {
+      const string = (index: number, empty = false): string => {
+        // Pinned Blink AddString emits -1 for empty title/attribute values.
+        // Identity-bearing fields must still resolve to nonempty table strings.
+        if (empty && index === -1) return '';
         if (!Number.isSafeInteger(index) || index < 0 || index >= raw.strings.length) throw classifiedRefusal();
-        return raw.strings[index]!;
+        const value = raw.strings[index]!; if (!empty && value.length === 0) throw classifiedRefusal(); return value;
+      };
+      let expandedBytes = 0, attributeIndices = 0;
+      const referenced = (index: number, empty = false): string => {
+        const value = string(index, empty);
+        if ((expandedBytes += index === -1 ? 0 : stringBytes[index]!) > 16 * 1024 * 1024) throw classifiedRefusal();
+        return value; // charge every reference before case folding/split/hash
       };
       const documents = raw.documents.filter(document => string(document.frameId) === frame.frameId);
       if (documents.length !== 1) throw classifiedRefusal(); const document = documents[0]!;
@@ -79,8 +91,16 @@ export class SensitiveFields {
           parents.length !== backends.length || names.length !== backends.length || attributes.length !== backends.length) throw classifiedRefusal();
       const closed = new Set<number>();
       const shadows = document.nodes.shadowRootType;
-      if (shadows) for (let index = 0; index < shadows.index.length; index++)
-        if (string(shadows.value[index]!) !== 'open') closed.add(shadows.index[index]!);
+      if (shadows) {
+        if (!Array.isArray(shadows.index) || !Array.isArray(shadows.value) || shadows.index.length !== shadows.value.length ||
+            shadows.index.length > backends.length) throw classifiedRefusal();
+        const seen = new Set<number>();
+        for (let index = 0; index < shadows.index.length; index++) {
+          const node = shadows.index[index]!;
+          if (!Number.isSafeInteger(node) || node < 0 || node >= backends.length || seen.has(node)) throw classifiedRefusal();
+          seen.add(node); if (string(shadows.value[index]!) !== 'open') closed.add(node);
+        }
+      }
       const nodes = new Map<number, DOMField>(), aggregates = new Set<number>();
       for (let index = 0; index < backends.length; index++) {
         const backend = backends[index]!, parentIndex = parents[index]!;
@@ -88,10 +108,16 @@ export class SensitiveFields {
             parentIndex < -1 || parentIndex >= index) throw classifiedRefusal();
         const parent = parentIndex < 0 ? undefined : nodes.get(backends[parentIndex]!);
         if (parentIndex >= 0 && !parent) throw classifiedRefusal();
-        const pairs = attributes[index]!; if (!Array.isArray(pairs) || pairs.length % 2 || pairs.length > 4096) throw classifiedRefusal();
+        const pairs = attributes[index]!;
+        if (!Array.isArray(pairs) || pairs.length % 2 || pairs.length > 4096 ||
+            (attributeIndices += pairs.length) > 1000000) throw classifiedRefusal();
+        const tag = referenced(names[index]!).toUpperCase();
         const attrs = new Map<string, string>();
-        for (let offset = 0; offset < pairs.length; offset += 2) attrs.set(string(pairs[offset]!).toLowerCase(), string(pairs[offset + 1]!));
-        const tag = string(names[index]!).toUpperCase(), type = (attrs.get('type') ?? '').toLowerCase();
+        for (let offset = 0; offset < pairs.length; offset += 2) {
+          const name = referenced(pairs[offset]!), value = referenced(pairs[offset + 1]!, true);
+          attrs.set(name.toLowerCase(), value);
+        }
+        const type = (attrs.get('type') ?? '').toLowerCase();
         const autocomplete = (attrs.get('autocomplete') ?? '').toLowerCase().split(/\s+/);
         const sensitive = Boolean(parent?.sensitive || this.known.has(frame.receipt, backend) ||
           (tag === 'INPUT' && type === 'password') || autocomplete.some(token => ['current-password', 'new-password', 'one-time-code'].includes(token)));
@@ -102,12 +128,12 @@ export class SensitiveFields {
         const relevant = ['type', 'autocomplete', 'role', 'contenteditable', 'disabled', 'readonly', 'aria-disabled', 'aria-expanded', 'aria-checked', 'aria-selected'];
         nodes.set(backend, Object.freeze({ backend, parent: parent?.backend ?? 0, tag, editable, sensitive, unavailable,
           signature: fingerprint([backend, parent?.signature, tag, relevant.map(name => [name, attrs.get(name)]), sensitive, unavailable]) }));
-        if (sensitive) {
-          let ancestor = parent, depth = 0;
-          while (ancestor) {
-            if (++depth > 100000) throw classifiedRefusal(); aggregates.add(ancestor.backend); ancestor = nodes.get(ancestor.parent);
-          }
-        }
+      }
+      // Validated parents precede children. One reverse pass propagates all
+      // sensitive descendants to ancestors without repeated depth walks.
+      for (let index = backends.length - 1; index >= 0; index--) {
+        const field = nodes.get(backends[index]!)!;
+        if (field.parent && (field.sensitive || aggregates.has(field.backend))) aggregates.add(field.parent);
       }
       const layout = document.layout;
       if (!layout || !Array.isArray(layout.nodeIndex) || !Array.isArray(layout.bounds) ||
@@ -118,7 +144,7 @@ export class SensitiveFields {
             !bounds.every(Number.isFinite)) throw classifiedRefusal();
       }
       this.readiness.assertInspection(frame, guard);
-      return Object.freeze({ frame, nodes, aggregates, address: string(document.documentURL), title: text(string(document.title), 512),
+      return Object.freeze({ frame, nodes, aggregates, address: string(document.documentURL), title: text(string(document.title, true), 512),
         signature: fingerprint([[...nodes.values()].map(node => [node.backend, node.signature]), layout.nodeIndex, layout.bounds]) });
     } catch (error) {
       guard(); if (error instanceof ClassifiedGeometryRefusal) throw error; throw classifiedRefusal();
