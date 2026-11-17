@@ -69,7 +69,7 @@ inline bool retainNativeImage() {
 // A nonzero-arg query can sleep behind a zombie/reap controller. Only these
 // four detached read-only workers perform it; the actual protocol/command
 // thread never waits and retains its unchanged original deadline.
-enum class KernelState : int { pending=-1,uncertain=-2,live=0,exiting=1,absent=2 };
+enum class KernelState : int { transient=-3,pending=-1,uncertain=-2,live=0,exiting=1,absent=2 };
 struct KernelAnswer {
   std::atomic<KernelState> state{KernelState::pending}; double completed=0;
   Info observed{};
@@ -88,9 +88,10 @@ class KernelQueries {
         job=std::move(queue_.front()); queue_.pop_front(); ++running_;
       }
       Info info{}; errno=0;
-      int n=proc_pidinfo(job.original.pid,18,1,&info,sizeof(info));
+      int n=proc_pidinfo(job.original.pid,18,1,&info,sizeof(info)); int failure=errno;
       KernelState result=KernelState::uncertain;
-      if(!n&&errno==ESRCH) result=KernelState::absent;
+      if(!n&&failure==ESRCH) result=KernelState::absent;
+      else if(n<=0&&(failure==EINTR||failure==EAGAIN||failure==EBUSY)) result=KernelState::transient;
       else if(n==sizeof(info)&&info.bsd.pbi_pid==(uint32_t)job.original.pid&&info.unique.start&&info.unique.version>0) {
         Identity actual{job.original.pid,info.unique.start,info.unique.version,info.bsd.pbi_uid,info.bsd.pbi_pgid};
         if(actual.start!=job.original.start) result=KernelState::absent;
@@ -140,7 +141,7 @@ public:
     if(answer_) {
       KernelState result=answer_->state.load(std::memory_order_acquire);
       if(result==KernelState::absent) return true;
-      if((result==KernelState::live||result==KernelState::exiting)&&clockMs()>=answer_->completed+10) answer_.reset();
+      if((result==KernelState::live||result==KernelState::exiting||result==KernelState::transient)&&clockMs()>=answer_->completed+10) answer_.reset();
     }
     if(!answer_) { auto* pool=KernelQueries::get(); if(pool) answer_=pool->submit(original,false); }
     return answer_&&answer_->state.load(std::memory_order_acquire)==KernelState::absent;

@@ -75,16 +75,24 @@ class KernelExitProbe {
 public:
   enum Result { pending=-1,uncertain=-2,live=0,exiting=1,absent=2 };
 private:
-  bool attempted_=false; std::shared_ptr<arbol_boundary::KernelAnswer> answer_;
+  bool attempted_=false; Identity original_{}; std::shared_ptr<arbol_boundary::KernelAnswer> answer_;
 public:
   bool start(const Identity& original) {
-    if(attempted_) return false; attempted_=true;
+    if(attempted_) return false; attempted_=true; original_=original;
     auto* pool=arbol_boundary::KernelQueries::get();
     if(pool) answer_=pool->submit(original,true,true);
     return (bool)answer_;
   }
-  Result result() const {
-    return answer_?(Result)(int)answer_->state.load(std::memory_order_acquire):(attempted_?uncertain:pending);
+  Result result() {
+    if(!answer_) return attempted_?uncertain:pending;
+    auto state=answer_->state.load(std::memory_order_acquire);
+    if(state!=arbol_boundary::KernelState::transient) return (Result)(int)state;
+    if(arbol_boundary::clockMs()>=answer_->completed+10) {
+      auto* pool=arbol_boundary::KernelQueries::get();
+      auto retry=pool?pool->submit(original_,true,true):nullptr;
+      if(retry) answer_=retry;
+    }
+    return pending; // original identity, watch, fatal history and cutoff unchanged
   }
   bool started() const { return attempted_; }
 };
