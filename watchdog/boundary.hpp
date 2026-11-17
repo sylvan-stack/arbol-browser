@@ -250,6 +250,32 @@ struct Context {
     if(!observation.absent(id)) return false;
     return !family||same(id,main)||same(id,primary)||same(id,custody)||family->retire(observation.proof());
   }
+  bool monitorBirthsCurrent() {
+    // Observe the actual originals independently of UID/group census filters.
+    // An exec/version or UID change in the SAME birth is uncertainty, never
+    // numeric-PID recycling or a newly eligible Chromium helper.
+    for(const auto& original:{primary,custody}) {
+      if(!original.pid) continue;
+      Identity actual; int state=observe(original.pid,actual);
+      if(state<0||(state==1&&actual.start==original.start&&!same(actual,original))) {
+        uncertainFamily(); return false;
+      }
+    }
+    return !familyUncertain;
+  }
+  bool engineMonitorNumberEligible(const Identity& id) {
+    for(const auto& original:{primary,custody}) {
+      if(!original.pid||id.pid!=original.pid) continue;
+      if(id.start==original.start) {
+        if(!same(id,original)) uncertainFamily();
+        return false; // the exact original monitor is never an engine target
+      }
+      // Live-list replacement alone is insufficient. Only the independently
+      // retained full-kernel original-exit observation authorizes this reuse.
+      if(!originalGone(original)) return false;
+    }
+    return !familyUncertain;
+  }
   std::string engine() const { return bundle + "/Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron"; }
   std::string helper() const { return bundle + "/Contents/Resources/browser/native/watchdog"; }
   unsigned engineRole(const std::string& path) const {
@@ -345,7 +371,7 @@ struct Context {
   }
   bool census(std::vector<Identity>& targets,bool forceFull=false) {
     targets.clear();
-    if(!authenticated||!foundation()) return false;
+    if(!authenticated||!foundation()||!monitorBirthsCurrent()) return false;
     bool valid=!familyUncertain;
     if(family) {
       std::vector<FamilyObservation> shared;
@@ -418,6 +444,7 @@ struct Context {
          !same(id,main)&&!same(id,primary)&&!same(id,custody)) return;
       if(same(id,primary)) { if(!primaryMonitor()) valid=false; return; }
       if(same(id,custody)) { if(!monitor(custody,true)) valid=false; return; }
+      if(!engineMonitorNumberEligible(id)) { valid=false; return; }
       if(id.uid!=main.uid) { uncertainFamily(); valid=false; return; }
       bool original=captured&&same(old->second,id);
       std::string path; bool image=executable(id,path);
@@ -488,16 +515,18 @@ struct Context {
   }
   bool signalEngine(const Identity& original) {
     Identity actual; std::string path;
-    if(observe(original.pid,actual)!=1||!same(original,actual)||actual.uid!=main.uid||
+    if(!monitorBirthsCurrent()||!engineMonitorNumberEligible(original)||
+       observe(original.pid,actual)!=1||!same(original,actual)||actual.uid!=main.uid||
        actual.group!=main.group||getsid(actual.pid)!=session||!executable(actual,path)||
        (same(actual,main)?path!=engine():!enginePath(path))||!signature(path,true)) return false;
+    if(!monitorBirthsCurrent()||!engineMonitorNumberEligible(actual)) return false;
     return signalExact(original,SIGKILL);
   }
   void enforce(bool executingMain = false) {
     if(!authenticated) return;
     std::vector<Identity> targets;
     if (!census(targets)) { targets.clear(); for (const auto& entry : seen) targets.push_back(entry.second); }
-    for (const auto& id : targets) if ((!executingMain || !same(id,main)) && id.pid != primary.pid && id.pid != custody.pid) (void)signalEngine(id);
+    for (const auto& id : targets) if ((!executingMain || !same(id,main)) && !same(id,primary) && !same(id,custody)) (void)signalEngine(id);
     if (!executingMain) (void)signalEngine(main);
   }
   bool retireMonitorPeer(const Identity& peer, bool executingMain = false) {
