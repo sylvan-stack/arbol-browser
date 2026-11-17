@@ -1121,10 +1121,18 @@ static napi_value latchWatchdogFatal(napi_env env,napi_callback_info info) {
     arbol_boundary::reap(c->context.primary); arbol_boundary::reap(c->context.custody);
     if(c->context.engineGone(true)) {
       bool a=c->context.retireMonitorPeer(c->context.primary,true);
-      bool b=!c->context.custody.pid ? arbol_boundary::current(c->context.primary)==0 : c->context.retireMonitorPeer(c->context.custody,true);
+      bool b=!c->context.custody.pid ? c->context.originalGone(c->context.primary) : c->context.retireMonitorPeer(c->context.custody,true);
       arbol_boundary::reap(c->context.primary); arbol_boundary::reap(c->context.custody);
-      if(a && b && c->context.engineGone(true) && arbol_boundary::current(c->context.primary)==0 && arbol_boundary::current(c->context.custody)==0)
-        (void)arbol_boundary::signalExact(c->context.main,SIGKILL);
+      if(a&&b&&c->context.engineGone(true)&&c->context.originalGone(c->context.primary)&&c->context.originalGone(c->context.custody)) {
+        // The original MAIN is still alive and holds the actual descriptions.
+        // Host mode cannot inherit the legacy signal-only release path. An
+        // incomplete/failed pre-arm or transfer has no enrolled family proof:
+        // retain it, and let the independent command return bounded refusal.
+        bool mayExit=!c->continuousBuild&&!c->hostRequired;
+        if(c->continuousBuild&&c->hostRequired&&c->finalization.present())
+          mayExit=c->finalization.publishDirtyMain(c->context);
+        if(mayExit) (void)arbol_boundary::signalExact(c->context.main,SIGKILL);
+      }
     }
     // Uncertainty is retained fatal custody, never permission to return/unlock.
     usleep(10000);

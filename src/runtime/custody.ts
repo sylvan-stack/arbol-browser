@@ -41,9 +41,11 @@ export function assertHostCustody(value: HostCustody): void {
   actual.native.assert(); actual.native.assertHost();
 }
 /** Cancellation/refusal before pre-spawn preparation has not transferred a
- * child or admitted data. First retain the actual originals natively, then use
- * the same independently guarded native family unwind. This is never a JS
- * finally/release path or an assertion that a durable claim armed a watchdog. */
+ * child or admitted data by this function. First retain the actual originals
+ * natively. The native continuous-Build guard prevents legacy signal-only
+ * release: missing pre-arm enrollment retains protection and independent
+ * commands refuse within their own original bounds. Neither this call nor an
+ * untransferred label certifies never-admitted, closed family or flush. */
 export async function abortUnadmittedHost(host: VerifiedHost, ownerLease: OwnerLease, build: BuildLease,
   platform: PlatformPort): Promise<never> {
   assertPlatform(platform);

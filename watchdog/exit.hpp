@@ -1304,32 +1304,50 @@ public:
     const auto& peer=role_==1?c.custody:c.primary;
     return c.originalGone(peer)&&arbol_boundary::clockMs()<deadline;
   }
-  bool publishDirtyMonitor(arbol_boundary::Context& c) {
-    if(terminalCommitted_) return originalMonitor(c)&&c.engineGone()&&c.originalGone(role_==1?c.custody:c.primary);
-    if(terminalAttempted_||!originalMonitor(c)||activationCommitted()||activationUnresolved()||storagePending()||activationPending()) return false;
+  bool originalMain(arbol_boundary::Context& c) const {
+    arbol_boundary::Identity actual; std::string image;
+    return present()&&role_==0&&getpid()==c.main.pid&&c.authenticated&&c.foundation()&&exclusiveWriter()&&
+      state_->enrolled.load(std::memory_order_acquire)==7&&state_->main.is(c.main)&&
+      c.primary.pid>1&&c.custody.pid>1&&state_->primary.is(c.primary)&&state_->custody.is(c.custody)&&
+      arbol_boundary::observe(getpid(),actual)==1&&arbol_boundary::same(actual,c.main)&&actual.group==c.main.group&&
+      getsid(0)==c.session&&arbol_boundary::executable(actual,image)&&image==c.engine()&&arbol_boundary::signature(image,true)&&metadata();
+  }
+  bool dirtyMainCurrent(arbol_boundary::Context& c,double deadline) {
+    return originalMain(c)&&!activationCommitted()&&!activationUnresolved()&&!storagePending()&&!activationPending()&&
+      state_->fatal.load(std::memory_order_acquire)!=0&&arbol_boundary::clockMs()<deadline&&
+      c.engineGone(true)&&c.originalGone(c.primary)&&c.originalGone(c.custody)&&family_&&family_->complete()&&
+      arbol_boundary::clockMs()<deadline;
+  }
+  bool publishDirtyTerminal(arbol_boundary::Context& c,bool mainLast) {
+    auto original=[&] { return mainLast?originalMain(c):originalMonitor(c); };
+    auto gone=[&] { return mainLast?(c.engineGone(true)&&c.originalGone(c.primary)&&c.originalGone(c.custody)):
+      (c.engineGone()&&c.originalGone(role_==1?c.custody:c.primary)); };
+    auto currentTerminal=[&] { return mainLast?dirtyMainCurrent(c,terminalDeadline_):dirtyMonitorCurrent(c,terminalDeadline_); };
+    if(terminalCommitted_) return original()&&gone();
+    if(terminalAttempted_||!original()||activationCommitted()||activationUnresolved()||storagePending()||activationPending()) return false;
     state_->poison(forced); // irreversible dirty attribution precedes its final proof
     // No engine or caller deadline is renewed. This separate one-shot bounded
     // METADATA phase starts only after genuine whole-engine/peer quiescence.
     // Late dirty evidence can serve a later independent reader, never turn an
     // expired Close into success; its original cutoffs remain recorded below.
-    if(!c.engineGone()||!c.originalGone(role_==1?c.custody:c.primary)||!family_||!family_->complete()) return false;
+    if(!gone()||!family_||!family_->complete()) return false;
     terminalAttempted_=true;
     terminalDeadline_=arbol_boundary::clockMs()+1000;
-    if(!dirtyMonitorCurrent(c,terminalDeadline_)||!family_->seal()) return false;
+    if(!currentTerminal()||!family_->seal()) return false;
     terminalUnresolved_=true;
     @try { try {
       arbol_attempt::Claim claim; std::string raw; NSDictionary* current=nil;
       if(!currentAttempt(c,claim,raw,current,terminalDeadline_)) return false;
       id marker=terminalMarker(c); NSDictionary* frontier=family_->frontierTuple(); Identity self;
       if(!marker||!frontier||arbol_boundary::observe(getpid(),self)!=1||
-         !arbol_boundary::same(self,role_==1?c.primary:c.custody)||!dirtyMonitorCurrent(c,terminalDeadline_)) return false;
+         !arbol_boundary::same(self,mainLast?c.main:(role_==1?c.primary:c.custody))||!currentTerminal()) return false;
       NSDictionary* receipt=@{@"format":@1,@"kind":@"terminal-exit",@"disposition":@"dirty",@"bootSession":value_[@"bootSession"],
         @"profileInstance":current[@"profileInstance"],@"profilePathHash":current[@"profilePathHash"],@"profileDirectory":value_[@"profileDirectory"],
         @"profileRecordDigest":value_[@"profileRecordDigest"],@"request":current[@"request"],@"build":current[@"build"],
         @"sourceDigest":current[@"sourceDigest"],@"productDigest":current[@"productDigest"],@"candidateDigest":current[@"candidateDigest"],
         @"capability":value_,@"capabilityDigest":arbol_attempt::digest(raw_),@"attempt":current,@"runtime":value_[@"runtime"],
         @"main":value_[@"main"],@"primary":arbol_boundary::capsuleIdentity(c.primary),@"custody":arbol_boundary::capsuleIdentity(c.custody),
-        @"lastHolder":arbol_boundary::capsuleIdentity(self,c.session),@"lastRole":role_==1?@"primary":@"custody",@"marker":marker,@"family":frontier,
+        @"lastHolder":arbol_boundary::capsuleIdentity(self,c.session),@"lastRole":mainLast?@"main":(role_==1?@"primary":@"custody"),@"marker":marker,@"family":frontier,
         @"nativeState":@{@"fatal":@(state_->fatal.load(std::memory_order_acquire)),@"fatalCutoffUs":@(state_->fatalCutoffUs.load(std::memory_order_acquire)),
           @"enrolled":@(state_->enrolled.load(std::memory_order_acquire)),@"transfer":@(state_->transfer.load(std::memory_order_acquire)),
           @"mutation":@(state_->mutation.load(std::memory_order_acquire)),@"markerBound":@(state_->markerBound.load(std::memory_order_acquire)),
@@ -1341,7 +1359,7 @@ public:
       NSString* path=value_[@"receiptDirectory"][@"path"]; NativeFile directory;
       directory.fd=open(path.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC); struct stat identity{},published{};
       if(directory.fd<0||fstat(directory.fd,&identity)||![fileIdentity(identity) isEqual:value_[@"receiptDirectory"][@"identity"]]||
-         !publishNativeReceipt(directory.fd,"terminal.json",bytes,terminalDeadline_,published)||!dirtyMonitorCurrent(c,terminalDeadline_)||
+         !publishNativeReceipt(directory.fd,"terminal.json",bytes,terminalDeadline_,published)||!currentTerminal()||
          ![terminalMarker(c) isEqual:marker]||![family_->frontierTuple() isEqual:frontier]) return false;
       NSMutableDictionary* closed=[current mutableCopy]; closed[@"phase"]=@"closed";
       closed[@"terminal"]=@{@"path":[path stringByAppendingPathComponent:@"terminal.json"],@"digest":arbol_attempt::digest(bytes)};
@@ -1352,10 +1370,12 @@ public:
       if(proof.fd<0||fstat(proof.fd,&before)||fsync(proof.fd)||fcntl(proof.fd,F_FULLFSYNC)||fsync(claim.at.directory)||
          !readNativeFile(claim.at.directory,"claim.json",checked,named,arbol_attempt::limit)||checked!=next||fstat(proof.fd,&after)||
          !arbol_attempt::sameFile(before,after)||!arbol_attempt::sameFile(after,named)||!arbol_attempt::unchanged(claim.at)||
-         !dirtyMonitorCurrent(c,terminalDeadline_)||![terminalMarker(c) isEqual:marker]||!proof.finish()||!directory.finish()) return false;
+         !currentTerminal()||![terminalMarker(c) isEqual:marker]||!proof.finish()||!directory.finish()) return false;
       terminalCommitted_=true; terminalUnresolved_=false; return true;
     } catch(...) { return false; } } @catch(NSException*) { return false; }
   }
+  bool publishDirtyMonitor(arbol_boundary::Context& c) { return publishDirtyTerminal(c,false); }
+  bool publishDirtyMain(arbol_boundary::Context& c) { return publishDirtyTerminal(c,true); }
   bool terminalUnresolved() const { return terminalUnresolved_; }
   bool held(arbol_boundary::Context& c) const {
     return present()&&exclusiveWriter()&&state_->enrolled.load(std::memory_order_acquire)==7&&

@@ -326,6 +326,9 @@ export function loadPlatform(): PlatformPort {
       const custody = makeCustody(owner, build, bundle, digest);
       hostHandover = { owner, build, bundle, digest, custody, consumed: false, prepared: false };
       try { custody.prepareHost(input); hostHandover.prepared = true; return custody; }
+      // Native retains the adopted Build/owner descriptions even when host
+      // preparation never reached complete authenticated enrollment. It cannot
+      // downgrade that failure to the legacy signal-only termination provider.
       catch { return custody.terminate(); }
     },
     prepareWatchdogCustody(owner: HeldLock, build: HeldLock, bundle: string, digest: string): WatchdogCustody {
