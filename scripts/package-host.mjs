@@ -53,18 +53,20 @@ export function command(program, args, maximum = 1048576) {
   if (result.error || result.status !== 0) fail('Host preparation command failed');
   return result.stdout;
 }
-export async function privateDirectory(path) {
+async function checkedDirectory(path, privateLeaf, registered) {
   if (await realpath(path) !== path) fail('Host directory must be physical');
   const st = await lstat(path);
-  if (!st.isDirectory() || st.uid !== userInfo().uid || (st.mode & 0o7777) !== 0o700) fail('Host directory must be private');
+  if (!st.isDirectory() || ![0, userInfo().uid].includes(st.uid) || (st.mode & 0o022) ||
+      (privateLeaf && (st.uid !== userInfo().uid || (st.mode & 0o7777) !== 0o700))) fail('Unsafe host directory');
   for (let parent = dirname(path); parent !== dirname(parent); parent = dirname(parent)) {
     const ancestor = await lstat(parent);
-    const systemTemporary = parent === '/private/tmp' && ancestor.uid === 0 && (ancestor.mode & 0o1777) === 0o1777;
+    const systemTemporary = !registered && parent === '/private/tmp' && ancestor.uid === 0 && (ancestor.mode & 0o1777) === 0o1777;
     if (!ancestor.isDirectory() || ancestor.isSymbolicLink() || (![0, userInfo().uid].includes(ancestor.uid)) ||
         (!systemTemporary && (ancestor.mode & 0o022))) fail('Unsafe host directory ancestry');
   }
-  return { device: String(st.dev), inode: String(st.ino), uid: st.uid, mode: 0o700 };
+  return { device: String(st.dev), inode: String(st.ino), uid: st.uid, mode: st.mode & 0o7777 };
 }
+export function privateDirectory(path, registered = false) { return checkedDirectory(path, true, registered); }
 async function protectedPath(path) {
   let current = path; const tail = [];
   for (;;) {
@@ -82,7 +84,7 @@ export async function assertHostIsolation(buildRoot, stateRoot) {
     const protectedRoot = await protectedPath(path);
     for (const actual of [buildRoot, stateRoot]) if (inside(actual, protectedRoot) || inside(protectedRoot, actual)) fail('Owner installation/data is not qualification state');
   }
-  for (const path of [dirname(buildRoot), buildRoot, stateRoot]) await privateDirectory(path);
+  for (const path of [dirname(buildRoot), buildRoot, stateRoot]) await privateDirectory(path, true);
   if (inside(stateRoot, buildRoot) || inside(buildRoot, stateRoot)) fail('Qualification state overlaps product');
   // One separately prepared disposable state per isolated registry scope. It
   // can survive same-scope compatible Build changes without copying profiles.
@@ -377,7 +379,7 @@ export async function prepareAllocatedHost(environment = process.env) {
   if (typeof buildRoot !== 'string' || typeof build !== 'string' || resolve(buildRoot) !== buildRoot ||
       basename(buildRoot) !== build || basename(dirname(buildRoot)) !== 'arbol-browser' || !/^[1-9a-f][0-9a-f]{0,15}$/.test(build))
     fail('Authentic allocated Arbol Building inputs required');
-  await privateDirectory(buildRoot); await privateDirectory(dirname(buildRoot));
+  await privateDirectory(buildRoot, true); await privateDirectory(dirname(buildRoot), true);
   if ((await readdir(buildRoot)).sort().join(',') !== 'build.json,build.log') fail('Allocated Build is not fresh and unselected');
   const allocation = await json(join(buildRoot, 'build.json')), record = allocation.value;
   const pkg = (await json(join(root, 'package.json'))).value, compiled = await currentHostCompilation();
@@ -393,6 +395,7 @@ export async function prepareAllocatedHost(environment = process.env) {
     const protectedRoot = await protectedPath(join(home, 'Library/Application Support/Arbol', name));
     for (const path of [buildRoot, stateRoot]) if (inside(path, protectedRoot) || inside(protectedRoot, path)) fail('Owner installation is not isolated qualification');
   }
+  await checkedDirectory(dirname(stateRoot), false, true);
   try { await mkdir(stateRoot, { mode: 0o700 }); } catch (error) { if (error.code !== 'EEXIST') throw error; }
   await assertHostIsolation(buildRoot, stateRoot);
   const review = command('/usr/bin/git', ['-C', foresterRoot, 'rev-parse', 'refs/remotes/origin/main']).trim();

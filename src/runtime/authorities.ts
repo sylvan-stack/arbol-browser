@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { unavailable } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
-import { selectedLayout, type BuildSelection, type PackagedLayout } from './selection.js';
+import { packagedLayout, selectedLayout, type BuildSelection, type PackagedLayout } from './selection.js';
 import type { Contract } from '../contracts/generated.js';
 import { directory, assertDirectory } from '../profiles/paths.js';
 import { assertHostCustody } from './custody.js';
@@ -57,6 +57,17 @@ export async function physicalJson(path: string, limit = 1048576, deadline = Inf
       digest: createHash('sha256').update(raw).digest('hex') });
   } catch { throw unavailable('browser'); } finally { await file.close(); }
 }
+function decodePackagedIdentity(layout: PackagedLayout, metadata: PhysicalJson, stateDirectory: string): PackagedIdentity {
+  const value = metadata.value as Record<string, unknown>;
+  const host = value?.host as Record<string, unknown>;
+  const component = { ...(value?.component as object), stateDirectory };
+  if (!value || value.format !== 1 || !validator('wire.ComponentInfo')(component) ||
+      component.build !== layout.build || !digest(value.sourceDigest) || !host ||
+      Object.keys(host).sort().join(',') !== 'compileDigest,layout,productDigest' || host.layout !== 1 ||
+      !digest(host.compileDigest) || !digest(host.productDigest)) throw unavailable('browser');
+  return Object.freeze({ layout, component: Object.freeze(component), sourceDigest: value.sourceDigest,
+    compileDigest: host.compileDigest, productDigest: host.productDigest, metadataDigest: metadata.digest });
+}
 export async function readPackagedIdentity(selection: BuildSelection, payload: string,
   stateDirectory: string, deadline = Infinity): Promise<PackagedIdentity> {
   const layout = selectedLayout(selection, payload);
@@ -65,15 +76,7 @@ export async function readPackagedIdentity(selection: BuildSelection, payload: s
     if (await realpath(path) !== path) throw unavailable('browser');
   }
   const metadata = await physicalJson(join(payload, 'metadata.json'), 1048576, deadline);
-  const value = metadata.value as Record<string, unknown>;
-  const host = value?.host as Record<string, unknown>;
-  const component = { ...(value?.component as object), stateDirectory };
-  if (!value || value.format !== 1 || !validator('wire.ComponentInfo')(component) ||
-      component.build !== selection.build || !digest(value.sourceDigest) || !host ||
-      Object.keys(host).sort().join(',') !== 'compileDigest,layout,productDigest' || host.layout !== 1 ||
-      !digest(host.compileDigest) || !digest(host.productDigest)) throw unavailable('browser');
-  return Object.freeze({ layout, component: Object.freeze(component), sourceDigest: value.sourceDigest,
-    compileDigest: host.compileDigest, productDigest: host.productDigest, metadataDigest: metadata.digest });
+  return decodePackagedIdentity(layout, metadata, stateDirectory);
 }
 
 export interface HostPolicy {
@@ -239,6 +242,31 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
   assertBudget(deadline); verifiedHosts.add(result); await result.assertTrusted(deadline); return result;
 }
 
+/** Metadata-only host-layout correlation. It reads only fixed neighboring
+ * package files, never state/profile, a native addon, a socket or a subprocess.
+ * No VerifiedHost/admission capability is minted from this information. */
+export async function readPackagedComponentInfo(payload: string, deadline = performance.now() + 5000): Promise<Contract<'wire.ComponentInfo'>> {
+  assertBudget(deadline);
+  const metadata = await physicalJson(join(payload, 'metadata.json'), 1048576, deadline);
+  const value = metadata.value as Record<string, unknown>;
+  const component = value?.component as Record<string, unknown> | undefined;
+  if (!component || typeof component.build !== 'string') throw unavailable('browser');
+  const layout = packagedLayout(component.build, payload);
+  for (const path of [layout.buildRoot, layout.bundle, layout.payload]) {
+    assertBudget(deadline); if (await realpath(path) !== path) throw unavailable('browser');
+  }
+  const policyFile = join(layout.bundle, 'Contents/Resources/host-policy.json');
+  const rawPolicy = await physicalJson(policyFile, 16383, deadline), policy = readPolicy(rawPolicy.value);
+  const identity = decodePackagedIdentity(layout, metadata, policy.stateRoot);
+  if (policy.build !== layout.build || policy.buildRoot !== layout.buildRoot || policy.metadataDigest !== metadata.digest ||
+      policy.sourceDigest !== identity.sourceDigest || policy.productDigest !== identity.productDigest) throw unavailable('browser');
+  // Correlate final fixed package bytes. Canonical stateRoot is reported as
+  // declared by policy without opening/creating that directory or consuming a
+  // launcher hint. Runtime/compatibility/signature admission remains separate.
+  if ((await physicalJson(policyFile, 16383, deadline)).digest !== rawPolicy.digest ||
+      (await physicalJson(join(payload, 'metadata.json'), 1048576, deadline)).digest !== metadata.digest) throw unavailable('browser');
+  assertBudget(deadline); return identity.component;
+}
 /** Canonical actual signed host engine authority. No version inference, selected
  * Foundation metadata or user/environment compatibility input is accepted. */
 const engineAuthorities = new WeakSet<object>();

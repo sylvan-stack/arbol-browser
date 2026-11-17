@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from './parse.js';
 import { publicFailure, unavailable, type ExitCode } from '../contracts/errors.js';
@@ -42,7 +42,16 @@ async function productionPorts(selection: BuildSelection): Promise<CommandPorts>
 
 /** Metadata only: no Electron import, native load, profile read, socket or child. */
 export async function componentInfo(): Promise<Contract<'wire.ComponentInfo'>> {
+  const payload = resolve(fileURLToPath(new URL('../../', import.meta.url)));
+  const fixedHost = basename(payload) === 'browser' && basename(dirname(payload)) === 'Resources' &&
+    basename(dirname(dirname(payload))) === 'Contents' && basename(dirname(dirname(dirname(payload)))) === 'ArbolBrowser.app';
+  if (fixedHost) {
+    const address = new URL('../runtime/authorities.js', import.meta.url).href;
+    const { readPackagedComponentInfo } = await import(address) as typeof import('../runtime/authorities.js');
+    return readPackagedComponentInfo(payload);
+  }
   const metadata: PackageMetadata = JSON.parse(await readFile(new URL('../../metadata.json', import.meta.url), 'utf8'));
+  if (Object.prototype.hasOwnProperty.call(metadata, 'host')) throw unavailable('browser');
   const info = { ...metadata.component, stateDirectory: join(homedir(), 'Library/Application Support/Arbol/browser') };
   if (!validator('wire.ComponentInfo')(info)) throw new Error('Invalid packaged component metadata');
   return info;
