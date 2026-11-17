@@ -162,13 +162,15 @@ export async function runHostEntry(): Promise<void> {
     // native capture. Never read the profile request or learn policy from it.
     const payload = resolve(fileURLToPath(new URL('../../', import.meta.url)));
     const bundle = dirname(dirname(dirname(payload))), buildRoot = dirname(bundle);
-    const args = process.argv.slice(2);
-    if (args.length !== 2 || args[0] !== '--arbol-host-request' || !args[1]) throw unavailable('browser');
     const selection: BuildSelection = Object.freeze({ build: basename(buildRoot), directory: buildRoot,
       guard: join(dirname(buildRoot), '.uses', basename(buildRoot)), explicit: true });
     const selectionURL = new URL('./selection.js', import.meta.url).href;
     const selections = await import(selectionURL) as typeof import('./selection.js');
-    selections.selectedLayout(selection, payload);
+    const layout = selections.selectedLayout(selection, payload), argv = [...process.argv];
+    if (argv.length !== 6 || argv[0] !== layout.engine || process.execPath !== layout.engine ||
+        argv[1] !== '--site-per-process' || argv[2] !== '--disable-features=MacAccessibilityTextOperation' ||
+        argv[3] !== layout.hostEntry || argv[4] !== '--arbol-host-request' || !argv[5]?.startsWith('/')) throw unavailable('browser');
+    const args = Object.freeze([argv[4], argv[5]] as const);
     const bootstrapURL = new URL('./bootstrap.js', import.meta.url).href;
     const bootstrap = await import(bootstrapURL) as typeof import('./bootstrap.js');
     // This finite read-only budget is not new engine admission: Native owns
@@ -221,9 +223,9 @@ export async function runHostEntry(): Promise<void> {
     if (boundary) return boundary.fatal.fail('native_boundary_unavailable');
     if (owned) return owned.custody.terminate();
     if (capture) return terminateCapturedHostBuild(capture);
-    // No unknown original receives a terminal/clean witness or a JS unlock.
-    // The inherited guard is untouched; no profile resource was admitted.
-    throw error;
+    // Pinned Electron's uncaught handler shows a GUI dialog and does not quit.
+    // Only this unknown BEFORE-capture branch gets fixed process-local refusal.
+    // It issues no clean/terminal witness, external signal or JS guard release.
+    void error; app.exit(4);
   }
 }
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await runHostEntry();
