@@ -1,3 +1,4 @@
+import { noteOpenCommand, type OpenCommandObservation } from './authorities.js';
 import { execFile } from 'node:child_process';
 import { join } from 'node:path';
 import { userInfo } from 'node:os';
@@ -60,15 +61,18 @@ export function unresolvedStartups(): readonly RetainedStartup[] { return [...re
 /** On-demand only. Repeated calls may inspect a live starting host, never launch
  * a replacement or kill a slow owner. There is no resident launch broker. */
 export function createStarter(options: { selection: BuildSelection; platform: PlatformPort; authority: StartAuthority;
-  acquireBuild(): Promise<BuildGuard>; launch?: LaunchPort; attempts?: LaunchAttemptPort }) {
+  acquireBuild(): Promise<BuildGuard>; launch?: LaunchPort; attempts?: LaunchAttemptPort; observation?: OpenCommandObservation }) {
   return async (profile: ProfileSnapshot, endpoint: Endpoint, deadline: number, contentionDeadline = Math.min(deadline, now() + 10000),
     label = 'Browser client'): Promise<{ client: RuntimeClient; record: RuntimeRecord; alreadyRunning: boolean }> => {
+    noteOpenCommand(options.observation, 'open-starter-profile-recheck');
     assertTime(deadline); await assertProfile(profile);
     // Production leaves time for permanent native cancellation/attestation
     // inside the original request budget. This never extends that budget.
     const admissionDeadline = options.attempts ? deadline - 1000 : deadline;
+    noteOpenCommand(options.observation, 'open-runtime-location');
     const location = await runtimeLocation(profile, true);
     if (!location) throw profileUnavailable();
+    noteOpenCommand(options.observation, 'open-initial-build-lease');
     const guard = await options.acquireBuild(); let startup: HeldLock | undefined;
     let request = '', launched: number | undefined, attempted = false, resolved = false;
     const release = () => { startup?.release(); guard.release(); resolved = true; };
@@ -76,6 +80,7 @@ export function createStarter(options: { selection: BuildSelection; platform: Pl
       await guard.assert();
       let current = await readRuntime(location);
       if (current && originalAlive(current, options.platform)) {
+        noteOpenCommand(options.observation, 'open-native-ready-attachment');
         while (current.phase === 'starting' && now() < deadline) {
           await setTimeout(Math.min(25, Math.max(1, deadline - now())));
           const observed = await readRuntime(location);
@@ -90,10 +95,12 @@ export function createStarter(options: { selection: BuildSelection; platform: Pl
           return { client, record: current, alreadyRunning: true };
         } catch (error) { client.close(); throw error; }
       }
+      noteOpenCommand(options.observation, 'open-startup-arbitration');
       startup = await startupArbitration(location, options.platform, contentionDeadline);
       await guard.assert(); assertTime(deadline);
       current = await readRuntime(location);
       if (current && originalAlive(current, options.platform)) {
+        noteOpenCommand(options.observation, 'open-native-ready-attachment');
         // Another starter won while we waited: attach within the same budget.
         while (current.phase === 'starting' && now() < deadline) {
           await setTimeout(Math.min(25, Math.max(1, deadline - now())));
@@ -109,6 +116,7 @@ export function createStarter(options: { selection: BuildSelection; platform: Pl
           return { client, record: current, alreadyRunning: true };
         } catch (error) { client.close(); throw error; }
       }
+      noteOpenCommand(options.observation, 'open-current-signed-start');
       await options.authority.assertTrusted(options.selection); assertTime(deadline);
       request = token('req');
       const path = join(location.leaf, `launch-${request}.json`);
@@ -121,10 +129,13 @@ export function createStarter(options: { selection: BuildSelection; platform: Pl
       // for a host while retaining the temporary Owner.
       attempted = true;
       assertTime(admissionDeadline);
+      noteOpenCommand(options.observation, 'open-reservation');
       await options.attempts?.reserve(profile, request, admissionDeadline, guard);
       await guard.assert(); assertTime(admissionDeadline);
+      noteOpenCommand(options.observation, 'open-launch');
       launched = await (options.launch ?? launchServices).launch(options.selection, path, admissionDeadline);
       await options.attempts?.launched(profile, request, launched, admissionDeadline);
+      noteOpenCommand(options.observation, 'open-native-ready-attachment');
       do {
         assertTime(admissionDeadline); await guard.assert(); startup.assertIdentity();
         const record = await readRuntime(location);

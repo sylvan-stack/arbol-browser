@@ -8,7 +8,7 @@ import { unavailable } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
 import { assertProfile, type ProfileSnapshot } from '../profiles/records.js';
 import { assertPlatform, type HeldLock, type PlatformPort, type ProcessProvenance } from './platform.js';
-import { assertTrustedHost, assertVerifiedHost, type VerifiedHost } from './authorities.js';
+import { noteOpenCommand, type OpenCommandObservation, assertTrustedHost, assertVerifiedHost, type VerifiedHost } from './authorities.js';
 import { assertTime, now, runtimeLocation, type RuntimeLocation, type RuntimeRecord } from './instance.js';
 import { createStarter, type LaunchAttemptPort } from './start.js';
 import type { ProcessIntegration } from './lifecycle.js';
@@ -307,7 +307,7 @@ export async function assertProductionCloseReady(profile: ProfileSnapshot, recor
 /** Actual selected, signed package integration. No caller-supplied providers,
  * fake native effects or MCP dependency can open this production boundary. */
 export function createProductionProcessIntegration(host: VerifiedHost, selection: BuildSelection,
-  platform: PlatformPort, exits: ProductionExitAuthority): ProcessIntegration {
+  platform: PlatformPort, exits: ProductionExitAuthority, observation?: OpenCommandObservation): ProcessIntegration {
   assertPlatform(platform); assertProductionExitAuthority(exits); assertVerifiedHost(host, now() + 5000);
   if (host.identity.layout.build !== selection.build || host.identity.layout.buildRoot !== selection.directory ||
       selection.guard !== join(selection.directory, '../.uses', selection.build)) throw unavailable('browser');
@@ -315,10 +315,11 @@ export function createProductionProcessIntegration(host: VerifiedHost, selection
     async assertAdmissionAvailable() { await host.assertTrusted(now() + 5000); },
     async start(profile: ProfileSnapshot, endpoint: import('./transport.js').Endpoint, deadline: number,
       contentionDeadline: number, label?: string) {
+      noteOpenCommand(observation, 'open-current-signed-start');
       assertTime(deadline); assertVerifiedHost(host, deadline);
       if (profile.paths.state !== host.policy.stateRoot) throw unavailable('profile');
       const attempts = createLaunchTransactions(host, platform, exits);
-      const starter = createStarter({ selection, platform, attempts,
+      const starter = createStarter({ selection, platform, attempts, ...(observation ? { observation } : {}),
         acquireBuild: () => acquireBuildLease(selection, platform),
         authority: {
           async assertTrusted(actual) {

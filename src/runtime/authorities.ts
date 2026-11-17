@@ -166,6 +166,24 @@ export async function assertTrustedHost(value: VerifiedHost, deadline: number): 
 function assertBudget(deadline: number): void {
   if (!Number.isFinite(deadline) || performance.now() >= deadline) throw unavailable('browser');
 }
+const openCommandStageNames = Object.freeze(['open-dispatch-admission-trust', 'open-profile-selection',
+  'open-current-signed-start', 'open-starter-profile-recheck', 'open-runtime-location',
+  'open-initial-build-lease', 'open-startup-arbitration', 'open-reservation',
+  'open-launch', 'open-native-ready-attachment', 'open-reply', 'open-reply-validation'] as const);
+export type OpenCommandStage = typeof openCommandStageNames[number];
+export interface OpenCommandObservation { readonly stage: OpenCommandStage | undefined }
+const openCommandStages = new WeakMap<OpenCommandObservation, OpenCommandStage | undefined>();
+/** This private command-local token observes fixed milestones only. It carries
+ * no authority, callbacks, raw values, deadline or failure replacement. */
+export function createOpenCommandObservation(): OpenCommandObservation {
+  const observation: OpenCommandObservation = Object.freeze({ get stage() { return openCommandStages.get(observation); } });
+  openCommandStages.set(observation, undefined); return observation;
+}
+export function noteOpenCommand(observation: OpenCommandObservation | undefined, stage: OpenCommandStage): void {
+  try { if (observation && openCommandStages.has(observation) && openCommandStageNames.includes(stage))
+    openCommandStages.set(observation, stage); }
+  catch { /* Observation cannot change an original result or failure. */ }
+}
 export type HostVerificationStage = 'signed-bundle' | 'signed-policy-metadata-compatibility' |
   'isolated-roots' | 'build-guard' | 'initial-verified-host';
 export type HostVerificationObservation = Readonly<object>;

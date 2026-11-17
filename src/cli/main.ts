@@ -15,7 +15,7 @@ const coldStages = ['package-metadata', 'selected-build', 'runtime-imports', 'si
   'pinned-runtime-tuple', 'repeated-host-trust', 'native-platform', 'production-adapters',
   'command-dispatch', 'result-schema'] as const;
 type ColdStage = typeof coldStages[number];
-interface ColdObservation { stage: ColdStage }
+interface ColdObservation { stage: ColdStage; open?: import('../runtime/authorities.js').OpenCommandObservation }
 function noteCold(observation: ColdObservation | undefined, stage: ColdStage): void {
   if (observation) observation.stage = stage;
 }
@@ -24,7 +24,7 @@ function coldFailureSuffix(observation: ColdObservation | undefined, status: Exi
   // additional stream operation can introduce a new asynchronous failure.
   try {
     if (observation && (status === 4 || status === 70) && coldStages.includes(observation.stage))
-      return `arbol-browser: cold-stage ${observation.stage}\n`;
+      return `arbol-browser: cold-stage ${observation.open?.stage ?? observation.stage}\n`;
   } catch { /* best effort only */ }
   return '';
 }
@@ -66,11 +66,14 @@ async function productionPorts(selection: BuildSelection, observation?: ColdObse
   const platform = loadPlatform();
   noteCold(observation, 'production-adapters');
   const exits = createProductionExitAuthority(platform, selection);
-  const integration = createProductionProcessIntegration(host, selection, platform, exits);
+  const openObservation = observation ? authorities.createOpenCommandObservation() : undefined;
+  if (observation && openObservation) observation.open = openObservation;
+  const integration = createProductionProcessIntegration(host, selection, platform, exits, openObservation);
   const state = host.policy.stateRoot;
   return Object.freeze({
     profiles: createProfileService({ state, platform: () => platform, runtime: createProfileRuntime(platform, selection, exits) }),
-    process: createProcessService({ state, selection, platform: () => platform, integration, exits }),
+    process: createProcessService({ state, selection, platform: () => platform, integration, exits,
+      ...(openObservation ? { observation: openObservation } : {}) }),
   });
 }
 
@@ -124,6 +127,7 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
         result = await activePorts.profiles.remove(command.profile, io);
         check = validator('profile.ProfileRemoved'); break;
     }
+    if (observation) delete observation.open;
     noteCold(observation, 'result-schema');
     if (!check(result)) throw new Error('Invalid command result');
     io.stdout.write(`${JSON.stringify(result)}\n`);

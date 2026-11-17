@@ -1,3 +1,4 @@
+import { noteOpenCommand, type OpenCommandObservation } from './authorities.js';
 import { setTimeout } from 'node:timers/promises';
 import type { Contract } from '../contracts/generated.js';
 import { unavailable, BrowserFailure } from '../contracts/errors.js';
@@ -259,20 +260,25 @@ export interface ProcessIntegration {
   mcp(connect: (label: string) => Promise<RuntimeClient>, io: Stdio): Promise<void>;
 }
 export function createProcessService(options: { selection: BuildSelection; platform: () => PlatformPort;
-  state?: string; integration?: ProcessIntegration; exits?: ExitAuthority }): ProcessPort {
+  state?: string; integration?: ProcessIntegration; exits?: ExitAuthority; observation?: OpenCommandObservation }): ProcessPort {
   const state = options.state ?? stateDirectory();
   return Object.freeze<ProcessPort>({
     async open(input) {
       const integration = options.integration;
       if (!integration) return preflightPageAdmission();
       const deadline = startupDeadline(), contentionDeadline = Math.min(deadline, now() + 10000);
+      noteOpenCommand(options.observation, 'open-dispatch-admission-trust');
       await within(deadline, () => integration.assertAdmissionAvailable());
+      noteOpenCommand(options.observation, 'open-profile-selection');
       const profile = await within(deadline, () => selectProfile(input.profile, options.platform(), { state, createDefault: true, deadline: contentionDeadline }));
+      noteOpenCommand(options.observation, 'open-current-signed-start');
       const attached = await acquireWithin(deadline,
         () => integration.start(profile, 'management', deadline, contentionDeadline), result => result.client.close());
       try {
+        noteOpenCommand(options.observation, 'open-reply');
         const result = await attached.client.call({ wire: 1, id: token('req'), method: 'open',
           params: input.url === undefined ? {} : { url: input.url } }, Math.min(deadline, now() + 15000)) as Contract<'wire.OpenResult'>;
+        noteOpenCommand(options.observation, 'open-reply-validation');
         if (result.instance !== attached.record.instance || result.process !== attached.record.pid || result.profile !== profile.record.id)
           throw unavailable('browser');
         return { ...result, alreadyRunning: attached.alreadyRunning };
