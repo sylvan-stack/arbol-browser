@@ -75,3 +75,20 @@ not a positive general text-service qualification. Physical keys/click/wheel,
 trackpad/momentum, OS source drag and multilingual IME/dictation/Writing Tools
 remain unavailable under this Beat. These routes prevent trusting production
 agent admission; every previous host/Driver/release obligation remains.
+
+ABR-12 selects five current-host top-tier cases alongside every existing
+Foundation and pinned Native case. These add distinct signed-entry arbitration
+and listener, connection privacy/release, genuine hang-latch, persistent Session
+and normal complete-close oracles. Execution and its actual disposition belong
+to the ABR-12 hand-over; inventory changes supply no runtime pass.
+
+The ordinary Control entry has no admitted shell presentation/accessibility,
+Share/Take/Return or recovery-action oracle. Tools/ABR-30 inspection, action
+effects and in-flight drain remain unavailable. Physical input, momentum, OS
+source drag, multilingual IME, dictation and Writing Tools retain separate scope.
+There is no reliable signed post-arm mutation seam, engine reader-transaction
+access oracle, surviving-helper/blocked-main phase trigger, genuine lost-ACK
+observation or confirmed-removal/waiting-starter race oracle in the retained
+current-host cases. Cross-site/OOPIF replacement and explicit recovery remain
+unqualified. Earlier Native passes do not supply these complete-host claims.
+No low-tier case was invented/restored and no mid-tier suite was added or run.

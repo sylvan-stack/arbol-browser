@@ -37,7 +37,15 @@ const selection = [
   ['nativeMonitorLossBoundary', 'recovery', ['primary-lost', 'primary-hung', 'primary-timeout', 'custody-lost', 'custody-hung', 'both-lost', 'custody-consent']],
   ['nativeHelperExitBoundary', 'recovery', ['kernel-helper-exit-controls', 'signed-supported-helper-exit']],
 ].map(([id, group, scenarios]) => [id, 'tests/top/test_native_' + group + '.mjs', scenarios]);
-const allCases = [...foundationSelection, ...selection];
+const controlSelection = [
+  ['controlStartupBoundary', 'tests/top/test_control_lifecycle.mjs'],
+  ['controlConnectionBoundary', 'tests/top/test_control_boundary.mjs'],
+  ['controlHealthBoundary', 'tests/top/test_control_recovery.mjs'],
+  ['controlProfilePersistence', 'tests/top/test_control_lifecycle.mjs'],
+  ['controlCompleteClose', 'tests/top/test_control_lifecycle.mjs'],
+];
+const allCases = [...foundationSelection, ...selection, ...controlSelection];
+const controlSupport = ['tests/support/control.mjs'];
 const foundationSupport = ['tests/support/foundation.mjs', 'tests/support/foundation-deadlines.mjs', 'tests/support/foundation-startup-deadlines.mjs'];
 const nativeSupport = ['tests/support/native.mjs', 'tests/support/native-entry.mjs', 'tests/support/native-callbacks.mm',
   'tests/support/native-observer.mm', 'tests/support/native-census.mm', 'tests/support/native-launch.mm', 'scripts/compile-native.mjs', 'scripts/package-base.mjs'];
@@ -63,9 +71,9 @@ async function verifyExports(cases) {
   return modules;
 }
 
-const args = process.argv.slice(2), embedded = args.at(-1) === '--embedded';
-if (embedded) args.pop();
-assert.ok(args.length === 4 || (!embedded && args.length === 6),
+const args = process.argv.slice(2), embedded = args.at(-1) === '--embedded', controlWorker = args.at(-1) === '--control-worker';
+if (embedded || controlWorker) args.pop();
+assert.ok(args.length === 4 || (!embedded && !controlWorker && args.length === 6),
   'Usage: top-gate.mjs --candidate <package> --out <new-private-output> [--native-consumer <pinned-manifest>]');
 assert.equal(args[0], '--candidate'); assert.equal(args[2], '--out');
 assert.ok(args[1] && args[3] && isAbsolute(args[1]) && isAbsolute(args[3]));
@@ -78,7 +86,7 @@ assert.equal(await realpath(candidate), candidate, 'The ordinary sealed host pay
 const protectedRoots = [resolve(repository), buildRoot, dirname(nativeConsumer.manifest), '/Users/msix/Artifacts'];
 assert.ok(!protectedRoots.some(path => output === path || output.startsWith(path + sep)),
   'Qualification evidence must be outside the checkout, candidate and artifact trees');
-if (!embedded) {
+if (!embedded && !controlWorker) {
   assert.equal(await realpath(dirname(output)), dirname(output), 'Qualification output must have a canonical parent');
   await mkdir(output, { mode: 0o700 }); // refuse reuse of prior evidence
   const file = join(output, 'result.json');
@@ -87,7 +95,7 @@ if (!embedded) {
   try {
     const inventory = await readSelection();
     gate.unavailableOutsideSelection = inventory.unavailable;
-    const sources = sourceFiles(allCases, [...foundationSupport, ...nativeSupport]);
+    const sources = sourceFiles(allCases, [...foundationSupport, ...nativeSupport, ...controlSupport]);
     gate.harness = await snapshot(sources);
     gate.harnessCommit = execFileSync('/usr/bin/git', ['-C', repository, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
     const nativeModules = await verifyExports(selection);
@@ -106,6 +114,18 @@ if (!embedded) {
     const foundationOutput = join(output, 'foundation'), home = join(foundationOutput, 'runtime-home');
     await mkdir(foundationOutput, { mode: 0o700 });
     await mkdir(home, { mode: 0o700 });
+    await save();
+    const controlOutput = join(output, 'control'); await mkdir(controlOutput, { mode: 0o700 });
+    const controlRun = spawnSync(join(candidate, 'runtime/Electron.app/Contents/MacOS/Electron'),
+      [fileURLToPath(import.meta.url), '--candidate', buildRoot, '--out', controlOutput, '--control-worker'], {
+        cwd: repository, env: { HOME: home, PATH: '/usr/bin:/bin', ELECTRON_RUN_AS_NODE: '1', LANG: 'en_US.UTF-8' },
+        stdio: 'inherit', timeout: 480000,
+      });
+    const control = await readJson(join(controlOutput, 'result.json'));
+    assert.deepEqual(control.selection, controlSelection.map(([id]) => id));
+    assert.deepEqual(control.harness, Object.fromEntries(sourceFiles(controlSelection, controlSupport).map(path => [path, gate.harness[path]])));
+    gate.control = { record: join(controlOutput, 'result.json'), passed: control.passed,
+      status: controlRun.status, signal: controlRun.signal, error: controlRun.error ? String(controlRun.error) : undefined };
     await save();
     const result = spawnSync(join(candidate, 'runtime/Electron.app/Contents/MacOS/Electron'),
       [fileURLToPath(import.meta.url), '--candidate', buildRoot, '--out', foundationOutput, '--embedded'], {
@@ -209,10 +229,13 @@ if (!embedded) {
       row.elapsedMs = performance.now() - began;
       await save();
     }
+    gate.cases.push(...control.cases);
     assert.deepEqual(await snapshot(sources), gate.harness, 'Qualification harness changed during the gate');
     assert.equal(inventoryDigest(await sourceInventory()), foundationSource, 'Foundation source changed during the gate');
     assert.deepEqual(gate.cases.map(item => item.id), gate.selection);
-    gate.passed = foundation.passed && gate.cases.every(item => item.status === 'passed');
+    assert.equal(inventoryDigest(await (await import('./package-base.mjs')).inventory(join(buildRoot, 'ArbolBrowser.app'))), gate.signedBundle.inventory,
+      'Signed ordinary assembly changed during qualification');
+    gate.passed = foundation.passed && control.passed && controlRun.status === 0 && gate.cases.every(item => item.status === 'passed');
   } catch (error) {
     gate.gateError = String(error.stack ?? error);
     console.error('GATE FAILED: ' + error.message);
@@ -224,6 +247,32 @@ if (!embedded) {
   gate.finishedAt = new Date().toISOString();
   await save();
   process.exitCode = gate.passed ? 0 : 1;
+} else if (controlWorker) {
+  process.noAsar = true;
+  const { contextFor, finish } = await import('../tests/support/control.mjs');
+  const files = sourceFiles(controlSelection, controlSupport), harness = await snapshot(files);
+  const result = { format: 1, buildRoot, candidate, selection: controlSelection.map(([id]) => id), harness, cases: [], passed: false };
+  try {
+    await readSelection(); const modules = await verifyExports(controlSelection);
+    for (const [id, body] of controlSelection) {
+      const row = { id, status: 'failed', body, bodyDigest: harness[body], began: new Date().toISOString() };
+      result.cases.push(row); let context;
+      try {
+        context = await contextFor({ buildRoot, payload: candidate, output }, id);
+        row.evidence = await modules.get(body)[id](context); row.status = 'passed';
+      } catch (error) { row.error = String(error.stack ?? error); }
+      finally {
+        if (context) try { await finish(context); } catch (error) { row.cleanupError = String(error.stack ?? error); row.status = 'failed'; }
+      }
+      row.finishedAt = new Date().toISOString(); console.log((row.status === 'passed' ? 'PASS ' : 'FAIL ') + id);
+      await writeFile(join(output, 'result.json'), JSON.stringify(result, null, 2) + '\n', { mode: 0o600 });
+    }
+    assert.deepEqual(await snapshot(files), harness, 'Control harness changed while executing');
+    result.passed = result.cases.length === controlSelection.length && result.cases.every(row => row.status === 'passed');
+  } catch (error) { result.gateError = String(error.stack ?? error); }
+  result.finishedAt = new Date().toISOString();
+  await writeFile(join(output, 'result.json'), JSON.stringify(result, null, 2) + '\n', { mode: 0o600 });
+  process.exitCode = result.passed ? 0 : 1;
 } else {
   try {
   // Electron's ASAR filesystem view must not replace physical archive bytes in

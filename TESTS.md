@@ -7,8 +7,11 @@ retaining ABR-8's earlier cases and recorded limitations. The exact case and
 scenario selection, admission reasons and unavailable routes are in
 [test-tiers.json](test-tiers.json). No earlier low-tier bodies existed.
 
-The normal Build gate executes all six Foundation cases and ten native cases.
-The Foundation worker uses the ordinary candidate's packaged CLI, compiled
+The normal Build gate selects all six unchanged Foundation cases, ten unchanged
+native cases (50 scenarios), and five Control cases. ABR-12 owns current-host
+qualification; source selection alone is not an executed result.
+The Foundation worker calls the ordinary candidate's physical compiled `runCli`
+through explicit no-integration fixture ports, compiled
 libraries, Darwin process addon and embedded Node with disposable state, kernel
 locks and AF_UNIX sockets. The native worker uses the independently bound,
 immutable ABR-46 signed consumer and separately built private fixtures. Its
@@ -37,13 +40,21 @@ worker has its own 90-second deadline. Each native launch and external observer
 has its own bounded deadline. Scenarios with a declared observation retry keep
 every attempt, and a witnessed failure ends the scenario.
 
-To repeat the complete gate against the exact ordinary package made from the
-same source and a fresh private output, use:
+Control runs the actual `<Build>/bin/arbol-browser` sealed production entry while
+the ordinary record is still `building`. Its private selection hint comes from
+that real record, canonical layout and actual `.uses` inode; it supplies no
+native authority. The gate cannot force a record working or repeat Control
+through an arbitrary staged package. Use a clean detached managed testing commit
+and fresh private registry/bin/state under canonical non-writable ancestors
+beneath `/Users/msix/Builds/sylvan-stack/arbol-browser/`, with the normal Build
+command above.
 
-```sh
-node scripts/top-gate.mjs --candidate /absolute/immutable/package --out /absolute/new-private-output \
-  --native-consumer /Users/msix/Builds/sylvan-stack/arbol-browser/ABR-46-20261116-6df9y348/consumer-manifest.json
-```
+The five Control cases cover startup arbitration and listener observations,
+ungranted connection isolation and release, genuine renderer hang latching,
+separate persistent website Sessions, and complete-close observations. Every
+selected case remains required. The gate binds bodies, support and inventory
+before and after use, exact sealed assembly and separate lane results. Control
+supplies no Tools provider or privileged shell fixture.
 
 Keep the run outside owner profiles, the normal registry and the accepted
 consumer's artifact tree. The isolated `working` status covers the documented

@@ -1,7 +1,7 @@
 {
   "format": 1,
   "component": "arbol-browser",
-  "reviewed": "2026-11-16",
+  "reviewed": "2026-11-17",
   "cases": [
     {
       "id": "receiptRace",
@@ -291,6 +291,79 @@
         "kernel-helper-exit-controls",
         "signed-supported-helper-exit"
       ]
+    },
+    {
+      "id": "controlStartupBoundary",
+      "file": "tests/top/test_control_lifecycle.mjs",
+      "tier": "top",
+      "status": "retained",
+      "reason": "concurrent explicit opens create multiple originals or restart dead instance implicitly",
+      "oracle": "metadata-only info no state change; concurrent CLI results exact same runtime instance/native PID birth; externally sampled tree/listeners; complete close then no process restart",
+      "incrementalValue": "ordinary Building guarded signed entry, not Foundation no-engine starter",
+      "origins": [
+        "BRW-0.4",
+        "BRW-0.6",
+        "BRW-0.14",
+        "BRW-3.11"
+      ]
+    },
+    {
+      "id": "controlConnectionBoundary",
+      "file": "tests/top/test_control_boundary.mjs",
+      "tier": "top",
+      "status": "retained",
+      "reason": "observer/client confusion leaks authority or disconnect fails to remove controller",
+      "oracle": "Distinct genuine attachments; ungranted client sees no private/owner-created tabs and cannot release them. Owner release returns private projection with new generation and rejects stale close. Reconnect sees no inherited grant; prior-owner cleanup itself remains unavailable without an independent granted observer/shell oracle.",
+      "incrementalValue": "current signed host protected transport and native handoff, distinct from retained native fixture",
+      "origins": [
+        "BRW-2.1",
+        "BRW-2.2",
+        "BRW-2.9",
+        "BRW-2.12",
+        "BRW-3.14"
+      ]
+    },
+    {
+      "id": "controlHealthBoundary",
+      "file": "tests/top/test_control_recovery.mjs",
+      "tier": "top",
+      "status": "retained",
+      "reason": "hung page stays available or exposes stale control after heartbeat fault",
+      "oracle": "loopback page reports ready then separate long-poll arm causes genuine renderer spin; receiver list eventually latches non-ready fault; no self-recovery",
+      "incrementalValue": "current host independent heartbeat and ownership integration",
+      "origins": [
+        "BRW-2.17",
+        "BRW-4.5",
+        "BRW-4.6"
+      ]
+    },
+    {
+      "id": "controlProfilePersistence",
+      "file": "tests/top/test_control_lifecycle.mjs",
+      "tier": "top",
+      "status": "retained",
+      "reason": "real Sessions share cookies/storage or lose persisted data across close/reopen",
+      "oracle": "two live originals and loopback server records separate cookie/localStorage tokens; complete clean close/restart preserves only intended profile token and private authority",
+      "incrementalValue": "actual Electron persistent website Sessions",
+      "origins": [
+        "BRW-1.4",
+        "BRW-1.5",
+        "BRW-2.10"
+      ]
+    },
+    {
+      "id": "controlCompleteClose",
+      "file": "tests/top/test_control_lifecycle.mjs",
+      "tier": "top",
+      "status": "retained",
+      "reason": "CLI succeeds or marks clean before complete originals exit/flush",
+      "oracle": "recorded original family and independent ps/lsof plus native identity and post-close engine marker and restart data; no elapsed-time-only success",
+      "incrementalValue": "complete production close beyond pinned native helper test",
+      "origins": [
+        "BRW-0.7",
+        "BRW-1.5",
+        "BRW-1.7"
+      ]
     }
   ],
   "mid": [],
@@ -327,6 +400,10 @@
     {
       "id": "native-enforcement-limits",
       "reason": "Runtime write failure, continuous process confinement before the observed baseline, and concurrent loss of both monitors while main is blocked remain unqualified."
+    },
+    {
+      "id": "control-required-gaps",
+      "reason": "physical native keys/click/wheel/momentum and OS drag; live IME/dictation/Writing Tools/configured text services; actual shell Take/Return/share/revoke/focus/presentation/accessible control oracle; Tools inspection/action drain and in-flight model effects; reliable signed post-arm mutation seam; no synthetic monitor or earlier signature rejection substituted; engine reader transaction fault corpus lacking independently admitted engine-access oracle; main-dead surviving-helper custody and blocked-main dual-watchdog fault routes pending concrete external phase control; genuine lost acknowledgement and authentic failed-launch replay route; cross-site/OOPIF replacement with independent current-view observations; explicit shell recovery action unavailable under present external interface; controlling-TTY removal with a deterministic already-waiting starter: no admitted external phase oracle yet; retain piped/default refusals in unchanged Foundation"
     }
   ],
   "qualificationOwners": {
