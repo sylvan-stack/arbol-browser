@@ -357,29 +357,31 @@ struct Deadline {
 
 static void pipeDescriptors(int (&out)[2]) {
   int raw[2]; if(pipe(raw)) throw 4;
-  out[0]=fcntl(raw[0],F_DUPFD_CLOEXEC,10); out[1]=fcntl(raw[1],F_DUPFD_CLOEXEC,10); close(raw[0]); close(raw[1]);
+  out[0]=fcntl(raw[0],F_DUPFD_CLOEXEC,64); out[1]=fcntl(raw[1],F_DUPFD_CLOEXEC,64); close(raw[0]); close(raw[1]);
   if(out[0]<0||out[1]<0) throw 4;
 }
 static Channel launchCustody(Context& c,double deadline,arbol_exit::HostCapability* cap) {
   int init= capsuleDescriptor(capsuleBytes(c,false)),forward[2],reply[2]; if(init<0) throw 4; pipeDescriptors(forward); pipeDescriptors(reply);
-  int owner=fcntl(3,F_DUPFD_CLOEXEC,10),build=fcntl(4,F_DUPFD_CLOEXEC,10);
-  posix_spawn_file_actions_t actions; posix_spawnattr_t attr;
+  int owner=fcntl(3,F_DUPFD_CLOEXEC,64),build=fcntl(4,F_DUPFD_CLOEXEC,64);
+  posix_spawn_file_actions_t actions; posix_spawnattr_t attr; SpawnCopies copies;
   if(owner<0||build<0||posix_spawn_file_actions_init(&actions)||posix_spawnattr_init(&attr)) throw 4;
-  bool ok=!posix_spawn_file_actions_adddup2(&actions,owner,3)&&!posix_spawn_file_actions_adddup2(&actions,build,4)&&
-    !posix_spawn_file_actions_adddup2(&actions,init,5)&&!posix_spawn_file_actions_adddup2(&actions,forward[0],6)&&!posix_spawn_file_actions_adddup2(&actions,reply[1],7)&&
+  bool ok=copies.map(actions,owner,3)&&copies.map(actions,build,4)&&copies.map(actions,init,5)&&
+    copies.map(actions,forward[0],6)&&copies.map(actions,reply[1],7)&&
     !posix_spawn_file_actions_addopen(&actions,0,"/dev/null",O_RDONLY,0)&&!posix_spawn_file_actions_addopen(&actions,1,"/dev/null",O_WRONLY,0)&&!posix_spawn_file_actions_addopen(&actions,2,"/dev/null",O_WRONLY,0)&&
     !posix_spawnattr_setpgroup(&attr,c.main.group)&&!posix_spawnattr_setflags(&attr,POSIX_SPAWN_SETPGROUP|POSIX_SPAWN_CLOEXEC_DEFAULT);
-  if(ok&&cap) ok=cap->present()&&!posix_spawn_file_actions_adddup2(&actions,cap->capsule(),8)&&
-    !posix_spawn_file_actions_adddup2(&actions,cap->stateDescriptor(),9);
+  if(ok&&cap) ok=cap->spawnBindings(actions,copies,2);
   std::string helper=c.helper(); char* args[]={helper.data(),(char*)"--custody",cap?(char*)"--host-finalization":nullptr,nullptr}; char* env[]={(char*)"PATH=/usr/bin:/bin",nullptr}; pid_t pid=0;
   int result=ok?posix_spawn(&pid,helper.c_str(),&actions,&attr,args,env):EINVAL;
   posix_spawn_file_actions_destroy(&actions); posix_spawnattr_destroy(&attr);
+  bool copiesClosed=copies.closeCopies();
   close(owner); close(build); close(init); close(forward[0]); close(reply[1]);
   if(result) throw 4;
+  if(cap&&!cap->spawned(2)) copiesClosed=false;
   // Capture the actual child even if its validation fails: failed-attempt
   // retirement must not forget a child which already owns duplicate locks.
   if(observe(pid,c.custody)!=1||!c.monitor(c.custody,true)) throw 4;
   if(cap&&!cap->shared()->custody.bind(c.custody,deadline)) throw 4;
+  if(!copiesClosed) throw 4;
   Channel pair(reply[0],forward[1]);
   std::string expected="C 1 "+std::to_string(c.custody.pid)+" "+std::to_string(c.custody.start);
   for(;;) { if(clockMs()>=deadline||pair.failed||current(c.custody)!=1) throw 4;

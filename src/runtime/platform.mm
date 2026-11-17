@@ -451,27 +451,28 @@ static napi_value spawnWatchdog(napi_env env,napi_callback_info info) {
     // Provenance is the actual pipe() pair owned by this one native spawn,
     // never a caller-provided numeric FD whose fstat merely looks plausible.
     if(!c->retainedReader.retain(c->reader,O_RDONLY)||!c->retainedWriter.retain(c->writer,O_WRONLY)) return fail(env);
-    posix_spawn_file_actions_t actions; posix_spawnattr_t attr;
+    posix_spawn_file_actions_t actions; posix_spawnattr_t attr; arbol_boundary::SpawnCopies copies;
     bool actionsReady=!posix_spawn_file_actions_init(&actions),attrReady=!posix_spawnattr_init(&attr);
     bool ok=actionsReady&&attrReady;
-    if(ok) ok=!posix_spawn_file_actions_adddup2(&actions,c->context.owner.fd,3)&&!posix_spawn_file_actions_adddup2(&actions,c->context.build.fd,4)&&
-      !posix_spawn_file_actions_adddup2(&actions,c->capsule,5)&&!posix_spawn_file_actions_adddup2(&actions,down[0],0)&&
-      !posix_spawn_file_actions_adddup2(&actions,up[1],1)&&!posix_spawn_file_actions_addopen(&actions,2,"/dev/null",O_WRONLY,0)&&
+    if(ok) ok=copies.map(actions,c->context.owner.fd,3)&&copies.map(actions,c->context.build.fd,4)&&
+      copies.map(actions,c->capsule,5)&&copies.map(actions,down[0],0)&&copies.map(actions,up[1],1)&&!posix_spawn_file_actions_addopen(&actions,2,"/dev/null",O_WRONLY,0)&&
       !posix_spawnattr_setflags(&attr,POSIX_SPAWN_CLOEXEC_DEFAULT);
-    if(ok&&c->hostRequired) ok=!posix_spawn_file_actions_adddup2(&actions,c->finalization.capsule(),8)&&
-      !posix_spawn_file_actions_adddup2(&actions,c->finalization.stateDescriptor(),9);
+    if(ok&&c->hostRequired) ok=c->finalization.spawnBindings(actions,copies,1);
     std::string helper=c->context.helper(); char* argv[]={helper.data(),(char*)"--watchdog",c->hostRequired?(char*)"--host-finalization":nullptr,nullptr};
     char* environment[]={(char*)"PATH=/usr/bin:/bin",nullptr}; pid_t pid=0;
     int result=ok?posix_spawn(&pid,helper.c_str(),&actions,&attr,argv,environment):EINVAL;
     if(actionsReady) posix_spawn_file_actions_destroy(&actions); if(attrReady) posix_spawnattr_destroy(&attr);
+    bool copiesClosed=copies.closeCopies();
     close(down[0]); close(up[1]);
     if(result) return fail(env);
+    if(c->hostRequired&&!c->finalization.spawned(1)) copiesClosed=false;
     arbol_boundary::Info birth{}; arbol_boundary::Identity original;
     if(arbol_boundary::observe(pid,original,&birth)!=1) return fail(env);
     c->context.primary=original; // retain the actual child even if validation fails
     if(birth.unique.parent!=c->context.main.start||birth.unique.originalParentVersion!=c->context.main.version||
        (!c->context.monitor(original,true)&&!c->context.monitor(original,false))) return fail(env);
     if(c->hostRequired&&!c->finalization.shared()->primary.bind(original,arbol_boundary::clockMs()+1000)) return fail(env);
+    if(!copiesClosed) return fail(env);
     // The exact child executes cleanup even if its producer never resumes.
     // Its one legal setpgid may occur before/between the parent observations;
     // neither group alone is a substitute for the later actual C/G/J proof.

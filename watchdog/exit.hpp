@@ -111,6 +111,42 @@ struct IdentitySlot {
   // and physical signed executable at each birth/C/G/J/retirement boundary.
   bool is(const Identity& id) const { return state.load(std::memory_order_acquire)==2 && arbol_boundary::same(value,id); }
 };
+// Reusable active slots use atomic scalar fields plus a monotonically tagged
+// publication. A reader never races non-atomic payload reuse or mistakes ABA
+// for one complete identity. Phase 1 is actual incomplete identity publication,
+// not a generic read-only census in progress.
+struct FamilySlot {
+  std::atomic<uint64_t> publication{0},start{0},parentStart{0},capturedUs{0};
+  std::atomic<uint32_t> pid{0},version{0},uid{0},group{0},parentVersion{0},session{0},image{0};
+  bool read(arbol_boundary::FamilyObservation& out,uint64_t& serial) const {
+    uint64_t before=publication.load(std::memory_order_acquire);
+    if((before&3)!=2) return false;
+    out.original={(int)pid.load(),start.load(),(int32_t)version.load(),uid.load(),group.load()};
+    out.parentStart=parentStart.load(); out.parentVersion=(int32_t)parentVersion.load();
+    out.capturedUs=capturedUs.load(); out.session=session.load(); out.image=image.load();
+    serial=before>>2; return publication.load(std::memory_order_acquire)==before;
+  }
+  bool publish(const arbol_boundary::FamilyObservation& value,uint64_t serial) {
+    uint64_t empty=publication.load(std::memory_order_acquire);
+    if((empty&3)||!serial||serial>(UINT64_MAX>>2)||
+       !publication.compare_exchange_strong(empty,(serial<<2)|1,std::memory_order_acq_rel)) return false;
+    pid.store(value.original.pid); start.store(value.original.start); version.store(value.original.version);
+    uid.store(value.original.uid); group.store(value.original.group); parentStart.store(value.parentStart);
+    parentVersion.store(value.parentVersion); capturedUs.store(value.capturedUs); session.store(value.session); image.store(value.image);
+    publication.store((serial<<2)|2,std::memory_order_release); return true;
+  }
+};
+struct FamilyRoleState {
+  std::atomic<uint64_t> nextCapture{0};
+  std::atomic<uint32_t> appendInFlight{0},failed{0},sealed{0};
+  FamilySlot active[4096]; // simultaneous unresolved originals, not lifetime count
+};
+struct FamilyState { std::atomic<uint32_t> uncertain{0}; FamilyRoleState roles[3]; };
+struct LedgerHeader {
+  char magic[8]={'A','B','R','2','9','F','1','\0'}; uint32_t format=1,role=0;
+  char capabilityDigest[65]{},nonce[65]{}; uint8_t reserved[6]{};
+};
+static_assert(sizeof(LedgerHeader)==152);
 struct MarkerBinding {
   uint64_t device=0,inode=0,size=0,dataEpoch=0; uint32_t uid=0;
   char digest[65]{},reader[257]{};
@@ -123,6 +159,7 @@ struct SharedState {
   uint64_t bytes=sizeof(SharedState); std::atomic<uint64_t> fatal{0};
   std::atomic<uint64_t> fatalCutoffUs{0};
   IdentitySlot main,primary,custody;
+  FamilyState family;
   std::atomic<uint32_t> enrolled{0},transfer{0},mutation{0},markerBound{0},admitted{0};
   std::atomic<uint32_t> cookieAcknowledged{0},domRequested{0},quitRequested{0},retiredPages{0};
   std::atomic<uint32_t> primaryConsent{0},custodyConsent{0};
@@ -181,9 +218,104 @@ inline bool privateDirectoryAt(int parent,const char* name,struct stat& out,bool
   if(valid&&created) valid=!fsync(fd)&&!fsync(parent);
   if(close(fd)) valid=false; return valid;
 }
+class RetainedFamily final:public arbol_boundary::FamilyCapture {
+  SharedState* state_; unsigned role_; Identity main_; int session_;
+public:
+  RetainedFamily(SharedState* state,unsigned role,const Identity& main,int session):state_(state),role_(role),main_(main),session_(session) {}
+  void refuse() override { state_->family.uncertain.store(1,std::memory_order_release); state_->poison(identityLoss); }
+  bool capture(const arbol_boundary::FamilyObservation& value) override {
+    if(role_>2||value.original.pid<=1||!value.original.start||value.original.version<=0||value.original.uid!=main_.uid||
+       value.original.group!=main_.group||value.parentStart!=main_.start||value.parentVersion!=main_.version||
+       value.session!=(uint32_t)session_||value.image<1||value.image>4) { refuse(); return false; }
+    auto& role=state_->family.roles[role_];
+    for(auto& slot:role.active) {
+      arbol_boundary::FamilyObservation old; uint64_t serial;
+      if(slot.read(old,serial)&&arbol_boundary::same(old.original,value.original))
+        return old.original.group==value.original.group&&old.parentStart==value.parentStart&&old.parentVersion==value.parentVersion&&
+          old.session==value.session&&old.image==value.image;
+    }
+    for(auto& slot:role.active) if(!(slot.publication.load(std::memory_order_acquire)&3)) {
+      uint64_t serial=role.nextCapture.fetch_add(1,std::memory_order_acq_rel)+1;
+      if(slot.publish(value,serial)) return true;
+    }
+    refuse(); return false;
+  }
+};
 class HostCapability {
   int capsule_=-1,stateFd_=-1; SharedState* state_=nullptr;
+  int reads_[3]{-1,-1,-1},writes_[3]{-1,-1,-1}; unsigned role_=0;
+  RetainedFamily* family_=nullptr;
   NSDictionary* value_=nil; std::string raw_; bool attempted_=false,valid_=false;
+  bool ledgerDescriptor(int fd,unsigned index,bool writable,bool header=true) const {
+    NSArray* streams=value_[@"family"];
+    if(![streams isKindOfClass:NSArray.class]||streams.count!=3||index>2||fd<0) return false;
+    NSDictionary* stream=streams[index]; uint64_t role;
+    if(!arbol_attempt::keys(stream,@[@"role",@"path",@"identity",@"nonce"])||!arbol_attempt::uintNumber(stream[@"role"],role)||role!=index||
+       !arbol_attempt::path(stream[@"path"])||!arbol_attempt::pattern(stream[@"nonce"],@"^[0-9a-f]{64}$")) return false;
+    NSString* expected=[value_[@"receiptDirectory"][@"path"] stringByAppendingPathComponent:
+      [@[@"family-main.log",@"family-primary.log",@"family-custody.log"] objectAtIndex:index]];
+    std::string path=expected.fileSystemRepresentation; char actual[PATH_MAX]{}; struct stat held{},named{};
+    int flags=fcntl(fd,F_GETFL);
+    if(![stream[@"path"] isEqual:expected]||!arbol_boundary::canonical(path)||flags<0||
+       (flags&O_ACCMODE)!=(writable?O_WRONLY:O_RDONLY)||fstat(fd,&held)||lstat(path.c_str(),&named)||
+       !arbol_attempt::privateFile(held)||!arbol_attempt::privateFile(named)||held.st_dev!=named.st_dev||held.st_ino!=named.st_ino||
+       ![fileIdentity(held) isEqual:stream[@"identity"]]||fcntl(fd,F_GETPATH,actual)||path!=actual) return false;
+    if(!header) return true;
+    LedgerHeader bytes{},expectedHeader{}; expectedHeader.role=index;
+    memcpy(expectedHeader.capabilityDigest,[arbol_attempt::digest(raw_) UTF8String],65);
+    memcpy(expectedHeader.nonce,[stream[@"nonce"] UTF8String],65);
+    // Writer validation uses its already verified read-only sibling; no role
+    // reopens a writer by pathname or acquires another writer's description.
+    int reader=writable?reads_[index]:fd;
+    return reader>=0&&held.st_size>=(off_t)sizeof(bytes)&&pread(reader,&bytes,sizeof(bytes),0)==sizeof(bytes)&&
+      !memcmp(&bytes,&expectedHeader,sizeof(bytes));
+  }
+  bool createLedgers(NSString* directory,dev_t device,NSArray* __strong& streams) {
+    int parent=open(directory.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC); if(parent<0) return false;
+    NSMutableArray* values=[NSMutableArray new]; bool ok=true;
+    for(unsigned i=0;i<3&&ok;++i) {
+      NSString* name=@[@"family-main.log",@"family-primary.log",@"family-custody.log"][i];
+      int writer=openat(parent,name.UTF8String,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC,0600);
+      if(writer<0) { ok=false; break; }
+      int reader=openat(parent,name.UTF8String,O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
+      struct stat w{},r{},named{};
+      ok=reader>=0&&!fchmod(writer,0600)&&!fstat(writer,&w)&&!fstat(reader,&r)&&!fstatat(parent,name.UTF8String,&named,AT_SYMLINK_NOFOLLOW)&&
+        arbol_attempt::privateFile(w)&&w.st_dev==device&&w.st_size==0&&w.st_dev==r.st_dev&&w.st_ino==r.st_ino&&w.st_dev==named.st_dev&&w.st_ino==named.st_ino;
+      if(ok) { writes_[i]=fcntl(writer,F_DUPFD_CLOEXEC,64); reads_[i]=fcntl(reader,F_DUPFD_CLOEXEC,64); ok=writes_[i]>=64&&reads_[i]>=64; }
+      if(close(writer)) ok=false; if(reader>=0&&close(reader)) ok=false;
+      if(ok) [values addObject:@{@"role":@(i),@"path":[directory stringByAppendingPathComponent:name],@"identity":fileIdentity(w),
+        @"nonce":arbol_attempt::digest(NSUUID.UUID.UUIDString.UTF8String)}];
+    }
+    if(ok) ok=!fsync(parent); if(close(parent)) ok=false;
+    streams=values; return ok&&values.count==3;
+  }
+  bool initializeLedgers() {
+    for(unsigned i=0;i<3;++i) {
+      LedgerHeader header{}; header.role=i;
+      memcpy(header.capabilityDigest,[arbol_attempt::digest(raw_) UTF8String],65);
+      memcpy(header.nonce,[value_[@"family"][i][@"nonce"] UTF8String],65);
+      size_t at=0; const char* bytes=(const char*)&header;
+      while(at<sizeof(header)) { ssize_t n=pwrite(writes_[i],bytes+at,sizeof(header)-at,at); if(n>0) at+=n; else if(n<0&&errno==EINTR) continue; else return false; }
+      if(fsync(writes_[i])||!ledgerDescriptor(reads_[i],i,false)||!ledgerDescriptor(writes_[i],i,true)) return false;
+    }
+    return true;
+  }
+  bool loadLedgers(bool primary) {
+    role_=primary?1:2;
+    for(unsigned i=0;i<3;++i) {
+      reads_[i]=fcntl(10+i,F_DUPFD_CLOEXEC,64);
+      if(reads_[i]<64||!ledgerDescriptor(reads_[i],i,false)) return false;
+    }
+    writes_[role_]=fcntl(13,F_DUPFD_CLOEXEC,64);
+    if(writes_[role_]<64||!ledgerDescriptor(writes_[role_],role_,true)) return false;
+    if(primary) { writes_[2]=fcntl(14,F_DUPFD_CLOEXEC,64); if(writes_[2]<64||!ledgerDescriptor(writes_[2],2,true)) return false; }
+    for(int fd=10;fd<=13+(primary?1:0);++fd) if(close(fd)) return false;
+    return true;
+  }
+  bool attachFamily(arbol_boundary::Context& c) {
+    if(family_||role_>2) return false;
+    family_=new RetainedFamily(state_,role_,c.main,c.session); c.family=family_; return true;
+  }
 public:
   HostCapability()=default; HostCapability(const HostCapability&)=delete; HostCapability& operator=(const HostCapability&)=delete;
   // Native custody keeps this object for process lifetime. A helper's OS exit
@@ -192,6 +324,28 @@ public:
   SharedState* shared() const { return state_; } NSDictionary* value() const { return value_; }
   const std::string& raw() const { return raw_; }
   bool present() const { return valid_ && state_ && value_; }
+  bool spawnBindings(posix_spawn_file_actions_t& actions,arbol_boundary::SpawnCopies& copies,unsigned childRole) {
+    if(!present()||!((role_==0&&childRole==1)||(role_==1&&childRole==2))) return false;
+    if(!copies.map(actions,capsule_,8)||!copies.map(actions,stateFd_,9)) return false;
+    for(unsigned i=0;i<3;++i) if(!ledgerDescriptor(reads_[i],i,false)||!copies.map(actions,reads_[i],10+i)) return false;
+    if(!ledgerDescriptor(writes_[childRole],childRole,true)||!copies.map(actions,writes_[childRole],13)) return false;
+    return childRole!=1||(ledgerDescriptor(writes_[2],2,true)&&copies.map(actions,writes_[2],14));
+  }
+  bool spawned(unsigned childRole) {
+    // Close only actual producer aliases after successful actual spawn. The
+    // child's own checked descriptors are already retained by the kernel.
+    bool ok=true;
+    for(unsigned i=childRole;i<3;++i) if(i!=role_&&writes_[i]>=0) {
+      if(close(writes_[i])) ok=false; else writes_[i]=-1;
+    }
+    if(!ok) { state_->family.uncertain.store(1,std::memory_order_release); state_->poison(identityLoss); }
+    return ok;
+  }
+  bool exclusiveWriter() const {
+    for(unsigned i=0;i<3;++i) if(i!=role_&&writes_[i]>=0) return false;
+    return ledgerDescriptor(writes_[role_],role_,true);
+  }
+
   bool prepare(arbol_boundary::Context& c,const std::string& input,double deadline) {
     if(attempted_) return false; attempted_=true;
     if(getpid()!=c.main.pid || !c.initial()) return false;
@@ -255,14 +409,17 @@ public:
        arbol_attempt::path(prior[@"path"])&&arbol_attempt::pattern(prior[@"digest"],@"^[0-9a-f]{64}$"));
     if(!priorOK) return false;
     NSString* boot=bootSession(); if(!boot) return false;
+    NSString* receiptPath=[[[state stringByAppendingPathComponent:@"exit-evidence"] stringByAppendingPathComponent:attempt[@"profilePathHash"]] stringByAppendingPathComponent:attempt[@"request"]];
+    NSArray* streams=nil; if(!createLedgers(receiptPath,root.st_dev,streams)) return false;
+
     value_=@{@"format":@1,@"kind":@"host-finalization",@"bootSession":boot,@"bundle":[NSString stringWithUTF8String:c.bundle.c_str()],
       @"main":arbol_boundary::capsuleIdentity(c.main,c.session),@"locks":@{@"owner":arbol_boundary::capsuleLock(c.owner),@"build":arbol_boundary::capsuleLock(c.build)},
       @"attempt":attempt,@"attemptPath":[NSString stringWithUTF8String:(claim.at.path+"/claim.json").c_str()],
       @"profileDirectory":fileIdentity(root),@"profileRecord":fileIdentity(record),@"profileRecordDigest":arbol_attempt::digest(profileRaw),
       @"directories":@{@"data":fileIdentity(data),@"userData":fileIdentity(userData)},
       @"receiptDirectory":@{@"path":[[[state stringByAppendingPathComponent:@"exit-evidence"] stringByAppendingPathComponent:attempt[@"profilePathHash"]] stringByAppendingPathComponent:attempt[@"request"]],@"identity":fileIdentity(receiptDirectory)},
-      @"runtime":proposed[@"runtime"],@"markerPath":[profile stringByAppendingPathComponent:@"engine.json"],@"prior":prior};
-    raw_=arbol_attempt::bytes(value_); capsule_=arbol_boundary::capsuleDescriptor(raw_); if(capsule_<0) return false;
+      @"family":streams,@"runtime":proposed[@"runtime"],@"markerPath":[profile stringByAppendingPathComponent:@"engine.json"],@"prior":prior};
+    raw_=arbol_attempt::bytes(value_); if(!initializeLedgers()) return false; capsule_=arbol_boundary::capsuleDescriptor(raw_); if(capsule_<0) return false;
     char temporary[]="/private/tmp/arbol-browser-state-XXXXXX"; int writer=mkstemp(temporary);
     if(writer<0) return false;
     bool ok=!fcntl(writer,F_SETFD,FD_CLOEXEC)&&!fchmod(writer,0600)&&!ftruncate(writer,sizeof(SharedState))&&!unlink(temporary);
@@ -271,6 +428,7 @@ public:
     void* mapping=mmap(nullptr,sizeof(SharedState),PROT_READ|PROT_WRITE,MAP_SHARED,stateFd_,0); if(mapping==MAP_FAILED) return false;
     state_=new(mapping) SharedState; memcpy(state_->capabilityDigest,[arbol_attempt::digest(raw_) UTF8String],65);
     if(!state_->main.bind(c.main,deadline)) return false; state_->enrolled.fetch_or(1,std::memory_order_release);
+    if(!attachFamily(c)) return false;
     valid_=arbol_boundary::clockMs()<deadline && metadata() && arbol_boundary::lockIdentity(c.owner)&&arbol_boundary::lockIdentity(c.build);
     return valid_;
   }
@@ -278,7 +436,7 @@ public:
     if(attempted_) return false; attempted_=true;
     if(!anonymousBytes(8,raw_,deadline)||!anonymousFile(9,true,sizeof(SharedState))) return false;
     value_=arbol_attempt::json(raw_); NSDictionary* main=value_[@"main"],*locks=value_[@"locks"],*attempt=value_[@"attempt"];
-    if(!arbol_attempt::keys(value_,@[@"format",@"kind",@"bootSession",@"bundle",@"main",@"locks",@"attempt",@"attemptPath",@"profileDirectory",@"profileRecord",@"profileRecordDigest",@"directories",@"receiptDirectory",@"runtime",@"markerPath",@"prior"]) ||
+    if(!arbol_attempt::keys(value_,@[@"format",@"kind",@"bootSession",@"bundle",@"main",@"locks",@"attempt",@"attemptPath",@"profileDirectory",@"profileRecord",@"profileRecordDigest",@"directories",@"receiptDirectory",@"family",@"runtime",@"markerPath",@"prior"]) ||
        ![value_[@"format"] isEqual:@1]||![value_[@"kind"] isEqual:@"host-finalization"]||
        ![value_[@"bootSession"] isEqual:bootSession()]||
        ![value_[@"bundle"] isEqual:[NSString stringWithUTF8String:c.bundle.c_str()]]||
@@ -293,6 +451,7 @@ public:
     state_=static_cast<SharedState*>(mapping);
     if(memcmp(state_->magic,"ABR29S1",8)||state_->bytes!=sizeof(SharedState)||
        memcmp(state_->capabilityDigest,[arbol_attempt::digest(raw_) UTF8String],65)||!state_->main.is(c.main)) return false;
+    if(!loadLedgers(primary)||!attachFamily(c)) return false;
     const Identity& self=primary?c.primary:c.custody;
     valid_=metadata() && arbol_boundary::clockMs()<deadline && arbol_boundary::current(self)==1 && c.monitor(self,true) &&
       (primary?state_->primary:state_->custody).bind(self,deadline);
@@ -345,7 +504,7 @@ public:
     if(close(fd)) valid=false; return valid;
   }
   bool held(arbol_boundary::Context& c) const {
-    return present()&&state_->enrolled.load(std::memory_order_acquire)==7&&
+    return present()&&exclusiveWriter()&&state_->enrolled.load(std::memory_order_acquire)==7&&
       state_->main.is(c.main)&&state_->primary.is(c.primary)&&state_->custody.is(c.custody)&&
       arbol_boundary::current(c.main)==1&&arbol_boundary::current(c.primary)==1&&arbol_boundary::current(c.custody)==1&&
       getpgid(c.main.pid)==(int)c.main.group&&getsid(c.main.pid)==c.session&&c.primaryMonitor()&&c.monitor(c.custody,true)&&

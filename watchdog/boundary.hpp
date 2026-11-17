@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <sys/proc.h>
 #include <sys/wait.h>
+#include <spawn.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <unistd.h>
@@ -191,21 +192,52 @@ inline bool lockIdentity(const Lock& lock) {
     S_ISREG(d.st_mode) && S_ISREG(p.st_mode) && d.st_nlink == 1 && p.st_nlink == 1 && d.st_uid == lock.uid && lock.uid == geteuid() &&
     (d.st_mode & 07777) == lock.mode && lock.mode == 0600 && (uint64_t)d.st_dev == lock.device && d.st_ino == lock.inode && d.st_dev == p.st_dev && d.st_ino == p.st_ino;
 }
+// Every child mapping first duplicates its actual source ABOVE all reserved
+// targets. Ordered dup2 actions must never overwrite a later source descriptor.
+class SpawnCopies {
+  std::vector<int> copies_;
+public:
+  SpawnCopies()=default; SpawnCopies(const SpawnCopies&)=delete;
+  ~SpawnCopies() { (void)closeCopies(); }
+  bool closeCopies() { bool ok=true; for(int fd:copies_) if(close(fd)) ok=false; copies_.clear(); return ok; }
+  bool map(posix_spawn_file_actions_t& actions,int source,int target) {
+    if(source<0||target<0||target>14) return false;
+    int copy=fcntl(source,F_DUPFD_CLOEXEC,64); if(copy<0) return false;
+    copies_.push_back(copy); return !posix_spawn_file_actions_adddup2(&actions,copy,target);
+  }
+};
+struct FamilyObservation {
+  Identity original{}; uint64_t parentStart=0,capturedUs=0;
+  int32_t parentVersion=0; uint32_t session=0,image=0;
+};
+class FamilyCapture {
+public:
+  virtual ~FamilyCapture()=default;
+  virtual bool capture(const FamilyObservation& original)=0;
+  virtual void refuse()=0;
+};
 struct Context {
   Identity main, primary, custody; bool authenticated=false, cleanupOnly=false, primaryOutside=false,familyUncertain=false; std::string bundle, digest; int session = 0; Lock owner, build;
   std::map<OriginalKey,Identity> seen;
   std::map<OriginalKey,OriginalExit> exits;
+  FamilyCapture* family=nullptr; // actual native capability owns its lifetime
+  void uncertainFamily() { familyUncertain=true; if(family) family->refuse(); }
   bool originalGone(const Identity& id) {
     if(!id.pid) return true;
-    if(exits.size()>=4096&&!exits.count(key(id))) { familyUncertain=true; return false; }
+    if(exits.size()>=4096&&!exits.count(key(id))) { uncertainFamily(); return false; }
     return exits[key(id)].absent(id);
   }
   std::string engine() const { return bundle + "/Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron"; }
   std::string helper() const { return bundle + "/Contents/Resources/browser/native/watchdog"; }
-  bool enginePath(const std::string& path) const {
-    for (const char* suffix : {"", " (Renderer)", " (GPU)", " (Plugin)"}) { std::string name = std::string("Electron Helper") + suffix;
-      if (path == bundle + "/Contents/Resources/browser/runtime/Electron.app/Contents/Frameworks/" + name + ".app/Contents/MacOS/" + name) return true; } return false;
+  unsigned engineRole(const std::string& path) const {
+    unsigned role=0;
+    for(const char* suffix:{""," (Renderer)"," (GPU)"," (Plugin)"}) {
+      ++role; std::string name=std::string("Electron Helper")+suffix;
+      if(path==bundle+"/Contents/Resources/browser/runtime/Electron.app/Contents/Frameworks/"+name+".app/Contents/MacOS/"+name) return role;
+    }
+    return 0;
   }
+  bool enginePath(const std::string& path) const { return engineRole(path)!=0; }
   bool foundation() const {
     return main.pid>1&&main.group==(uint32_t)main.pid&&main.uid==geteuid()&&canonical(bundle)&&bundle.size()>4&&bundle.substr(bundle.size()-4)==".app"&&
       owner.heldMode==LOCK_EX&&build.heldMode==LOCK_SH&&lockIdentity(owner)&&lockIdentity(build)&&(owner.device!=build.device||owner.inode!=build.inode);
@@ -321,18 +353,22 @@ struct Context {
       if(!eligible) {
         // A known original may be in irreversible exit without an image. Keep
         // its original provenance and require complete kernel absence below.
-        if(!captured||!(info.bsd.pbi_flags&PROC_FLAG_INEXIT)||!same(seen.at(key(id)),id)) { familyUncertain=true; valid=false; }
+        if(!captured||!(info.bsd.pbi_flags&PROC_FLAG_INEXIT)||!same(seen.at(key(id)),id)) { uncertainFamily(); valid=false; }
       } else {
         if(!captured) {
           if(seen.size()>=4096||!signature(path,true)) { valid=false; continue; }
-          seen.emplace(key(id),id); // immutable history; PID reuse never erases it
-        } else if(!same(seen.at(key(id)),id)) { familyUncertain=true; valid=false; }
+          if(family&&!same(id,main)) {
+            FamilyObservation observation{id,info.unique.parent,(uint64_t)(clockMs()*1000),info.unique.originalParentVersion,(uint32_t)getsid(id.pid),engineRole(path)};
+            if(!family->capture(observation)) { uncertainFamily(); valid=false; continue; }
+          }
+          seen.emplace(key(id),id); // first authoritative capture is retained before local use
+        } else if(!same(seen.at(key(id)),id)) { uncertainFamily(); valid=false; }
       }
       if(id.group!=main.group||(!(info.bsd.pbi_flags&PROC_FLAG_INEXIT)&&getsid(id.pid)!=session)||
          (!same(id,main)&&!direct&&!original)) {
         // Retain authenticated originals for exact cleanup, but escape/drift
         // permanently refuses readiness/ordinary finalization.
-        familyUncertain=true; valid=false;
+        uncertainFamily(); valid=false;
       }
     }
     // A second kernel group list includes allproc AND zombproc on the pinned
@@ -349,7 +385,7 @@ struct Context {
         // it until the separate exiting/zombie-aware query proves absence.
         bool known=pids[i]==main.pid||pids[i]==primary.pid||pids[i]==custody.pid;
         for(const auto& entry:seen) if(entry.second.pid==pids[i]) known=true;
-        if(!known) { familyUncertain=true; valid=false; }
+        if(!known) { uncertainFamily(); valid=false; }
         continue;
       }
       if(state<0) { valid=false; continue; }
