@@ -4,10 +4,11 @@ import { join } from 'node:path';
 import { isMainThread } from 'node:worker_threads';
 import type { Contract } from '../contracts/generated.js';
 import { validator } from '../contracts/schema.js';
-import { assertNativeFeatures } from './features.js';
+import { assertNativeFeatures, configureNativeFeatures } from './features.js';
 import { createNativeOwnership, validateOwnershipAddon, type NativeOwnership } from './api.js';
 import { nativeLimit, pinnedRuntime, stable, refuse, verifyNativeCandidate, type CandidateTrust } from './manifest.js';
 import { assertNativeWatchdog, type NativeWatchdog } from './watchdog.js';
+import { consumeArmedHostSnapshot, type ArmedHostSnapshot } from '../runtime/custody.js';
 
 export interface CompatibilityAddon {
   getABI(): string;
@@ -34,6 +35,19 @@ export interface NativeCompatibility {
   seal(): NativeStatus;
 }
 export function preflightNative(bundle: string, fatal: (reason: string) => void, watchdog: NativeWatchdog): NativeCompatibility {
+  return preflightImplementation(bundle, fatal, watchdog);
+}
+/** Actual armed host only. Consume current operation/custody/byte proof before
+ * ABI, features or install. Standalone Native retains its original full check. */
+export function preflightArmedNative(trust: CandidateTrust, receipt: ArmedHostSnapshot, operation: object,
+  fatal: (reason: string) => void, watchdog: NativeWatchdog): NativeCompatibility {
+  consumeArmedHostSnapshot(receipt, trust, 'native-install', operation);
+  assertNativeWatchdog(watchdog); watchdog.assertArmed(trust);
+  configureNativeFeatures();
+  return preflightImplementation(trust.bundle, fatal, watchdog, trust);
+}
+function preflightImplementation(bundle: string, fatal: (reason: string) => void, watchdog: NativeWatchdog,
+  armedTrust?: CandidateTrust): NativeCompatibility {
   if (attempted) return refuse();
   attempted = true;
   let failed = false;
@@ -49,7 +63,7 @@ export function preflightNative(bundle: string, fatal: (reason: string) => void,
     for (const key of ['NODE_OPTIONS', 'NODE_PATH', 'ELECTRON_EXTRA_LAUNCH_ARGS', 'ELECTRON_OVERRIDE_DIST_PATH', 'ELECTRON_RUN_AS_NODE', 'DYLD_INSERT_LIBRARIES', 'DYLD_LIBRARY_PATH'])
       if (process.env[key] !== undefined) refuse();
     assertNativeFeatures();
-    const trust = verifyNativeCandidate(bundle);
+    const trust = armedTrust ?? verifyNativeCandidate(bundle);
     assertNativeWatchdog(watchdog);
     watchdog.assertArmed(trust);
     const addon = validateOwnershipAddon(createRequire(import.meta.url)(join(trust.bundle, 'Contents/Resources/browser/native/ownership.node')));

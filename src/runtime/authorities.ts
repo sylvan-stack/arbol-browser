@@ -90,6 +90,12 @@ export interface VerifiedHost {
   assertTrusted(deadline: number): Promise<void>;
 }
 const verifiedHosts = new WeakSet<object>();
+const armedHosts = new WeakMap<VerifiedHost, import('./custody.js').HostCustody>();
+import { assertHostCustody } from './custody.js';
+export function bindArmedHost(host: VerifiedHost, custody: import('./custody.js').HostCustody): void {
+  if (!verifiedHosts.has(host) || custody.host !== host || armedHosts.has(host)) throw unavailable('browser');
+  assertHostCustody(custody); armedHosts.set(host, custody);
+}
 const hostPolicyKeys = ['format', 'purpose', 'build', 'buildRoot', 'stateRoot', 'sourceDigest', 'productDigest',
   'metadataDigest', 'compatibilityDigest', 'reviewDigest', 'qualificationDigest', 'readerKey',
   'readableReaderKeys', 'readableDataEpochs'].sort().join(',');
@@ -197,7 +203,8 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
   const result: VerifiedHost = Object.freeze({ identity, policy, signed, policyDigest: rawPolicy.digest, guardIdentity,
     async assertTrusted(limit: number) {
       if (!verifiedHosts.has(result)) throw unavailable('browser');
-      assertBudget(limit); signed.assertIdentity(limit);
+      const custody = armedHosts.get(result);
+      assertBudget(limit); if (custody) assertHostCustody(custody); else signed.assertIdentity(limit);
       if ((await physicalJson(policyFile, 1048576, limit)).digest !== rawPolicy.digest ||
           (await physicalJson(join(payload, 'metadata.json'), 1048576, limit)).digest !== identity.metadataDigest ||
           (await physicalJson(join(layout.bundle, 'Contents/Resources/native-compatibility.json'), 1048576, limit)).digest !== compatibility.digest)
@@ -206,7 +213,13 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
       await assertIsolation(layout, policy.stateRoot, limit);
       await assertGuard(limit);
       for (const path of [layout.buildRoot, layout.bundle, layout.payload]) { assertBudget(limit); await directory(path, false); }
-      signed.assertIdentity(limit); assertBudget(limit);
+      if (custody) {
+        assertHostCustody(custody);
+        const proof = await manifests.compareSignedSnapshot(signed, limit);
+        assertHostCustody(custody); manifests.consumeSignedSnapshot(proof, signed, limit);
+        assertHostCustody(custody);
+      } else signed.assertIdentity(limit);
+      assertBudget(limit);
     } });
   assertBudget(deadline); verifiedHosts.add(result); await result.assertTrusted(deadline); return result;
 }

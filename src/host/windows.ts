@@ -1,3 +1,4 @@
+import { consumeArmedHostSnapshot, type ArmedHostSnapshot } from '../runtime/custody.js';
 import { BaseWindow, WebContentsView, View, type Session } from 'electron';
 import { fileURLToPath } from 'node:url';
 import { realpathSync } from 'node:fs';
@@ -68,8 +69,10 @@ function preferences(session: Session) {
 /** Main-process contribution only. The installed boundary is supplied by bootstrap;
  * this creates no EngineAuthority and no document/input readiness. */
 export function createWindowHost(sessions: ProfileSessions, boundary: NativeFailureBoundary,
-  onCloseRequested: () => void): WindowHost {
-  assertCandidateTrust(boundary.native.trust); boundary.fatal.assertHealthy(); boundary.native.assertIntegrity();
+  onCloseRequested: () => void, proof?: ArmedHostSnapshot): WindowHost {
+  if (proof) consumeArmedHostSnapshot(proof, boundary.native.trust, 'window', onCloseRequested);
+  else assertCandidateTrust(boundary.native.trust);
+  boundary.fatal.assertHealthy(); boundary.native.assertIntegrity();
   if (sessions.website === sessions.shell || sessions.shell.getStoragePath() !== null ||
       sessions.website.getStoragePath() === null || realpathSync(preloadPath) !== preloadPath ||
       realpathSync(fileURLToPath(shellURL)) !== fileURLToPath(shellURL)) throw unavailable('browser');

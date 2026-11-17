@@ -1,3 +1,4 @@
+import { prepareArmedHostSnapshot, type HostCustody } from './custody.js';
 import { unavailable } from '../contracts/errors.js';
 import type { CommandPorts } from './ports.js';
 
@@ -96,7 +97,7 @@ export function assertNativeFailureBoundary(value: NativeFailureBoundary): void 
 /** The same concrete armed child covers feature setup and the one addon install.
  * Variable module URLs keep Electron-only imports out of the Node CLI bundle. */
 export async function installNativeBoundary(prepared: NativeBoundaryPreparation, watchdog: NativeWatchdog,
-  effects: FatalEffects): Promise<NativeFailureBoundary> {
+  effects: FatalEffects, custody?: HostCustody, deadline = performance.now() + 5000): Promise<NativeFailureBoundary> {
   assertNativeBoundaryPreparation(prepared);
   const services = preparationServices.get(prepared);
   if (!services) throw unavailable('browser');
@@ -111,7 +112,7 @@ export async function installNativeBoundary(prepared: NativeBoundaryPreparation,
     fatal = fatalModule.createProfileFatal(watchdog, effects);
     const featuresUrl = new URL('../native/features.js', import.meta.url).href;
     const features = await import(featuresUrl) as typeof import('../native/features.js');
-    fatal.assertHealthy(); features.configureNativeFeatures();
+    fatal.assertHealthy();
     const preflightUrl = new URL('../native/preflight.js', import.meta.url).href;
     const preflight = await import(preflightUrl) as typeof import('../native/preflight.js');
     fatal.assertHealthy(); watchdog.assertArmed(prepared.trust);
@@ -119,7 +120,17 @@ export async function installNativeBoundary(prepared: NativeBoundaryPreparation,
     const retirement = await import(retirementUrl) as typeof import('../native/retirement.js');
     const guard = fatal;
     guard.assertHealthy(); watchdog.assertArmed(prepared.trust);
-    const native = preflight.preflightNative(prepared.trust.bundle, reason => guard.fail(reason), watchdog);
+    let native: NativeCompatibility;
+    if (custody) {
+      if (custody.host.signed.bundle !== prepared.trust.bundle || custody.host.signed.snapshotDigest !== prepared.trust.snapshotDigest)
+        return custody.terminate();
+      const proof = await prepareArmedHostSnapshot(custody, prepared.trust, 'native-install', prepared, deadline);
+      native = preflight.preflightArmedNative(prepared.trust, proof, prepared, reason => guard.fail(reason), watchdog);
+    } else {
+      // Existing explicit standalone Native keeps full legacy verification.
+      features.configureNativeFeatures();
+      native = preflight.preflightNative(prepared.trust.bundle, reason => guard.fail(reason), watchdog);
+    }
     guard.attach(native);
     const boundary: NativeFailureBoundary = Object.freeze({ native, fatal: guard, watchdog, pageAdmission: false as const,
       retire: (key: BindingKey, parent: View, view: WebContentsView) => {
@@ -220,7 +231,8 @@ export interface TrustedShellIntegration {
  * No default services, EngineAuthority or readiness are invented here. The ordinary
  * entry above continues to refuse; this function is never invoked by this Beat. */
 export async function integrateTrustedShell(port: NativeShellPort, prepared: HostPreparation,
-  selection: BuildSelection, sessions: ProfileSessions, lifecycle: TabLifecycle, authority: ShellAuthority): Promise<TrustedShellIntegration> {
+  selection: BuildSelection, sessions: ProfileSessions, lifecycle: TabLifecycle, authority: ShellAuthority,
+  deadline = performance.now() + 5000): Promise<TrustedShellIntegration> {
   const value = nativeShellPorts.get(port);
   if (!value) throw unavailable('browser');
   const { boundary, modules } = value;
@@ -250,9 +262,11 @@ export async function integrateTrustedShell(port: NativeShellPort, prepared: Hos
   };
   let host: WindowHost;
   try {
-    host = modules.windows.createWindowHost(sessions, boundary, () => {
+    const onClose = () => {
       void tabs.closeWindow(host).catch(() => boundary.fatal.fail('native_retirement_unavailable'));
-    });
+    };
+    const proof = await prepareArmedHostSnapshot(prepared.custody, boundary.native.trust, 'window', onClose, deadline);
+    host = modules.windows.createWindowHost(sessions, boundary, onClose, proof);
     const registration = modules.ipc.registerShellIPC(host, tabs, guardedAuthority);
     // Return the actual registered hidden resources before any asynchronous
     // loading. Assembly must bind ownership/window closure first, then await
@@ -266,7 +280,7 @@ export async function integrateTrustedShell(port: NativeShellPort, prepared: Hos
  * installed Native and lifecycle brands. ABR-29 still owns complete qualified
  * assembly and initial admission; ordinary entry remains closed above. */
 export async function prepareRendererControl(boundary: NativeFailureBoundary, prepared: HostPreparation,
-  selection: BuildSelection): Promise<import('../host/recovery.js').RendererControl> {
+  selection: BuildSelection, deadline = performance.now() + 5000): Promise<import('../host/recovery.js').RendererControl> {
   const custody = handovers.get(boundary.watchdog);
   if (!installedBoundaries.has(boundary) || !custody) throw unavailable('browser');
   await prepared.instance.owner.assert(); await prepared.buildGuard.assert(); await prepared.engine.assertReady();
@@ -277,6 +291,8 @@ export async function prepareRendererControl(boundary: NativeFailureBoundary, pr
   const moduleURL = new URL('../host/recovery.js', import.meta.url).href;
   const control = await import(moduleURL) as typeof import('../host/recovery.js');
   assertNativeFailureBoundary(boundary);
-  return control.createRendererControl(boundary, Object.freeze({ contract: 1,
-    profile: prepared.instance.record.profile, instance: prepared.instance.record.instance, build: prepared.instance.record.build }));
+  const identity = Object.freeze({ contract: 1 as const,
+    profile: prepared.instance.record.profile, instance: prepared.instance.record.instance, build: prepared.instance.record.build });
+  const proof = await prepareArmedHostSnapshot(prepared.custody, boundary.native.trust, 'ownership', identity, deadline);
+  return control.createRendererControl(boundary, identity, proof);
 }

@@ -243,10 +243,14 @@ export function assertHostLifecycle(value: HostLifecycle): void {
 /** Canonical host-only dynamic boundary: never import Electron through the Node
  * CLI static graph. No provider, profile or native capability is defaulted. */
 export async function prepareOwnershipControl(boundary: import('./bootstrap.js').NativeFailureBoundary,
-  documents: import('../host/authority.js').DocumentAuthority, operations: import('../host/handoff.js').OwnershipOperations): Promise<import('../host/handoff.js').OwnershipHost> {
+  documents: import('../host/authority.js').DocumentAuthority, operations: import('../host/handoff.js').OwnershipOperations,
+  custody: import('./custody.js').HostCustody, deadline: number): Promise<import('../host/handoff.js').OwnershipHost> {
   const address = new URL('../host/handoff.js', import.meta.url).href;
   const host = await import(address) as typeof import('../host/handoff.js');
-  return host.createOwnershipHost(boundary, documents, operations);
+  const custodyURL = new URL('./custody.js', import.meta.url).href;
+  const proofs = await import(custodyURL) as typeof import('./custody.js');
+  const proof = await proofs.prepareArmedHostSnapshot(custody, boundary.native.trust, 'ownership', documents, deadline);
+  return host.createOwnershipHost(boundary, documents, operations, proof, documents);
 }
 export interface HostNativeLifetime {
   /** Validate the already acknowledged native custody receipt against this exact

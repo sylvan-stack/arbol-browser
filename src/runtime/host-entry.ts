@@ -50,6 +50,7 @@ export interface OwnedHost {
   readonly buildGuard: BuildLease;
   readonly custody: HostCustody;
   readonly watchdog: NativeWatchdog;
+  installNative(effects: import('../native/fatal.js').FatalEffects, deadline: number): Promise<import('./bootstrap.js').NativeFailureBoundary>;
 }
 const ownedHosts = new WeakSet<object>();
 export function assertOwnedHost(host: OwnedHost): void {
@@ -92,7 +93,13 @@ export async function prepareOwnedHost(actualApp: ProfileApp, request: HostReque
     const watchdog = await custody.arm(native, deadline);
     custody.assertRetained(); assertTime(deadline);
     if (actualApp.isReady()) return custody.terminate();
-    const owned: OwnedHost = Object.freeze({ instance, buildGuard, custody, watchdog });
+    const retainedCustody = custody;
+    const owned: OwnedHost = Object.freeze({ instance, buildGuard, custody, watchdog,
+      installNative(effects: import('../native/fatal.js').FatalEffects, limit: number) {
+        retainedCustody.assertRetained();
+        return bootstrap.installNativeBoundary(native, watchdog, effects, retainedCustody, Math.min(deadline, limit));
+      },
+    });
     ownedHosts.add(owned); return owned;
   } catch {
     if (custody) return custody.terminate();

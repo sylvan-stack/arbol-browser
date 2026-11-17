@@ -5,13 +5,14 @@ import { unavailable } from '../contracts/errors.js';
 import { assertProfile } from '../profiles/records.js';
 import { withOwnerLockForCustody, type OwnerLease } from '../profiles/locking.js';
 import { terminateAdoptedBuild, withBuildLockForCustody, type BuildLease } from './build-lease.js';
-import { assertVerifiedHost, type VerifiedHost } from './authorities.js';
+import { assertVerifiedHost, bindArmedHost, type VerifiedHost } from './authorities.js';
 import { assertPlatform, assertWatchdogCustody, type PlatformPort, type WatchdogCustody, type PriorMarkerExpectation } from './platform.js';
 import { assertTime, type InstanceOwner } from './instance.js';
 import { claimedHostAttempt } from './process.js';
 import type { NativeBoundaryPreparation } from './bootstrap.js';
 import type { NativeWatchdog } from '../native/watchdog.js';
 import { assertActualSessionFactory, type ActualSessionFactory, type ActualSessionSeal } from '../profiles/session.js';
+import { consumeSignedSnapshot } from '../native/manifest.js';
 
 export interface HostCustody {
   readonly host: VerifiedHost;
@@ -40,6 +41,49 @@ export function assertHostCustody(value: HostCustody): void {
   if (!actual?.watchdog) throw unavailable('browser');
   actual.native.assert(); actual.native.assertHost();
 }
+/** A current host operation, not a transferable signed-package assertion. */
+export interface ArmedHostSnapshot { readonly deadline: number }
+type SnapshotPurpose = 'native-install' | 'ownership' | 'window';
+const armedSnapshots = new WeakMap<ArmedHostSnapshot, {
+  custody: HostCustody; trust: import('../native/manifest.js').CandidateTrust;
+  purpose: SnapshotPurpose; operation: object; runtime: import('./instance.js').RuntimeRecord;
+  proof: import('../native/manifest.js').SignedSnapshotComparison; used: boolean;
+}>();
+const preparingSnapshots = new WeakSet<HostCustody>();
+export async function prepareArmedHostSnapshot(custody: HostCustody, trust: import('../native/manifest.js').CandidateTrust,
+  purpose: SnapshotPurpose, operation: object, deadline: number): Promise<ArmedHostSnapshot> {
+  assertHostCustody(custody); assertTime(deadline);
+  if (preparingSnapshots.has(custody) || !operation || trust.bundle !== custody.host.signed.bundle ||
+      trust.snapshotDigest !== custody.host.signed.snapshotDigest) return custody.terminate();
+  preparingSnapshots.add(custody);
+  try {
+    const moduleURL = new URL('../native/manifest.js', import.meta.url).href;
+    const manifest = await import(moduleURL) as typeof import('../native/manifest.js');
+    assertHostCustody(custody); assertTime(deadline);
+    const runtime = custody.instance.record;
+    const proof = await manifest.compareSignedSnapshot(trust, deadline);
+    // No further await after minting: the caller immediately enters its exact
+    // synchronous constructor/preflight chain with this private receipt.
+    assertHostCustody(custody); assertTime(deadline);
+    if (custody.instance.record !== runtime) return custody.terminate();
+    const receipt: ArmedHostSnapshot = Object.freeze({ deadline });
+    armedSnapshots.set(receipt, { custody, trust, purpose, operation, runtime, proof, used: false }); return receipt;
+  } catch { return custody.terminate(); }
+  finally { preparingSnapshots.delete(custody); }
+}
+export function consumeArmedHostSnapshot(receipt: ArmedHostSnapshot, trust: import('../native/manifest.js').CandidateTrust,
+  purpose: SnapshotPurpose, operation: object): void {
+  const actual = armedSnapshots.get(receipt);
+  if (!actual) throw unavailable('browser');
+  try {
+    if (actual.used || actual.trust !== trust || actual.purpose !== purpose || actual.operation !== operation ||
+        actual.custody.instance.record !== actual.runtime) return actual.custody.terminate();
+    actual.used = true; assertTime(receipt.deadline); assertHostCustody(actual.custody);
+    consumeSignedSnapshot(actual.proof, trust, receipt.deadline);
+    assertHostCustody(actual.custody); assertTime(receipt.deadline);
+  } catch { return actual.custody.terminate(); }
+}
+
 /** Cancellation/refusal before resource permission uses the actual adopted
  * native original. It retains any genuine acquired Owner and either publishes
  * authentic no-use or joins already-started native custody cleanup. Unknown
@@ -88,7 +132,7 @@ export async function prepareHostCustody(host: VerifiedHost, instance: InstanceO
           withBuildLockForCustody(build, platform, heldBuild => prepared.arm(owner, heldBuild)));
         if (watchdog.custody !== native) return native.terminate();
         native.assert(); native.assertHost(); watchdog.assertArmed(prepared.trust); assertTime(limit);
-        receipts.get(receipt)!.watchdog = watchdog; return watchdog;
+        receipts.get(receipt)!.watchdog = watchdog; bindArmedHost(host, receipt); return watchdog;
       } catch { return native.terminate(); }
     },
     assertRetained() { assertHostCustody(receipt); },

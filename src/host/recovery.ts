@@ -1,3 +1,4 @@
+import type { ArmedHostSnapshot } from '../runtime/custody.js';
 import { webFrameMain, type WebContents } from 'electron';
 import { performance } from 'node:perf_hooks';
 import { setTimeout as pause } from 'node:timers/promises';
@@ -296,7 +297,7 @@ export interface RendererControl {
 /** Executable control-only contribution. The caller supplies genuine installed
  * Native custody and owned metadata. There is no EngineAuthority, normal launch
  * path, permissive engine operation or dependency on a later Tools adapter. */
-export function createRendererControl(boundary: NativeFailureBoundary, identity: ControlIdentity): RendererControl {
+export function createRendererControl(boundary: NativeFailureBoundary, identity: ControlIdentity, proof?: ArmedHostSnapshot): RendererControl {
   assertNativeFailureBoundary(boundary);
   if (identity.contract !== 1 || !validator('browser.ProfileId')(identity.profile) ||
       !validator('browser.InstanceId')(identity.instance) || !validator('browser.Build')(identity.build) ||
@@ -328,7 +329,7 @@ export function createRendererControl(boundary: NativeFailureBoundary, identity:
       for (const registration of registrations.values()) registration.dispose(); registrations.clear();
       recovery.closeAll(); documents.closeAll(); health.closeAll(); removeReady();
     },
-  });
+  }, proof, identity);
   health = new RendererHealth(documents, readiness, ownership.authority, fault => ownership.healthFailure(fault.target, fault));
   recovery = new PageRecovery(ownership, documents, health, (transition, receipt, guard) => ownership.recovered(transition, receipt, guard));
   documents.bind(ownership.authority, readiness, fault => health.failed(fault));

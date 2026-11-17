@@ -1,3 +1,4 @@
+import type { ArmedHostSnapshot } from '../runtime/custody.js';
 import { performance } from 'node:perf_hooks';
 import { createHash } from 'node:crypto';
 import { setTimeout as pause } from 'node:timers/promises';
@@ -304,13 +305,13 @@ interface StagedProof { proof: DeliveryProof; invalidated: boolean; listDigest?:
 /** Closed canonical contribution. This does not launch, install, choose a
  * profile, construct an EngineAuthority or qualify/open ordinary entry. */
 export function createOwnershipHost(boundary: NativeFailureBoundary, documents: import('./authority.js').DocumentAuthority,
-  operations: OwnershipOperations): OwnershipHost {
+  operations: OwnershipOperations, proof?: ArmedHostSnapshot, operation: object = documents): OwnershipHost {
   assertNativeFailureBoundary(boundary);
   for (const method of ['current', 'assertCurrent', 'assertFault', 'prepare', 'assertSuccessor'] as const)
     if (typeof documents[method] !== 'function') throw unavailable('browser');
   for (const method of ['info', 'agent', 'user', 'recover', 'invalidate', 'shutdown', 'leaveAgentMode'] as const)
     if (typeof operations[method] !== 'function') throw unavailable('browser');
-  const authority = new TabAuthority(boundary, documents);
+  const authority = new TabAuthority(boundary, documents, proof, operation);
   let phase: 'prepared' | 'live' | 'closed' = 'prepared';
   let registry: TabRegistry | undefined, runtime: HostLifecycle | undefined, everBound = false;
   const windows = new Map<WindowHost, ShellRegistration>();

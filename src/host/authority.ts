@@ -1,3 +1,4 @@
+import { consumeArmedHostSnapshot, type ArmedHostSnapshot } from '../runtime/custody.js';
 import { randomBytes } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import type { Contract } from '../contracts/generated.js';
@@ -108,8 +109,11 @@ export class TabAuthority {
   private readonly recoveries = new WeakMap<RecoveryTransition, RecoveryState>();
   private readonly activeRecoveries = new WeakMap<TabTarget, RecoveryTransition>();
   private sealed = false;
-  constructor(readonly boundary: NativeFailureBoundary, readonly documents: DocumentAuthority) {
-    assertCandidateTrust(boundary.native.trust); this.assertHealthy();
+  constructor(readonly boundary: NativeFailureBoundary, readonly documents: DocumentAuthority,
+    proof?: ArmedHostSnapshot, operation: object = documents) {
+    if (proof) consumeArmedHostSnapshot(proof, boundary.native.trust, 'ownership', operation);
+    else assertCandidateTrust(boundary.native.trust);
+    this.assertHealthy();
   }
   assertHealthy(): void {
     this.boundary.fatal.assertHealthy(); this.boundary.native.assertIntegrity();
