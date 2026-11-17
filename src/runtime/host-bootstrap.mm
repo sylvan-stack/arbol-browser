@@ -138,7 +138,7 @@ static bool payload(NSString* bundle, NSDictionary* manifest) {
     NSString* path = [root stringByAppendingPathComponent:relative]; struct stat stat{};
     if (lstat(path.fileSystemRepresentation, &stat)) return false;
     bool link = S_ISLNK(stat.st_mode);
-    if (link) { [walk skipDescendants]; if (![[path stringByResolvingSymlinksInPath] hasPrefix:prefix]) return false; }
+    if (link) { if (![[path stringByResolvingSymlinksInPath] hasPrefix:prefix]) return false; }
     else if (S_ISDIR(stat.st_mode)) continue;
     else if (!S_ISREG(stat.st_mode)) return false;
     uint32_t magic=0; NSString* hash = digest(path, link,magic); if (!hash) return false;
