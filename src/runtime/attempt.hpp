@@ -234,7 +234,7 @@ inline bool transition(NSDictionary* old, NSDictionary* next, Role role) {
     // claimed family needs the separate native exit verifier, not this generic
     // starter JSON transaction. Unclaimed cancelled intent has no engine.
     if (role != Role::starter || ![phase isEqual:@"pending"] || (old && !unused) ||
-        !currentProcess(next[@"starter"],true) || [next[@"expires"] doubleValue] <= now || [next[@"expires"] doubleValue] > now+30000) return false;
+        !currentProcess(next[@"starter"],true) || [next[@"expires"] doubleValue] <= now || [next[@"expires"] doubleValue] > now+60000) return false;
     return true;
   }
   if (!immutable(old,next) || [old[@"phase"] isEqual:@"closed"]) return false;

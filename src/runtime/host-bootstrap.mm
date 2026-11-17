@@ -157,7 +157,7 @@ int main(int argc, const char* argv[]) {
   @autoreleasepool {
     arbol_exit::NoUseOriginal noUse;
     try { @try {
-      expiry=arbol_boundary::clockMs()+30000;
+      expiry=arbol_boundary::clockMs()+60000;
       if (argc != 3 || strcmp(argv[1], "--arbol-host-request") || argv[2][0] != '/' || getppid() != 1 || setpgid(0, 0) || getpgrp() != getpid()) return 4;
       NSOperatingSystemVersion os = NSProcessInfo.processInfo.operatingSystemVersion;
       if (os.majorVersion != 27 || os.minorVersion != 0 || os.patchVersion != 1 || sizeof(void*) != 8) return 4;

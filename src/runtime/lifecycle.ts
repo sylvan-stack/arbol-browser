@@ -260,13 +260,13 @@ export interface ProcessIntegration {
   mcp(connect: (label: string) => Promise<RuntimeClient>, io: Stdio): Promise<void>;
 }
 export function createProcessService(options: { selection: BuildSelection; platform: () => PlatformPort;
-  state?: string; integration?: ProcessIntegration; exits?: ExitAuthority; observation?: OpenCommandObservation }): ProcessPort {
+  state?: string; integration?: ProcessIntegration; exits?: ExitAuthority; observation?: OpenCommandObservation; openCutoff?: number }): ProcessPort {
   const state = options.state ?? stateDirectory();
   return Object.freeze<ProcessPort>({
     async open(input) {
       const integration = options.integration;
       if (!integration) return preflightPageAdmission();
-      const deadline = startupDeadline(), contentionDeadline = Math.min(deadline, now() + 10000);
+      const deadline = Math.min(startupDeadline(), options.openCutoff ?? Infinity), contentionDeadline = Math.min(deadline, now() + 10000);
       noteOpenCommand(options.observation, 'open-dispatch-admission-trust');
       await within(deadline, () => integration.assertAdmissionAvailable(deadline));
       noteOpenCommand(options.observation, 'open-profile-selection');
@@ -281,7 +281,7 @@ export function createProcessService(options: { selection: BuildSelection; platf
         noteOpenCommand(options.observation, 'open-reply-validation');
         if (result.instance !== attached.record.instance || result.process !== attached.record.pid || result.profile !== profile.record.id)
           throw unavailable('browser');
-        return { ...result, alreadyRunning: attached.alreadyRunning };
+        assertTime(deadline); return { ...result, alreadyRunning: attached.alreadyRunning };
       } finally { attached.client.close(); }
     },
     async close(id) {

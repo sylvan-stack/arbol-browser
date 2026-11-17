@@ -14,7 +14,7 @@ import type { HeldLock, PlatformPort, ProcessIdentity } from './platform.js';
 export type RuntimeRecord = Readonly<Contract<'wire.RuntimeRecord'>>;
 export const now = (): number => performance.now();
 export const token = (prefix: string): string => `${prefix}_${randomBytes(16).toString('base64url')}`;
-export const startupDeadline = (): number => now() + 30000;
+export const startupDeadline = (): number => now() + 60000;
 export function assertTime(deadline: number): void { if (now() >= deadline) throw unavailable('browser'); }
 export function sameProcess(a: ProcessIdentity, b: ProcessIdentity): boolean {
   return a.pid === b.pid && a.uid === b.uid && a.startId === b.startId;
@@ -159,7 +159,7 @@ export interface InstanceOwner {
   phase(next: 'ready' | 'closing'): Promise<void>;
 }
 /** Separate stable startup inode serializes launch requests only; host never
- * waits for it. Bounded to 10 seconds, inside the original 30-second budget. */
+ * waits for it. Bounded to 10 seconds, inside the original 60-second startup budget. */
 export async function startupArbitration(location: RuntimeLocation, platform: PlatformPort,
   deadline: number): Promise<HeldLock> {
   const limit = Math.min(deadline, now() + 10000);

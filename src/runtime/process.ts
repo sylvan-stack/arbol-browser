@@ -113,7 +113,7 @@ export async function pendingLaunchAttempt(profile: ProfileSnapshot, host: Verif
   // Sampling native first and the caller clock second is conservative. Sleep
   // can shorten native continuous-time admission, never extend the caller bound.
   const nativeNow = platform.continuousTime(), sampled = now(); assertTime(deadline);
-  const expires = nativeNow + Math.min(30000, deadline - sampled);
+  const expires = nativeNow + Math.min(60000, deadline - sampled);
   return frozen({ format: 1, request, nonce: randomBytes(32).toString('base64url'),
     profile: profile.paths.root, profileInstance: profile.record.instance, profilePathHash: location.hash,
     build: host.identity.layout.build, buildRoot: host.identity.layout.buildRoot,

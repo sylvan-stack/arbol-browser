@@ -43,7 +43,8 @@ function coldFailureSuffix(observation: ColdObservation | undefined, status: Exi
 
 // All native/profile/runtime work is lazy. info remains metadata only.
 const defaultPorts = Object.freeze({}) as CommandPorts;
-async function productionPorts(selection: BuildSelection, observation?: ColdObservation): Promise<CommandPorts> {
+async function productionPorts(selection: BuildSelection, observation?: ColdObservation, openCutoff?: number): Promise<CommandPorts> {
+  if (openCutoff !== undefined && performance.now() >= openCutoff) throw unavailable('browser');
   noteCold(observation, 'runtime-imports');
   const [{ createProfileService }, { loadPlatform }, { createProcessService, createProfileRuntime },
     authorities, { createProductionExitAuthority }, { createProductionProcessIntegration }] = await Promise.all([
@@ -51,7 +52,7 @@ async function productionPorts(selection: BuildSelection, observation?: ColdObse
     import('../runtime/authorities.js'), import('../runtime/exit.js'), import('../runtime/process.js'),
   ]);
   const payload = resolve(fileURLToPath(new URL('../../', import.meta.url)));
-  const deadline = performance.now() + 30000;
+  const deadline = openCutoff ?? performance.now() + 30000;
   // Verify the real current outer/payload before loading its native support.
   // The fixed packaged entry must be running as the exact stock engine in
   // Node mode; no system Node, older Foundation or ad hoc helper substitution.
@@ -87,7 +88,8 @@ async function productionPorts(selection: BuildSelection, observation?: ColdObse
   return Object.freeze({
     profiles: createProfileService({ state, platform: () => platform, runtime: createProfileRuntime(platform, selection, exits) }),
     process: createProcessService({ state, selection, platform: () => platform, integration, exits,
-      ...(openObservation ? { observation: openObservation } : {}) }),
+      ...(openObservation ? { observation: openObservation } : {}),
+      ...(openCutoff === undefined ? {} : { openCutoff }) }),
   });
 }
 
@@ -110,20 +112,23 @@ export async function componentInfo(): Promise<Contract<'wire.ComponentInfo'>> {
 
 export async function runCli(args: readonly string[], ports: CommandPorts = defaultPorts,
   io: Stdio = process): Promise<ExitCode> {
+  const commandCutoff = performance.now() + 60000;
   // On the MCP path stdout is reserved exclusively for the MCP transport, including failures.
   const mcp = args[0] === 'mcp';
   let observation: ColdObservation | undefined;
   try {
     const command = parse(args);
+    const openCutoff = ports === defaultPorts && command.kind === 'open' ? commandCutoff : undefined;
     if (ports === defaultPorts && (command.kind === 'open' || command.kind === 'profiles-create'))
       observation = { stage: 'package-metadata' };
     if (ports === defaultPorts && command.kind === 'mcp') throw unavailable('browser');
     let activePorts = ports;
     if (ports === defaultPorts && command.kind !== 'info') {
+      if (openCutoff !== undefined && performance.now() >= openCutoff) throw unavailable('browser');
       const metadata = await componentInfo();
       noteCold(observation, 'selected-build');
       const selection = consumePackagedSelection(metadata.build, resolve(fileURLToPath(new URL('../../', import.meta.url))));
-      activePorts = await productionPorts(selection, observation);
+      activePorts = await productionPorts(selection, observation, openCutoff);
     }
     if (command.kind === 'mcp') { await activePorts.process.mcp(command.profile, io); return 0; }
     let result: unknown;
@@ -144,6 +149,7 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
     if (observation) delete observation.open;
     noteCold(observation, 'result-schema');
     if (!check(result)) throw new Error('Invalid command result');
+    if (openCutoff !== undefined && performance.now() >= openCutoff) throw unavailable('browser');
     io.stdout.write(`${JSON.stringify(result)}\n`);
     return 0;
   } catch (error) {

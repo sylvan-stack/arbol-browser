@@ -19,7 +19,7 @@ export class McpLifecycle {
   async initialize(offered: string, name: string, signal: AbortSignal, receivedAt: number): Promise<McpRevision> {
     if (this.phase !== 'new') throw protocolError(ErrorCode.InvalidRequest);
     const revision = offered === MCP_REVISIONS[1] ? MCP_REVISIONS[1] : MCP_REVISIONS[0];
-    const label = sanitizedLabel(name), deadline = receivedAt + 30000;
+    const label = sanitizedLabel(name), deadline = receivedAt + 60000;
     this.phase = 'attaching';
     const cancel = () => { this.close(); this.failed(); };
     signal.addEventListener('abort', cancel, { once: true });

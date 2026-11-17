@@ -194,7 +194,7 @@ let entryAttempted = false;
 export async function runHostEntry(): Promise<void> {
   if (entryAttempted || process.type !== 'browser' || app.isReady()) throw unavailable('browser');
   entryAttempted = true;
-  const localBudget = performance.now() + 30000;
+  const localBudget = performance.now() + 60000;
   let capture: CapturedHostBuild | undefined, owned: OwnedHost | null = null;
   let boundary: import('./bootstrap.js').NativeFailureBoundary | undefined;
   const state: ActualHostAssembly = { closed: false };
