@@ -5,7 +5,7 @@ import { unavailable } from '../contracts/errors.js';
 import { assertProfile } from '../profiles/records.js';
 import { withOwnerLockForCustody, type OwnerLease } from '../profiles/locking.js';
 import { terminateAdoptedBuild, withBuildLockForCustody, type BuildLease } from './build-lease.js';
-import { assertVerifiedHost, bindArmedHost, type VerifiedHost } from './authorities.js';
+import { assertVerifiedHostMetadata, bindArmedHost, type VerifiedHost } from './authorities.js';
 import { assertPlatform, assertWatchdogCustody, type PlatformPort, type WatchdogCustody, type PriorMarkerExpectation, type HostStartupStage } from './platform.js';
 import { assertTime, type InstanceOwner } from './instance.js';
 import { claimedHostAttempt } from './process.js';
@@ -115,8 +115,8 @@ export async function abortUnadmittedHost(ownerLease: OwnerLease | undefined, bu
 export async function prepareHostCustody(host: VerifiedHost, instance: InstanceOwner, build: BuildLease,
   platform: PlatformPort, request: string, prior: PriorMarkerExpectation, deadline: number): Promise<HostCustody> {
   if (process.type !== 'browser' || preparations.has(instance)) throw unavailable('browser');
-  preparations.add(instance); assertPlatform(platform); assertVerifiedHost(host, deadline);
-  await assertProfile(instance.owner.profile); await instance.owner.assert(); await build.assert(); assertTime(deadline);
+  preparations.add(instance); assertPlatform(platform); assertVerifiedHostMetadata(host, deadline);
+  await assertProfile(instance.owner.profile); await instance.owner.assert(); assertTime(deadline);
   const attempt = await claimedHostAttempt(instance.owner.profile, host, platform, request, deadline);
   if (instance.record.pid !== process.pid || instance.record.processStartId !== attempt.engine?.startId ||
       instance.record.build !== host.identity.layout.build || instance.record.phase !== 'starting' ||
@@ -145,7 +145,7 @@ export async function prepareHostCustody(host: VerifiedHost, instance: InstanceO
         bootstrap.assertNativeBoundaryPreparation(prepared);
         if (prepared.platform !== platform || prepared.trust.bundle !== host.signed.bundle ||
             prepared.trust.snapshotDigest !== host.signed.snapshotDigest) return native.terminate();
-        assertTime(limit); await instance.owner.assert(); await build.assert(); assertTime(limit);
+        assertTime(limit); await instance.owner.assert(); assertTime(limit);
         const watchdog = await withOwnerLockForCustody(instance.owner, platform, owner =>
           withBuildLockForCustody(build, platform, heldBuild => prepared.arm(owner, heldBuild)));
         if (watchdog.custody !== native) return native.terminate();
