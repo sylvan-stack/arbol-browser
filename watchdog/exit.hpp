@@ -9,6 +9,7 @@
 #include <new>
 #include <thread>
 #include <memory>
+#include <dirent.h>
 namespace arbol_exit {
 using arbol_boundary::Identity;
 class ExitWatch {
@@ -473,6 +474,101 @@ public:
     return @{@"format":@1,@"capabilityDigest":[NSString stringWithUTF8String:capabilityDigest_.c_str()],@"streams":values};
   }
 };
+// One post-exit pass over opaque emitted files, never a backend transaction
+// acknowledgement. The private profile ancestor makes owner-owned 0644/0755
+// children private without rewriting Chromium modes. No symlink, hardlinked
+// regular file, foreign device/owner or group/other write access is admitted.
+struct StorageResult {
+  std::atomic<int> state{0}; // pending, 1=actual completed success, -1=refused
+  double started=0,completed=0; uint64_t files=0,directories=0; std::string digest;
+};
+class StorageScan {
+  NSDictionary* capability_; double deadline_; dev_t device_; uint64_t visited_=0,files_=0,directories_=0;
+  bool within() const { return arbol_boundary::clockMs()<deadline_; }
+  bool safe(const struct stat& st) const {
+    return st.st_dev==device_&&st.st_uid==geteuid()&&!(st.st_mode&0022)&&
+      ((S_ISREG(st.st_mode)&&st.st_nlink==1)||(S_ISDIR(st.st_mode)&&st.st_nlink>0));
+  }
+  static bool sameNode(const struct stat& a,const struct stat& b) {
+    return a.st_dev==b.st_dev&&a.st_ino==b.st_ino&&a.st_mode==b.st_mode&&a.st_uid==b.st_uid&&a.st_gid==b.st_gid&&
+      a.st_nlink==b.st_nlink&&a.st_size==b.st_size&&a.st_mtimespec.tv_sec==b.st_mtimespec.tv_sec&&
+      a.st_mtimespec.tv_nsec==b.st_mtimespec.tv_nsec&&a.st_ctimespec.tv_sec==b.st_ctimespec.tv_sec&&a.st_ctimespec.tv_nsec==b.st_ctimespec.tv_nsec;
+  }
+  static std::string metadata(const struct stat& st) {
+    std::string value;
+    for(auto v:{(uint64_t)st.st_dev,st.st_ino,(uint64_t)st.st_mode,(uint64_t)st.st_uid,(uint64_t)st.st_gid,
+      (uint64_t)st.st_nlink,(uint64_t)st.st_size,(uint64_t)st.st_mtimespec.tv_sec,(uint64_t)st.st_mtimespec.tv_nsec,
+      (uint64_t)st.st_ctimespec.tv_sec,(uint64_t)st.st_ctimespec.tv_nsec}) value+=std::to_string(v)+":";
+    return value;
+  }
+  bool node(int parent,const std::string& name,unsigned depth,bool synchronize,std::string& digest) {
+    if(!within()||depth>128||++visited_>131072||name.empty()||name=="."||name==".."||name.find('/')!=std::string::npos) return false;
+    struct stat named{},first{},last{},after{};
+    if(fstatat(parent,name.c_str(),&named,AT_SYMLINK_NOFOLLOW)||!safe(named)) return false;
+    int fd=openat(parent,name.c_str(),O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC|(S_ISDIR(named.st_mode)?O_DIRECTORY:0));
+    if(fd<0) return false;
+    bool ok=!fstat(fd,&first)&&safe(first)&&sameNode(first,named)&&within(); std::string summary=metadata(first);
+    if(ok&&S_ISDIR(first.st_mode)) {
+      ++directories_; std::vector<std::string> names;
+      int copy=fcntl(fd,F_DUPFD_CLOEXEC,64); DIR* stream=copy>=0?fdopendir(copy):nullptr;
+      if(!stream) { if(copy>=0) close(copy); ok=false; }
+      else {
+        errno=0;
+        while(auto* entry=readdir(stream)) {
+          if(!strcmp(entry->d_name,".")||!strcmp(entry->d_name,"..")) continue;
+          names.emplace_back(entry->d_name);
+          if(names.size()>131072||!within()) { ok=false; break; }
+        }
+        if(errno) ok=false; if(closedir(stream)) ok=false;
+      }
+      std::sort(names.begin(),names.end());
+      if(std::adjacent_find(names.begin(),names.end())!=names.end()) ok=false;
+      for(const auto& child:names) {
+        if(!ok) break; std::string content;
+        ok=node(fd,child,depth+1,synchronize,content);
+        // No file contents or names enter the durable receipt. Only an opaque
+        // digest of stable filesystem metadata and private names is retained.
+        if(ok) summary+=std::string([arbol_attempt::digest(child) UTF8String])+":"+content+":";
+      }
+      if(ok&&synchronize) ok=within()&&!fsync(fd)&&within(); // actual directory acknowledgement
+    } else if(ok) {
+      ++files_;
+      if(synchronize) ok=within()&&!fsync(fd)&&within()&&!fcntl(fd,F_FULLFSYNC)&&within();
+    }
+    ok=ok&&!fstat(fd,&last)&&!fstatat(parent,name.c_str(),&after,AT_SYMLINK_NOFOLLOW)&&
+      safe(last)&&sameNode(first,last)&&sameNode(last,after)&&within();
+    if(close(fd)) ok=false;
+    if(ok) digest=[arbol_attempt::digest(summary) UTF8String]; return ok;
+  }
+  bool pass(bool synchronize,std::string& digest) {
+    NSString* profile=capability_[@"attempt"][@"profile"];
+    if(!within()||!arbol_boundary::canonical(profile.fileSystemRepresentation)) return false;
+    int root=open(profile.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC); if(root<0) return false;
+    struct stat held{},named{},after{},endName{};
+    bool ok=!fstat(root,&held)&&!lstat(profile.fileSystemRepresentation,&named)&&safe(held)&&S_ISDIR(held.st_mode)&&
+      (held.st_mode&07777)==0700&&sameNode(held,named)&&[fileIdentity(held) isEqual:capability_[@"profileDirectory"]];
+    std::string result;
+    for(NSString* name in @[@"data",@"userData"]) {
+      struct stat child{}; std::string digest;
+      ok=ok&&!fstatat(root,name.UTF8String,&child,AT_SYMLINK_NOFOLLOW)&&S_ISDIR(child.st_mode)&&
+        [fileIdentity(child) isEqual:capability_[@"directories"][name]]&&node(root,name.UTF8String,0,synchronize,digest);
+      if(ok) result+=digest;
+    }
+    ok=ok&&!fstat(root,&after)&&!lstat(profile.fileSystemRepresentation,&endName)&&sameNode(held,after)&&sameNode(after,endName)&&within();
+    if(close(root)) ok=false; if(ok) digest=[arbol_attempt::digest(result) UTF8String]; return ok;
+  }
+public:
+  StorageScan(NSDictionary* capability,double deadline,dev_t device):capability_(capability),deadline_(deadline),device_(device) {}
+  bool run(StorageResult& out) {
+    std::string before,after;
+    if(!pass(true,before)) return false;
+    uint64_t files=files_,directories=directories_; visited_=files_=directories_=0;
+    // Reopen only to independently compare the complete stable metadata tree;
+    // this second pass neither interprets nor rewrites any storage content.
+    if(!pass(false,after)||before!=after||files!=files_||directories!=directories_) return false;
+    out.files=files; out.directories=directories; out.digest=after; return within();
+  }
+};
 class HostCapability {
   int capsule_=-1,stateFd_=-1; SharedState* state_=nullptr;
   int reads_[3]{-1,-1,-1},writes_[3]{-1,-1,-1}; unsigned role_=0;
@@ -480,6 +576,8 @@ class HostCapability {
   NSDictionary* value_=nil; std::string raw_; bool attempted_=false,valid_=false;
   NSDictionary* ordinaryProof_=nil; double ordinaryDeadline_=0;
   NSDictionary* quiescenceProof_=nil;
+  std::shared_ptr<StorageResult> storageJob_; NSDictionary* storageProof_=nil; bool storageAttempted_=false;
+  std::thread* storageThread_=nullptr; // one native process-lifetime handle, never a joinable temporary destructor
   bool ledgerDescriptor(int fd,unsigned index,bool writable,bool header=true) const {
     NSArray* streams=value_[@"family"];
     if(![streams isKindOfClass:NSArray.class]||streams.count!=3||index>2||fd<0) return false;
@@ -840,6 +938,60 @@ public:
   }
   NSDictionary* ordinaryProof() const { return ordinaryProof_; }
   double ordinaryDeadline() const { return ordinaryDeadline_; }
+  bool storagePending() const { return storageJob_&&storageJob_->state.load(std::memory_order_acquire)==0; }
+  bool startStorage(arbol_boundary::Context& c) {
+    if(storageAttempted_) return false; storageAttempted_=true;
+    if(!ordinaryProof_||!ordinaryCurrent(c,ordinaryDeadline_)||!family_->seal()||!arbol_boundary::retainNativeImage()||
+       ![boundMarker(c) isEqual:ordinaryProof_[@"marker"]]||![family_->frontierTuple() isEqual:ordinaryProof_[@"family"]]) return false;
+    arbol_boundary::Lock owner=c.owner,build=c.build;
+    owner.fd=fcntl(c.owner.fd,F_DUPFD_CLOEXEC,64); build.fd=fcntl(c.build.fd,F_DUPFD_CLOEXEC,64);
+    if(!arbol_boundary::lockIdentity(owner)||!arbol_boundary::lockIdentity(build)) {
+      if(owner.fd>=0) close(owner.fd); if(build.fd>=0) close(build.fd); return false;
+    }
+    try {
+      storageJob_=std::make_shared<StorageResult>(); auto result=storageJob_;
+      NSDictionary* capability=value_; double deadline=ordinaryDeadline_; dev_t device=(dev_t)state_->marker.device;
+      storageThread_=new std::thread([result,capability,deadline,device,owner,build] {
+        @autoreleasepool { @try {
+          result->started=arbol_boundary::clockMs(); bool ok=false;
+          try {
+            StorageScan scan(capability,deadline,device);
+            ok=arbol_boundary::lockIdentity(owner)&&arbol_boundary::lockIdentity(build)&&scan.run(*result)&&
+              arbol_boundary::lockIdentity(owner)&&arbol_boundary::lockIdentity(build);
+          } catch(...) { ok=false; }
+          if(close(owner.fd)) ok=false; if(close(build.fd)) ok=false;
+          result->completed=arbol_boundary::clockMs();
+          result->state.store(ok&&result->completed<deadline?1:-1,std::memory_order_release);
+        } @catch(NSException*) {
+          close(owner.fd); close(build.fd); result->completed=arbol_boundary::clockMs(); result->state.store(-1,std::memory_order_release);
+        } }
+      });
+      // Even an exceptional detach failure leaves the actual running thread
+      // and its one retained handle alive. Never terminate via a joinable
+      // temporary destructor, close worker-owned guards or block on join.
+      try { storageThread_->detach(); } catch(...) {}
+      return true;
+    } catch(...) {
+      close(owner.fd); close(build.fd); if(storageJob_) storageJob_->state.store(-1,std::memory_order_release); return false;
+    }
+  }
+  int pollStorage(arbol_boundary::Context& c) {
+    if(!storageJob_||!present()||!ordinaryProof_||arbol_boundary::clockMs()>=ordinaryDeadline_||
+       state_->fatal.load(std::memory_order_acquire)||!arbol_boundary::lockIdentity(c.owner)||!arbol_boundary::lockIdentity(c.build)) {
+      if(state_) state_->poison(storageLoss); return -1;
+    }
+    int result=storageJob_->state.load(std::memory_order_acquire); if(!result) return 0;
+    if(result<0||storageJob_->completed>=ordinaryDeadline_||!metadata()||
+       ![boundMarker(c) isEqual:ordinaryProof_[@"marker"]]||![family_->frontierTuple() isEqual:ordinaryProof_[@"family"]]||
+       !ordinaryCurrent(c,ordinaryDeadline_)) { state_->poison(storageLoss); return -1; }
+    if(!storageProof_) storageProof_=@{@"format":@1,@"kind":@"native-emitted-storage-sync",@"ordinaryProofDigest":arbol_attempt::digest(arbol_attempt::bytes(ordinaryProof_)),
+      @"device":@((uint64_t)state_->marker.device),@"directories":value_[@"directories"],@"files":@(storageJob_->files),@"directoryCount":@(storageJob_->directories),
+      @"metadataDigest":[NSString stringWithUTF8String:storageJob_->digest.c_str()],@"startedUs":@((uint64_t)(storageJob_->started*1000)),
+      @"completedUs":@((uint64_t)(storageJob_->completed*1000)),@"deadlineUs":@((uint64_t)(ordinaryDeadline_*1000)),
+      @"fileOperation":@"fsync+F_FULLFSYNC",@"directoryOperation":@"fsync",@"scope":@"opaque emitted data/userData; no stronger backend transaction claim"};
+    return 1;
+  }
+  NSDictionary* storageProof() const { return storageProof_; }
   bool held(arbol_boundary::Context& c) const {
     return present()&&exclusiveWriter()&&state_->enrolled.load(std::memory_order_acquire)==7&&
       state_->main.is(c.main)&&state_->primary.is(c.primary)&&state_->custody.is(c.custody)&&

@@ -191,7 +191,21 @@ struct Deadline {
       bool ordinary=consent&&watched&&peerWatch.ordinaryBefore(expires)&&mainWatch&&mainWatch->ordinaryBefore(mainLimit)&&
         cap->shared()->fatal.load(std::memory_order_acquire)==0&&c.originalGone(peer)&&
         cap->collectOrdinary(c,*mainWatch,peerWatch,mainLimit,requested,expires);
-      if(ordinary) { /* Native-only proof; synchronization/activation follows in13.2/13.3. */ }
+      if(ordinary) {
+        if(!cap->startStorage(c)) ordinary=false;
+        else {
+          int synchronized=0;
+          while((synchronized=cap->pollStorage(c))==0) usleep(1000);
+          ordinary=synchronized==1;
+        }
+        if(!ordinary) {
+          poison(cap,arbol_exit::storageLoss);
+          // A blocked native synchronization retains its actual original guard
+          // descriptions. It never hands a pending worker to an exit path.
+          while(cap->storagePending()) usleep(10000);
+          retainedRefusal(&c,cap);
+        }
+      }
       else poison(cap,arbol_exit::peerLoss);
       // No clean marker or flush receipt here. The later native independent
       // finalizer/dirty witness owns this last-holder exit boundary.
