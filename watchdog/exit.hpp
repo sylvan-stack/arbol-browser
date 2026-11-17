@@ -75,31 +75,18 @@ class KernelExitProbe {
 public:
   enum Result { pending=-1,uncertain=-2,live=0,exiting=1,absent=2 };
 private:
-  struct Answer { std::atomic<int> result{pending}; };
-  std::shared_ptr<Answer> answer_;
+  bool attempted_=false; std::shared_ptr<arbol_boundary::KernelAnswer> answer_;
 public:
   bool start(const Identity& original) {
-    if(answer_) return false;
-    answer_=std::make_shared<Answer>(); auto answer=answer_;
-    try { std::thread([answer,original] {
-      arbol_boundary::Info info{}; errno=0;
-      // The pinned private combined identity layout is already used by the
-      // Native boundary. Nonzero arg additionally includes exiting/zombie
-      // lookup; SDK PROC_FLAG_INEXIT is exit-in-progress, never a flush receipt.
-      int n=proc_pidinfo(original.pid,18,1,&info,sizeof(info)); int result=uncertain;
-      if(!n&&errno==ESRCH) result=absent;
-      else if(n==sizeof(info)&&info.bsd.pbi_pid==(uint32_t)original.pid&&info.unique.start) {
-        Identity actual{original.pid,info.unique.start,info.unique.version,info.bsd.pbi_uid,info.bsd.pbi_pgid};
-        if(actual.start!=original.start) result=absent;
-        else if(arbol_boundary::same(actual,original)&&actual.group==original.group)
-          result=(info.bsd.pbi_flags&PROC_FLAG_INEXIT)?exiting:live;
-      }
-      answer->result.store(result,std::memory_order_release);
-    }).detach(); } catch(...) { answer_->result.store(uncertain,std::memory_order_release); return false; }
-    return true;
+    if(attempted_) return false; attempted_=true;
+    auto* pool=arbol_boundary::KernelQueries::get();
+    if(pool) answer_=pool->submit(original,true,true);
+    return (bool)answer_;
   }
-  Result result() const { return answer_?(Result)answer_->result.load(std::memory_order_acquire):pending; }
-  bool started() const { return (bool)answer_; }
+  Result result() const {
+    return answer_?(Result)(int)answer_->state.load(std::memory_order_acquire):(attempted_?uncertain:pending);
+  }
+  bool started() const { return attempted_; }
 };
 
 enum FatalReason : uint64_t { protocolLoss=1,forced=2,identityLoss=4,watchLoss=8,storageLoss=16,admissionLoss=32,peerLoss=64 };

@@ -24,6 +24,9 @@
 #include <atomic>
 #include <memory>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
 #include <dlfcn.h>
 #include <mach-o/loader.h>
 namespace arbol_boundary {
@@ -44,37 +47,103 @@ inline int observe(int pid, Identity& id, Info* detail = nullptr) {
 inline int current(const Identity& original) { if (!original.pid) return 0; Identity now; int n = observe(original.pid, now); return n <= 0 ? n : same(original, now) ? 1 : now.start != original.start ? 0 : -1; }
 using OriginalKey=std::pair<int,uint64_t>;
 inline OriginalKey key(const Identity& id) { return {id.pid,id.start}; }
-// The nonzero-arg kernel query can sleep behind a zombie/reap controller.
-// Keep it off every protocol/command thread. Pending/uncertain never means
-// absent. The caller's existing absolute deadline is not extended by a worker.
+// One truthful module lifetime precedes every detached native operation. The
+// anchor has internal linkage in this actual Mach-O, not an inferred filename.
+static void nativeImageAnchor() {}
+inline bool retainNativeImage() {
+  struct Pin { std::once_flag once; void* handle=nullptr; bool valid=false; };
+  static Pin* pin=new Pin; // process lifetime; never a per-helper loader reference
+  Pin* state=pin;
+  std::call_once(pin->once,[state] {
+    Dl_info image{},again{};
+    if(!dladdr((const void*)&nativeImageAnchor,&image)||!image.dli_fname||!image.dli_fbase) return;
+    if(((const mach_header*)image.dli_fbase)->filetype!=MH_EXECUTE) {
+      state->handle=dlopen(image.dli_fname,RTLD_NOW|RTLD_NOLOAD|RTLD_NODELETE);
+      if(!state->handle) return;
+    }
+    state->valid=dladdr((const void*)&nativeImageAnchor,&again)&&again.dli_fbase==image.dli_fbase;
+  });
+  return pin->valid;
+}
+// These are kernel observations, never a flush receipt or an exit timeout.
+// A nonzero-arg query can sleep behind a zombie/reap controller. Only these
+// four detached read-only workers perform it; the actual protocol/command
+// thread never waits and retains its unchanged original deadline.
+enum class KernelState : int { pending=-1,uncertain=-2,live=0,exiting=1,absent=2 };
+struct KernelAnswer {
+  std::atomic<KernelState> state{KernelState::pending}; double completed=0;
+  Info observed{};
+};
+class KernelQueries {
+  struct Job { Identity original; bool exactGroup; std::shared_ptr<KernelAnswer> answer; };
+  std::mutex mutex_; std::condition_variable available_; std::deque<Job> queue_;
+  size_t running_=0; bool ready_=false,failed_=false;
+  void run() {
+    for(;;) {
+      Job job;
+      {
+        std::unique_lock<std::mutex> held(mutex_);
+        available_.wait(held,[&] { return failed_||(ready_&&!queue_.empty()); });
+        if(failed_) return;
+        job=std::move(queue_.front()); queue_.pop_front(); ++running_;
+      }
+      Info info{}; errno=0;
+      int n=proc_pidinfo(job.original.pid,18,1,&info,sizeof(info));
+      KernelState result=KernelState::uncertain;
+      if(!n&&errno==ESRCH) result=KernelState::absent;
+      else if(n==sizeof(info)&&info.bsd.pbi_pid==(uint32_t)job.original.pid&&info.unique.start&&info.unique.version>0) {
+        Identity actual{job.original.pid,info.unique.start,info.unique.version,info.bsd.pbi_uid,info.bsd.pbi_pgid};
+        if(actual.start!=job.original.start) result=KernelState::absent;
+        else if(same(actual,job.original)&&(!job.exactGroup||actual.group==job.original.group))
+          result=(info.bsd.pbi_flags&PROC_FLAG_INEXIT)?KernelState::exiting:KernelState::live;
+      }
+      job.answer->observed=info; job.answer->completed=clockMs();
+      job.answer->state.store(result,std::memory_order_release);
+      { std::lock_guard<std::mutex> held(mutex_); --running_; }
+    }
+  }
+  KernelQueries() {
+    if(!retainNativeImage()) { failed_=true; return; }
+    try {
+      for(unsigned i=0;i<4;++i) std::thread([this] { run(); }).detach();
+      { std::lock_guard<std::mutex> held(mutex_); ready_=true; } available_.notify_all();
+    } catch(...) {
+      { std::lock_guard<std::mutex> held(mutex_); failed_=true; } available_.notify_all();
+    }
+  }
+public:
+  static KernelQueries* get() {
+    // Deliberately no static destructor racing detached blocked kernel reads.
+    // This bounded process-local pool is not a custody holder or command port.
+    static KernelQueries* pool=[] { try { return new KernelQueries; } catch(...) { return (KernelQueries*)nullptr; } }();
+    return pool;
+  }
+  std::shared_ptr<KernelAnswer> submit(const Identity& original,bool exactGroup,bool priority=false) {
+    if(original.pid<=1||!original.start||original.version<=0||original.uid!=geteuid()) return {};
+    std::lock_guard<std::mutex> held(mutex_);
+    if(!ready_||failed_||queue_.size()+running_>=4096) return {};
+    try {
+      auto answer=std::make_shared<KernelAnswer>(); Job job{original,exactGroup,answer};
+      if(priority) queue_.push_front(std::move(job)); else queue_.push_back(std::move(job));
+      available_.notify_one(); return answer;
+    } catch(...) { return {}; }
+  }
+};
 class OriginalExit {
-  struct Answer { std::atomic<int> value{-1}; double completed=0; };
-  std::shared_ptr<Answer> answer_;
+  std::shared_ptr<KernelAnswer> answer_;
 public:
   bool absent(const Identity& original) {
     if(original.pid<=1||!original.start||original.version<=0) return false;
     Identity now; int live=observe(original.pid,now);
-    if(live==1) return now.start!=original.start; // actual reuse requires reaping
+    if(live==1) return now.start!=original.start; // actual PID reuse requires reaping
     if(live<0) return false;
-    if(answer_&&answer_->value.load(std::memory_order_acquire)==0&&clockMs()>=answer_->completed+10) answer_.reset();
-    if(!answer_) {
-      answer_=std::make_shared<Answer>(); auto answer=answer_;
-      // A Node command may return before this read-only query. Pin the actual
-      // containing Mach-O image, never an inferred module path, before detach.
-      Dl_info image{};
-      if(!dladdr((const void*)&observe,&image)||!image.dli_fname||!image.dli_fbase||
-         (((const mach_header*)image.dli_fbase)->filetype!=MH_EXECUTE&&!dlopen(image.dli_fname,RTLD_NOW|RTLD_NODELETE))) { answer_->value.store(-2); return false; }
-      try { std::thread([answer,original] {
-        Info info{}; errno=0; int n=proc_pidinfo(original.pid,18,1,&info,sizeof(info));
-        int result=0;
-        if(!n&&errno==ESRCH) result=1;
-        else if(n==sizeof(info)&&info.bsd.pbi_pid==(uint32_t)original.pid&&info.unique.start)
-          result=info.unique.start!=original.start?1:0;
-        else result=-2;
-        answer->completed=clockMs(); answer->value.store(result,std::memory_order_release);
-      }).detach(); } catch(...) { answer_->value.store(-2,std::memory_order_release); }
+    if(answer_) {
+      KernelState result=answer_->state.load(std::memory_order_acquire);
+      if(result==KernelState::absent) return true;
+      if((result==KernelState::live||result==KernelState::exiting)&&clockMs()>=answer_->completed+10) answer_.reset();
     }
-    return answer_->value.load(std::memory_order_acquire)==1;
+    if(!answer_) { auto* pool=KernelQueries::get(); if(pool) answer_=pool->submit(original,false); }
+    return answer_&&answer_->state.load(std::memory_order_acquire)==KernelState::absent;
   }
 };
 inline bool canonical(const std::string& path) { char resolved[PATH_MAX]; return !path.empty() && path[0] == '/' && realpath(path.c_str(), resolved) && path == resolved; }
