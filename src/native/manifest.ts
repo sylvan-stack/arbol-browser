@@ -23,6 +23,26 @@ export const pinnedRuntime = Object.freeze({ electron: '45.3.2', chromium: '156.
 export const nativeLimit = 1048576;
 export type Compatibility = Contract<'native.BuildCompatibility'>;
 export function refuse(): never { throw new Error('native_candidate_unavailable'); }
+export type SignedVerificationPhase = 'bundle-selection' | 'initial-snapshot' |
+  'outer-signature-verification' | 'outer-signature-details' | 'outer-signature-entitlements' |
+  'nested-signature-verification' | 'nested-signature-details' | 'nested-signature-entitlements' |
+  'publisher' | 'compatibility' | 'inventory' | 'final-snapshot' | 'final-physical-comparison' |
+  'repeated-snapshot' | 'repeated-physical' | 'repeated-manifest' | 'repeated-cutoff' | 'snapshot-receipt';
+const verificationFailures = new WeakMap<Error, SignedVerificationPhase>();
+function noteVerificationFailure(error: unknown, phase: SignedVerificationPhase): void {
+  try { if (error instanceof Error && !verificationFailures.has(error)) verificationFailures.set(error, phase); }
+  catch { /* Diagnostics cannot replace the original failure. */ }
+}
+/** Read only a genuine same-module failure; caller-created errors have no phase. */
+export function readSignedVerificationPhase(error: unknown): SignedVerificationPhase | undefined {
+  try { return error instanceof Error ? verificationFailures.get(error) : undefined; }
+  catch { return undefined; }
+}
+/** Preserve each existing redaction's newly thrown Error, with its first phase. */
+function refuseVerification(phase: SignedVerificationPhase, original?: unknown): never {
+  try { return refuse(); }
+  catch (error) { noteVerificationFailure(error, readSignedVerificationPhase(original) ?? phase); throw error; }
+}
 export function boundedJson(path: string, deadline = Infinity): unknown {
   budget(deadline);
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -85,21 +105,26 @@ function physicalFile(path: string, named: import('node:fs').Stats, deadline: nu
   } finally { closeSync(fd); }
 }
 function signature(path: string, outer = false, jit = false, deadline = Infinity): void {
-  const requirement = publisher.requirement + (outer ? ` and identifier "${publisher.bundleIdentifier}"` : '');
-  const result = spawnSync('/usr/bin/codesign', ['--verify', '--strict', '--deep', '-R', `=${requirement}`, path],
-    { timeout: budget(deadline), maxBuffer: nativeLimit, env: { PATH: '/usr/bin:/bin' }, encoding: 'utf8' });
-  budget(deadline);
-  if (result.error || result.status !== 0) refuse();
-  const details = spawnSync('/usr/bin/codesign', ['-dvvv', path], { timeout: budget(deadline), maxBuffer: nativeLimit, encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
-  budget(deadline);
-  if (details.error || details.status !== 0 || !details.stderr.includes(`TeamIdentifier=${publisher.team}`) ||
-      !details.stderr.includes('runtime)') || !details.stderr.includes('Timestamp=')) refuse();
-  const ent = spawnSync('/usr/bin/codesign', ['-d', '--entitlements', ':-', path], { timeout: budget(deadline), maxBuffer: nativeLimit, encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
-  budget(deadline);
-  if (ent.error || ent.status !== 0 || /com\.apple\.security\.(?:cs\.(?:disable-library-validation|allow-unsigned-executable-memory|allow-dyld-environment-variables)|get-task-allow)/.test(ent.stdout + ent.stderr)) refuse();
-  const keys = [...ent.stdout.matchAll(/<key>([^<]+)<\/key>/g)].map(match => match[1]);
-  if (keys.length > 1 || keys.some(key => key !== 'com.apple.security.cs.allow-jit' || !jit) ||
-      (keys.length && !/<key>com\.apple\.security\.cs\.allow-jit<\/key>\s*<true\s*\/>/.test(ent.stdout))) refuse();
+  let phase: SignedVerificationPhase = outer ? 'outer-signature-verification' : 'nested-signature-verification';
+  try {
+    const requirement = publisher.requirement + (outer ? ` and identifier "${publisher.bundleIdentifier}"` : '');
+    const result = spawnSync('/usr/bin/codesign', ['--verify', '--strict', '--deep', '-R', `=${requirement}`, path],
+      { timeout: budget(deadline), maxBuffer: nativeLimit, env: { PATH: '/usr/bin:/bin' }, encoding: 'utf8' });
+    budget(deadline);
+    if (result.error || result.status !== 0) refuse();
+    phase = outer ? 'outer-signature-details' : 'nested-signature-details';
+    const details = spawnSync('/usr/bin/codesign', ['-dvvv', path], { timeout: budget(deadline), maxBuffer: nativeLimit, encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
+    budget(deadline);
+    if (details.error || details.status !== 0 || !details.stderr.includes(`TeamIdentifier=${publisher.team}`) ||
+        !details.stderr.includes('runtime)') || !details.stderr.includes('Timestamp=')) refuse();
+    phase = outer ? 'outer-signature-entitlements' : 'nested-signature-entitlements';
+    const ent = spawnSync('/usr/bin/codesign', ['-d', '--entitlements', ':-', path], { timeout: budget(deadline), maxBuffer: nativeLimit, encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
+    budget(deadline);
+    if (ent.error || ent.status !== 0 || /com\.apple\.security\.(?:cs\.(?:disable-library-validation|allow-unsigned-executable-memory|allow-dyld-environment-variables)|get-task-allow)/.test(ent.stdout + ent.stderr)) refuse();
+    const keys = [...ent.stdout.matchAll(/<key>([^<]+)<\/key>/g)].map(match => match[1]);
+    if (keys.length > 1 || keys.some(key => key !== 'com.apple.security.cs.allow-jit' || !jit) ||
+        (keys.length && !/<key>com\.apple\.security\.cs\.allow-jit<\/key>\s*<true\s*\/>/.test(ent.stdout))) refuse();
+  } catch (error) { noteVerificationFailure(error, phase); throw error; }
 }
 export interface CandidateTrust {
   readonly bundle: string;
@@ -321,7 +346,7 @@ async function compareCompleteSnapshot(signed: SignedBundle, snapshot: FrozenSna
 }
 export async function compareSignedSnapshot(signed: SignedBundle, deadline: number): Promise<SignedSnapshotComparison> {
   const snapshot = signedSnapshots.get(signed);
-  if (!snapshot || snapshot.poisoned || (signed === trustedCandidate && poisonedTrust)) refuse();
+  if (!snapshot || snapshot.poisoned || (signed === trustedCandidate && poisonedTrust)) refuseVerification('repeated-snapshot');
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     budget(deadline);
@@ -335,8 +360,8 @@ export async function compareSignedSnapshot(signed: SignedBundle, deadline: numb
       if (actual && !actual.used) { snapshot.poisoned = true; if (signed === trustedCandidate) poisonedTrust = true; }
     }, Math.max(1, deadline - performance.now())); expiry.unref();
     comparisons.set(receipt, { signed, snapshot, used: false, expiry }); return receipt;
-  } catch {
-    snapshot.poisoned = true; if (signed === trustedCandidate) poisonedTrust = true; return refuse();
+  } catch (error) {
+    snapshot.poisoned = true; if (signed === trustedCandidate) poisonedTrust = true; return refuseVerification('repeated-snapshot', error);
   } finally { if (timer) clearTimeout(timer); }
 }
 /** One synchronous consumer, original local object and absolute deadline only.
@@ -347,11 +372,11 @@ export function consumeSignedSnapshot(receipt: SignedSnapshotComparison, signed:
     if (!actual || actual.used || actual.signed !== signed || actual.snapshot !== snapshot || !snapshot || snapshot.poisoned ||
         receipt.deadline !== deadline || (signed === trustedCandidate && poisonedTrust)) refuse();
     actual.used = true; clearTimeout(actual.expiry); budget(deadline);
-  } catch {
+  } catch (error) {
     if (actual) actual.snapshot.poisoned = true;
     if (snapshot) snapshot.poisoned = true;
     if (signed === trustedCandidate) poisonedTrust = true;
-    return refuse();
+    return refuseVerification('snapshot-receipt', error);
   }
 }
 
@@ -392,61 +417,74 @@ export function assertCandidateTrust(value: CandidateTrust): void {
   value.assertIdentity();
 }
 export function verifySignedBundle(bundle: string, deadline = Infinity): SignedBundle {
-  budget(deadline);
-  if (!bundle.endsWith('.app') || realpathSync(bundle) !== resolve(bundle)) refuse();
-  const root = resolve(bundle);
-  const check = (): Compatibility => {
-    signature(root, true, false, deadline);
-    if (stable(boundedJson(join(root, 'Contents/Resources/publisher-requirement.json'), deadline)) !== stable(publisher)) refuse();
-    const value = boundedJson(join(root, 'Contents/Resources/native-compatibility.json'), deadline);
-    if (!validator('native.BuildCompatibility')(value)) return refuse();
-    if (value.publisherTeam !== publisher.team || value.bundleIdentifier !== publisher.bundleIdentifier ||
-        stable(value.runtime) !== stable(pinnedRuntime) || value.nativeABI.compiledNapi !== 8 ||
-        stable(value.featureConfiguration) !== stable({ sitePerProcess: true, disabledFeatures: ['MacAccessibilityTextOperation'], extraChromiumArguments: [] })) refuse();
-    const inventory: Record<string, string> = Object.create(null); let count = 0;
-    function walk(directory: string): void {
-      const names = synchronousNames(directory, deadline, completeEntryLimit - count); count += names.length;
-      for (const name of names) {
-        budget(deadline);
-        const path = join(directory, name), key = relative(root, path), stat = lstatSync(path);
-        if (stat.isSymbolicLink()) {
-          const link = readlinkSync(path), target = realpathSync(path);
-          if (!target.startsWith(root + sep) || !resolve(dirname(path), link).startsWith(root + sep)) refuse();
-          inventory[key] = createHash('sha256').update(`symlink\0${link}`).digest('hex');
-        } else if (stat.isDirectory()) walk(path);
-        else if (stat.isFile()) {
-          const physical = physicalFile(path, stat, deadline); inventory[key] = physical.digest;
-          if (['cffaedfe', 'cefaedfe', 'feedfacf', 'cafebabe', 'bebafeca'].includes(physical.magic))
-            signature(path, false, key.startsWith('Contents/Resources/browser/runtime/Electron.app/') && key.includes('/Contents/MacOS/'), deadline);
-        } else refuse();
+  let phase: SignedVerificationPhase = 'bundle-selection';
+  try {
+    budget(deadline);
+    if (!bundle.endsWith('.app') || realpathSync(bundle) !== resolve(bundle)) refuse();
+    const root = resolve(bundle);
+    const check = (): Compatibility => {
+      signature(root, true, false, deadline);
+      phase = 'publisher';
+      if (stable(boundedJson(join(root, 'Contents/Resources/publisher-requirement.json'), deadline)) !== stable(publisher)) refuse();
+      phase = 'compatibility';
+      const value = boundedJson(join(root, 'Contents/Resources/native-compatibility.json'), deadline);
+      if (!validator('native.BuildCompatibility')(value)) return refuse();
+      if (value.publisherTeam !== publisher.team || value.bundleIdentifier !== publisher.bundleIdentifier ||
+          stable(value.runtime) !== stable(pinnedRuntime) || value.nativeABI.compiledNapi !== 8 ||
+          stable(value.featureConfiguration) !== stable({ sitePerProcess: true, disabledFeatures: ['MacAccessibilityTextOperation'], extraChromiumArguments: [] })) refuse();
+      phase = 'inventory';
+      const inventory: Record<string, string> = Object.create(null); let count = 0;
+      function walk(directory: string): void {
+        const names = synchronousNames(directory, deadline, completeEntryLimit - count); count += names.length;
+        for (const name of names) {
+          budget(deadline);
+          const path = join(directory, name), key = relative(root, path), stat = lstatSync(path);
+          if (stat.isSymbolicLink()) {
+            const link = readlinkSync(path), target = realpathSync(path);
+            if (!target.startsWith(root + sep) || !resolve(dirname(path), link).startsWith(root + sep)) refuse();
+            inventory[key] = createHash('sha256').update(`symlink\0${link}`).digest('hex');
+          } else if (stat.isDirectory()) walk(path);
+          else if (stat.isFile()) {
+            const physical = physicalFile(path, stat, deadline); inventory[key] = physical.digest;
+            if (['cffaedfe', 'cefaedfe', 'feedfacf', 'cafebabe', 'bebafeca'].includes(physical.magic))
+              signature(path, false, key.startsWith('Contents/Resources/browser/runtime/Electron.app/') && key.includes('/Contents/MacOS/'), deadline);
+          } else refuse();
+        }
       }
-    }
-    walk(join(root, 'Contents/Resources/browser'));
-    if (stable(inventory) !== stable(value.files)) refuse();
-    return value;
-  };
-  const physical: Record<string, PhysicalEntry> = Object.create(null), afterPhysical: Record<string, PhysicalEntry> = Object.create(null);
-  const before = completeSnapshot(root, deadline, physical);
-  const initial = check(), encoded = stable(initial);
-  const after = completeSnapshot(root, deadline, afterPhysical);
-  if (before !== after || stable(physical) !== stable(afterPhysical)) refuse();
-  // Snapshot validation cannot be bypassed by mutation through a caller-held object.
-  function frozen<T>(value: T): T { if (value && typeof value === 'object') { for (const entry of Object.values(value)) frozen(entry); Object.freeze(value); } return value; }
-  const manifest = frozen(initial);
-  const snapshot: FrozenSnapshot = { encoded: before, physical: Object.freeze(physical), poisoned: false };
-  const result: SignedBundle = Object.freeze({ bundle: root, manifest,
-    snapshotDigest: createHash('sha256').update(before).digest('hex'),
-    assertIdentity(limit = Infinity) {
-      try {
-        budget(limit);
-        const currentPhysical: Record<string, PhysicalEntry> = Object.create(null);
-        if (snapshot.poisoned || realpathSync(root) !== root || completeSnapshot(root, limit, currentPhysical) !== before ||
-            stable(currentPhysical) !== stable(snapshot.physical) ||
-            stable(boundedJson(join(root, 'Contents/Resources/native-compatibility.json'), limit)) !== encoded) refuse();
-        budget(limit);
-      } catch { snapshot.poisoned = true; return refuse(); }
-    } });
-  signedSnapshots.set(result, snapshot); return result;
+      walk(join(root, 'Contents/Resources/browser'));
+      if (stable(inventory) !== stable(value.files)) refuse();
+      return value;
+    };
+    const physical: Record<string, PhysicalEntry> = Object.create(null), afterPhysical: Record<string, PhysicalEntry> = Object.create(null);
+    phase = 'initial-snapshot';
+    const before = completeSnapshot(root, deadline, physical);
+    const initial = check(), encoded = stable(initial);
+    phase = 'final-snapshot';
+    const after = completeSnapshot(root, deadline, afterPhysical);
+    phase = 'final-physical-comparison';
+    if (before !== after || stable(physical) !== stable(afterPhysical)) refuse();
+    // Snapshot validation cannot be bypassed by mutation through a caller-held object.
+    function frozen<T>(value: T): T { if (value && typeof value === 'object') { for (const entry of Object.values(value)) frozen(entry); Object.freeze(value); } return value; }
+    const manifest = frozen(initial);
+    const snapshot: FrozenSnapshot = { encoded: before, physical: Object.freeze(physical), poisoned: false };
+    const result: SignedBundle = Object.freeze({ bundle: root, manifest,
+      snapshotDigest: createHash('sha256').update(before).digest('hex'),
+      assertIdentity(limit = Infinity) {
+        let repeatedPhase: SignedVerificationPhase = 'repeated-snapshot';
+        try {
+          budget(limit);
+          const currentPhysical: Record<string, PhysicalEntry> = Object.create(null);
+          if (snapshot.poisoned || realpathSync(root) !== root || completeSnapshot(root, limit, currentPhysical) !== before) refuse();
+          repeatedPhase = 'repeated-physical';
+          if (stable(currentPhysical) !== stable(snapshot.physical)) refuse();
+          repeatedPhase = 'repeated-manifest';
+          if (stable(boundedJson(join(root, 'Contents/Resources/native-compatibility.json'), limit)) !== encoded) refuse();
+          repeatedPhase = 'repeated-cutoff';
+          budget(limit);
+        } catch (error) { snapshot.poisoned = true; return refuseVerification(repeatedPhase, error); }
+      } });
+    signedSnapshots.set(result, snapshot); return result;
+  } catch (error) { noteVerificationFailure(error, phase); throw error; }
 }
 export function verifyNativeCandidate(bundle: string, deadline = Infinity): CandidateTrust {
   if (poisonedTrust) refuse();
@@ -456,6 +494,6 @@ export function verifyNativeCandidate(bundle: string, deadline = Infinity): Cand
   }
   if (attemptedTrust) refuse(); attemptedTrust = true;
   try { trustedCandidate = verifySignedBundle(bundle, deadline); return trustedCandidate; }
-  catch { poisonedTrust = true; return refuse(); }
+  catch (error) { poisonedTrust = true; return refuseVerification('bundle-selection', error); }
 }
 

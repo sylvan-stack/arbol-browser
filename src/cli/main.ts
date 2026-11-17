@@ -15,7 +15,12 @@ const coldStages = ['package-metadata', 'selected-build', 'runtime-imports', 'si
   'pinned-runtime-tuple', 'repeated-host-trust', 'native-platform', 'production-adapters',
   'command-dispatch', 'result-schema'] as const;
 type ColdStage = typeof coldStages[number];
-interface ColdObservation { stage: ColdStage; open?: import('../runtime/authorities.js').OpenCommandObservation }
+interface ColdObservation {
+  stage: ColdStage;
+  open?: import('../runtime/authorities.js').OpenCommandObservation;
+  verification?: Readonly<{ module: typeof import('../runtime/authorities.js');
+    observation: import('../runtime/authorities.js').HostVerificationObservation }>;
+}
 function noteCold(observation: ColdObservation | undefined, stage: ColdStage): void {
   if (observation) observation.stage = stage;
 }
@@ -23,8 +28,15 @@ function coldFailureSuffix(observation: ColdObservation | undefined, status: Exi
   // Compose only fixed supplemental text for the existing stderr write. No
   // additional stream operation can introduce a new asynchronous failure.
   try {
-    if (observation && (status === 4 || status === 70) && coldStages.includes(observation.stage))
-      return `arbol-browser: cold-stage ${observation.open?.stage ?? observation.stage}\n`;
+    if (observation && (status === 4 || status === 70) && coldStages.includes(observation.stage)) {
+      let phase: import('../native/manifest.js').SignedVerificationPhase | undefined;
+      try {
+        const verification = observation.verification;
+        phase = verification?.module.readHostVerificationFailurePhase(verification.observation);
+      } catch { /* A failed phase read must retain the existing safe suffix. */ }
+      return `arbol-browser: cold-stage ${observation.open?.stage ?? observation.stage}\n` +
+        (phase ? `arbol-browser: signed-phase ${phase}\n` : '');
+    }
   } catch { /* best effort only */ }
   return '';
 }
@@ -45,6 +57,8 @@ async function productionPorts(selection: BuildSelection, observation?: ColdObse
   // Node mode; no system Node, older Foundation or ad hoc helper substitution.
   noteCold(observation, 'signed-bundle');
   const verification = observation ? authorities.createHostVerificationObservation() : undefined;
+  try { if (observation && verification) observation.verification = Object.freeze({ module: authorities, observation: verification }); }
+  catch { /* Optional readback cannot alter production provider construction. */ }
   const host = await authorities.verifyPackagedHost(selection, payload, deadline, undefined, verification).catch(error => {
     // Read only this genuine module's observation; no callback enters trust
     // verification, and diagnostic readback cannot replace its actual error.

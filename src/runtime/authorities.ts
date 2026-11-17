@@ -10,7 +10,7 @@ import { packagedLayout, selectedLayout, type BuildSelection, type PackagedLayou
 import type { Contract } from '../contracts/generated.js';
 import { directory, assertDirectory } from '../profiles/paths.js';
 import { assertHostCustody } from './custody.js';
-import type { SignedBundle } from '../native/manifest.js';
+import type { SignedBundle, SignedVerificationPhase } from '../native/manifest.js';
 
 const physicalFS = process.getBuiltinModule(typeof process.versions.electron === 'string' ? 'original-fs' : 'fs') as typeof import('node:fs') | undefined;
 if (!physicalFS || !physicalFS.promises || typeof physicalFS.promises.open !== 'function') throw unavailable('browser');
@@ -188,6 +188,7 @@ export type HostVerificationStage = 'signed-bundle' | 'signed-policy-metadata-co
   'isolated-roots' | 'build-guard' | 'initial-verified-host';
 export type HostVerificationObservation = Readonly<object>;
 const verificationStages = new WeakMap<HostVerificationObservation, HostVerificationStage>();
+const verificationFailurePhases = new WeakMap<HostVerificationObservation, SignedVerificationPhase>();
 /** A command-local observation only. It is never a VerifiedHost or callback,
  * and no supplied object can change the verifier's authority or failure. */
 export function createHostVerificationObservation(): HostVerificationObservation {
@@ -197,6 +198,10 @@ export function createHostVerificationObservation(): HostVerificationObservation
 }
 export function readHostVerificationStage(observation: HostVerificationObservation): HostVerificationStage | undefined {
   return verificationStages.get(observation);
+}
+export function readHostVerificationFailurePhase(observation: HostVerificationObservation): SignedVerificationPhase | undefined {
+  try { return verificationFailurePhases.get(observation); }
+  catch { return undefined; }
 }
 function noteHostVerification(observation: HostVerificationObservation | undefined, stage: HostVerificationStage): void {
   if (observation && verificationStages.has(observation)) verificationStages.set(observation, stage);
@@ -221,7 +226,14 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
       signed = manifests.verifyNativeCandidate(layout.bundle, deadline);
       if (signed !== bootstrapSigned) throw unavailable('browser');
     } else signed = manifests.verifySignedBundle(layout.bundle, deadline);
-  } catch { throw unavailable('browser'); }
+  } catch (error) {
+    try {
+      const phase = manifests.readSignedVerificationPhase(error);
+      if (observation && verificationStages.has(observation) && phase && !verificationFailurePhases.has(observation))
+        verificationFailurePhases.set(observation, phase);
+    } catch { /* Preserve the original public redaction and failure. */ }
+    throw unavailable('browser');
+  }
   assertBudget(deadline);
   noteHostVerification(observation, 'signed-policy-metadata-compatibility');
   const policyFile = join(layout.bundle, 'Contents/Resources/host-policy.json');
@@ -279,6 +291,11 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
         } else signed.assertIdentity(limit);
         assertBudget(limit);
       } catch (error) {
+        try {
+          const phase = manifests.readSignedVerificationPhase(error);
+          if (observation && verificationStages.has(observation) && phase && !verificationFailurePhases.has(observation))
+            verificationFailurePhases.set(observation, phase);
+        } catch { /* Observation cannot alter custody or the original failure. */ }
         // Detected armed package drift closes the real original even if an
         // upstream caller would otherwise redact or swallow an exception.
         if (custody) return custody.terminate();
