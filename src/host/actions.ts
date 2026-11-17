@@ -4,6 +4,7 @@ import { BrowserFailure, type ErrorCode } from '../contracts/errors.js';
 import { TabAuthority, type AuthorityStamp, type DocumentReceipt, type Invalidation, type NavigationContinuation } from './authority.js';
 import type { HandoffOperations } from './handoff.js';
 import { refused, type TabTarget } from './tabs.js';
+import { ClassifiedGeometryRefusal, classifiedRefusal } from '../content/sensitive.js';
 
 export type Sequence = 'pointer' | 'drag' | 'composition' | 'key' | 'wheel';
 /** A real operation-specific settlement producer must supply these observations.
@@ -48,6 +49,11 @@ export interface CaptureReservation {
   /** Only after original lifecycle, animation and responsiveness verification. */
   restored(): void;
 }
+/** Internal recognized condition retains the original read stamp for the final
+ * protected failure commitment. No provider message or page text is retained. */
+export class ClassifiedReadRefusal extends ClassifiedGeometryRefusal {
+  constructor(readonly stamp: AuthorityStamp) { super(); }
+}
 interface Slot { active?: Task; waiting: Task[] }
 interface Preparation {
   target: TabTarget; generation: number; controller: AbortController; completion: Promise<void>; retired: boolean;
@@ -59,6 +65,12 @@ export interface IssuedNavigation {
   assertCurrent(): void;
 }
 const issuedExecutions = new WeakMap<ActionExecution, (authority: TabAuthority) => IssuedNavigation>();
+const executionQueues = new WeakMap<ActionExecution, ActionQueue>();
+/** Retain the actual queue behind an authentic execution; host composition does
+ * not expose or replace OwnershipHost's private queue to install inspection. */
+export function owningQueue(execution: ActionExecution): ActionQueue {
+  const queue = executionQueues.get(execution); if (!queue) throw refused('control_refused'); return queue;
+}
 /** Private host adapter proof of an actual ActionQueue-issued command. */
 export function issuedNavigation(execution: ActionExecution, authority: TabAuthority): IssuedNavigation {
   const current = issuedExecutions.get(execution);
@@ -158,6 +170,7 @@ export class ActionQueue implements HandoffOperations {
       },
     });
     this.executions.set(execution, task);
+    executionQueues.set(execution, this);
     issuedExecutions.set(execution, authority => {
       if (authority !== this.authority || !task.navigation || !task.started || task.terminal || task.retired ||
           task.workDone || task.issued.size !== 1 || task.controller.signal.aborted || performance.now() >= task.deadline)
@@ -181,7 +194,17 @@ export class ActionQueue implements HandoffOperations {
         if (task.controller.signal.aborted || task.retired || performance.now() >= task.deadline) throw this.failure(task, 'control_refused');
         resolve({ value, stamp: finalStamp, ...(task.action ? { action: task.action } : {}) });
       } catch (error) {
-        const code = error instanceof BrowserFailure ? error.detail.code : 'internal'; reject(this.failure(task, code));
+        // Current authority/error precedence outranks a provider's earlier
+        // classified refusal. Only this recognized read condition keeps the
+        // fixed remedy; arbitrary provider strings never cross the queue.
+        let current = error;
+        if (!task.mutation && current instanceof ClassifiedGeometryRefusal)
+          try { this.authority.check(task.stamp); } catch (changed) { current = changed; }
+        if (!task.mutation && !task.controller.signal.aborted && !task.retired && performance.now() < task.deadline &&
+            current instanceof ClassifiedGeometryRefusal) reject(new ClassifiedReadRefusal(task.stamp));
+        else {
+          const code = current instanceof BrowserFailure ? current.detail.code : 'internal'; reject(this.failure(task, code));
+        }
       } finally {
         task.workDone = true; task.cleanup(); this.safe(task);
         if (!task.mutation) { if (task.countedRead) { --this.reads; if (task.screenshot) --this.screenshots; } }

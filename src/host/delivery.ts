@@ -6,6 +6,7 @@ import type { ConnectionContext, Request } from '../runtime/transport.js';
 import { TabAuthority, type AuthorityStamp, type CompletedTransition, type Invalidation } from './authority.js';
 import { assertTabRegistry, type TabRegistry } from './tabs.js';
 import { projectAgentTabs } from './projections.js';
+import { ClassifiedReadRefusal } from './actions.js';
 
 export type DeliveryProof =
   | { readonly kind: 'snapshot' | 'screenshot'; readonly stamp: AuthorityStamp; readonly identity: string }
@@ -34,6 +35,7 @@ export class DeliveryAuthority {
   private readonly failures = new Map<ConnectionContext, Map<string, Buffer>>();
   private readonly outcomes = new Map<ConnectionContext, Map<string, KnownOutcome>>();
   private readonly malformed = new Map<ConnectionContext, Set<string>>();
+  private readonly classifiedFailures = new Map<ConnectionContext, Map<string, AuthorityStamp>>();
   constructor(readonly authority: TabAuthority, readonly registry: () => TabRegistry) {
     authority.onInvalidate(event => this.invalidate(event));
   }
@@ -50,6 +52,7 @@ export class DeliveryAuthority {
     // Publish before connect/changed subscribers can synchronously close/revoke.
     this.pending.set(context, reservation); this.failures.set(context, new Map());
     this.outcomes.set(context, new Map()); this.malformed.set(context, new Set());
+    this.classifiedFailures.set(context, new Map());
     try {
       if (context.endpoint === 'agent') {
         if (!context.attachment) throw unavailable('browser'); this.authority.connect(context.attachment, context.signal);
@@ -65,6 +68,7 @@ export class DeliveryAuthority {
     for (const record of this.pending.get(context)?.values() ?? []) record.bytes.fill(0);
     for (const bytes of this.failures.get(context)?.values() ?? []) bytes.fill(0);
     this.pending.delete(context); this.failures.delete(context); this.outcomes.delete(context); this.malformed.delete(context);
+    this.classifiedFailures.delete(context);
   }
   noteOutcome(context: ConnectionContext, request: Request, outcome: KnownOutcome): void {
     this.assertContext(context);
@@ -173,28 +177,43 @@ export class DeliveryAuthority {
     this.assertContext(context);
     if (this.malformed.get(context)?.has(request.id)) throw unavailable('browser');
     const known = this.outcomes.get(context)!.get(request.id);
-    const publicError = error instanceof BrowserFailure ? error.detail : undefined;
+    let current = error, classified: AuthorityStamp | undefined;
+    this.classifiedFailures.get(context)!.delete(request.id);
+    if (error instanceof ClassifiedReadRefusal) {
+      try {
+        if (context.attachment !== error.stamp.attachment || request.method !== 'tool' ||
+            !['browser_snapshot', 'browser_screenshot'].includes(request.params.name)) throw unavailable('browser');
+        this.authority.check(error.stamp); classified = error.stamp;
+      } catch (changed) { current = changed; }
+    }
+    const publicError = current instanceof BrowserFailure ? current.detail : undefined;
     const value: BrowserError = { code: publicError?.code ?? 'internal', message: 'The browser request could not complete.', retryable: true,
-      remedy: 'Inspect fresh browser state before deciding on another action.',
+      remedy: classified
+        ? 'Use Take control to inspect this page privately.' : 'Inspect fresh browser state before deciding on another action.',
       ...(known?.action ? { action: known.action, dispatchOutcome: known.dispatchOutcome! } : {}) };
     if (!validator('browser.BrowserError')(value)) throw unavailable('browser');
     const old = this.pending.get(context)!.get(request.id); old?.bytes.fill(0); this.pending.get(context)!.delete(request.id);
     const failures = this.failures.get(context)!;
     if (failures.size >= 32 && !failures.has(request.id)) throw unavailable('browser');
     failures.get(request.id)?.fill(0); failures.set(request.id, responseBytes(request.id, false, value));
+    if (classified) this.classifiedFailures.get(context)!.set(request.id, classified);
     return value;
   }
   commitFailure(context: ConnectionContext, request: Request, bytes: Uint8Array): void {
     this.assertContext(context); const failures = this.failures.get(context)!, expected = failures.get(request.id);
     if (!expected || !timingSafeEqual(digest(bytes), digest(expected))) throw unavailable('browser');
+    const classified = this.classifiedFailures.get(context)!.get(request.id);
+    if (classified) this.authority.check(classified);
     // No previous content/grant proof is reused to authorize this new redacted frame.
     this.assertContext(context); expected.fill(0); failures.delete(request.id); this.outcomes.get(context)!.delete(request.id);
+    this.classifiedFailures.get(context)!.delete(request.id);
   }
   forget(context: ConnectionContext, request: Request): void {
     this.pending.get(context)?.get(request.id)?.bytes.fill(0); this.pending.get(context)?.delete(request.id);
     this.failures.get(context)?.get(request.id)?.fill(0); this.failures.get(context)?.delete(request.id);
     this.outcomes.get(context)?.delete(request.id);
     this.malformed.get(context)?.delete(request.id);
+    this.classifiedFailures.get(context)?.delete(request.id);
   }
   private invalidate(event: Invalidation): void {
     for (const [context, entries] of this.pending) for (const [id, record] of entries) {

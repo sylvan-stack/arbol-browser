@@ -1,5 +1,5 @@
 import { performance } from 'node:perf_hooks';
-import type { ActionExecution, ActionQueue, CaptureReservation } from '../host/actions.js';
+import { owningQueue, type ActionExecution, type ActionQueue, type CaptureReservation } from '../host/actions.js';
 import type { HostDocument, HostDocuments } from '../host/documents.js';
 import type { InspectionFrame, PageReadiness } from '../host/readiness.js';
 import { staleSnapshot } from '../host/authority.js';
@@ -32,10 +32,14 @@ export class CaptureProof {
   private touched = false;
   private active = true;
   private stamp?: CaptureStamp;
-  constructor(readonly queue: ActionQueue, readonly documents: HostDocuments, readonly readiness: PageReadiness,
+  readonly queue: ActionQueue;
+  private restoration?: Promise<void>;
+  constructor(readonly documents: HostDocuments, readonly readiness: PageReadiness,
     readonly fields: SensitiveFields, readonly execution: ActionExecution) {
     // Must precede debugger setup, animation/lifecycle operations and geometry.
-    this.reservation = queue.reserveCapture(execution);
+    this.queue = owningQueue(execution);
+    if (this.queue.authority.documents !== documents || readiness.documents !== documents || fields.readiness !== readiness) throw staleSnapshot();
+    this.reservation = this.queue.reserveCapture(execution);
     this.receipt = this.reservation.original as HostDocument;
   }
   guard = (): void => {
@@ -105,5 +109,48 @@ export class CaptureProof {
     // proof. ABR-16 owns a positive pinned-runtime witness and any required
     // explicitly reviewed producer repair before useful screenshots qualify.
     throw classifiedRefusal();
+  }
+  /** Restoration survives recipient revocation but never original-page or
+   * document retirement. Its independent guard cannot act on a replacement.
+   * A timeout poisons this job before late acknowledgements can continue. */
+  restore(): Promise<void> {
+    if (this.restoration) return this.restoration;
+    let resolve!: () => void, reject!: (error: unknown) => void;
+    const result = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
+    this.restoration = result; // before native/renderer callbacks can reenter
+    const remaining = this.execution.deadline - performance.now();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const run = async () => {
+      this.original();
+      if (this.touched) {
+        const frame = this.frame, playback = this.playback;
+        if (!frame || playback === undefined) throw classifiedRefusal();
+        acknowledge(await this.readiness.inspect(frame, this.original, 'Page.setWebLifecycleState', { state: 'active' }));
+        acknowledge(await this.readiness.inspect(frame, this.original, 'Animation.setPlaybackRate', { playbackRate: playback }));
+        const observed = await this.readiness.inspect(frame, this.original, 'Animation.getPlaybackRate') as { playbackRate?: number };
+        this.original(); if (observed.playbackRate !== playback) throw classifiedRefusal();
+        // Actual original frame-queue service, isolated frame callbacks and
+        // native presentation/binding observations verify resumed readiness.
+        // Neither a lifecycle acknowledgement nor a timer releases exclusion.
+        await this.readiness.barrier(this.receipt, this.execution.deadline, this.original); this.original();
+      }
+      this.surface?.close(); delete this.surface;
+      this.original(); this.reservation.restored(); this.active = false;
+    };
+    void Promise.race([run(), new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => { this.active = false; reject(classifiedRefusal()); }, Math.max(1, remaining));
+    })]).catch(() => {
+      this.active = false;
+      // The canonical producer authenticates literal original-page ownership,
+      // latches RendererHealth.failed and invokes existing guarded Take/retire.
+      // Keep the queue reservation until that real retirement is confirmed.
+      this.documents.failPage(this.execution.stamp.target, this.receipt.page, 'unavailable', 'capture_restoration_failed');
+      throw classifiedRefusal();
+    }).finally(() => {
+      if (timer) clearTimeout(timer);
+      delete this.stamp;
+      try { this.surface?.close(); } finally { delete this.surface; }
+    }).then(resolve, reject);
+    return result;
   }
 }
