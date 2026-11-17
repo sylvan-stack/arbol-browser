@@ -8,6 +8,7 @@ import { assertProfile, type ProfileSnapshot } from '../profiles/records.js';
 import { assertPlatform, type HeldLock, type PlatformPort, type ProcessProvenance } from './platform.js';
 import { assertVerifiedHost, type VerifiedHost } from './authorities.js';
 import { assertTime, now, runtimeLocation, type RuntimeLocation, type RuntimeRecord } from './instance.js';
+import type { LaunchAttemptPort } from './start.js';
 
 export interface LaunchAttempt {
   readonly format: 1; readonly request: string; readonly nonce: string;
@@ -137,5 +138,63 @@ export async function claimedHostAttempt(profile: ProfileSnapshot, host: Verifie
         current.bootstrap.pid !== self.pid || current.bootstrap.startId !== self.startId ||
         current.bootstrap.pidVersion === self.pidVersion) throw unavailable('browser');
     return current;
+  });
+}
+
+/** Real packaged starter transactions. Process-local state merely remembers this
+ * caller's nonce; durable native claim/cancel and the retained native originals
+ * provide protection when the CLI or NSWorkspace reply disappears. */
+export function createLaunchTransactions(host: VerifiedHost, platform: PlatformPort): LaunchAttemptPort {
+  assertPlatform(platform);
+  const pending = new Map<string, LaunchAttempt>();
+  return Object.freeze({
+    async reserve(profile: ProfileSnapshot, request: string, deadline: number) {
+      assertVerifiedHost(host, deadline); await host.assertTrusted(deadline);
+      const next = await pendingLaunchAttempt(profile, host, platform, request, deadline);
+      if (pending.has(request)) throw unavailable('browser'); pending.set(request, next);
+      await withLaunchAttempt(profile, platform, deadline, transaction => {
+        const previous = transaction.current;
+        // A previous claimed family is retired only by the independent native
+        // exit verifier, under its actual owner/Build/transition protection.
+        if (previous && !(previous.phase === 'cancelled' && previous.stage === 'untransferred' &&
+            !previous.bootstrap && !previous.engine && !previous.runtime && !previous.terminal)) throw unavailable('browser');
+        transaction.replace(next);
+      });
+    },
+    async launched(profile: ProfileSnapshot, request: string, pid: number, deadline: number) {
+      const expected = pending.get(request);
+      if (!expected || !Number.isSafeInteger(pid) || pid <= 1) throw unavailable('browser');
+      for (;;) {
+        assertTime(deadline);
+        const accepted = await withLaunchAttempt(profile, platform, deadline, transaction => {
+          const current = transaction.current;
+          if (!current || current.request !== request || current.nonce !== expected.nonce ||
+              current.profileInstance !== profile.record.instance || current.expires <= platform.continuousTime() ||
+              current.phase === 'cancelled' || current.phase === 'closed' || current.phase === 'closing') throw unavailable('browser');
+          if (current.phase === 'pending') return false;
+          const original = current.bootstrap, live = platform.processProvenance(pid);
+          if (!original || original.pid !== pid || !live || original.startId !== live.startId || original.uid !== live.uid ||
+              original.group !== live.group || original.session !== live.session ||
+              original.executable !== join(host.identity.layout.bundle, 'Contents/MacOS/arbol-browser-native')) throw unavailable('browser');
+          // NSWorkspace may reply on either side of the fixed exec. Its PID is
+          // not proof by itself; require the matching durable original claim
+          // and either that exact still-live outer or its actual adopted engine.
+          if (live.pidVersion === original.pidVersion && live.executable === original.executable) return true;
+          if (!current.engine) return false;
+          if ((['pid', 'uid', 'startId', 'pidVersion', 'group', 'session', 'parentStartId', 'parentPidVersion', 'executable'] as const)
+            .some(key => current.engine![key] !== live[key]) || live.executable !== host.identity.layout.engine) throw unavailable('browser');
+          return true;
+        });
+        if (accepted) { assertVerifiedHost(host, deadline); return; }
+        await setTimeout(Math.min(10, Math.max(1, deadline - now())));
+      }
+    },
+    async cancel(profile: ProfileSnapshot, request: string, deadline: number) {
+      const expected = pending.get(request);
+      if (!expected) return; // reservation failed before any native write/submission
+      const belongs = await withLaunchAttempt(profile, platform, deadline, tx => tx.current?.request === request);
+      if (!belongs) return; // reservation refused an unrelated already-owned attempt
+      await cancelLaunchAttempt(profile, platform, request, expected.nonce, deadline);
+    },
   });
 }
