@@ -82,6 +82,16 @@ export const agentToolSchemas = Object.entries(browser['x-tools']).map(([name, t
     destructiveHint: !tool.readOnlyHint, openWorldHint: true },
 }));
 
+/** Select the outstanding method, including private screenshot transport; a
+ * generic success union cannot validate a correlated tool reply. */
+export type AgentToolName = keyof typeof browser['x-tools'];
+export function agentToolValidator(name: AgentToolName, direction: 'input' | 'success' | 'wireSuccess'): ValidateFunction {
+  const ref = direction === 'wireSuccess' && name === 'browser_screenshot'
+    ? `${browser.$id}#/$defs/ScreenshotPayload`
+    : browser['x-tools'][name][direction === 'input' ? 'input' : 'success'].$ref;
+  return ajv.compile({ $ref: ref });
+}
+
 /** TypeScript shapes are generated from the same assets used by runtime validators.
  * Numeric/string bounds and conditional requirements remain runtime obligations. */
 export function generatedTypes(): string {
