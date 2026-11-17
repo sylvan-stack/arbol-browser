@@ -10,7 +10,7 @@ import { validator } from '../contracts/schema.js';
 // Trust covers physical signed bytes, including ASAR archives, on every check.
 // Browser verification uses the mandatory unpatched Electron builtin. The Node
 // CLI has an unpatched filesystem already and never imports Electron code.
-const { constants, lstatSync, openSync, fstatSync, readSync, closeSync, readdirSync, readlinkSync, realpathSync } =
+const { constants, lstatSync, openSync, fstatSync, readSync, closeSync, opendirSync, readlinkSync, realpathSync } =
   createRequire(import.meta.url)(process.type === 'browser' ? 'original-fs' : 'node:fs') as typeof import('node:fs');
 
 export const publisher = Object.freeze({ team: '7V372XL59S', bundleIdentifier: 'com.sylvan-stack.arbol-browser.native-candidate',
@@ -130,7 +130,7 @@ function physicalStamp(stat: import('node:fs').BigIntStats): string {
 // These callbacks perform filesystem work off the browser heartbeat thread.
 const originalAsyncFS = createRequire(import.meta.url)(process.type === 'browser' ? 'original-fs' : 'node:fs') as typeof import('node:fs');
 const asynchronousFS = Object.freeze({ lstat: originalAsyncFS.lstat, fstat: originalAsyncFS.fstat, open: originalAsyncFS.open,
-  close: originalAsyncFS.close, read: originalAsyncFS.read, readdir: originalAsyncFS.readdir, readlink: originalAsyncFS.readlink, realpath: originalAsyncFS.realpath });
+  close: originalAsyncFS.close, read: originalAsyncFS.read, opendir: originalAsyncFS.opendir, readlink: originalAsyncFS.readlink, realpath: originalAsyncFS.realpath });
 function asyncLstat(path: string): Promise<import('node:fs').BigIntStats> {
   return new Promise((resolve, reject) => asynchronousFS.lstat(path, { bigint: true }, (error, stat) => error ? reject(error) : resolve(stat)));
 }
@@ -140,9 +140,91 @@ function asyncStat(fd: number): Promise<import('node:fs').BigIntStats> {
 function asyncRealpath(path: string): Promise<string> {
   return new Promise((resolve, reject) => asynchronousFS.realpath(path, (error, value) => error ? reject(error) : resolve(value)));
 }
-function asyncNames(path: string): Promise<string[]> {
-  return new Promise((resolve, reject) => asynchronousFS.readdir(path, (error, value) => error ? reject(error) : resolve(value.sort())));
+// macOS 27 SDK sys/syslimits.h: NAME_MAX=255 bytes, PATH_MAX=1024
+// (including terminating NUL). The original complete-entry ceiling is 4096.
+const completeEntryLimit = 4096, rawNameLimit = 255, rawPathLimit = 1024;
+function directoryPath(path: string): void {
+  if (Buffer.byteLength(path, 'utf8') >= rawPathLimit || !path.startsWith('/') || path.includes('\0')) refuse();
 }
+function directoryName(raw: unknown, directory: string): string {
+  if (!Buffer.isBuffer(raw) || !raw.length || raw.length > rawNameLimit || raw.includes(0) || raw.includes(47)) refuse();
+  if (Buffer.byteLength(directory, 'utf8') + 1 + raw.length >= rawPathLimit) refuse();
+  const name = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(raw);
+  if (name === '.' || name === '..' || !Buffer.from(name, 'utf8').equals(raw)) refuse();
+  directoryPath(join(directory, name)); return name;
+}
+function sameDirectoryPath(dir: import('node:fs').Dir, path: string): boolean {
+  const actual: unknown = dir.path;
+  return Buffer.isBuffer(actual) ? actual.equals(Buffer.from(path)) : actual === path;
+}
+// Pinned Node24.22.2 internal/fs/utils.js getOptions expressly accepts
+// encoding 'buffer'; its public DirOptions declaration omits that spelling.
+// These narrow adapters preserve the original functions and raw-name checks.
+const rawOpendirSync = opendirSync as unknown as (path: string,
+  options: { encoding: 'buffer'; bufferSize: number }) => import('node:fs').Dir;
+const rawOpendir = asynchronousFS.opendir as unknown as (path: string,
+  options: { encoding: 'buffer'; bufferSize: number },
+  callback: (error: NodeJS.ErrnoException | null, directory: import('node:fs').Dir) => void) => void;
+function synchronousNames(path: string, deadline: number, maximum: number): string[] {
+  budget(deadline); directoryPath(path);
+  if (!Number.isSafeInteger(maximum) || maximum < 0 || maximum > completeEntryLimit) refuse();
+  const before = lstatSync(path, { bigint: true });
+  if (!before.isDirectory() || realpathSync(path) !== path) refuse();
+  const stamp = physicalStamp(before), names: string[] = [], seen = new Set<string>();
+  let directory: import('node:fs').Dir | undefined;
+  try {
+    directory = rawOpendirSync(path, { encoding: 'buffer', bufferSize: 1 });
+    if (!sameDirectoryPath(directory, path)) refuse();
+    // Read at most the bounded permitted count plus the one necessary EOF /
+    // extra-entry observation. Never allocate or sort an unbounded census.
+    for (let index = 0; index <= maximum; ++index) {
+      budget(deadline); const entry = directory.readSync(); budget(deadline);
+      if (!entry) {
+        if (physicalStamp(lstatSync(path, { bigint: true })) !== stamp || realpathSync(path) !== path) refuse();
+        return names.sort();
+      }
+      if (names.length === maximum) refuse();
+      const name = directoryName(entry.name, path); if (seen.has(name)) refuse();
+      seen.add(name); names.push(name);
+    }
+    return refuse();
+  } finally { if (directory) directory.closeSync(); budget(deadline); }
+}
+function asyncDirectory(path: string): Promise<import('node:fs').Dir> {
+  return new Promise((resolve, reject) => rawOpendir(path, { encoding: 'buffer', bufferSize: 1 },
+    (error, directory) => error ? reject(error) : resolve(directory)));
+}
+function asyncDirectoryRead(directory: import('node:fs').Dir): Promise<import('node:fs').Dirent | null> {
+  return new Promise((resolve, reject) => directory.read((error, entry) => error ? reject(error) : resolve(entry)));
+}
+function asyncDirectoryClose(directory: import('node:fs').Dir): Promise<void> {
+  return new Promise((resolve, reject) => directory.close(error => error ? reject(error) : resolve()));
+}
+async function asynchronousNames(path: string, expected: PhysicalEntry, deadline: number): Promise<string[]> {
+  budget(deadline); directoryPath(path);
+  const maximum = expected.children?.length;
+  if (expected.kind !== 'directory' || maximum === undefined || maximum > completeEntryLimit) refuse();
+  const before = await asyncLstat(path);
+  if (!before.isDirectory() || physicalStamp(before) !== expected.stamp || await asyncRealpath(path) !== path) refuse();
+  const names: string[] = [], seen = new Set<string>(); let directory: import('node:fs').Dir | undefined;
+  try {
+    budget(deadline); directory = await asyncDirectory(path); budget(deadline);
+    if (!sameDirectoryPath(directory, path)) refuse();
+    for (let index = 0; index <= maximum; ++index) {
+      budget(deadline); const entry = await asyncDirectoryRead(directory); budget(deadline);
+      if (!entry) {
+        const after = await asyncLstat(path);
+        if (!after.isDirectory() || physicalStamp(after) !== expected.stamp || await asyncRealpath(path) !== path) refuse();
+        budget(deadline); return names.sort();
+      }
+      if (names.length === maximum) refuse();
+      const name = directoryName(entry.name, path); if (seen.has(name)) refuse();
+      seen.add(name); names.push(name);
+    }
+    return refuse();
+  } finally { if (directory) await asyncDirectoryClose(directory); budget(deadline); }
+}
+
 function asyncLink(path: string): Promise<string> {
   return new Promise((resolve, reject) => asynchronousFS.readlink(path, (error, value) => error ? reject(error) : resolve(value)));
 }
@@ -160,7 +242,7 @@ function asyncRead(fd: number, buffer: Buffer, length: number, position: number)
 /** Recompare every original byte and physical entry. Nothing here signs,
  * loads an addon, spawns a verifier or learns a replacement snapshot. */
 async function compareCompleteSnapshot(signed: SignedBundle, snapshot: FrozenSnapshot, deadline: number): Promise<void> {
-  const root = signed.bundle, entries: Record<string, string> = {}, keys = Object.keys(snapshot.physical).sort();
+  const root = signed.bundle, entries: Record<string, string> = Object.create(null), keys = Object.keys(snapshot.physical).sort();
   if (keys.length > 4097) refuse();
   const check = async (key: string, topology: boolean): Promise<import('node:fs').BigIntStats> => {
     budget(deadline); if (snapshot.poisoned) refuse();
@@ -175,7 +257,7 @@ async function compareCompleteSnapshot(signed: SignedBundle, snapshot: FrozenSna
           !resolve(dirname(path), link).startsWith(root + sep) || await asyncLink(path) !== link) refuse();
     } else {
       if (await asyncRealpath(path) !== path) refuse();
-      if (topology && expected.kind === 'directory' && stable(await asyncNames(path)) !== stable(expected.children)) refuse();
+      if (topology && expected.kind === 'directory' && stable(await asynchronousNames(path, expected, deadline)) !== stable(expected.children)) refuse();
     }
     budget(deadline); return stat;
   };
@@ -251,10 +333,11 @@ let trustedCandidate: CandidateTrust | undefined;
 /** Complete physical signed bundle, including the outer seal and directories.
  * No subprocess, expected-byte learning, or symlink traversal on later checks. */
 function completeSnapshot(root: string, deadline = Infinity, physical?: Record<string, PhysicalEntry>): string {
-  const entries: Record<string, string> = {};
+  const entries: Record<string, string> = Object.create(null); let count = 0;
   function walk(directory: string): void {
     budget(deadline);
-    const original = lstatSync(directory), originalStamp = physicalStamp(lstatSync(directory, { bigint: true })), names = readdirSync(directory).sort();
+    const original = lstatSync(directory), originalStamp = physicalStamp(lstatSync(directory, { bigint: true })), names = synchronousNames(directory, deadline, completeEntryLimit - count);
+    count += names.length;
     if (realpathSync(directory) !== directory || !original.isDirectory()) return refuse();
     if (physical) physical[relative(root, directory)] = Object.freeze({ stamp: originalStamp, kind: 'directory', children: Object.freeze(names) });
     for (const name of names) {
@@ -271,9 +354,9 @@ function completeSnapshot(root: string, deadline = Infinity, physical?: Record<s
         if (physical) physical[key] = Object.freeze({ stamp: beforeStamp, kind: 'file' });
       } else refuse();
       const after = lstatSync(path);
-      if (after.dev !== before.dev || after.ino !== before.ino || after.mode !== before.mode || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs || physicalStamp(lstatSync(path, { bigint: true })) !== beforeStamp || Object.keys(entries).length > 4096) refuse();
+      if (after.dev !== before.dev || after.ino !== before.ino || after.mode !== before.mode || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs || physicalStamp(lstatSync(path, { bigint: true })) !== beforeStamp) refuse();
     }
-    if (physicalStamp(lstatSync(directory, { bigint: true })) !== originalStamp || stable(readdirSync(directory).sort()) !== stable(names)) refuse();
+    if (physicalStamp(lstatSync(directory, { bigint: true })) !== originalStamp || stable(synchronousNames(directory, deadline, names.length)) !== stable(names)) refuse();
   }
   walk(root); budget(deadline); return stable(entries);
 }
@@ -293,9 +376,10 @@ export function verifySignedBundle(bundle: string, deadline = Infinity): SignedB
     if (value.publisherTeam !== publisher.team || value.bundleIdentifier !== publisher.bundleIdentifier ||
         stable(value.runtime) !== stable(pinnedRuntime) || value.nativeABI.compiledNapi !== 8 ||
         stable(value.featureConfiguration) !== stable({ sitePerProcess: true, disabledFeatures: ['MacAccessibilityTextOperation'], extraChromiumArguments: [] })) refuse();
-    const inventory: Record<string, string> = {};
+    const inventory: Record<string, string> = Object.create(null); let count = 0;
     function walk(directory: string): void {
-      for (const name of readdirSync(directory).sort()) {
+      const names = synchronousNames(directory, deadline, completeEntryLimit - count); count += names.length;
+      for (const name of names) {
         budget(deadline);
         const path = join(directory, name), key = relative(root, path), stat = lstatSync(path);
         if (stat.isSymbolicLink()) {
@@ -308,14 +392,13 @@ export function verifySignedBundle(bundle: string, deadline = Infinity): SignedB
           if (['cffaedfe', 'cefaedfe', 'feedfacf', 'cafebabe', 'bebafeca'].includes(physical.magic))
             signature(path, false, key.startsWith('Contents/Resources/browser/runtime/Electron.app/') && key.includes('/Contents/MacOS/'), deadline);
         } else refuse();
-        if (Object.keys(inventory).length > 4096) refuse();
       }
     }
     walk(join(root, 'Contents/Resources/browser'));
     if (stable(inventory) !== stable(value.files)) refuse();
     return value;
   };
-  const physical: Record<string, PhysicalEntry> = {}, afterPhysical: Record<string, PhysicalEntry> = {};
+  const physical: Record<string, PhysicalEntry> = Object.create(null), afterPhysical: Record<string, PhysicalEntry> = Object.create(null);
   const before = completeSnapshot(root, deadline, physical);
   const initial = check(), encoded = stable(initial);
   const after = completeSnapshot(root, deadline, afterPhysical);
@@ -329,7 +412,7 @@ export function verifySignedBundle(bundle: string, deadline = Infinity): SignedB
     assertIdentity(limit = Infinity) {
       try {
         budget(limit);
-        const currentPhysical: Record<string, PhysicalEntry> = {};
+        const currentPhysical: Record<string, PhysicalEntry> = Object.create(null);
         if (snapshot.poisoned || realpathSync(root) !== root || completeSnapshot(root, limit, currentPhysical) !== before ||
             stable(currentPhysical) !== stable(snapshot.physical) ||
             stable(boundedJson(join(root, 'Contents/Resources/native-compatibility.json'), limit)) !== encoded) refuse();
