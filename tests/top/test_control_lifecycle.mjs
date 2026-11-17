@@ -1,6 +1,6 @@
 import { readFile, lstat } from 'node:fs/promises';
 import { join } from 'node:path';
-import { assert, cli, success, create, open, runtime, closes, save, family, delay, loopback, until, agent, tool } from '../support/control.mjs';
+import { assert, cli, success, create, open, runtime, closes, save, family, delay, loopback, until, agent, tool, processSnapshot } from '../support/control.mjs';
 
 export async function controlStartupBoundary(c) {
   let absent; try { absent = await lstat(join(c.state, 'profiles/control-startup')); } catch (e) { if (e.code !== 'ENOENT') throw e; }
@@ -50,4 +50,39 @@ export async function controlProfilePersistence(c) {
       dirtyRecovery: 'unavailable: no admitted engine transaction/force-close oracle' });
     return { boundary: 'two actual persistent website Sessions and clean restart', dirtyRecovery: 'unavailable' };
   } finally { await page.close(); }
+}
+
+export async function controlCompleteClose(c) {
+  const profile = 'control-complete-close'; await create(c, profile);
+  const page = await loopback(c), samples = [];
+  try {
+    await open(c, profile, page.url('close-seed', 'close-fictional'));
+    await until(() => page.observations.some(o => o.name === 'close-seed'));
+    const r = await runtime(c, profile), markerPath = join(c.state, 'profiles', profile, 'engine.json');
+    assert.equal(JSON.parse(await readFile(markerPath)).cleanExit, false);
+    const baseline = await family(c, 'before-close');
+    const originals = baseline.map(line => Number(line.trim().split(/\s+/)[0])).map(pid => r.platform.processIdentity(pid)).filter(Boolean);
+    assert.ok(originals.some(p => p.pid === r.record.pid)); assert.ok(originals.length > 1, 'No owned helper/monitor baseline observed');
+    let done = false;
+    const observer = (async () => {
+      do {
+        const marker = JSON.parse(await readFile(markerPath));
+        const live = originals.filter(p => { const now = r.platform.processIdentity(p.pid); return now?.startId === p.startId && now.uid === p.uid; });
+        const row = { monotonic: performance.now(), clean: marker.cleanExit, live }; samples.push(row);
+        if (marker.cleanExit) assert.deepEqual(live, [], 'Clean marker observed before original family disappearance');
+        await delay(15);
+      } while (!done);
+    })();
+    let result;
+    try { result = await closes(c, profile); } finally { done = true; await observer; }
+    assert.equal(result.closed, true); assert.equal(JSON.parse(await readFile(markerPath)).cleanExit, true);
+    assert.deepEqual(await family(c, 'after-close'), []);
+    for (const original of originals) assert.notEqual(r.platform.processIdentity(original.pid)?.startId, original.startId);
+    await open(c, profile, page.url('close-restored'));
+    const restored = await until(() => page.observations.find(o => o.name === 'close-restored'));
+    assert.equal(restored.stored, 'close-fictional'); assert.equal(restored.cookie, 'fictional=close-fictional');
+    await save(join(c.output, 'observations.json'), { result, originals, samples, restored,
+      scope: 'Externally sampled original family plus normal native close authority; not continuous pre-baseline confinement or genuine lost-ACK proof' });
+    return { boundary: 'actual normal close, sampled originals, clean publication and persistent restart', lostAcknowledgement: 'unavailable' };
+  } finally { await save(join(c.output, 'close-samples.json'), samples); await page.close(); }
 }

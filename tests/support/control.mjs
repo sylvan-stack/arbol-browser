@@ -124,7 +124,7 @@ export async function loopback(c) {
     const name = url.searchParams.get('name') ?? 'page', seed = url.searchParams.get('seed');
     res.setHeader('Content-Type', 'text/html'); res.setHeader('Cache-Control', 'no-store');
     res.end(`<!doctype html><title>Fictional qualification ${name}</title><input aria-label="Fictional field"><script>
-      ${seed ? `document.cookie='fictional=${seed}; SameSite=Lax'; localStorage.setItem('fictional',${JSON.stringify(seed)});` : ''}
+      ${seed ? `document.cookie='fictional=${seed}; Max-Age=3600; SameSite=Lax'; localStorage.setItem('fictional',${JSON.stringify(seed)});` : ''}
       fetch('/seen?name='+${JSON.stringify(name)}+'&stored='+encodeURIComponent(localStorage.getItem('fictional')));
       fetch('/arm?name='+${JSON.stringify(name)}).then(r=>r.text()).then(v=>{if(v==='hang')for(;;){}});
       </script>`);
