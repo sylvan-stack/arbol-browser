@@ -53,6 +53,22 @@ export interface WatchdogCustody {
   terminate(): never;
 }
 export type PriorMarkerExpectation = Readonly<{ kind: 'absent' } | { kind: 'activated' | 'terminal'; path: string; digest: string }>;
+export interface NativeExitInput {
+  readonly format: 1;
+  readonly mode: 'prior' | 'full' | 'retire';
+  readonly profile: string; readonly profileInstance: string; readonly profilePathHash: string;
+  readonly runtimeLeaf: string; readonly bundle: string;
+  readonly attempt: import('./process.js').LaunchAttempt | null;
+  readonly previous: import('./instance.js').RuntimeRecord | null;
+}
+export interface ExitInspectionReceipt {
+  readonly kind: 'never-opened' | 'activated' | 'terminal'; readonly clean: boolean;
+  readonly prior: PriorMarkerExpectation; readonly request: string | null;
+}
+const exitInspectionReceipts = new WeakSet<object>();
+export function assertExitInspectionReceipt(value: ExitInspectionReceipt): void {
+  if (!exitInspectionReceipts.has(value)) throw unavailable('profile');
+}
 export interface HostFinalizationInput {
   readonly requestPath: string;
   readonly signedPolicy: Readonly<{ policyDigest: string; compatibilityDigest: string }>;
@@ -66,6 +82,10 @@ export function assertWatchdogCustody(value: WatchdogCustody): void {
   if (!custodyReceipts.has(value)) throw unavailable('browser');
 }
 export interface PlatformPort {
+  /** Actual held owner and independently verified OLD Build; native claims,
+   * complete receipts, physical metadata/marker/frontiers and full original
+   * absence are verified off the caller event loop under the original bound. */
+  inspectExit(owner: HeldLock, build: HeldLock, input: NativeExitInput, deadline: number): Promise<ExitInspectionReceipt>;
   /** One-use fixed-exec native adoption. No numeric FD or role is accepted. */
   adoptHostBuild(requestPath: string, guard: string, bundle: string): HeldLock;
   /** Kernel continuous time shared by native outer, host and both monitors. */
@@ -97,6 +117,9 @@ export interface PlatformPort {
   peerIdentity(socketFd: number): ProcessIdentity;
 }
 interface NativeSupport {
+  beginExitInspection(owner: object, build: object, input: string, nativeDeadline: number): object;
+  pollExitInspection(handle: object): string | null;
+  cancelExitInspection(handle: object): void;
   beginHostSessionUse(handle: object): object;
   acceptHostSessionUse(handle: object, facts: string): object;
   abortHostSessionUse(handle: object): never;
@@ -155,7 +178,7 @@ export function loadPlatform(): PlatformPort {
   let native: NativeSupport;
   try {
     native = createRequire(import.meta.url)(fileURLToPath(new URL('../../native/platform.node', import.meta.url)));
-    for (const name of ['beginHostSessionUse', 'acceptHostSessionUse', 'abortHostSessionUse', 'recordPagesRetired', 'recordDOMRequested', 'recordCookieAcknowledged', 'recordQuitIntended', 'captureCloseBudget', 'beginCloseStamp', 'pollCloseStamp', 'cancelCloseStamp', 'beginCloseRetirement', 'pollCloseRetirement', 'consumeCloseRequest', 'armLocalClose', 'beginHostMarkerMutation', 'acceptHostMarkerMutation', 'assertHostMarker', 'abortHostMarkerMutation', 'latchWatchdogFatal', 'prepareHostFinalization', 'spawnWatchdog', 'assertHostFinalization', 'adoptHostBuild', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
+    for (const name of ['beginExitInspection', 'pollExitInspection', 'cancelExitInspection', 'beginHostSessionUse', 'acceptHostSessionUse', 'abortHostSessionUse', 'recordPagesRetired', 'recordDOMRequested', 'recordCookieAcknowledged', 'recordQuitIntended', 'captureCloseBudget', 'beginCloseStamp', 'pollCloseStamp', 'cancelCloseStamp', 'beginCloseRetirement', 'pollCloseRetirement', 'consumeCloseRequest', 'armLocalClose', 'beginHostMarkerMutation', 'acceptHostMarkerMutation', 'assertHostMarker', 'abortHostMarkerMutation', 'latchWatchdogFatal', 'prepareHostFinalization', 'spawnWatchdog', 'assertHostFinalization', 'adoptHostBuild', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
       if (typeof native[name] !== 'function') throw new Error('Missing process support');
   } catch { throw unavailable('profile'); }
   const call = <T>(operation: () => T): T => {
@@ -298,6 +321,39 @@ export function loadPlatform(): PlatformPort {
         if (state !== 0 || current >= budget.overall) throw unavailable('browser');
         await setTimeout(Math.min(10, Math.max(1, budget.overall - current)));
       }
+    },
+    async inspectExit(owner: HeldLock, build: HeldLock, input: NativeExitInput, deadline: number): Promise<ExitInspectionReceipt> {
+      const actualOwner = locks.get(owner), actualBuild = locks.get(build);
+      if (!actualOwner || !actualBuild || !Number.isFinite(deadline)) throw unavailable('profile');
+      owner.assertIdentity(); build.assertIdentity();
+      const nativeNow = call(() => native.continuousTime()), sampled = performance.now();
+      if (sampled >= deadline) throw unavailable('profile');
+      const nativeDeadline = nativeNow + Math.min(10000, deadline - sampled);
+      const handle = call(() => native.beginExitInspection(actualOwner, actualBuild, JSON.stringify(input), nativeDeadline));
+      try {
+        while (performance.now() < deadline && call(() => native.continuousTime()) < nativeDeadline) {
+          const raw = call(() => native.pollExitInspection(handle));
+          if (raw !== null) {
+            if (typeof raw !== 'string' || !raw.length || Buffer.byteLength(raw) > 16384) throw unavailable('profile');
+            const value = JSON.parse(raw) as ExitInspectionReceipt & { format: number };
+            if (!value || Object.keys(value).sort().join(',') !== 'clean,format,kind,prior,request' || value.format !== 1 ||
+                !['never-opened', 'activated', 'terminal'].includes(value.kind) || typeof value.clean !== 'boolean' ||
+                value.clean !== (value.kind === 'activated') || (value.request !== null && !/^req_[A-Za-z0-9_-]{22}$/.test(value.request)))
+              throw unavailable('profile');
+            const prior = value.prior;
+            if (!prior || (prior.kind === 'absent' ? Object.keys(prior).join(',') !== 'kind' :
+                !['activated', 'terminal'].includes(prior.kind) || Object.keys(prior).sort().join(',') !== 'digest,kind,path' ||
+                !isAbsolute(prior.path) || !/^[0-9a-f]{64}$/.test(prior.digest))) throw unavailable('profile');
+            owner.assertIdentity(); build.assertIdentity();
+            if (performance.now() >= deadline || call(() => native.continuousTime()) >= nativeDeadline) throw unavailable('profile');
+            const result: ExitInspectionReceipt = Object.freeze({ kind: value.kind, clean: value.clean,
+              prior: Object.freeze({ ...prior }), request: value.request });
+            exitInspectionReceipts.add(result); return result;
+          }
+          await setTimeout(Math.min(5, Math.max(1, deadline - performance.now())));
+        }
+        throw unavailable('profile');
+      } finally { call(() => native.cancelExitInspection(handle)); }
     },
     processProvenance(pid: number): ProcessProvenance | null {
       const value = call(() => native.processProvenance(pid));
