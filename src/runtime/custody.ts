@@ -3,7 +3,7 @@
 import { join } from 'node:path';
 import { unavailable } from '../contracts/errors.js';
 import { assertProfile } from '../profiles/records.js';
-import { withOwnerLockForCustody } from '../profiles/locking.js';
+import { withOwnerLockForCustody, type OwnerLease } from '../profiles/locking.js';
 import { withBuildLockForCustody, type BuildLease } from './build-lease.js';
 import { assertVerifiedHost, type VerifiedHost } from './authorities.js';
 import { assertPlatform, assertWatchdogCustody, type PlatformPort, type WatchdogCustody, type PriorMarkerExpectation } from './platform.js';
@@ -33,10 +33,10 @@ export function assertHostCustody(value: HostCustody): void {
  * child or admitted data. First retain the actual originals natively, then use
  * the same independently guarded native family unwind. This is never a JS
  * finally/release path or an assertion that a durable claim armed a watchdog. */
-export async function abortUnadmittedHost(host: VerifiedHost, instance: InstanceOwner, build: BuildLease,
+export async function abortUnadmittedHost(host: VerifiedHost, ownerLease: OwnerLease, build: BuildLease,
   platform: PlatformPort): Promise<never> {
   assertPlatform(platform);
-  const native = await withOwnerLockForCustody(instance.owner, platform, owner =>
+  const native = await withOwnerLockForCustody(ownerLease, platform, owner =>
     withBuildLockForCustody(build, platform, heldBuild =>
       platform.prepareWatchdogCustody(owner, heldBuild, host.signed.bundle, host.signed.snapshotDigest)));
   return native.terminate();

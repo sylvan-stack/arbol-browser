@@ -88,22 +88,32 @@ async function unchanged(location: RuntimeLocation, previous: RuntimeRecord | un
 export interface PreviousExit {
   /** Must account for original main AND all helpers (including after main death).
    * Group emptiness alone is insufficient without trusted containment evidence. */
-  assertExited(profile: ProfileSnapshot, previous: RuntimeRecord | undefined): Promise<void>;
+  assertExited(profile: ProfileSnapshot, previous: RuntimeRecord | undefined, owner?: OwnerLease): Promise<void>;
+}
+export interface InstanceAcquisition {
+  /** Production uses the actual native short claim transaction. No engine or
+   * marker access is permitted by this callback or by acquisition itself. */
+  assertAdmission(): Promise<void>;
+  /** Once production ownership is acquired, failed preparation retains the
+   * actual guard and enters native unwind instead of the Foundation release. */
+  failed(owner: OwnerLease): Promise<never>;
 }
 /** Only the host takes exclusive data ownership. A starter never retains this
  * lock while waiting for a LaunchServices host to acquire it. */
 export async function acquireInstance(profile: ProfileSnapshot, platform: PlatformPort, build: string,
-  previousExit: PreviousExit, deadline: number): Promise<InstanceOwner | null> {
+  previousExit: PreviousExit, deadline: number, acquisition?: InstanceAcquisition): Promise<InstanceOwner | null> {
   assertTime(deadline);
   if (!validator('browser.Build')(build)) throw profileUnavailable();
+  await acquisition?.assertAdmission(); assertTime(deadline);
   const owner = await ownerLock(profile, platform, false, Math.min(deadline, now() + 10000));
   if (!owner) return null;
   try {
+    await acquisition?.assertAdmission(); await owner.assert();
     const location = await runtimeLocation(profile, true);
     if (!location) throw profileUnavailable();
     const previous = await readRuntime(location);
     if (previous && originalAlive(previous, platform)) throw profileUnavailable();
-    await previousExit.assertExited(profile, previous);
+    await previousExit.assertExited(profile, previous, owner);
     await owner.assert(); await unchanged(location, previous); assertTime(deadline);
     // Unknown/stale socket identity never licenses removal while its owner lives.
     for (const path of [location.agent, location.management]) {
@@ -111,7 +121,7 @@ export async function acquireInstance(profile: ProfileSnapshot, platform: Platfo
         if (!previous) throw profileUnavailable();
         await assertSocket(location, path); await owner.assert();
         if (originalAlive(previous, platform)) throw profileUnavailable();
-        await unlink(path);
+        await acquisition?.assertAdmission(); await unlink(path);
       }
     }
     const own = platform.processIdentity(process.pid);
@@ -130,9 +140,9 @@ export async function acquireInstance(profile: ProfileSnapshot, platform: Platfo
       await rename(temporary, location.record);
       current = next; await location.assert();
     };
-    await publish(record);
+    await acquisition?.assertAdmission(); await publish(record);
     let phase: RuntimeRecord['phase'] = 'starting';
-    return Object.freeze({ owner, location, get record() { return current!; },
+    return Object.freeze({ owner, location, previous, get record() { return current!; },
       async phase(next: 'ready' | 'closing') {
         if (phase === 'closing' || (next === 'ready' && phase !== 'starting')) throw profileUnavailable();
         if (next === 'ready') {
@@ -141,10 +151,11 @@ export async function acquireInstance(profile: ProfileSnapshot, platform: Platfo
         phase = next; await publish(Object.freeze({ ...current!, phase: next }));
       },
     });
-  } catch (error) { owner.release(); throw error; }
+  } catch (error) { if (acquisition) return acquisition.failed(owner); owner.release(); throw error; }
 }
 export interface InstanceOwner {
   readonly owner: OwnerLease; readonly location: RuntimeLocation; readonly record: RuntimeRecord;
+  readonly previous?: RuntimeRecord | undefined;
   phase(next: 'ready' | 'closing'): Promise<void>;
 }
 /** Separate stable startup inode serializes launch requests only; host never
