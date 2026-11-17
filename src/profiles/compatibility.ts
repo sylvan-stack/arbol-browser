@@ -18,6 +18,14 @@ export interface EngineAuthority {
   assertTrusted(): Promise<void>;
   /** Includes original main process AND owned helpers, not just flock/PID death. */
   assertPreviousEngineExited(profile: ProfileSnapshot): Promise<void>;
+  /** Production-only native claim permit. Its original short lock spans the
+   * real atomic marker transaction; acceptance captures the resulting inode. */
+  beginMutation?(owner: OwnerLease, marker: Readonly<EngineMarker>): Promise<EngineMutation>;
+}
+export interface EngineMutation {
+  accept(): void;
+  assertBound(): void;
+  abort(): never;
 }
 export interface EngineExitEvidence {
   /** Called after Chromium session/storage flush and complete main/helper exit.
@@ -75,8 +83,8 @@ export async function prepareEngine(owner: OwnerLease, authority: EngineAuthorit
     preparedOwners.add(owner);
     await owner.assert();
     const profile = owner.profile;
-    const previous = await storedMarker(profile);
     await authority.assertTrusted();
+    const previous = await storedMarker(profile);
     // Snapshot verified inputs: later caller mutation must not change the transaction.
     const manifest: Contract<'native.BuildCompatibility'> = structuredClone(authority.manifest);
     const build = authority.build;
@@ -97,14 +105,22 @@ export async function prepareEngine(owner: OwnerLease, authority: EngineAuthorit
       dataEpoch: manifest.dataEpoch, lastWriterBuild: build, lastWriterChromium: manifest.runtime.chromium,
       lastWriterElectron: manifest.runtime.electron, requiredReader: manifest.writerKey, cleanExit: false };
     if (!validator('profile.EngineMarker')(dirty)) throw profileUnavailable();
-    let current = await replaceMarker(owner, previous, dirty);
+    const mutation = await authority.beginMutation?.(owner, Object.freeze({ ...dirty }));
+    let current: StoredMarker;
+    try { current = await replaceMarker(owner, previous, dirty); mutation?.accept(); }
+    catch (error) { if (mutation) return mutation.abort(); throw error; }
     let phase: 'prepared' | 'closing' | 'clean' | 'failed' = 'prepared';
     return Object.freeze({ owner, marker: current.marker,
       async assertReady() {
         if (phase !== 'prepared') throw profileUnavailable();
         await owner.assert(); await assertMarker(profile, current);
+        mutation?.assertBound();
       },
       async completeExit(evidence: EngineExitEvidence) {
+        // A real host cannot certify its own future process death or publish
+        // clean while disappearing. Its original retained native finalizer is
+        // the only production clean writer. Foundation's explicit port remains.
+        if (mutation) throw profileUnavailable();
         if (phase !== 'prepared') throw profileUnavailable();
         phase = 'closing';
         try {

@@ -20,6 +20,8 @@ export interface HostCustody {
    * already-prepared native descriptions and one-use private capability. */
   arm(prepared: NativeBoundaryPreparation, deadline: number): Promise<NativeWatchdog>;
   assertRetained(): void;
+  beginMarkerMutation(marker: Readonly<import('../profiles/compatibility.js').EngineMarker>): Promise<import('../profiles/compatibility.js').EngineMutation>;
+  assertMarker(): void;
   terminate(): never;
 }
 const receipts = new WeakMap<HostCustody, { native: WatchdogCustody; watchdog?: NativeWatchdog }>();
@@ -81,6 +83,13 @@ export async function prepareHostCustody(host: VerifiedHost, instance: InstanceO
       } catch { return native.terminate(); }
     },
     assertRetained() { assertHostCustody(receipt); },
+    assertMarker() { assertHostCustody(receipt); native.assertMarker(); },
+    async beginMarkerMutation(marker: Readonly<import('../profiles/compatibility.js').EngineMarker>) {
+      assertHostCustody(receipt); await instance.owner.assert(); await build.assert();
+      assertHostCustody(receipt);
+      try { return native.beginMarkerMutation(`${JSON.stringify(marker)}\n`); }
+      catch { return native.terminate(); }
+    },
     terminate(): never { return native.terminate(); },
   });
   receipts.set(receipt, { native }); return receipt;

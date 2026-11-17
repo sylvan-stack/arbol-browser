@@ -18,6 +18,7 @@
 #include <cerrno>
 #include <climits>
 #include <cmath>
+#include <dirent.h>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -370,11 +371,13 @@ struct RetainedPipe {
   // No close/destructor/FD export. These exact native-created original pipe
   // descriptions last until actual main-process death, not Node teardown.
 };
+struct MarkerPermit;
 struct Custody {
   arbol_boundary::Context context; int capsule=-1; bool bound=false,continuousBuild=false,hostRequired=false,spawned=false;
   arbol_exit::HostCapability finalization;
   int reader=-1,writer=-1; bool endpointsPublished=false;
   RetainedPipe retainedReader,retainedWriter;
+  MarkerPermit* mutation=nullptr; bool markerAttempted=false;
 };
 static std::set<Custody*> nativeCustodies;
 static bool custodyAttempted = false;
@@ -517,6 +520,171 @@ static napi_value watchdogBind(napi_env env,napi_callback_info info) {
   }
   c->bound=true; napi_value out; napi_get_undefined(env,&out); return out;
 }
+
+// Only the genuine prearmed host capability can own this one-shot mutation.
+// It retains its original short Claim across the async atomic JS transaction.
+struct MarkerPermit {
+  Custody* custody=nullptr; arbol_attempt::Claim claim;
+  std::string currentRaw,dirtyRaw; NSDictionary* attempt=nil; bool active=false,accepted=false;
+  bool current() {
+    if(!active||!custody||!custody->finalization.ready(custody->context)) return false;
+    std::string raw; NSDictionary* value=nil;
+    return claim.read(raw,value)&&raw==currentRaw&&[value isEqual:attempt]&&
+      [value[@"phase"] isEqual:@"claimed"]&&[value[@"stage"] isEqual:@"mutation-started"]&&
+      [value[@"expires"] doubleValue]>arbol_boundary::clockMs();
+  }
+  void relinquish() { active=false; if(claim.fd>=0) { close(claim.fd); claim.fd=-1; } }
+};
+static std::set<MarkerPermit*> markerPermits;
+static MarkerPermit* markerArgument(napi_env env,napi_value value) {
+  void* data=nullptr; if(napi_get_value_external(env,value,&data)!=napi_ok) return nullptr;
+  auto* p=static_cast<MarkerPermit*>(data); return markerPermits.count(p)?p:nullptr;
+}
+static bool nativeMarker(NSDictionary* value) {
+  uint64_t epoch;
+  return arbol_attempt::keys(value,@[@"format",@"profileInstance",@"engine",@"dataEpoch",@"lastWriterBuild",@"lastWriterChromium",@"lastWriterElectron",@"requiredReader",@"cleanExit"])&&
+    [value[@"format"] isEqual:@1]&&[value[@"engine"] isEqual:@"chromium"]&&
+    arbol_attempt::pattern(value[@"profileInstance"],@"^prf_[A-Za-z0-9_-]{22}$")&&
+    arbol_attempt::uintNumber(value[@"dataEpoch"],epoch)&&epoch>0&&
+    arbol_attempt::pattern(value[@"lastWriterBuild"],@"^[1-9a-f][0-9a-f]{0,15}$")&&
+    [value[@"lastWriterChromium"] isKindOfClass:NSString.class]&&[value[@"lastWriterChromium"] length]>0&&
+    [value[@"lastWriterElectron"] isKindOfClass:NSString.class]&&[value[@"lastWriterElectron"] length]>0&&
+    [value[@"requiredReader"] isKindOfClass:NSString.class]&&[value[@"requiredReader"] length]>0&&[value[@"requiredReader"] length]<=256&&
+    CFGetTypeID((__bridge CFTypeRef)value[@"cleanExit"])==CFBooleanGetTypeID();
+}
+static bool currentMarker(Custody* c,std::string& raw,struct stat& st,bool& absent) {
+  if(!c->finalization.present()||!c->finalization.metadata()) return false;
+  NSString* profile=c->finalization.value()[@"attempt"][@"profile"];
+  int fd=open(profile.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC); if(fd<0) return false;
+  bool ok=arbol_attempt::readAt(fd,"engine.json",raw,absent);
+  if(ok&&!absent) ok=!fstatat(fd,"engine.json",&st,AT_SYMLINK_NOFOLLOW)&&arbol_attempt::privateFile(st)&&nativeMarker(arbol_attempt::json(raw))&&
+    [arbol_attempt::json(raw)[@"profileInstance"] isEqual:c->finalization.value()[@"attempt"][@"profileInstance"]];
+  if(close(fd)) ok=false; return ok;
+}
+static NSDictionary* sealedObject(const std::string& path) {
+  if(!arbol_boundary::canonical(path)) return nil;
+  int fd=open(path.c_str(),O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC); if(fd<0) return nil;
+  struct stat first{},named{},last{},after{}; std::string bytes;
+  bool ok=!fstat(fd,&first)&&!lstat(path.c_str(),&named)&&S_ISREG(first.st_mode)&&first.st_nlink==1&&
+    !(first.st_mode&0022)&&(first.st_uid==geteuid()||first.st_uid==0)&&arbol_attempt::sameFile(first,named)&&first.st_size>0&&first.st_size<16384;
+  char buffer[4096];
+  while(ok&&bytes.size()<=(size_t)first.st_size) {
+    ssize_t n=read(fd,buffer,std::min(sizeof(buffer),(size_t)first.st_size+1-bytes.size()));
+    if(n>0) bytes.append(buffer,n); else if(!n) break; else if(errno!=EINTR) ok=false;
+  }
+  ok=ok&&bytes.size()==(size_t)first.st_size&&!fstat(fd,&last)&&!lstat(path.c_str(),&after)&&
+    arbol_attempt::sameFile(first,last)&&arbol_attempt::sameFile(last,after);
+  if(close(fd)) ok=false; return ok?arbol_attempt::json(bytes):nil;
+}
+static bool emptyNativeDirectory(NSString* path) {
+  if(!arbol_boundary::canonical(path.fileSystemRepresentation)) return false;
+  int fd=open(path.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC); if(fd<0) return false;
+  DIR* directory=fdopendir(fd); if(!directory) { close(fd); return false; }
+  bool empty=true; errno=0;
+  while(auto* entry=readdir(directory)) if(strcmp(entry->d_name,".")&&strcmp(entry->d_name,"..")) { empty=false; break; }
+  if(errno) empty=false; if(closedir(directory)) empty=false; return empty;
+}
+static bool priorMarkerMatches(Custody* c,const std::string& raw,const struct stat& st,bool absent) {
+  NSDictionary* capability=c->finalization.value(),*prior=capability[@"prior"],*attempt=capability[@"attempt"];
+  if([prior[@"kind"] isEqual:@"absent"]) return absent;
+  NSString* path=prior[@"path"],*state=[attempt[@"profile"] stringByDeletingLastPathComponent].stringByDeletingLastPathComponent;
+  NSString* prefix=[[state stringByAppendingPathComponent:@"exit-evidence"] stringByAppendingPathComponent:attempt[@"profilePathHash"]];
+  if(![path hasPrefix:[prefix stringByAppendingString:@"/"]]||
+     ![@[@"activation.json",@"terminal.json"] containsObject:path.lastPathComponent]||!arbol_boundary::canonical(path.fileSystemRepresentation)) return false;
+  int fd=open(path.stringByDeletingLastPathComponent.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC); if(fd<0) return false;
+  std::string bytes; bool missing;
+  bool ok=arbol_attempt::readAt(fd,path.lastPathComponent.UTF8String,bytes,missing)&&!missing&&[arbol_attempt::digest(bytes) isEqual:prior[@"digest"]];
+  if(close(fd)) ok=false;
+  NSDictionary* receipt=arbol_attempt::json(bytes),*marker=receipt[@"marker"];
+  ok=ok&&[receipt[@"format"] isEqual:@1]&&[receipt[@"profileInstance"] isEqual:attempt[@"profileInstance"]]&&
+    [receipt[@"profilePathHash"] isEqual:attempt[@"profilePathHash"]]&&[receipt[@"profileDirectory"] isEqual:capability[@"profileDirectory"]];
+  if(absent) return ok&&marker==(id)NSNull.null;
+  return ok&&arbol_attempt::keys(marker,@[@"identity",@"digest",@"value"])&&
+    [marker[@"identity"] isEqual:arbol_exit::fileIdentity(st)]&&[marker[@"digest"] isEqual:arbol_attempt::digest(raw)]&&
+    [marker[@"value"] isEqual:arbol_attempt::json(raw)];
+}
+static bool signedDirty(Custody* c,const std::string& dirtyRaw,const std::string& previous,bool absent) {
+  NSDictionary* dirty=arbol_attempt::json(dirtyRaw),*attempt=c->finalization.value()[@"attempt"];
+  NSDictionary* policy=sealedObject(c->context.bundle+"/Contents/Resources/host-policy.json");
+  NSDictionary* compatibility=sealedObject(c->context.bundle+"/Contents/Resources/native-compatibility.json");
+  if(!policy||!compatibility||!nativeMarker(dirty)||![dirty[@"cleanExit"] isEqual:@NO]||
+     ![policy[@"purpose"] isEqual:@"isolated-qualification"]||![policy[@"build"] isEqual:attempt[@"build"]]||
+     ![policy[@"buildRoot"] isEqual:attempt[@"buildRoot"]]||![policy[@"sourceDigest"] isEqual:attempt[@"sourceDigest"]]||
+     ![policy[@"productDigest"] isEqual:attempt[@"productDigest"]]||
+     ![policy[@"stateRoot"] isEqual:[attempt[@"profile"] stringByDeletingLastPathComponent].stringByDeletingLastPathComponent]||
+     ![policy[@"readerKey"] isEqual:[@"host-isolated:1:" stringByAppendingString:attempt[@"productDigest"]]]||
+     ![compatibility[@"writerKey"] isEqual:policy[@"readerKey"]]||
+     ![compatibility[@"compatibleReaderKeys"] isEqual:policy[@"readableReaderKeys"]]||
+     ![compatibility[@"readableDataEpochs"] isEqual:policy[@"readableDataEpochs"]]||
+     ![compatibility[@"runtime"][@"electron"] isEqual:@"45.3.2"]||![compatibility[@"runtime"][@"chromium"] isEqual:@"156.0.8078.100"]||
+     ![dirty[@"profileInstance"] isEqual:attempt[@"profileInstance"]]||![dirty[@"lastWriterBuild"] isEqual:attempt[@"build"]]||
+     ![dirty[@"lastWriterChromium"] isEqual:compatibility[@"runtime"][@"chromium"]]||
+     ![dirty[@"lastWriterElectron"] isEqual:compatibility[@"runtime"][@"electron"]]||
+     ![dirty[@"requiredReader"] isEqual:policy[@"readerKey"]]||![dirty[@"dataEpoch"] isEqual:compatibility[@"dataEpoch"]]) return false;
+  if(absent) return [dirty[@"dataEpoch"] isEqual:@1]&&
+    emptyNativeDirectory([attempt[@"profile"] stringByAppendingPathComponent:@"data"])&&
+    emptyNativeDirectory([attempt[@"profile"] stringByAppendingPathComponent:@"userData"]);
+  NSDictionary* old=arbol_attempt::json(previous);
+  return nativeMarker(old)&&[policy[@"readableReaderKeys"] containsObject:old[@"requiredReader"]]&&
+    [policy[@"readableDataEpochs"] containsObject:old[@"dataEpoch"]];
+}
+static napi_value beginHostMarkerMutation(napi_env env,napi_callback_info info) {
+  napi_value args[2]; size_t n=2; std::string dirty;
+  if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok||n!=2||!boundedText(env,args[1],dirty)) return fail(env);
+  auto* c=custodyArgument(env,args[0]);
+  if(!c||!c->bound||c->markerAttempted||!c->finalization.ready(c->context)) return fail(env);
+  c->markerAttempted=true;
+  @autoreleasepool { @try {
+    auto* permit=new MarkerPermit; permit->custody=c; markerPermits.insert(permit); c->mutation=permit;
+    const double deadline=arbol_boundary::clockMs()+500;
+    if(!c->finalization.currentAttempt(c->context,permit->claim,permit->currentRaw,permit->attempt,deadline)||
+       ![permit->attempt[@"phase"] isEqual:@"claimed"]||![permit->attempt[@"stage"] isEqual:@"retained"]||
+       [permit->attempt[@"expires"] doubleValue]<=arbol_boundary::clockMs()) return fail(env);
+    std::string previous; struct stat st{}; bool absent;
+    if(!currentMarker(c,previous,st,absent)||!priorMarkerMatches(c,previous,st,absent)||!signedDirty(c,dirty,previous,absent)||
+       arbol_boundary::clockMs()>=deadline) { permit->relinquish(); return fail(env); }
+    NSMutableDictionary* next=[permit->attempt mutableCopy]; next[@"stage"]=@"mutation-started";
+    permit->dirtyRaw=dirty;
+    if(!arbol_attempt::transition(permit->attempt,next,arbol_attempt::Role::engine)||
+       !arbol_attempt::replace(permit->claim.at,permit->currentRaw,false,arbol_attempt::bytes(next))) { permit->relinquish(); return fail(env); }
+    permit->attempt=next; permit->currentRaw=arbol_attempt::bytes(next);
+    std::string digest=[arbol_attempt::digest(dirty) UTF8String]; memcpy(c->finalization.shared()->expectedMarkerDigest,digest.c_str(),65);
+    c->finalization.shared()->mutation.store(1,std::memory_order_release);
+    permit->active=true; c->mutation=permit;
+    napi_value out; if(napi_create_external(env,permit,nullptr,nullptr,&out)!=napi_ok) return fail(env); return out;
+  } @catch(NSException*) { return fail(env); } }
+}
+static napi_value acceptHostMarkerMutation(napi_env env,napi_callback_info info) {
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* permit=markerArgument(env,arg);
+  if(!permit||!permit->current()) return fail(env); auto* c=permit->custody;
+  @autoreleasepool { @try {
+    std::string actual; struct stat st{}; bool absent;
+    if(!currentMarker(c,actual,st,absent)||absent||actual!=permit->dirtyRaw) return fail(env);
+    NSDictionary* marker=arbol_attempt::json(actual); auto* state=c->finalization.shared();
+    std::string digest=[arbol_attempt::digest(actual) UTF8String],reader=[marker[@"requiredReader"] UTF8String];
+    if(reader.size()>256||digest.size()!=64) return fail(env);
+    state->marker.device=st.st_dev; state->marker.inode=st.st_ino; state->marker.uid=st.st_uid; state->marker.size=st.st_size;
+    state->marker.dataEpoch=[marker[@"dataEpoch"] unsignedLongLongValue];
+    memcpy(state->marker.digest,digest.c_str(),65); memcpy(state->marker.reader,reader.c_str(),reader.size()+1);
+    NSMutableDictionary* next=[permit->attempt mutableCopy]; next[@"stage"]=@"marker-bound";
+    if(!arbol_attempt::transition(permit->attempt,next,arbol_attempt::Role::engine)||
+       !arbol_attempt::replace(permit->claim.at,permit->currentRaw,false,arbol_attempt::bytes(next))) return fail(env);
+    state->markerBound.store(1,std::memory_order_release); permit->accepted=true; permit->relinquish(); c->mutation=nullptr;
+    napi_value out; napi_get_undefined(env,&out); return out;
+  } @catch(NSException*) { return fail(env); } }
+}
+static napi_value assertHostMarker(napi_env env,napi_callback_info info) {
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg);
+  if(!c||!c->finalization.ready(c->context)||c->mutation||c->finalization.shared()->markerBound.load(std::memory_order_acquire)!=1) return fail(env);
+  @autoreleasepool { @try {
+    std::string raw; struct stat st{}; bool absent; const auto& bound=c->finalization.shared()->marker;
+    if(!currentMarker(c,raw,st,absent)||absent||(uint64_t)st.st_dev!=bound.device||st.st_ino!=bound.inode||st.st_uid!=bound.uid||
+       (uint64_t)st.st_size!=bound.size||![arbol_attempt::digest(raw) isEqual:[NSString stringWithUTF8String:bound.digest]]||
+       !c->finalization.controls(c->context,arbol_boundary::clockMs()+100)) return fail(env);
+    napi_value out; napi_get_undefined(env,&out); return out;
+  } @catch(NSException*) { return fail(env); } }
+}
+static napi_value abortHostMarkerMutation(napi_env env,napi_callback_info info);
 static napi_value watchdogAssert(napi_env env,napi_callback_info info) {
   napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg);
   if(!c || !c->bound || arbol_boundary::current(c->context.main)!=1 || arbol_boundary::current(c->context.primary)!=1 || arbol_boundary::current(c->context.custody)!=1 || !arbol_boundary::lockIdentity(c->context.owner) || !arbol_boundary::lockIdentity(c->context.build)) return fail(env);
@@ -524,7 +692,7 @@ static napi_value watchdogAssert(napi_env env,napi_callback_info info) {
   if(c->hostRequired) {
     auto* state=c->finalization.shared(); uint64_t reasons=state->fatal.load(std::memory_order_acquire),cutoff=state->fatalCutoffUs.load(std::memory_order_acquire);
     if((reasons&~arbol_exit::admissionLoss)||(reasons&&(!cutoff||arbol_boundary::clockMs()*1000>=cutoff))||
-       !c->finalization.held(c->context)||!c->finalization.controls(c->context,arbol_boundary::clockMs()+100)) return fail(env);
+       !c->finalization.held(c->context)||!(c->mutation?c->mutation->current():c->finalization.controls(c->context,arbol_boundary::clockMs()+100))) return fail(env);
   }
   napi_value out; napi_get_undefined(env,&out); return out;
 }
@@ -543,11 +711,10 @@ static napi_value latchWatchdogFatal(napi_env env,napi_callback_info info) {
 
 // No application/native-input cleanup is entered here. Both native lock
 // descriptions remain retained for the lifetime of this nonreturning path.
-static napi_value terminateProfileNow(napi_env env,napi_callback_info info) {
-  napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg);
-  if(!c || getpid()!=c->context.main.pid || arbol_boundary::current(c->context.main)!=1) return fail(env);
+[[noreturn]] static void terminateCustody(Custody* c) {
   // Irreversible attribution precedes discovery, retirement or any signal.
   if(c->finalization.present()) c->finalization.shared()->poison(arbol_exit::protocolLoss|arbol_exit::forced);
+  if(c->mutation) { c->mutation->relinquish(); c->mutation=nullptr; }
   for(;;) {
     (void)c->context.discoverCustody();
     c->context.enforce(true);
@@ -563,8 +730,24 @@ static napi_value terminateProfileNow(napi_env env,napi_callback_info info) {
     usleep(10000);
   }
 }
+static napi_value terminateProfileNow(napi_env env,napi_callback_info info) {
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg);
+  if(!c||getpid()!=c->context.main.pid||arbol_boundary::current(c->context.main)!=1) return fail(env);
+  terminateCustody(c);
+}
+static napi_value abortHostMarkerMutation(napi_env env,napi_callback_info info) {
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* permit=markerArgument(env,arg);
+  if(!permit||!permit->custody||getpid()!=permit->custody->context.main.pid||
+     arbol_boundary::current(permit->custody->context.main)!=1) return fail(env);
+  permit->custody->finalization.shared()->poison(arbol_exit::storageLoss|arbol_exit::forced);
+  terminateCustody(permit->custody);
+}
 static napi_value init(napi_env env, napi_value exports) {
   napi_property_descriptor properties[] = {
+    {"beginHostMarkerMutation",nullptr,beginHostMarkerMutation,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"acceptHostMarkerMutation",nullptr,acceptHostMarkerMutation,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"assertHostMarker",nullptr,assertHostMarker,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"abortHostMarkerMutation",nullptr,abortHostMarkerMutation,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"prepareHostFinalization",nullptr,prepareHostFinalization,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"spawnWatchdog",nullptr,spawnWatchdog,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"assertHostFinalization",nullptr,assertHostFinalization,nullptr,nullptr,nullptr,napi_default,nullptr},

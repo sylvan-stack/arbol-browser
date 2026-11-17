@@ -11,7 +11,7 @@ import { consumeSelection, type BuildSelection } from './selection.js';
 import { validator } from '../contracts/schema.js';
 import { unavailable } from '../contracts/errors.js';
 import { adoptHostBuildLease, type BuildLease } from './build-lease.js';
-import { assertVerifiedHost, type VerifiedHost } from './authorities.js';
+import { assertVerifiedHost, assertHostEngineAuthority, type VerifiedHost } from './authorities.js';
 import { claimedHostAttempt } from './process.js';
 import { prepareHostCustody, abortUnadmittedHost, type HostCustody } from './custody.js';
 import type { NativeBoundaryPreparation } from './bootstrap.js';
@@ -107,14 +107,14 @@ export interface HostPreparation extends OwnedHost {
 /** Called with the real app in the entry's awaited pre-ready phase. Ownership
  * and Build guards already belong to this host. No page authority is created. */
 export async function prepareHost(actualApp: ProfileApp, owned: OwnedHost, authority: EngineAuthority): Promise<HostPreparation> {
-  assertOwnedHost(owned);
+  assertOwnedHost(owned); assertHostEngineAuthority(authority);
   const { instance, buildGuard, custody } = owned;
   if (actualApp.isReady()) return custody.terminate();
   try {
     await instance.owner.assert(); await buildGuard.assert(); custody.assertRetained();
     if (authority.build !== instance.record.build) return custody.terminate();
     const engine = await prepareEngine(instance.owner, authority);
-    custody.assertRetained();
+    custody.assertRetained(); custody.assertMarker();
     const binding = await configureProfileSession(actualApp, engine);
     if (actualApp.isReady()) return custody.terminate();
     const prepared: HostPreparation = Object.freeze({ ...owned, engine, binding });

@@ -209,3 +209,32 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
     } });
   assertBudget(deadline); verifiedHosts.add(result); await result.assertTrusted(deadline); return result;
 }
+
+/** Canonical actual signed host engine authority. No version inference, selected
+ * Foundation metadata or user/environment compatibility input is accepted. */
+const engineAuthorities = new WeakSet<object>();
+export function assertHostEngineAuthority(value: import('../profiles/compatibility.js').EngineAuthority): void {
+  if (!engineAuthorities.has(value)) throw unavailable('browser');
+}
+export function createHostEngineAuthority(host: VerifiedHost, custody: import('./custody.js').HostCustody,
+  previousExit: import('./host-entry.js').HostPreviousExit): import('../profiles/compatibility.js').EngineAuthority {
+  if (!verifiedHosts.has(host) || custody.host !== host) throw unavailable('browser');
+  custody.assertRetained();
+  const authority: import('../profiles/compatibility.js').EngineAuthority = Object.freeze({
+    build: host.identity.layout.build, manifest: host.signed.manifest,
+    async assertTrusted() {
+      custody.assertRetained(); await host.assertTrusted(performance.now() + 5000); custody.assertRetained();
+    },
+    async assertPreviousEngineExited(profile: import('../profiles/records.js').ProfileSnapshot) {
+      if (profile !== custody.instance.owner.profile) return custody.terminate();
+      await previousExit.assertExited(profile, custody.instance.previous, custody.instance.owner);
+      custody.assertRetained();
+    },
+    async beginMutation(owner: import('../profiles/locking.js').OwnerLease,
+      marker: Readonly<import('../profiles/compatibility.js').EngineMarker>) {
+      if (owner !== custody.instance.owner) return custody.terminate();
+      return custody.beginMarkerMutation(marker);
+    },
+  });
+  engineAuthorities.add(authority); return authority;
+}

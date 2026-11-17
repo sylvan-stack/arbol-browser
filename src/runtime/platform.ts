@@ -23,6 +23,8 @@ export interface WatchdogCustody {
   spawn(): Readonly<{ pid: number; reader: number; writer: number }>;
   prepareHost(input: HostFinalizationInput): void;
   assertHost(): void;
+  beginMarkerMutation(bytes: string): import('../profiles/compatibility.js').EngineMutation;
+  assertMarker(): void;
   /** Native shared attribution precedes any JS/native cleanup; no raw flags. */
   latchFatal(): void;
   now(): number;
@@ -72,6 +74,10 @@ export interface PlatformPort {
   peerIdentity(socketFd: number): ProcessIdentity;
 }
 interface NativeSupport {
+  beginHostMarkerMutation(handle: object, bytes: string): object;
+  acceptHostMarkerMutation(handle: object): void;
+  assertHostMarker(handle: object): void;
+  abortHostMarkerMutation(handle: object): never;
   prepareHostFinalization(handle: object, input: string): void;
   spawnWatchdog(handle: object): { pid: number; reader: number; writer: number };
   assertHostFinalization(handle: object): void;
@@ -111,7 +117,7 @@ export function loadPlatform(): PlatformPort {
   let native: NativeSupport;
   try {
     native = createRequire(import.meta.url)(fileURLToPath(new URL('../../native/platform.node', import.meta.url)));
-    for (const name of ['latchWatchdogFatal', 'prepareHostFinalization', 'spawnWatchdog', 'assertHostFinalization', 'adoptHostBuild', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
+    for (const name of ['beginHostMarkerMutation', 'acceptHostMarkerMutation', 'assertHostMarker', 'abortHostMarkerMutation', 'latchWatchdogFatal', 'prepareHostFinalization', 'spawnWatchdog', 'assertHostFinalization', 'adoptHostBuild', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
       if (typeof native[name] !== 'function') throw new Error('Missing process support');
   } catch { throw unavailable('profile'); }
   const call = <T>(operation: () => T): T => {
@@ -152,6 +158,20 @@ export function loadPlatform(): PlatformPort {
           call(() => native.prepareHostFinalization(handle, encoded));
         },
         assertHost: () => call(() => native.assertHostFinalization(handle)),
+        assertMarker: () => call(() => native.assertHostMarker(handle)),
+        beginMarkerMutation(bytes: string) {
+          if (typeof bytes !== 'string' || Buffer.byteLength(bytes) > 16384) throw unavailable('browser');
+          let accepted = false;
+          const permit = call(() => native.beginHostMarkerMutation(handle, bytes));
+          return Object.freeze({
+            accept() {
+              if (accepted) throw unavailable('browser');
+              call(() => native.acceptHostMarkerMutation(permit)); accepted = true;
+            },
+            assertBound() { if (!accepted) throw unavailable('browser'); call(() => native.assertHostMarker(handle)); },
+            abort(): never { native.abortHostMarkerMutation(permit); throw unavailable('browser'); },
+          });
+        },
         latchFatal: () => call(() => native.latchWatchdogFatal(handle)),
         now: () => call(() => native.continuousTime()),
         capture: (pid: number) => call(() => native.captureWatchdog(handle, pid)),
