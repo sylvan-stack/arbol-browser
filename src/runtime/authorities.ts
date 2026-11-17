@@ -152,9 +152,14 @@ function readPolicy(input: unknown): Readonly<HostPolicy> {
   return Object.freeze({ ...value, readableReaderKeys: Object.freeze([...value.readableReaderKeys]),
     readableDataEpochs: Object.freeze([...value.readableDataEpochs]) });
 }
-export function assertVerifiedHost(value: VerifiedHost, deadline: number): void {
+/** Source-owned metadata only. Callers retain independent full signed proof
+ * at their existing resource boundary; this grants no Owner or ready authority. */
+export function assertVerifiedHostMetadata(value: VerifiedHost, deadline: number): void {
   if (!verifiedHosts.has(value)) throw unavailable('browser');
-  assertBudget(deadline); value.signed.assertIdentity(deadline); assertBudget(deadline);
+  assertBudget(deadline);
+}
+export function assertVerifiedHost(value: VerifiedHost, deadline: number): void {
+  assertVerifiedHostMetadata(value, deadline); value.signed.assertIdentity(deadline); assertVerifiedHostMetadata(value, deadline);
 }
 /** One current complete verification at a boundary that otherwise repeated the
  * same snapshot scan immediately before assertTrusted. Brand and cutoff are

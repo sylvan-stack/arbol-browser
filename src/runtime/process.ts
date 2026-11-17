@@ -8,7 +8,7 @@ import { unavailable } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
 import { assertProfile, type ProfileSnapshot } from '../profiles/records.js';
 import { assertPlatform, type HeldLock, type PlatformPort, type ProcessProvenance } from './platform.js';
-import { noteOpenCommand, type OpenCommandObservation, assertTrustedHost, assertVerifiedHost, type VerifiedHost } from './authorities.js';
+import { noteOpenCommand, type OpenCommandObservation, assertTrustedHost, assertVerifiedHost, assertVerifiedHostMetadata, type VerifiedHost } from './authorities.js';
 import { assertTime, now, runtimeLocation, type RuntimeLocation, type RuntimeRecord } from './instance.js';
 import { createStarter, type LaunchAttemptPort } from './start.js';
 import type { ProcessIntegration } from './lifecycle.js';
@@ -104,7 +104,7 @@ export async function withLaunchAttempt<T>(profile: ProfileSnapshot, platform: P
  * phase labels and an available lock supply no PreviousExit authority. */
 export async function pendingLaunchAttempt(profile: ProfileSnapshot, host: VerifiedHost, platform: PlatformPort,
   request: string, deadline: number): Promise<LaunchAttempt> {
-  assertPlatform(platform); assertVerifiedHost(host, deadline); await assertProfile(profile);
+  assertPlatform(platform); assertVerifiedHostMetadata(host, deadline); await assertProfile(profile);
   if (!/^req_[A-Za-z0-9_-]{22}$/.test(request) ||
       profile.paths.root !== join(host.policy.stateRoot, 'profiles', profile.record.id)) throw unavailable('profile');
   const location = await runtimeLocation(profile, true); if (!location) throw unavailable('profile');
@@ -141,7 +141,7 @@ export async function cancelLaunchAttempt(profile: ProfileSnapshot, platform: Pl
  * mutation boundary must still be established by the pre-ready assembly. */
 export async function claimedHostAttempt(profile: ProfileSnapshot, host: VerifiedHost, platform: PlatformPort,
   request: string, deadline: number): Promise<LaunchAttempt> {
-  assertPlatform(platform); assertVerifiedHost(host, deadline); await assertProfile(profile);
+  assertPlatform(platform); assertVerifiedHostMetadata(host, deadline); await assertProfile(profile);
   return withLaunchAttempt(profile, platform, deadline, transaction => {
     const current = transaction.current, self = platform.processProvenance(process.pid), layout = host.identity.layout;
     if (!current || current.request !== request || current.profileInstance !== profile.record.instance ||
