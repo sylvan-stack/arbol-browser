@@ -12,7 +12,6 @@ import { claimedHostAttempt } from './process.js';
 import type { NativeBoundaryPreparation } from './bootstrap.js';
 import type { NativeWatchdog } from '../native/watchdog.js';
 import { assertActualSessionFactory, type ActualSessionFactory, type ActualSessionSeal } from '../profiles/session.js';
-import { consumeSignedSnapshot } from '../native/manifest.js';
 
 export interface HostCustody {
   readonly host: VerifiedHost;
@@ -47,7 +46,7 @@ type SnapshotPurpose = 'native-install' | 'ownership' | 'window';
 const armedSnapshots = new WeakMap<ArmedHostSnapshot, {
   custody: HostCustody; trust: import('../native/manifest.js').CandidateTrust;
   purpose: SnapshotPurpose; operation: object; runtime: import('./instance.js').RuntimeRecord;
-  proof: import('../native/manifest.js').SignedSnapshotComparison; used: boolean;
+  consume: () => void; used: boolean;
 }>();
 const preparingSnapshots = new WeakSet<HostCustody>();
 export async function prepareArmedHostSnapshot(custody: HostCustody, trust: import('../native/manifest.js').CandidateTrust,
@@ -67,9 +66,9 @@ export async function prepareArmedHostSnapshot(custody: HostCustody, trust: impo
     assertHostCustody(custody); assertTime(deadline);
     if (custody.instance.record !== runtime) return custody.terminate();
     const receipt: ArmedHostSnapshot = Object.freeze({ deadline });
-    armedSnapshots.set(receipt, { custody, trust, purpose, operation, runtime, proof, used: false }); return receipt;
-  } catch { return custody.terminate(); }
-  finally { preparingSnapshots.delete(custody); }
+    armedSnapshots.set(receipt, { custody, trust, purpose, operation, runtime,
+      consume: () => manifest.consumeSignedSnapshot(proof, trust, deadline), used: false }); return receipt;
+  } catch { preparingSnapshots.delete(custody); return custody.terminate(); }
 }
 export function consumeArmedHostSnapshot(receipt: ArmedHostSnapshot, trust: import('../native/manifest.js').CandidateTrust,
   purpose: SnapshotPurpose, operation: object): void {
@@ -79,8 +78,9 @@ export function consumeArmedHostSnapshot(receipt: ArmedHostSnapshot, trust: impo
     if (actual.used || actual.trust !== trust || actual.purpose !== purpose || actual.operation !== operation ||
         actual.custody.instance.record !== actual.runtime) return actual.custody.terminate();
     actual.used = true; assertTime(receipt.deadline); assertHostCustody(actual.custody);
-    consumeSignedSnapshot(actual.proof, trust, receipt.deadline);
+    actual.consume();
     assertHostCustody(actual.custody); assertTime(receipt.deadline);
+    preparingSnapshots.delete(actual.custody);
   } catch { return actual.custody.terminate(); }
 }
 
