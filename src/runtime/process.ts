@@ -312,7 +312,7 @@ export function createProductionProcessIntegration(host: VerifiedHost, selection
   if (host.identity.layout.build !== selection.build || host.identity.layout.buildRoot !== selection.directory ||
       selection.guard !== join(selection.directory, '../.uses', selection.build)) throw unavailable('browser');
   return Object.freeze({
-    async assertAdmissionAvailable() { await host.assertTrusted(now() + 5000); },
+    async assertAdmissionAvailable(deadline = now() + 5000) { await host.assertTrusted(deadline); },
     async start(profile: ProfileSnapshot, endpoint: import('./transport.js').Endpoint, deadline: number,
       contentionDeadline: number, label?: string) {
       noteOpenCommand(observation, 'open-current-signed-start');

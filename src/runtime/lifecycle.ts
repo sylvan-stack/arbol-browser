@@ -251,7 +251,7 @@ export async function closeProfile(profile: ProfileSnapshot, selection: BuildSel
   throw profileUnavailable();
 }
 export interface ProcessIntegration {
-  assertAdmissionAvailable(): Promise<void>;
+  assertAdmissionAvailable(deadline?: number): Promise<void>;
   start(profile: ProfileSnapshot, endpoint: Endpoint, deadline: number, contentionDeadline: number, label?: string): Promise<{
     client: RuntimeClient; record: RuntimeRecord; alreadyRunning: boolean;
   }>;
@@ -268,7 +268,7 @@ export function createProcessService(options: { selection: BuildSelection; platf
       if (!integration) return preflightPageAdmission();
       const deadline = startupDeadline(), contentionDeadline = Math.min(deadline, now() + 10000);
       noteOpenCommand(options.observation, 'open-dispatch-admission-trust');
-      await within(deadline, () => integration.assertAdmissionAvailable());
+      await within(deadline, () => integration.assertAdmissionAvailable(deadline));
       noteOpenCommand(options.observation, 'open-profile-selection');
       const profile = await within(deadline, () => selectProfile(input.profile, options.platform(), { state, createDefault: true, deadline: contentionDeadline }));
       noteOpenCommand(options.observation, 'open-current-signed-start');
@@ -313,7 +313,7 @@ export function createProcessService(options: { selection: BuildSelection; platf
           if (attempted || disconnected) throw unavailable('browser');
           attempted = true;
           const deadline = startupDeadline(), contentionDeadline = Math.min(deadline, now() + 10000);
-          await within(deadline, () => integration.assertAdmissionAvailable());
+          await within(deadline, () => integration.assertAdmissionAvailable(deadline));
           const profile = await within(deadline, () => selectProfile(id, options.platform(), { state, createDefault: true, deadline: contentionDeadline }));
           client = (await acquireWithin(deadline,
             () => integration.start(profile, 'agent', deadline, contentionDeadline, label), result => result.client.close())).client;
