@@ -16,9 +16,27 @@ inline bool pattern(id value, NSString* expression) {
     numberOfMatchesInString:value options:0 range:NSMakeRange(0, [value length])] == 1;
 }
 inline bool path(id value) {
-  return [value isKindOfClass:NSString.class] && [value length] > 0 && [value length] < PATH_MAX &&
-    [value hasPrefix:@"/"] && [value rangeOfCharacterFromSet:[NSCharacterSet characterSetWithRange:NSMakeRange(0,1)]].location == NSNotFound &&
-    [value isEqual:[value stringByStandardizingPath]];
+  if (![value isKindOfClass:NSString.class] || [value length] == 0 || [value length] >= PATH_MAX) return false;
+  NSData* encoded = [value dataUsingEncoding:NSUTF8StringEncoding allowLossyConversion:NO];
+  // Shape only: no Foundation alias rewriting or filesystem resolution.
+  // Reserve one byte for the NUL required by the actual filesystem consumers.
+  size_t length = encoded.length;
+  if (!encoded || !length || length >= PATH_MAX) return false;
+  const unsigned char* bytes = (const unsigned char*)encoded.bytes;
+  if (bytes[0] != '/') return false;
+  if (length == 1) return true;
+  size_t component = 1;
+  for (size_t i = 1; i <= length; ++i) {
+    if (i < length && bytes[i] != '/') {
+      if (!bytes[i]) return false;
+      continue;
+    }
+    size_t count = i - component;
+    if (!count || (count == 1 && bytes[component] == '.') ||
+        (count == 2 && bytes[component] == '.' && bytes[component + 1] == '.')) return false;
+    component = i + 1;
+  }
+  return true;
 }
 inline bool uintNumber(id value, uint64_t& out) {
   if (![value isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID()) return false;
