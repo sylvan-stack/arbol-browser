@@ -4,12 +4,28 @@ import { assertNativeFailureBoundary, type NativeFailureBoundary } from '../runt
 import { unavailable } from '../contracts/errors.js';
 import { bindingKey } from '../native/retirement.js';
 import type { DocumentReceipt } from './authority.js';
-import type { HostDocuments, HostDocument, DocumentPreparation } from './documents.js';
+import type { HostDocuments, HostDocument, DocumentPreparation, PhysicalFrame } from './documents.js';
 import { PresentationSuperseded, presentationCategory } from './documents.js';
 import { staleSnapshot } from './authority.js';
 import { assertPageSurface, type PageSurface } from './windows.js';
 import type { TabTarget } from './tabs.js';
 
+export type InspectionMethod = 'Page.getFrameTree' | 'Accessibility.enable' | 'Accessibility.getFullAXTree' |
+  'Accessibility.getPartialAXTree' | 'DOMSnapshot.captureSnapshot' | 'DOM.describeNode' | 'DOM.resolveNode' |
+  'DOM.getBoxModel' | 'DOM.getNodeForLocation' | 'Page.getLayoutMetrics' | 'Page.captureScreenshot' |
+  'Page.setWebLifecycleState' | 'Animation.getPlaybackRate' | 'Animation.setPlaybackRate';
+export interface InspectionFrame {
+  readonly receipt: HostDocument;
+  readonly frameId: string;
+  readonly session: string | undefined;
+  readonly physical: PhysicalFrame | undefined;
+}
+export interface InspectionObservation {
+  readonly epoch: number;
+  readonly sessions: number;
+  readonly unknownActivity: boolean;
+}
+interface ChildSession { targetId: string; parent: string | undefined }
 interface Channel {
   readonly page: PageSurface;
   readonly contents: WebContents;
@@ -18,6 +34,11 @@ interface Channel {
   active: boolean;
   interception: 'unknown' | 'enabled' | 'disabled';
   interceptionInFlight?: object;
+  inspection?: Promise<void>;
+  epoch: number;
+  unknownActivity: boolean;
+  sessions: Map<string, ChildSession>;
+  observers: Set<() => void>;
 }
 function emptyAck(value: unknown): void {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length) throw staleSnapshot();
@@ -40,8 +61,25 @@ export class PageReadiness implements DocumentPreparation {
     if (page.retirement()) throw staleSnapshot();
     const contents = page.view.webContents, debugger_ = contents.debugger;
     if (contents.isDestroyed() || debugger_.isAttached()) throw unavailable('browser');
-    const channel: Channel = { page, contents, debugger: debugger_, identity: Object.freeze({}), active: true, interception: 'unknown' };
+    const channel: Channel = { page, contents, debugger: debugger_, identity: Object.freeze({}), active: true, interception: 'unknown', epoch: 0, unknownActivity: false, sessions: new Map(), observers: new Set() };
     this.channels.set(page, channel);
+    debugger_.on('message', (_event, method, params, sessionId) => {
+      if (!channel.active || this.channels.get(page) !== channel) return;
+      if (!/^(Target|Page|DOM|Animation|Network|Runtime)\./.test(method)) return;
+      if (++channel.epoch >= Number.MAX_SAFE_INTEGER) return this.boundary.fatal.fail('native_boundary_unavailable');
+      if (method === 'Target.attachedToTarget') {
+        const child = params as { sessionId?: string; targetInfo?: { type?: string; targetId?: string } };
+        if (child.sessionId && child.targetInfo?.type === 'iframe' && child.targetInfo.targetId && channel.sessions.size < 256)
+          channel.sessions.set(child.sessionId, { targetId: child.targetInfo.targetId, parent: sessionId || undefined });
+        else channel.unknownActivity = true;
+      } else if (method === 'Target.detachedFromTarget') {
+        const child = params as { sessionId?: string };
+        if (child.sessionId) channel.sessions.delete(child.sessionId); else channel.unknownActivity = true;
+      }
+      // Events are invalidations, never proof that pixels/geometry settled.
+      if (sessionId && !channel.sessions.has(sessionId)) channel.unknownActivity = true;
+      for (const notify of channel.observers) notify();
+    });
     debugger_.on('detach', () => {
       if (!channel.active) return;
       channel.active = false;
@@ -64,10 +102,11 @@ export class PageReadiness implements DocumentPreparation {
   }
   /** Host-only callers retain original page/job guards. Result data does not
    * carry authority and is checked again after the actual channel response. */
-  async command(page: PageSurface, assertCurrent: () => void, method: string, params?: object): Promise<unknown> {
+  async command(page: PageSurface, assertCurrent: () => void, method: string, params?: object, session?: string): Promise<unknown> {
     const channel = this.owned(page);
     const check = () => { this.synchronous(assertCurrent); this.assertChannel(channel); };
-    check(); if (channel.interceptionInFlight) throw staleSnapshot();
+    check(); if (session !== undefined && !channel.sessions.has(session)) throw staleSnapshot();
+    if (channel.interceptionInFlight) throw staleSnapshot();
     const intercept = method === 'Input.setInterceptDrags', token = Object.freeze({});
     const enabled = (params as { enabled?: unknown } | undefined)?.enabled;
     if (intercept) {
@@ -77,13 +116,79 @@ export class PageReadiness implements DocumentPreparation {
       channel.interception = 'unknown'; channel.interceptionInFlight = token;
     }
     try {
-      check(); const result: unknown = await channel.debugger.sendCommand(method, params); check();
+      check(); const result: unknown = await channel.debugger.sendCommand(method, params, session); check();
       if (intercept) {
         if (channel.interceptionInFlight !== token) throw staleSnapshot(); emptyAck(result);
         channel.interception = enabled ? 'enabled' : 'disabled';
       }
       return result;
     } finally { if (channel.interceptionInFlight === token) delete channel.interceptionInFlight; }
+  }
+  private readonly inspectionFrames = new WeakSet<InspectionFrame>();
+  /** The debugger is attached to this literal WebContents. Its root is the
+   * original owned main frame; CDP child IDs are never Electron frame tokens.
+   * Until a child has a physical correlation it is unavailable, even if its
+   * URL/name, process or sampled image happens to match. */
+  async inspection(receipt: HostDocument, assertCurrent: () => void): Promise<readonly InspectionFrame[]> {
+    const channel = this.owned(receipt.page);
+    const guard = () => { this.synchronous(assertCurrent); this.documents.target(receipt); this.assertChannel(channel);
+      if (receipt.channel !== channel.identity) throw staleSnapshot(); };
+    guard();
+    if (!channel.inspection) {
+      const setup = (async () => {
+      for (const method of ['Page.enable', 'DOM.enable', 'Animation.enable', 'Network.enable'])
+        emptyAck(await this.command(receipt.page, guard, method));
+      emptyAck(await this.command(receipt.page, guard, 'Target.setAutoAttach',
+        { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }));
+      })();
+      channel.inspection = setup;
+      // Only this failed attempt is cleared. Current callers still share the
+      // same in-flight work and each caller keeps its own exact receipt guard.
+      void setup.catch(() => { if (channel.inspection === setup) delete channel.inspection; });
+    }
+    await channel.inspection; guard();
+    const result = await this.command(receipt.page, guard, 'Page.getFrameTree') as {
+      frameTree?: { frame?: { id?: string }; childFrames?: unknown[] } };
+    guard(); const root = result.frameTree?.frame?.id;
+    if (!root || receipt.page.view.webContents.mainFrame !== receipt.frame.handle || receipt.frame.handle.parent !== null) throw staleSnapshot();
+    const frames: InspectionFrame[] = [];
+    const add = (frameId: string, session: string | undefined, physical: PhysicalFrame | undefined) => {
+      const frame = Object.freeze({ receipt, frameId, session, physical }); this.inspectionFrames.add(frame); frames.push(frame);
+    };
+    add(root, undefined, receipt.frame);
+    // Keep the flattened routing map distinct from physical authority. Unknown
+    // same-process children are represented by the physical census below too.
+    for (const [session, child] of channel.sessions) {
+      // Target ids are not frame ids either. Query that flattened session's
+      // own tree; the result is routing metadata, never physical authority.
+      const tree = await this.command(receipt.page, guard, 'Page.getFrameTree', undefined, session) as {
+        frameTree?: { frame?: { id?: string } } };
+      guard(); if (channel.sessions.get(session) !== child) throw staleSnapshot();
+      add(tree.frameTree?.frame?.id ?? '', session, undefined);
+    }
+    for (const physical of receipt.frames) if (physical !== receipt.frame) add('', undefined, undefined);
+    return Object.freeze(frames);
+  }
+  assertInspection(frame: InspectionFrame, assertCurrent: () => void): void {
+    this.synchronous(assertCurrent); this.documents.target(frame.receipt);
+    const channel = this.owned(frame.receipt.page);
+    if (!this.inspectionFrames.has(frame) || frame.receipt.channel !== channel.identity || !frame.physical ||
+        !frame.receipt.frames.includes(frame.physical) || frame.physical !== frame.receipt.frame || frame.session !== undefined)
+      throw staleSnapshot();
+  }
+  async inspect(frame: InspectionFrame, assertCurrent: () => void, method: InspectionMethod, params?: object): Promise<unknown> {
+    const guard = () => this.assertInspection(frame, assertCurrent);
+    guard(); const value = await this.command(frame.receipt.page, guard, method, params, frame.session); guard(); return value;
+  }
+  observation(receipt: HostDocument): InspectionObservation {
+    this.documents.target(receipt); const channel = this.owned(receipt.page);
+    if (channel.identity !== receipt.channel) throw staleSnapshot();
+    return Object.freeze({ epoch: channel.epoch, sessions: channel.sessions.size, unknownActivity: channel.unknownActivity });
+  }
+  observeInspection(receipt: HostDocument, notify: () => void): () => void {
+    this.documents.target(receipt); const channel = this.owned(receipt.page);
+    if (channel.identity !== receipt.channel) throw staleSnapshot();
+    channel.observers.add(notify); return () => { channel.observers.delete(notify); };
   }
   private async deadline<T>(deadline: number, assertCurrent: () => void, work: (check: () => void) => Promise<T>): Promise<T> {
     let active = true, timer: ReturnType<typeof setTimeout> | undefined;

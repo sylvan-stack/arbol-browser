@@ -35,7 +35,7 @@ export interface DocumentPreparation {
   channel(page: PageSurface): object;
   barrier(receipt: HostDocument, deadline: number, assertCurrent: () => void): Promise<void>;
   ping(receipt: HostDocument, assertCurrent: () => void): Promise<void>;
-  command(page: PageSurface, assertCurrent: () => void, method: string, params?: object): Promise<unknown>;
+  command(page: PageSurface, assertCurrent: () => void, method: string, params?: object, session?: string): Promise<unknown>;
   close(page: PageSurface): void;
 }
 export interface DocumentEvent {
@@ -67,6 +67,7 @@ interface PageRecord {
   presentationPending?: boolean;
   barrierDeadline?: number;
   holdReadiness: boolean;
+  presentationEpoch: number;
 }
 function navigationFailed(): BrowserFailure {
   return new BrowserFailure({ code: 'navigation_failed', message: 'The page did not complete its current navigation.', retryable: true,
@@ -191,7 +192,7 @@ export class HostDocuments implements DocumentAuthority {
     const page = target.page, contents = page.view.webContents;
     const record: PageRecord = { target, page, contents, use: Object.freeze({}), channel: this.preparation!.channel(page), closed: false,
       committed: false, mainDOM: false, lastSafeURL: previous?.lastSafeURL ?? 'about:blank', startHTTPS: false, redirects: 0,
-      listeners: [], presentation: presentationCategory(page), holdReadiness };
+      listeners: [], presentationEpoch: 0, presentation: presentationCategory(page), holdReadiness };
     this.records.set(target, record);
     const on = <K extends string>(name: K, receive: (...args: any[]) => void) => {
       contents.on(name as never, receive); record.listeners.push(() => contents.removeListener(name as never, receive));
@@ -468,6 +469,7 @@ export class HostDocuments implements DocumentAuthority {
       // Only a completed real proof can open a fresh presentation budget.
       // Repeated in-flight category changes retain the original absolute time.
       if (record.state?.ready) delete record.barrierDeadline;
+      if (++record.presentationEpoch >= Number.MAX_SAFE_INTEGER) return this.authority().exhausted();
       record.presentationPending = true;
       const jobs = this.poisonEpoch(record);
       if (!record.ticket) this.authority().suspendDocument(record.target);
@@ -479,6 +481,11 @@ export class HostDocuments implements DocumentAuthority {
       record.presentationPending = false; record.presentation = presentationCategory(page);
       this.emit(record, 'changed'); this.authority().changed(); this.schedule(record);
     }
+  }
+  presentedEpoch(receipt: HostDocument): number {
+    const target = this.target(receipt), record = this.records.get(target)!;
+    if (record.presentationPending || presentationCategory(record.page) !== 'presented') throw staleSnapshot();
+    return record.presentationEpoch;
   }
   failure(target: TabTarget): DocumentFault | undefined { return this.records.get(target)?.fault; }
   lastSafeURL(target: TabTarget): string { const record = this.records.get(target); if (!record) throw staleSnapshot(); return record.lastSafeURL; }
