@@ -96,7 +96,8 @@ export class BrowserMcpAdapter implements McpApplication {
       void runtime.cancel(id).catch(() => { this.close(); void this.transport.close(); });
     };
     try {
-      if (!runtime || runtime.signal.aborted || this.closed) throw new Error();
+      if (!runtime || runtime.signal.aborted || this.closed || runtime.hello.contract !== 1 ||
+          runtime.hello.profile !== this.profile || !runtime.hello.attachment) throw new Error();
       if (this.pending.size >= MCP_LIMITS.pending) return envelope({ error: { code: 'control_refused',
         message: 'Browser capacity is exhausted.', retryable: true, remedy: 'Wait, then inspect fresh state.' } }, true);
       this.pending.set(context.requestId, id);
@@ -130,7 +131,10 @@ export class BrowserMcpAdapter implements McpApplication {
   close(): void {
     if (this.closed) return;
     this.closed = true; this.removeLost?.(); this.removeLost = undefined;
-    const runtime = this.runtime; this.runtime = undefined; this.pending.clear(); runtime?.close();
+    const runtime = this.runtime; this.runtime = undefined; this.pending.clear();
+    // Socket loss is the sole release signal to the real host. Never issue a
+    // browser-wide close, sweep tabs or fabricate a replacement attachment.
+    runtime?.close();
   }
 }
 /** Source-only composition. No entrypoint, process acquisition or vendor config
