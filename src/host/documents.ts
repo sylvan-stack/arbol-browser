@@ -56,6 +56,9 @@ interface EpochState { valid: boolean; ready: boolean; availability: Contract<'b
 interface Job { active: boolean; controller: AbortController }
 interface Ticket {
   issued: IssuedNavigation; original: HostDocument; execution: ActionExecution; candidate?: HostDocument; commits: number; starts: number;
+  readonly kind: 'cross-document' | 'fragment'; readonly address: string;
+  readonly before: Readonly<{ frame: string; loader: string; address: string }>;
+  authenticated: boolean;
 }
 interface PageRecord {
   target: TabTarget; page: PageSurface; contents: WebContents; use: object; channel: object; closed: boolean;
@@ -76,6 +79,11 @@ function navigationFailed(): BrowserFailure {
 function sameFrame(a: PhysicalFrame, b: PhysicalFrame): boolean {
   return a.handle === b.handle && a.process === b.process && a.osProcess === b.osProcess && a.routing === b.routing &&
     a.token === b.token && a.node === b.node;
+}
+function fragmentChange(before: string, after: string): boolean {
+  if (before === after || before === 'about:blank' || after === 'about:blank') return false;
+  const from = new URL(before), to = new URL(after); from.hash = ''; to.hash = '';
+  return from.href === to.href;
 }
 /** WebFrameMain can change its underlying RFH in place. Copy every physical
  * identity; the wrapper itself and a URL are insufficient lifetime evidence. */
@@ -183,6 +191,12 @@ export class HostDocuments implements DocumentAuthority {
     return Boolean(frame && !frame.isDestroyed() && !frame.detached && webContents.fromFrame(frame) === record.page.view.webContents &&
       record.page.view.webContents.mainFrame.framesInSubtree.includes(frame));
   }
+  private originalRoot(record: PageRecord, ticket: Ticket): boolean {
+    try {
+      const root = physicalFrames(record.page).find(frame => frame.handle === record.contents.mainFrame);
+      return Boolean(root && sameFrame(root, ticket.original.frame));
+    } catch { return false; }
+  }
   watch(target: TabTarget, holdReadiness = false): void {
     this.authority(); assertPageSurface(target.page);
     if (!this.windows.has(target.page.window)) throw unavailable('browser');
@@ -200,10 +214,13 @@ export class HostDocuments implements DocumentAuthority {
     const committed = (process: number, routing: number, main: boolean, address: string, sameDocument: boolean) => {
       if (!this.frameEvent(record, process, routing)) return;
       let safe: string; try { safe = userURL(address); } catch { this.failPage(target, page, 'unavailable', 'navigation_policy'); return; }
+      const ticket = record.ticket;
+      const fragment = Boolean(ticket?.kind === 'fragment' && main && sameDocument && ticket.starts === 1 && ticket.commits === 0 &&
+        safe === ticket.address && process === ticket.original.frame.process && routing === ticket.original.frame.routing && this.originalRoot(record, ticket));
       const jobs = this.poisonEpoch(record);
       if (main) { record.committed = true; if (sameDocument) record.mainDOM = true; record.lastSafeURL = safe; }
-      const receipt = this.capture(record), ticket = record.ticket;
-      if (ticket && !sameDocument && ticket.commits === 0) {
+      const receipt = this.capture(record);
+      if (ticket && ticket.commits === 0 && ((ticket.kind === 'cross-document' && !sameDocument) || fragment)) {
         if (main) { ticket.commits++; ticket.candidate = receipt; }
       }
       else {
@@ -224,8 +241,13 @@ export class HostDocuments implements DocumentAuthority {
         if (!details.isSameDocument) { record.committed = false; record.mainDOM = false; }
       }
       const ticket = record.ticket;
-      const preserve = Boolean(!details.isSameDocument && ticket && ticket.commits === 0 &&
-        (details.isMainFrame ? ++ticket.starts === 1 : details.frame && webContents.fromFrame(details.frame) === contents));
+      let preserve = false;
+      if (ticket?.kind === 'fragment') {
+        let address: string | undefined; try { address = userURL(details.url); } catch { /* no positive start proof */ }
+        preserve = Boolean(details.isSameDocument && details.isMainFrame && details.frame === ticket.original.frame.handle &&
+          address === ticket.address && ticket.commits === 0 && ++ticket.starts === 1 && this.originalRoot(record, ticket));
+      } else preserve = Boolean(!details.isSameDocument && ticket && ticket.commits === 0 &&
+          (details.isMainFrame ? ++ticket.starts === 1 : details.frame && webContents.fromFrame(details.frame) === contents));
       this.suspend(record, preserve);
     });
     on('did-frame-navigate', (_event: unknown, address: string, _code: number, _text: string, main: boolean, process: number, routing: number) =>
@@ -240,15 +262,19 @@ export class HostDocuments implements DocumentAuthority {
       const frame = details.frame;
       if (!this.alive(record) || !frame || frame.isDestroyed() || frame.detached || webContents.fromFrame(frame) !== contents) return;
       // A new child/RFH is a reference boundary. Its wrapper may later retarget.
-      const preserve = Boolean(record.ticket && record.ticket.commits === 0);
+      const preserve = Boolean(record.ticket?.kind === 'cross-document' && record.ticket.commits === 0);
       this.suspend(record, preserve); try { this.capture(record); } catch { return; }
       this.schedule(record);
     });
-    on('will-redirect', (event: Electron.Event, address: string) => {
+    on('will-redirect', (event: Electron.Event, address: string, _inPlace: boolean, main: boolean) => {
       if (!this.alive(record)) { event.preventDefault(); return; }
       try {
         const safe = userURL(address), state = this.authority().state(target);
-        if (state.controller.kind === 'agent' && (++record.redirects > 20 || (record.startHTTPS && safe.startsWith('http:')))) throw navigationFailed();
+        if (main && state.controller.kind === 'agent') {
+          if (record.ticket?.kind === 'fragment' || ++record.redirects > 20 || (record.startHTTPS && safe.startsWith('http:'))) throw navigationFailed();
+          // An HTTP start cannot launder a later HTTPS -> HTTP downgrade.
+          if (safe.startsWith('https:')) record.startHTTPS = true;
+        }
       } catch { event.preventDefault(); this.failPage(target, page, 'unavailable', 'navigation_policy'); }
     });
     on('did-fail-load', (_event: unknown, code: number, _description: string, _address: string, main: boolean, process: number, routing: number) => {
@@ -367,15 +393,27 @@ export class HostDocuments implements DocumentAuthority {
       context.signal.removeEventListener('abort', abort);
     }
   }
-  /** Later Tools can call this real producer only with the actual issued
-   * ActionExecution. A missing loader id (same-document Page.navigate) refuses
-   * causal successor proof while the actual commit still invalidates identity. */
+  /** Only a genuine issued command can reserve a successor. Cross-document
+   * loaders and the bounded original-frame fragment proof remain distinct. */
   async navigateAction(execution: ActionExecution, address: string): Promise<HostDocument> {
     const owner = this.authority(), target = execution.stamp.target, record = this.records.get(target);
     const original = this.current(target); this.assertCurrent(target, original); address = userURL(address);
     if (!record || record.ticket || execution.stamp.document !== original) throw staleSnapshot();
+    const preGuard = () => {
+      owner.check(execution.stamp, true); this.assertCurrent(target, original);
+      if (execution.signal.aborted || performance.now() >= execution.deadline || !this.alive(record) || record.ticket) throw staleSnapshot();
+    };
+    preGuard();
+    const beforeTree = await this.preparation!.command(record.page, preGuard, 'Page.getFrameTree') as {
+      frameTree?: { frame?: { id?: string; loaderId?: string; url?: string } } };
+    preGuard(); const before = beforeTree.frameTree?.frame;
+    const originalAddress = userURL(record.contents.getURL());
+    if (!before?.id || !before.url || userURL(before.url) !== originalAddress) throw staleSnapshot();
+    const kind = fragmentChange(originalAddress, address) ? 'fragment' : 'cross-document';
+    if (kind === 'fragment' && !before.loaderId) throw navigationFailed();
     return execution.dispatch(async () => {
-      const issued = issuedNavigation(execution, owner), ticket: Ticket = { issued, original, execution, commits: 0, starts: 0 };
+      const issued = issuedNavigation(execution, owner), ticket: Ticket = { issued, original, execution, commits: 0, starts: 0, kind,
+        address, before: Object.freeze({ frame: before.id!, loader: before.loaderId ?? '', address: originalAddress }), authenticated: false };
       issued.assertCurrent(); record.ticket = ticket; const jobs = this.poisonEpoch(record);
       owner.provisionalNavigation(issued.token, issued.command);
       this.abortJobs(jobs);
@@ -384,16 +422,23 @@ export class HostDocuments implements DocumentAuthority {
         guard();
         const result = await this.preparation!.command(record.page, guard, 'Page.navigate', { url: address }) as { frameId?: string; loaderId?: string; errorText?: string; isDownload?: boolean };
         guard();
-        if (!result.loaderId || !result.frameId || result.errorText || result.isDownload)
+        if (!result.frameId || result.errorText || result.isDownload ||
+            (ticket.kind === 'cross-document' ? !result.loaderId : result.loaderId !== undefined || result.frameId !== ticket.before.frame))
           throw navigationFailed();
         // Pinned transport can deliver the response before or after the native
         // commit. Keep the same genuine issued slot until both are available.
         await this.waitCandidate(record, ticket, guard);
         const candidate = ticket.candidate;
         if (!candidate || ticket.commits !== 1) throw navigationFailed();
-        const tree = await this.preparation!.command(record.page, guard, 'Page.getFrameTree') as { frameTree?: { frame?: { id?: string; loaderId?: string } } };
+        const tree = await this.preparation!.command(record.page, guard, 'Page.getFrameTree') as { frameTree?: { frame?: { id?: string; loaderId?: string; url?: string } } };
         guard(); this.assertCurrent(target, candidate);
-        if (tree.frameTree?.frame?.id !== result.frameId || tree.frameTree?.frame?.loaderId !== result.loaderId) throw staleSnapshot();
+        const frame = tree.frameTree?.frame;
+        if (ticket.kind === 'cross-document') {
+          if (frame?.id !== result.frameId || frame.loaderId !== result.loaderId) throw staleSnapshot();
+        } else if (ticket.starts !== 1 || !this.originalRoot(record, ticket) || !sameFrame(candidate.frame, original.frame) ||
+            frame?.id !== ticket.before.frame || frame.loaderId !== ticket.before.loader || !frame.url ||
+            userURL(frame.url) !== ticket.address || userURL(record.contents.getURL()) !== ticket.address) throw staleSnapshot();
+        ticket.authenticated = true;
         this.successors.set(candidate, ticket); owner.acceptNavigation(issued.token, candidate);
         delete record.ticket; this.schedule(record);
         await this.waitReady(target, candidate, execution.signal, execution.deadline, () => issued.assertCurrent());
@@ -438,7 +483,8 @@ export class HostDocuments implements DocumentAuthority {
   assertSuccessor(target: TabTarget, original: DocumentReceipt, successor: DocumentReceipt, action: string, operation: string): void {
     const ticket = this.successors.get(successor);
     if (!ticket || ticket.original !== original || ticket.candidate !== successor || ticket.execution.action !== action ||
-        ticket.issued.operation !== operation || ticket.execution.stamp.target !== target || ticket.commits !== 1) throw staleSnapshot();
+        ticket.issued.operation !== operation || ticket.execution.stamp.target !== target || ticket.commits !== 1 || !ticket.authenticated ||
+        (ticket.kind === 'fragment' && ticket.starts !== 1)) throw staleSnapshot();
     ticket.issued.assertCurrent(); this.assertCurrent(target, successor);
   }
   failPage(target: TabTarget, page: PageSurface, availability: DocumentFault['availability'], reason: string): DocumentFault | undefined {

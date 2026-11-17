@@ -27,7 +27,9 @@ export class AgentNavigationPolicy {
   }
   redirect(address: string): string {
     if (++this.redirects > 20) throw invalidInput();
-    return agentURL(address, this.initialHTTPS ? 'https:' : undefined);
+    const safe = agentURL(address, this.initialHTTPS ? 'https:' : undefined);
+    if (safe.startsWith('https:')) this.initialHTTPS = true;
+    return safe;
   }
 }
 export async function navigateTrusted(inspection: SnapshotInspection, execution: ActionExecution,
@@ -38,7 +40,8 @@ export async function navigateTrusted(inspection: SnapshotInspection, execution:
   inspection.authority.requireSnapshot(input.snapshot, stamp);
   const address = agentURL(input.url, inspection.documents.lastSafeURL(stamp.target)); guard();
   // HostDocuments owns the actual issued slot, loader/frame correlation, commit,
-  // DOMContentLoaded and readiness. Missing same-document loader proof refuses.
+  // DOMContentLoaded and readiness, including its exact loader-free fragment
+  // request/start/commit proof. Other missing causal signals still refuse.
   const current = await inspection.documents.navigateAction(execution, address);
   inspection.authority.assertHealthy(); inspection.documents.assertCurrent(stamp.target, current);
   if (execution.signal.aborted || performance.now() >= execution.deadline || !current.ready) throw staleSnapshot();
