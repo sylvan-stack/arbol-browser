@@ -2,8 +2,10 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { isAbsolute } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
+import { performance } from 'node:perf_hooks';
 import { unavailable } from '../contracts/errors.js';
 import { assertActualSessionFactory, consumeActualSessionSeal, type ActualSessionFactory, type ActualSessionSeal } from '../profiles/session.js';
+import { assertHostCustody, type HostCustody } from './custody.js';
 
 export interface FileIdentity { readonly device: string; readonly inode: string; readonly uid: number }
 export interface ProcessIdentity { readonly pid: number; readonly uid: number; readonly startId: string }
@@ -84,7 +86,18 @@ const custodyReceipts = new WeakSet<object>();
 export function assertWatchdogCustody(value: WatchdogCustody): void {
   if (!custodyReceipts.has(value)) throw unavailable('browser');
 }
+/** Native-verified process-lifetime protection, not a clipboard operation or
+ * a caller-created readiness fact. The handle stays inside this provider. */
+export interface SystemClipboardProtection { readonly scope: 'browser-general-pasteboard' }
+const clipboardProtections = new WeakMap<SystemClipboardProtection, { custody: HostCustody; check: () => void }>();
+export function assertSystemClipboardProtection(value: SystemClipboardProtection, custody: HostCustody): void {
+  const actual = clipboardProtections.get(value);
+  if (!actual || actual.custody !== custody) throw unavailable('browser');
+  actual.check();
+}
 export interface PlatformPort {
+  /** Before app readiness, actual Sessions and all chrome/website creation. */
+  protectSystemClipboard(custody: HostCustody, deadline: number): Promise<SystemClipboardProtection>;
   /** Actual held owner and independently verified OLD Build; native claims,
    * complete receipts, physical metadata/marker/frontiers and full original
    * absence are verified off the caller event loop under the original bound. */
@@ -123,6 +136,9 @@ export interface PlatformPort {
   peerIdentity(socketFd: number): ProcessIdentity;
 }
 interface NativeSupport {
+  beginHostClipboard(custody: object): object;
+  finishHostClipboard(custody: object, preparation: object): boolean;
+  assertHostClipboard(custody: object, preparation: object): void;
   beginExitInspection(owner: object, build: object, input: string, nativeDeadline: number, data: object | null, next: object | null): object;
   pollExitInspection(handle: object): string | null;
   cancelExitInspection(handle: object): void;
@@ -188,6 +204,8 @@ export function loadPlatform(): PlatformPort {
     native = createRequire(import.meta.url)(fileURLToPath(new URL('../../native/platform.node', import.meta.url)));
     for (const name of ['publishHostReady', 'beginExitInspection', 'pollExitInspection', 'cancelExitInspection', 'beginHostSessionUse', 'acceptHostSessionUse', 'abortHostSessionUse', 'recordPagesRetired', 'recordDOMRequested', 'recordCookieAcknowledged', 'recordQuitIntended', 'captureCloseBudget', 'beginCloseStamp', 'pollCloseStamp', 'cancelCloseStamp', 'beginCloseRetirement', 'pollCloseRetirement', 'consumeCloseRequest', 'armLocalClose', 'beginHostMarkerMutation', 'acceptHostMarkerMutation', 'assertHostMarker', 'abortHostMarkerMutation', 'latchWatchdogFatal', 'prepareHostFinalization', 'spawnWatchdog', 'assertHostFinalization', 'adoptHostBuild', 'terminateAdoptedHost', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
       if (typeof native[name] !== 'function') throw new Error('Missing process support');
+    for (const name of ['beginHostClipboard', 'finishHostClipboard', 'assertHostClipboard'] as const)
+      if (typeof native[name] !== 'function') throw new Error('Missing clipboard protection');
   } catch { throw unavailable('profile'); }
   const call = <T>(operation: () => T): T => {
     try { return operation(); } catch { throw unavailable('profile'); }
@@ -195,6 +213,8 @@ export function loadPlatform(): PlatformPort {
   const locks = new WeakMap<HeldLock, object>();
   const budgets = new WeakMap<CloseBudget, object>();
   const consumedBudgets = new WeakMap<CloseBudget, object>();
+  const custodyHandles = new WeakMap<WatchdogCustody, object>();
+  let clipboardAttempted = false;
   const clockBudget = (value: CloseBudget): CloseBudget => {
     if (!value || ![value.received, value.grace, value.overall].every(n => Number.isFinite(n) && n > 0) ||
         Math.abs(value.grace - value.received - 5000) > 0.001 || Math.abs(value.overall - value.received - 8000) > 0.001)
@@ -284,9 +304,50 @@ export function loadPlatform(): PlatformPort {
         capture: (pid: number) => call(() => native.captureWatchdog(handle, pid)),
         bind: () => call(() => native.watchdogBind(handle)), assert: () => call(() => native.watchdogAssert(handle)),
         terminate: (): never => { native.terminateProfileNow(handle); throw unavailable('browser'); } });
-      custodyReceipts.add(receipt); return receipt;
+      custodyReceipts.add(receipt); custodyHandles.set(receipt, handle); return receipt;
   };
   const port: PlatformPort = Object.freeze({
+    async protectSystemClipboard(custody: HostCustody, deadline: number): Promise<SystemClipboardProtection> {
+      assertHostCustody(custody);
+      const actual = hostHandover;
+      if (clipboardAttempted || !actual?.prepared || !actual.consumed || process.type !== 'browser' ||
+          custody.host.signed.bundle !== actual.bundle || custody.host.signed.snapshotDigest !== actual.digest ||
+          !Number.isFinite(deadline) || performance.now() >= deadline) throw unavailable('browser');
+      clipboardAttempted = true;
+      const handle = custodyHandles.get(actual.custody); if (!handle) return custody.terminate();
+      const current = () => {
+        assertHostCustody(custody);
+        if (hostHandover !== actual || !actual.prepared || !actual.consumed ||
+            custody.host.signed.bundle !== actual.bundle || custody.host.signed.snapshotDigest !== actual.digest)
+          throw unavailable('browser');
+      };
+      let actualApp: typeof import('electron').app | undefined;
+      let isReady: (() => boolean) | undefined;
+      const preparing = () => {
+        current();
+        if (performance.now() >= deadline || (actualApp && (actualApp.isReady !== isReady || isReady!.call(actualApp))))
+          throw unavailable('browser');
+      };
+      try {
+        preparing(); actualApp = (await import('electron')).app;
+        if (!actualApp || typeof actualApp.isReady !== 'function') throw unavailable('browser');
+        isReady = actualApp.isReady; preparing();
+        preparing(); await custody.host.assertTrusted(deadline); preparing();
+        // Source hashing/signature verification runs in the retained native
+        // worker. The real host heartbeat continues through every await.
+        const preparation = call(() => native.beginHostClipboard(handle)); preparing();
+        for (;;) {
+          preparing(); const ready = call(() => native.finishHostClipboard(handle, preparation)); preparing();
+          if (ready === true) break;
+          if (ready !== false) throw unavailable('browser');
+          await setTimeout(Math.min(20, Math.max(1, deadline - performance.now()))); preparing();
+        }
+        const check = () => { current(); call(() => native.assertHostClipboard(handle, preparation)); current(); };
+        check();
+        const protection: SystemClipboardProtection = Object.freeze({ scope: 'browser-general-pasteboard' });
+        clipboardProtections.set(protection, { custody, check }); return protection;
+      } catch { return custody.terminate(); }
+    },
     adoptHostBuild(requestPath: string, guard: string, bundle: string): HeldLock {
       if (process.type !== 'browser' || ![requestPath, guard, bundle].every(path => isAbsolute(path) && !path.includes('\0')))
         throw unavailable('browser');

@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "system-clipboard.hpp"
 
 // Darwin kernel ABI, absent from the public SDK. Refuse unavailable/changed sizes.
 // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/proc_info_private.h
@@ -586,6 +587,28 @@ struct Custody {
   std::string policyDigest,compatibilityDigest;
 };
 static std::set<Custody*> nativeCustodies;
+struct ClipboardPreparation {
+  Custody* custody=nullptr; arbol_clipboard::Source* source=nullptr;
+  arbol_boundary::Identity main;
+  arbol_boundary::Lock owner,build;
+  arbol_exit::SharedState* state=nullptr;
+  bool installed=false;
+};
+static ClipboardPreparation* clipboardPreparation=nullptr;
+static bool clipboardCurrent(void* value) {
+  auto* p=static_cast<ClipboardPreparation*>(value);
+  return p&&p==clipboardPreparation&&p->custody&&p->state&&
+    p->state->enrolled.load(std::memory_order_acquire)==7&&p->state->transfer.load(std::memory_order_acquire)==2&&
+    getpid()==p->main.pid&&arbol_boundary::current(p->main)==1&&
+    arbol_boundary::lockIdentity(p->owner)&&arbol_boundary::lockIdentity(p->build);
+}
+static void clipboardFatal(void* value) {
+  auto* p=static_cast<ClipboardPreparation*>(value);
+  // Native callbacks may run away from the N-API thread. Only the genuine
+  // shared atomic fatal boundary is touched here; original monitors retire
+  // the family. Never manipulate the main thread's mutable Context from here.
+  if(p&&p==clipboardPreparation&&p->state) p->state->declareFatal();
+}
 static bool custodyAttempted = false;
 static Custody* custodyArgument(napi_env env, napi_value value) {
   void* data = nullptr; if (napi_get_value_external(env,value,&data) != napi_ok) return nullptr;
@@ -1181,6 +1204,54 @@ static napi_value assertHostFinalization(napi_env env,napi_callback_info info) {
   napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg);
   if(!c||!c->hostRequired||!c->bound||!c->finalization.ready(c->context)||
      c->finalization.shared()->transfer.load(std::memory_order_acquire)!=2) return fail(env);
+  napi_value out; napi_get_undefined(env,&out); return out;
+}
+static napi_value beginHostClipboard(napi_env env,napi_callback_info info) {
+  napi_value args[2]; size_t n=2;
+  if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok||n!=1||![NSThread isMainThread]||clipboardPreparation) return fail(env);
+  auto* c=custodyArgument(env,args[0]);
+  if(!c||!c->continuousBuild||!c->hostRequired||!c->bound||c->sessionAttempted||c->readyAttempted||
+     !c->finalization.ready(c->context)||c->finalization.shared()->transfer.load(std::memory_order_acquire)!=2||
+     (NSApp&&NSApp.windows.count)) return fail(env);
+  @autoreleasepool { try { @try {
+    auto* p=new ClipboardPreparation; clipboardPreparation=p; p->custody=c;
+    p->main=c->context.main;
+    p->owner=c->context.owner; p->build=c->context.build; p->state=c->finalization.shared();
+    p->source=new arbol_clipboard::Source(c->context.bundle+
+      "/Contents/Resources/browser/runtime/Electron.app/Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework");
+    const double deadline=std::min(arbol_boundary::clockMs()+5000,[c->finalization.value()[@"attempt"][@"expires"] doubleValue]);
+    if(!clipboardCurrent(p)||deadline<=arbol_boundary::clockMs()||!arbol_boundary::retainNativeImage()) return fail(env);
+    p->source->start(deadline);
+    napi_value out; if(napi_create_external(env,p,nullptr,nullptr,&out)!=napi_ok) return fail(env); return out;
+  } @catch(NSException*) { clipboardFatal(clipboardPreparation); return fail(env); } }
+  catch(...) { clipboardFatal(clipboardPreparation); return fail(env); } }
+}
+static ClipboardPreparation* clipboardArgument(napi_env env,napi_callback_info info) {
+  napi_value args[3]; size_t n=3; void* handle=nullptr;
+  if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok||n!=2||
+     napi_get_value_external(env,args[1],&handle)!=napi_ok||handle!=clipboardPreparation) return nullptr;
+  auto* c=custodyArgument(env,args[0]); auto* p=clipboardPreparation;
+  return c&&p&&p->custody==c&&clipboardCurrent(p)?p:nullptr;
+}
+static napi_value finishHostClipboard(napi_env env,napi_callback_info info) {
+  auto* p=clipboardArgument(env,info);
+  if(!p||![NSThread isMainThread]||!p->source||p->installed||p->custody->sessionAttempted||p->custody->readyAttempted||
+     !p->custody->finalization.ready(p->custody->context)||(NSApp&&NSApp.windows.count)) return fail(env);
+  int state=p->source->result.load(std::memory_order_acquire);
+  if(state<0) { clipboardFatal(p); return fail(env); }
+  bool done=false;
+  if(state==1) { try { @try {
+    done=arbol_clipboard::Guard::instance().install(p->source,p,clipboardCurrent,clipboardFatal);
+    if(!done) { clipboardFatal(p); return fail(env); } p->installed=true;
+  } @catch(NSException*) { clipboardFatal(p); return fail(env); } }
+  catch(...) { clipboardFatal(p); return fail(env); } }
+  napi_value out; if(napi_get_boolean(env,done,&out)!=napi_ok) return fail(env); return out;
+}
+static napi_value assertHostClipboard(napi_env env,napi_callback_info info) {
+  auto* p=clipboardArgument(env,info);
+  if(!p||![NSThread isMainThread]||!p->installed||!arbol_clipboard::Guard::instance().check(p)) {
+    clipboardFatal(clipboardPreparation); return fail(env);
+  }
   napi_value out; napi_get_undefined(env,&out); return out;
 }
 static napi_value latchWatchdogFatal(napi_env env,napi_callback_info info) {
@@ -1960,6 +2031,9 @@ static napi_value init(napi_env env, napi_value exports) {
     {"prepareHostFinalization",nullptr,prepareHostFinalization,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"spawnWatchdog",nullptr,spawnWatchdog,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"assertHostFinalization",nullptr,assertHostFinalization,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"beginHostClipboard",nullptr,beginHostClipboard,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"finishHostClipboard",nullptr,finishHostClipboard,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"assertHostClipboard",nullptr,assertHostClipboard,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"latchWatchdogFatal",nullptr,latchWatchdogFatal,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"adoptHostBuild",nullptr,adoptHostBuild,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"continuousTime",nullptr,continuousTime,nullptr,nullptr,nullptr,napi_default,nullptr},
