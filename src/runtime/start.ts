@@ -26,7 +26,7 @@ export interface LaunchPort { launch(selection: BuildSelection, requestPath: str
  * transport primitive remains usable in its original bounded scope; only the
  * fully verified packaged integration may call it for a production launch. */
 export interface LaunchAttemptPort {
-  reserve(profile: ProfileSnapshot, request: string, deadline: number): Promise<void>;
+  reserve(profile: ProfileSnapshot, request: string, deadline: number, build?: BuildGuard): Promise<void>;
   launched(profile: ProfileSnapshot, request: string, pid: number, deadline: number): Promise<void>;
   cancel(profile: ProfileSnapshot, request: string, deadline: number): Promise<void>;
 }
@@ -111,10 +111,12 @@ export function createStarter(options: { selection: BuildSelection; platform: Pl
       await writeNewFile(path, JSON.stringify({ format: 1, request, profile: profile.paths.root,
         profileInstance: profile.record.instance, selection: options.selection }) + '\n');
       await location.assert(); await guard.assert(); assertTime(deadline);
-      // No owner.lock is acquired or transferred by this starter.
+      // Production temporarily takes Owner only inside verified reservation;
+      // it releases that exact description before LaunchServices, never waits
+      // for a host while retaining the temporary Owner.
       attempted = true;
       assertTime(admissionDeadline);
-      await options.attempts?.reserve(profile, request, admissionDeadline);
+      await options.attempts?.reserve(profile, request, admissionDeadline, guard);
       await guard.assert(); assertTime(admissionDeadline);
       launched = await (options.launch ?? launchServices).launch(options.selection, path, admissionDeadline);
       await options.attempts?.launched(profile, request, launched, admissionDeadline);

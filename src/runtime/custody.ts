@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { unavailable } from '../contracts/errors.js';
 import { assertProfile } from '../profiles/records.js';
 import { withOwnerLockForCustody, type OwnerLease } from '../profiles/locking.js';
-import { withBuildLockForCustody, type BuildLease } from './build-lease.js';
+import { terminateAdoptedBuild, withBuildLockForCustody, type BuildLease } from './build-lease.js';
 import { assertVerifiedHost, type VerifiedHost } from './authorities.js';
 import { assertPlatform, assertWatchdogCustody, type PlatformPort, type WatchdogCustody, type PriorMarkerExpectation } from './platform.js';
 import { assertTime, type InstanceOwner } from './instance.js';
@@ -40,19 +40,16 @@ export function assertHostCustody(value: HostCustody): void {
   if (!actual?.watchdog) throw unavailable('browser');
   actual.native.assert(); actual.native.assertHost();
 }
-/** Cancellation/refusal before pre-spawn preparation has not transferred a
- * child or admitted data by this function. First retain the actual originals
- * natively. The native continuous-Build guard prevents legacy signal-only
- * release: missing pre-arm enrollment retains protection and independent
- * commands refuse within their own original bounds. Neither this call nor an
- * untransferred label certifies never-admitted, closed family or flush. */
-export async function abortUnadmittedHost(host: VerifiedHost, ownerLease: OwnerLease, build: BuildLease,
+/** Cancellation/refusal before resource permission uses the actual adopted
+ * native original. It retains any genuine acquired Owner and either publishes
+ * authentic no-use or joins already-started native custody cleanup. Unknown
+ * transfer stays protected; JS labels never certify family exit or flush. */
+export async function abortUnadmittedHost(ownerLease: OwnerLease | undefined, build: BuildLease,
   platform: PlatformPort): Promise<never> {
   assertPlatform(platform);
-  const native = await withOwnerLockForCustody(ownerLease, platform, owner =>
-    withBuildLockForCustody(build, platform, heldBuild =>
-      platform.prepareWatchdogCustody(owner, heldBuild, host.signed.bundle, host.signed.snapshotDigest)));
-  return native.terminate();
+  // Absence of Owner is real for pre-acquisition failure/losing contention.
+  // Never manufacture an owner or start a monitor just to obtain an exit path.
+  return terminateAdoptedBuild(build, platform, ownerLease);
 }
 /** Called after actual owner acquisition/runtime publication and before every
  * engine-marker/session operation. Prior is only a bound expectation here; the

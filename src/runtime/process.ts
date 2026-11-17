@@ -9,6 +9,9 @@ import { assertPlatform, type HeldLock, type PlatformPort, type ProcessProvenanc
 import { assertVerifiedHost, type VerifiedHost } from './authorities.js';
 import { assertTime, now, runtimeLocation, type RuntimeLocation, type RuntimeRecord } from './instance.js';
 import type { LaunchAttemptPort } from './start.js';
+import { ownerLock } from '../profiles/locking.js';
+import { acquireBuildLease, type BuildLease } from './build-lease.js';
+import { createProductionExitAuthority, assertProductionExitAuthority, type ProductionExitAuthority } from './exit.js';
 
 export interface LaunchAttempt {
   readonly format: 1; readonly request: string; readonly nonce: string;
@@ -144,31 +147,33 @@ export async function claimedHostAttempt(profile: ProfileSnapshot, host: Verifie
 /** Real packaged starter transactions. Process-local state merely remembers this
  * caller's nonce; durable native claim/cancel and the retained native originals
  * provide protection when the CLI or NSWorkspace reply disappears. */
-export function createLaunchTransactions(host: VerifiedHost, platform: PlatformPort): LaunchAttemptPort {
-  assertPlatform(platform);
+export function createLaunchTransactions(host: VerifiedHost, platform: PlatformPort,
+  exits: ProductionExitAuthority = createProductionExitAuthority(platform, {
+    build: host.identity.layout.build, directory: host.identity.layout.buildRoot,
+    guard: join(host.identity.layout.buildRoot, '../.uses', host.identity.layout.build), explicit: true,
+  })): LaunchAttemptPort {
+  assertPlatform(platform); assertProductionExitAuthority(exits);
   const pending = new Map<string, LaunchAttempt>();
   return Object.freeze({
-    async reserve(profile: ProfileSnapshot, request: string, deadline: number) {
+    async reserve(profile: ProfileSnapshot, request: string, deadline: number, heldBuild?: import('./start.js').BuildGuard) {
       assertVerifiedHost(host, deadline); await host.assertTrusted(deadline);
       const next = await pendingLaunchAttempt(profile, host, platform, request, deadline);
       if (pending.has(request)) throw unavailable('browser'); pending.set(request, next);
-      await withLaunchAttempt(profile, platform, deadline, transaction => {
-        let previous = transaction.current;
-        if (previous?.phase === 'pending' && previous.profileInstance === profile.record.instance &&
-            previous.expires <= platform.continuousTime() && previous.stage === 'untransferred' &&
-            !previous.bootstrap && !previous.engine && !previous.runtime && !previous.terminal) {
-          // The native role permits only this exact expired original withdrawal.
-          // It is durable before the new nonce can be reserved, so a late old
-          // LaunchServices delivery can never adopt the replacement request.
-          transaction.replace(frozen({ ...previous, phase: 'cancelled' }));
-          previous = transaction.current;
-        }
-        // A previous claimed family is retired only by the independent native
-        // exit verifier, under its actual owner/Build/transition protection.
-        if (previous && !(previous.phase === 'cancelled' && previous.stage === 'untransferred' &&
-            !previous.bootstrap && !previous.engine && !previous.runtime && !previous.terminal)) throw unavailable('browser');
-        transaction.replace(next);
-      });
+      // Every production reservation, including the first and an expired
+      // affirmatively unclaimed retry, reaches the native bound transition.
+      // Temporary Owner is released BEFORE any LaunchServices submission.
+      const owner = await ownerLock(profile, platform, false, deadline);
+      if (!owner) throw unavailable('profile');
+      let build: BuildLease | undefined;
+      try {
+        build = heldBuild as BuildLease | undefined;
+        if (!build) build = await acquireBuildLease({ build: host.identity.layout.build, directory: host.identity.layout.buildRoot,
+          guard: join(host.identity.layout.buildRoot, '../.uses', host.identity.layout.build), explicit: true }, platform);
+        // The genuine private Build handover, rather than this structural cast,
+        // authorizes native admission. A fake or unrelated guard is rejected.
+        await exits.reserve(profile, owner, host, build, next, deadline);
+        await owner.assert(); await build.assert(); assertTime(deadline);
+      } finally { owner.release(); if (!heldBuild) build?.release(); }
     },
     async launched(profile: ProfileSnapshot, request: string, pid: number, deadline: number) {
       const expected = pending.get(request);

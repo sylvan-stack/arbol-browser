@@ -7,6 +7,7 @@ import type { BuildSelection } from './selection.js';
 import type { BuildGuard } from './start.js';
 import { assertVerifiedHost, type VerifiedHost } from './authorities.js';
 import { assertPlatform } from './platform.js';
+import { withOwnerLockForCustody, type OwnerLease } from '../profiles/locking.js';
 
 export interface BuildLease extends BuildGuard {
   readonly selection: BuildSelection;
@@ -22,6 +23,17 @@ export async function withBuildLockForCustody<T>(lease: BuildLease, platform: Pl
   await lease.assert();
   if (buildDescriptions.get(lease) !== source) throw profileUnavailable();
   source.held.assertIdentity(); return handover(source.held);
+}
+/** Terminal-only handover uses the actual adopted description, without
+ * repeating an expired admission or synchronous signed-payload scan. Native
+ * verifies its own one-use adoption and either finalizes genuine no-use or
+ * retains the real enrolled/uncertain custody. No numeric FD is exported. */
+export async function terminateAdoptedBuild(lease: BuildLease, platform: PlatformPort, owner?: OwnerLease): Promise<never> {
+  const source = buildDescriptions.get(lease);
+  if (!source || source.platform !== platform) throw profileUnavailable();
+  source.held.assertIdentity();
+  return owner ? withOwnerLockForCustody(owner, platform, heldOwner => platform.terminateAdoptedHost(source.held, heldOwner)) :
+    platform.terminateAdoptedHost(source.held);
 }
 /** Host-only continuous outer description. This is deliberately separate from
  * the Node starter's ordinary independently acquired shared guard below. The
@@ -44,7 +56,9 @@ export async function adoptHostBuildLease(host: VerifiedHost, platform: Platform
     },
     release(): never { throw profileUnavailable(); },
   });
-  buildDescriptions.set(lease, { platform, held }); await lease.assert(); return lease;
+  buildDescriptions.set(lease, { platform, held });
+  try { await lease.assert(); return lease; }
+  catch { return platform.terminateAdoptedHost(held); }
 }
 /** Reacquire the launcher's exact stable .uses/<hex> shared kernel flock.
  * This is Build-use protection, never publisher/native/engine compatibility

@@ -77,14 +77,14 @@ export async function prepareOwnedHost(actualApp: ProfileApp, request: HostReque
     await claimedHostAttempt(request.profile, host, platform, request.request, deadline);
     await buildGuard.assert(); assertTime(deadline);
   };
-  await assertAdmission();
-  const instance = await acquireInstance(request.profile, platform, request.selection.build, previousExit, deadline,
-    { assertAdmission, failed: owner => abortUnadmittedHost(host, owner, buildGuard, platform) });
-  // No ownership/data transfer occurred. The adopted Build remains natively
-  // retained until this losing original actually exits; there is no release().
-  if (!instance) return null;
-  let custody: HostCustody | undefined;
+  let instance: InstanceOwner | null = null, custody: HostCustody | undefined;
   try {
+    await assertAdmission();
+    instance = await acquireInstance(request.profile, platform, request.selection.build, previousExit, deadline,
+      { assertAdmission, failed: owner => abortUnadmittedHost(owner, buildGuard, platform) });
+    // The losing original still owns the genuine inherited Build, and must
+    // publish terminal-only no-use before exact self exit. No invented Owner.
+    if (!instance) return abortUnadmittedHost(undefined, buildGuard, platform);
     await assertAdmission(); await instance.owner.assert();
     const prior = await previousExit.priorExpectation(request.profile, instance.previous, instance.owner, buildGuard, deadline);
     await assertAdmission();
@@ -96,7 +96,7 @@ export async function prepareOwnedHost(actualApp: ProfileApp, request: HostReque
     ownedHosts.add(owned); return owned;
   } catch {
     if (custody) return custody.terminate();
-    return abortUnadmittedHost(host, instance.owner, buildGuard, platform);
+    return abortUnadmittedHost(instance?.owner, buildGuard, platform);
   }
 }
 
