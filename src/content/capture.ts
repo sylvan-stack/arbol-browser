@@ -1,6 +1,6 @@
 import { nativeImage, type NativeImage } from 'electron';
 import type { Contract } from '../contracts/generated.js';
-import { CaptureProof, type CaptureStamp } from './capture-proof.js';
+import type { CaptureProof, CaptureStamp } from './capture-proof.js';
 import { classifiedRefusal } from './sensitive.js';
 import type { ActionExecution } from '../host/actions.js';
 import type { SnapshotInspection } from './snapshot.js';
@@ -49,7 +49,8 @@ function mask(bitmap: Buffer, width: number, height: number, stamp: CaptureStamp
   guard();
 }
 
-/** Only memory-owned buffers exist. In particular, no raw PNG/base64, cached
+/** Private future provider consumer; the actual screenshot entry stays closed.
+ * Only memory-owned buffers exist. In particular, no raw PNG/base64, cached
  * page data or unmasked fallback survives a failed proof or authority check. */
 export async function captureViewport(proof: CaptureProof, stamp: CaptureStamp, snapshot: string): Promise<Contract<'browser.ScreenshotPayload'>> {
   let raw: Buffer | undefined, bitmap: Buffer | undefined, output: Buffer | undefined;
@@ -80,17 +81,12 @@ export async function captureViewport(proof: CaptureProof, stamp: CaptureStamp, 
     pixels.data = ''; raw?.fill(0); bitmap?.fill(0); output?.fill(0); image = undefined; masked = undefined;
   }
 }
-/** The actual provider always joins cleanup, including quiesce/pixel/proof
- * failure. A failed restoration retains the real queue reservation and invokes
- * the existing health/retirement chain; it is never a successful screenshot. */
+/** Until an authenticated positive provider exists, refuse after the original
+ * authority/snapshot checks and before reserving capture or touching a renderer.
+ * Actual touched-operation restoration/retirement remains with CaptureProof. */
 export async function inspectScreenshot(inspection: SnapshotInspection, execution: ActionExecution,
   snapshot: string): Promise<Contract<'browser.ScreenshotPayload'>> {
   const guard = inspection.guard(execution);
   guard(); inspection.authority.requireSnapshot(snapshot, execution.stamp, false);
-  const proof = new CaptureProof(inspection.documents, inspection.readiness, inspection.fields, execution);
-  try {
-    const stamp = await proof.quiesce();
-    const result = await captureViewport(proof, stamp, snapshot);
-    guard(); inspection.authority.requireSnapshot(snapshot, execution.stamp, false); return result;
-  } finally { await proof.restore(); }
+  throw classifiedRefusal();
 }
