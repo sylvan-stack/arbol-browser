@@ -1,7 +1,7 @@
 // Testing only: real allocated signed entry and protected Unix wire. No host,
 // engine, exit, readiness or action authority is supplied by this harness.
 import assert from 'node:assert/strict';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
 import { mkdir, readFile, writeFile, lstat, realpath } from 'node:fs/promises';
@@ -96,6 +96,24 @@ export async function family(c, label) {
   const rows = processSnapshot().split('\n').filter(line => line.includes(c.buildRoot + '/ArbolBrowser.app/') &&
     Number(line.trim().split(/\s+/)[0]) !== process.pid);
   await save(join(c.output, label + '-processes.json'), rows); return rows;
+}
+export async function listeners(c, r) {
+  const rows = await family(c, 'listener-family');
+  const identities = rows.map(line => Number(line.trim().split(/\s+/)[0])).map(pid => r.platform.processIdentity(pid)).filter(Boolean);
+  assert.ok(identities.some(p => p.pid === r.record.pid));
+  const pids = identities.map(p => p.pid).join(',');
+  const tcp = spawnSync('/usr/sbin/lsof', ['-nP', '-a', '-p', pids, '-iTCP', '-sTCP:LISTEN', '-Fpn'], { encoding: 'utf8' });
+  assert.equal(tcp.error, undefined); assert.equal(tcp.signal, null);
+  assert.equal(tcp.status, 1, 'Actual owned tree has a TCP listener or lsof failed'); assert.equal(tcp.stdout, ''); assert.equal(tcp.stderr, '');
+  const unix = spawnSync('/usr/sbin/lsof', ['-nP', '-a', '-p', String(r.record.pid), '-U', '-Fpn'], { encoding: 'utf8' });
+  assert.equal(unix.status, 0, unix.stderr);
+  for (const path of [r.location.agent, r.location.management]) {
+    const st = await lstat(path); assert.ok(st.isSocket()); assert.equal(st.uid, process.getuid()); assert.equal(st.mode & 0o7777, 0o600);
+    assert.ok(unix.stdout.includes('n' + path), 'OS does not observe declared private endpoint');
+  }
+  for (const p of identities) assert.deepEqual(r.platform.processIdentity(p.pid), p, 'Original process changed during socket census');
+  await save(join(c.output, 'listeners.json'), { identities, tcp: { status: tcp.status, stdout: tcp.stdout, stderr: tcp.stderr }, unix: unix.stdout,
+    scope: 'Exact sampled main/helper tree; no continuous pre-baseline or cross-UID qualification' });
 }
 export async function finish(c) {
   for (const peer of c.peers) peer.close();

@@ -1,6 +1,6 @@
 import { readFile, lstat } from 'node:fs/promises';
 import { join } from 'node:path';
-import { assert, cli, success, create, open, runtime, closes, save, family, delay, loopback, until, agent, tool, processSnapshot } from '../support/control.mjs';
+import { assert, cli, success, create, open, runtime, closes, save, family, delay, loopback, until, agent, tool, listeners } from '../support/control.mjs';
 
 export async function controlStartupBoundary(c) {
   let absent; try { absent = await lstat(join(c.state, 'profiles/control-startup')); } catch (e) { if (e.code !== 'ENOENT') throw e; }
@@ -16,10 +16,20 @@ export async function controlStartupBoundary(c) {
   assert.equal(values.filter(v => !v.alreadyRunning).length, 1, 'Exactly one original start must win');
   const r = await runtime(c, profile); assert.equal(r.record.phase, 'ready'); assert.equal(r.record.pid, values[0].process);
   const repeated = await open(c, profile); assert.equal(repeated.instance, r.record.instance); assert.equal(repeated.alreadyRunning, true);
+  await listeners(c, r);
   const tree = await family(c, 'ready'); assert.ok(tree.length > 0);
   const result = await closes(c, profile);
-  await delay(1200); assert.equal(r.platform.processIdentity(r.record.pid), null, 'Closed original must not restart');
-  await save(join(c.output, 'observations.json'), { info, values, repeated, identity: r.identity, record: r.record, tree, result });
+  const noRestart = [];
+  for (let i = 0; i < 6; ++i) {
+    await delay(200);
+    const identity = r.platform.processIdentity(r.record.pid);
+    assert.notEqual(identity?.startId, r.identity.startId, 'Closed original remains alive');
+    const current = await family(c, 'after-close-' + i); assert.deepEqual(current, [], 'A new package process implicitly restarted');
+    const marker = JSON.parse(await readFile(r.location.record));
+    assert.equal(marker.instance, r.record.instance); assert.notEqual(marker.phase, 'ready');
+    noRestart.push({ monotonic: performance.now(), originalIdentity: identity, current, runtime: marker });
+  }
+  await save(join(c.output, 'observations.json'), { info, values, repeated, identity: r.identity, record: r.record, tree, result, noRestart });
   return { boundary: 'actual sealed CLI Building allocation and single original arbitration', authenticFailedLaunchReplay: 'unavailable' };
 }
 
