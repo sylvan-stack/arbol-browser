@@ -153,7 +153,16 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
       const next = await pendingLaunchAttempt(profile, host, platform, request, deadline);
       if (pending.has(request)) throw unavailable('browser'); pending.set(request, next);
       await withLaunchAttempt(profile, platform, deadline, transaction => {
-        const previous = transaction.current;
+        let previous = transaction.current;
+        if (previous?.phase === 'pending' && previous.profileInstance === profile.record.instance &&
+            previous.expires <= platform.continuousTime() && previous.stage === 'untransferred' &&
+            !previous.bootstrap && !previous.engine && !previous.runtime && !previous.terminal) {
+          // The native role permits only this exact expired original withdrawal.
+          // It is durable before the new nonce can be reserved, so a late old
+          // LaunchServices delivery can never adopt the replacement request.
+          transaction.replace(frozen({ ...previous, phase: 'cancelled' }));
+          previous = transaction.current;
+        }
         // A previous claimed family is retired only by the independent native
         // exit verifier, under its actual owner/Build/transition protection.
         if (previous && !(previous.phase === 'cancelled' && previous.stage === 'untransferred' &&
