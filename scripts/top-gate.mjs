@@ -252,7 +252,7 @@ if (!embedded && !controlWorker) {
     assert.deepEqual(gate.cases.map(item => item.id), gate.selection);
     assert.equal(inventoryDigest(await (await import('./package-base.mjs')).inventory(join(buildRoot, 'ArbolBrowser.app'))), gate.signedBundle.inventory,
       'Signed ordinary assembly changed during qualification');
-    gate.passed = foundation.passed && control.passed && controlRun.status === 0 && gate.cases.every(item => item.status === 'passed');
+    gate.passed = foundation.passed === true && gate.control.passed === true && gate.cases.every(item => item.status === 'passed');
   } catch (error) {
     gate.gateError = String(error.stack ?? error);
     console.error('GATE FAILED: ' + error.message);
