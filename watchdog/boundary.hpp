@@ -261,7 +261,7 @@ struct Context {
         uncertainFamily(); return false;
       }
     }
-    return !familyUncertain;
+    return true;
   }
   bool engineMonitorNumberEligible(const Identity& id) {
     for(const auto& original:{primary,custody}) {
@@ -274,7 +274,7 @@ struct Context {
       // retained full-kernel original-exit observation authorizes this reuse.
       if(!originalGone(original)) return false;
     }
-    return !familyUncertain;
+    return true;
   }
   std::string engine() const { return bundle + "/Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron"; }
   std::string helper() const { return bundle + "/Contents/Resources/browser/native/watchdog"; }
@@ -515,11 +515,17 @@ struct Context {
   }
   bool signalEngine(const Identity& original) {
     Identity actual; std::string path;
-    if(!monitorBirthsCurrent()||!engineMonitorNumberEligible(original)||
+    // Observe/latch monitor uncertainty independently of the census filters.
+    // Only a target which could alias that original monitor loses signaling
+    // authority; unrelated family uncertainty cannot shield a positively
+    // captured original engine/main from its existing exact fallback.
+    (void)monitorBirthsCurrent();
+    if(!engineMonitorNumberEligible(original)||
        observe(original.pid,actual)!=1||!same(original,actual)||actual.uid!=main.uid||
        actual.group!=main.group||getsid(actual.pid)!=session||!executable(actual,path)||
        (same(actual,main)?path!=engine():!enginePath(path))||!signature(path,true)) return false;
-    if(!monitorBirthsCurrent()||!engineMonitorNumberEligible(actual)) return false;
+    (void)monitorBirthsCurrent();
+    if(!engineMonitorNumberEligible(actual)) return false;
     return signalExact(original,SIGKILL);
   }
   void enforce(bool executingMain = false) {
