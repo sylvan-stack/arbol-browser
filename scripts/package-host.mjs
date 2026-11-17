@@ -479,15 +479,21 @@ export async function prepareAllocatedHost(environment = process.env) {
   return { build, buildRoot, source: record.source, productDigest: compiled.record.productDigest, reviewHandover: review,
     sealedFiles: signed.payloadDigest, qualification: 'unexecuted', status: 'building' };
 }
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const args = process.argv.slice(2);
+async function runPackageCommand(args) {
   if (args.length === 1 && args[0] === '--allocated') {
     console.log(JSON.stringify(await prepareAllocatedHost()));
   } else {
-  if (args.length !== 12 || args.filter((_arg, index) => index % 2 === 0).join(',') !==
-      '--out,--build-root,--state-root,--runtime-archive,--review-handover,--purpose')
-    fail('Usage: package-host.mjs --out <fresh.app> --build-root <allocated-Build> --state-root <isolated-state> --runtime-archive <pinned.zip> --review-handover <Forester-commit> --purpose <blocked|isolated-qualification>');
-  const result = await prepareUnsignedHost({ out: args[1], buildRoot: args[3], stateRoot: args[5], runtimeArchive: args[7], review: args[9], purpose: args[11] });
-  console.log(JSON.stringify({ bundle: result.bundle, qualification: 'unexecuted', purpose: result.record.purpose }));
+    if (args.length !== 12 || args.filter((_arg, index) => index % 2 === 0).join(',') !==
+        '--out,--build-root,--state-root,--runtime-archive,--review-handover,--purpose')
+      fail('Usage: package-host.mjs --out <fresh.app> --build-root <allocated-Build> --state-root <isolated-state> --runtime-archive <pinned.zip> --review-handover <Forester-commit> --purpose <blocked|isolated-qualification>');
+    const result = await prepareUnsignedHost({ out: args[1], buildRoot: args[3], stateRoot: args[5], runtimeArchive: args[7], review: args[9], purpose: args[11] });
+    console.log(JSON.stringify({ bundle: result.bundle, qualification: 'unexecuted', purpose: result.record.purpose }));
   }
+}
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  // Settle this recipe module before the signer imports it during CLI dispatch.
+  void runPackageCommand(process.argv.slice(2)).catch(error => {
+    console.error(error);
+    process.exitCode = 1;
+  });
 }
