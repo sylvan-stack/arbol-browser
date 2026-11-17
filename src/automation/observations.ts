@@ -40,10 +40,10 @@ const installMonitor = `function(action,binding){
   let token='',serial=0,live=true,pointer=false,composing=false,bad=false,expected;
   const captures=new Set(),keys=new Set();
   const allowedKeys=['Enter','Tab','Escape','Backspace','Delete','ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End','PageUp','PageDown',' ','a','A','Shift','Meta'];
-  const types=['pointerdown','pointerup','pointercancel','gotpointercapture','lostpointercapture','mousedown','mouseup','click','keydown','keyup','beforeinput','input','compositionstart','compositionend'];
+  const types=['pointerdown','pointerup','pointercancel','gotpointercapture','lostpointercapture','mousedown','mouseup','click','keydown','keyup','beforeinput','input','compositionstart','compositionend','wheel'];
   const receive=e=>{
     if(!live||!e.isTrusted)return;
-    const original=e.composedPath()[0]===source;
+    const original=e.composedPath()[0]===source||(e.type==='wheel'&&e.composedPath().includes(source));
     if(!original&&!['pointerup','pointercancel','lostpointercapture','mouseup','keyup'].includes(e.type))return;
     if(!token||++serial>128){bad=true;return;}
     if(e.type==='pointerdown')pointer=true;
@@ -64,7 +64,10 @@ const installMonitor = `function(action,binding){
   for(const type of types)doc.addEventListener(type,receive,true);
   return Object.freeze({
     arm(next){if(!live||typeof next!=='string'||next.length!==32||!source.isConnected)throw Error('arm');token=next;return true;},
-    state(){return {connected:source.isConnected&&source.ownerDocument===doc,pointer,captures:captures.size,keys:keys.size,composing,bad};},
+    state(){return {connected:source.isConnected&&(source===doc||source.ownerDocument===doc),pointer,captures:captures.size,keys:keys.size,composing,bad};},
+    contains(node){return source.isConnected&&node&&node.isConnected&&source.contains(node);},
+    offset(){const scroller=source===doc?doc.scrollingElement:source;
+      if(!scroller||!scroller.isConnected)throw Error('scroll');return {x:scroller.scrollLeft,y:scroller.scrollTop};},
     focused(){return source.isConnected&&(source.getRootNode().activeElement===source||doc.activeElement===source);},
     prepareText(text,mode){
       if(!this.focused()||typeof text!=='string'||text.length>20000||!['replace','append'].includes(mode))return false;
@@ -137,7 +140,7 @@ export class TrustedObservation {
       if (data?.action !== this.target.execution.action || typeof data.token !== 'string' || !this.issued.has(data.token) ||
           !Number.isSafeInteger(data.serial) || data.serial !== this.serial + 1 || data.serial > 128 ||
           !['pointerdown', 'pointerup', 'pointercancel', 'gotpointercapture', 'lostpointercapture', 'mousedown', 'mouseup', 'click', 'keydown', 'keyup',
-            'beforeinput', 'input', 'compositionstart', 'compositionend'].includes(data.type) ||
+            'beforeinput', 'input', 'compositionstart', 'compositionend', 'wheel'].includes(data.type) ||
           !['source', 'other'].includes(data.target) || this.events.length >= 128) { this.invalid = true; return; }
       this.serial = data.serial;
       if (['keydown', 'keyup'].includes(data.type) && !Object.values(physicalKeys).some(key => key[0] === data.key)) { this.invalid = true; return; }
@@ -249,6 +252,41 @@ export class TrustedObservation {
       modifiers: 0, autoRepeat: false, isSystemKey: false, commands: ['moveToEndOfDocument'] });
   }
   insertText(text: string): Promise<IssuedInput> { return this.issue('Input.insertText', { text }); }
+  async covers(backend: number): Promise<boolean> {
+    this.guard();
+    const resolved = await this.command('DOM.resolveNode', { backendNodeId: backend, executionContextId: this.context!.id,
+      objectGroup: this.group }) as { object?: { objectId?: string } };
+    this.guard(); if (!resolved.object?.objectId) throw staleSnapshot();
+    return await this.call('function(node){return this.contains(node);}', [{ objectId: resolved.object.objectId }]) === true;
+  }
+  scroll(point: TargetPoint, deltaX: number, deltaY: number): Promise<IssuedInput> {
+    if (![deltaX, deltaY].every(value => Number.isInteger(value) && Math.abs(value) <= 2000) || (!deltaX && !deltaY) ||
+        ![point.x, point.y].every(value => Number.isFinite(value) && value >= 0 && value <= 100000)) throw staleSnapshot();
+    return this.issue('Input.synthesizeScrollGesture', { x: point.x, y: point.y, xDistance: -deltaX, yDistance: -deltaY,
+      preventFling: true, speed: 800, gestureSourceType: 'mouse', repeatCount: 0 });
+  }
+  private async offset(): Promise<Readonly<{ x: number; y: number }>> {
+    const value = await this.call('function(){return this.offset();}') as { x?: number; y?: number };
+    if (!Number.isFinite(value?.x) || !Number.isFinite(value?.y)) throw staleSnapshot();
+    return Object.freeze({ x: value.x!, y: value.y! });
+  }
+  private async presentedOffset(): Promise<Readonly<{ x: number; y: number; time: number }>> {
+    await this.balanced(); const before = await this.offset(); this.guard();
+    // An actual compositor capture is used only as a current presentation
+    // barrier. No pixels are compared, delivered, cached or persisted, and this
+    // grants no public screenshot proof. It supplements genuine gesture/wheel
+    // settlement; equal offsets or images alone can never complete the action.
+    let frame: { data?: string } | undefined = await this.command('Page.captureScreenshot',
+      { format: 'png', fromSurface: true, captureBeyondViewport: false }) as { data?: string };
+    try {
+      this.guard();
+      if (typeof frame.data !== 'string' || frame.data.length < 32 || frame.data.length > 12 * 1024 * 1024 ||
+          !Buffer.from(frame.data.slice(0, 32), 'base64').subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) throw staleSnapshot();
+    } finally { frame = undefined; }
+    const after = await this.offset(); this.guard();
+    if (before.x !== after.x || before.y !== after.y) throw staleSnapshot();
+    return Object.freeze({ ...after, time: performance.now() });
+  }
   private seen(type: string, issued: IssuedInput, target: EventReceipt['target'] = 'source'): boolean {
     return this.issued.get(issued.token) === issued.command && this.events.some(event => event.type === type && event.token === issued.token && event.target === target);
   }
@@ -281,6 +319,19 @@ export class TrustedObservation {
     this.guard(); const { execution } = this.target;
     execution.settle({ action: execution.action!, operation: this.operation, original: execution.stamp.document,
       current: this.target.frame.receipt, delivered: true, quiescent: true, command: insertion.command });
+  }
+  async settleScroll(gesture: IssuedInput): Promise<void> {
+    this.guard();
+    if (!this.seen('wheel', gesture) || this.pending.size || gesture.command !== this.target.execution.command) throw staleSnapshot();
+    let previous = await this.presentedOffset();
+    for (;;) {
+      const current = await this.presentedOffset(); this.guard();
+      if (current.time - previous.time >= 16 && current.x === previous.x && current.y === previous.y) break;
+      if (current.x !== previous.x || current.y !== previous.y) previous = current;
+    }
+    await this.balanced(); this.guard(); const { execution } = this.target;
+    execution.settle({ action: execution.action!, operation: this.operation, original: execution.stamp.document,
+      current: this.target.frame.receipt, delivered: true, quiescent: true, command: gesture.command });
   }
   async settleClick(press: IssuedInput, release: IssuedInput): Promise<void> {
     await this.balanced(); this.guard();
