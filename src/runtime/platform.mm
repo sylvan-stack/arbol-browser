@@ -225,9 +225,9 @@ static napi_value publishDirectory(napi_env env, napi_callback_info info) {
   napi_value out; napi_get_undefined(env, &out); return out;
 }
 
-static bool boundedText(napi_env env, napi_value value, std::string& out) {
+static bool boundedText(napi_env env, napi_value value, std::string& out, size_t maximum=arbol_attempt::limit) {
   size_t length = 0, written = 0;
-  if (napi_get_value_string_utf8(env,value,nullptr,0,&length) != napi_ok || !length || length > arbol_attempt::limit) return false;
+  if (napi_get_value_string_utf8(env,value,nullptr,0,&length) != napi_ok || !length || length > maximum) return false;
   out.resize(length+1);
   if (napi_get_value_string_utf8(env,value,out.data(),out.size(),&written) != napi_ok || written != length) return false;
   out.resize(length); return out.find('\0') == std::string::npos;
@@ -1218,7 +1218,7 @@ static napi_value abortHostMarkerMutation(napi_env env,napi_callback_info info) 
 // caller's departure; blocking read-only kernel/FS work is off its event loop.
 struct ExitInspection {
   std::atomic<int> state{0}; std::atomic<bool> cancelled{false};
-  arbol_boundary::Lock owner,build; NSDictionary* input=nil; std::string result; double deadline=0;
+  arbol_boundary::Lock owner,build,dataBuild,nextBuild; NSDictionary* input=nil; std::string result; double deadline=0;
   // Captured only on the owning N-API thread. Worker uses its private Context
   // fields and genuinely shared atomic state, never the live mutable Context
   // or global nativeCustodies container.
@@ -1226,7 +1226,8 @@ struct ExitInspection {
   NSDictionary* hostCapability=nil;
   std::thread* thread=nullptr;
   bool within() const { return !cancelled.load(std::memory_order_acquire)&&arbol_boundary::clockMs()<deadline&&
-    arbol_boundary::lockIdentity(owner)&&arbol_boundary::lockIdentity(build); }
+    arbol_boundary::lockIdentity(owner)&&arbol_boundary::lockIdentity(build)&&
+    (dataBuild.fd<0||arbol_boundary::lockIdentity(dataBuild))&&(nextBuild.fd<0||arbol_boundary::lockIdentity(nextBuild)); }
 };
 static std::set<ExitInspection*> exitInspections;
 static bool receiptIdentity(id value,arbol_boundary::Identity& out,bool withSession=false) {
@@ -1392,7 +1393,7 @@ static bool ordinaryReceipt(NSDictionary* ordinary,NSDictionary* storage,NSDicti
     collected<=started&&started<=completed&&completed<deadline;
 }
 static bool verifyClosedReceipt(NSDictionary* closed,NSDictionary* __strong& capability,NSDictionary* __strong& receipt,
-  NSDictionary* __strong& frontier,ExitInspection& job) {
+  NSDictionary* __strong& frontier,ExitInspection& job,const arbol_boundary::Lock& proofBuild,NSString* bundle) {
   if(!arbol_attempt::record(closed)||![closed[@"phase"] isEqual:@"closed"]||closed[@"terminal"]==NSNull.null||closed[@"engine"]==NSNull.null) return false;
   NSString* path=closed[@"terminal"][@"path"],*profile=closed[@"profile"];
   NSString* state=profile.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent;
@@ -1450,9 +1451,9 @@ static bool verifyClosedReceipt(NSDictionary* closed,NSDictionary* __strong& cap
      ![capability[@"attempt"][@"engine"] isEqual:closed[@"engine"]]||![capability[@"attempt"][@"bootstrap"] isEqual:closed[@"bootstrap"]]||
      !arbol_attempt::sameRuntimeBinding(capability[@"runtime"],closed[@"runtime"])||
      ![capability[@"attemptPath"] isEqual:[job.input[@"runtimeLeaf"] stringByAppendingPathComponent:@"claim.json"]]||
-     ![capability[@"bundle"] isEqual:job.input[@"bundle"]]||![capability[@"markerPath"] isEqual:[profile stringByAppendingPathComponent:@"engine.json"]]||
+     ![capability[@"bundle"] isEqual:bundle]||![capability[@"markerPath"] isEqual:[profile stringByAppendingPathComponent:@"engine.json"]]||
      ![capability[@"locks"][@"owner"] isEqual:arbol_boundary::capsuleLock(job.owner)]||
-     ![capability[@"locks"][@"build"] isEqual:arbol_boundary::capsuleLock(job.build)]||
+     ![capability[@"locks"][@"build"] isEqual:arbol_boundary::capsuleLock(proofBuild)]||
      ![receipt[@"format"] isEqual:@1]||![receipt[@"bootSession"] isEqual:capability[@"bootSession"]]||
      ![receipt[@"profileDirectory"] isEqual:capability[@"profileDirectory"]]||
      ![receipt[@"capabilityDigest"] isEqual:arbol_attempt::digest(arbol_attempt::bytes(capability))]) return false;
@@ -1476,139 +1477,303 @@ static bool verifyClosedReceipt(NSDictionary* closed,NSDictionary* __strong& cap
   }
   return receiptMetadata(capability,closed,job)&&receiptFrontier(capability,frontier,receipt[@"capabilityDigest"],job)&&exitAllOriginalsGone(capability,receipt,job);
 }
+// A never-used original has a separate witness: no family, flush or clean
+// claim can be inferred from it. Its prior data writer is verified separately.
+static bool verifyUnusedReceipt(NSDictionary* closed,NSDictionary* __strong& receipt,ExitInspection& job) {
+  using namespace arbol_attempt;
+  if(!record(closed)||![closed[@"phase"] isEqual:@"closed"]||![closed[@"stage"] isEqual:@"untransferred"]||
+     closed[@"bootstrap"]==NSNull.null||closed[@"terminal"]==NSNull.null) return false;
+  NSString* path=closed[@"terminal"][@"path"],*profile=closed[@"profile"];
+  NSString* parent=[[[profile.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent
+    stringByAppendingPathComponent:@"exit-evidence"] stringByAppendingPathComponent:closed[@"profilePathHash"]] stringByAppendingPathComponent:closed[@"request"]];
+  std::string raw; struct stat identity{};
+  if(![path isEqual:[parent stringByAppendingPathComponent:@"unused.json"]]||
+     !exitReceiptAt(path,raw,receipt,identity)||![digest(raw) isEqual:closed[@"terminal"][@"digest"]]||
+     !keys(receipt,@[@"format",@"kind",@"bootSession",@"actorStage",@"actor",@"attempt",@"baseline",@"baselineDigest",@"bundle",@"locks",@"priorDataClaim",@"marker",@"nativeFacts",@"census",@"observedUs",@"metadataDeadlineUs",@"originalAdmissionExpiryUs"])||
+     ![receipt[@"format"] isEqual:@1]||![receipt[@"kind"] isEqual:@"unused-host-terminal"]||
+     !pattern(receipt[@"bootSession"],@"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")||
+     ![receipt[@"bundle"] isEqual:[closed[@"buildRoot"] stringByAppendingPathComponent:@"ArbolBrowser.app"]]||
+     ![receipt[@"bundle"] isEqual:job.input[@"bundle"]]||
+     !keys(receipt[@"locks"],@[@"build",@"owner"])||
+     ![receipt[@"locks"][@"build"] isEqual:arbol_boundary::capsuleLock(job.build)]||
+     ![receipt[@"marker"] isEqual:@{@"kind":@"unobserved"}]) return false;
+  NSDictionary* attempt=receipt[@"attempt"],*baseline=receipt[@"baseline"],*actor=receipt[@"actor"],*facts=receipt[@"nativeFacts"];
+  if(!record(attempt)||!record(baseline)||!immutable(attempt,closed)||!immutable(baseline,closed)||
+     ![digest(bytes(baseline)) isEqual:receipt[@"baselineDigest"]]||![baseline[@"stage"] isEqual:@"untransferred"]||
+     ![baseline[@"phase"] isEqual:@"claimed"]||baseline[@"terminal"]!=NSNull.null||
+     ![@[@"claimed",@"cancelled"] containsObject:attempt[@"phase"]]||attempt[@"terminal"]!=NSNull.null||
+     ![attempt[@"stage"] isEqual:closed[@"stage"]]||!sameRuntimeBinding(baseline[@"runtime"],attempt[@"runtime"])||
+     !process(actor)||![actor[@"group"] isEqual:actor[@"pid"]]||
+     !keys(facts,@[@"spawnIntent",@"markerPermission",@"sessionPermission",@"execIntent",@"execReturnedFailure",@"execError",@"ownerAcquired",@"fullEnrollmentClaimed"])) return false;
+  for(NSString* key in @[@"stage",@"bootstrap",@"engine",@"runtime"])
+    if(![attempt[key] isEqual:closed[key]]) return false;
+  for(NSString* key in @[@"bootstrap",@"engine"]) if(![baseline[key] isEqual:attempt[key]]) return false;
+  for(NSString* key in @[@"spawnIntent",@"markerPermission",@"sessionPermission",@"fullEnrollmentClaimed"])
+    if(CFGetTypeID((__bridge CFTypeRef)facts[key])!=CFBooleanGetTypeID()||![facts[key] isEqual:@NO]) return false;
+  for(NSString* key in @[@"execIntent",@"execReturnedFailure",@"ownerAcquired"])
+    if(CFGetTypeID((__bridge CFTypeRef)facts[key])!=CFBooleanGetTypeID()) return false;
+  uint64_t error,observed,limit,expiry;
+  if(!uintNumber(facts[@"execError"],error)||error>INT_MAX||!uintNumber(receipt[@"observedUs"],observed)||!observed||
+     !uintNumber(receipt[@"metadataDeadlineUs"],limit)||limit<=observed||limit-observed>1000000||
+     !uintNumber(receipt[@"originalAdmissionExpiryUs"],expiry)||expiry!=(uint64_t)([closed[@"expires"] doubleValue]*1000)||
+     ![receipt[@"census"] isEqual:@{@"kind":@"native-no-spawn-with-fresh-empty-supported-descendants",@"group":actor[@"group"],@"session":actor[@"session"]}]) return false;
+  bool owned=[facts[@"ownerAcquired"] boolValue];
+  if(owned?![receipt[@"locks"][@"owner"] isEqual:arbol_boundary::capsuleLock(job.owner)]:receipt[@"locks"][@"owner"]!=NSNull.null) return false;
+  NSString* stage=receipt[@"actorStage"],*bundle=receipt[@"bundle"];
+  if([stage isEqual:@"outer"]) {
+    if(owned||attempt[@"runtime"]!=NSNull.null||baseline[@"runtime"]!=NSNull.null||
+       ![actor isEqual:attempt[@"bootstrap"]]||attempt[@"engine"]!=NSNull.null||
+       ![actor[@"executable"] isEqual:[bundle stringByAppendingPathComponent:@"Contents/MacOS/arbol-browser-native"]]||
+       ([facts[@"execIntent"] boolValue]?(![facts[@"execReturnedFailure"] boolValue]||!error):([facts[@"execReturnedFailure"] boolValue]||error))) return false;
+  } else if([@[@"post-exec",@"adopted"] containsObject:stage]) {
+    if([facts[@"execIntent"] boolValue]||[facts[@"execReturnedFailure"] boolValue]||error||
+       ![actor[@"executable"] isEqual:[bundle stringByAppendingPathComponent:@"Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron"]]) return false;
+    for(NSString* key in @[@"pid",@"uid",@"startId",@"group",@"session",@"parentStartId",@"parentPidVersion"])
+      if(![actor[key] isEqual:attempt[@"bootstrap"][key]]) return false;
+    if([actor[@"pidVersion"] isEqual:attempt[@"bootstrap"][@"pidVersion"]]||
+       ([stage isEqual:@"post-exec"]&&(owned||attempt[@"runtime"]!=NSNull.null||baseline[@"runtime"]!=NSNull.null))||
+       ([stage isEqual:@"adopted"]?![actor isEqual:attempt[@"engine"]]:attempt[@"engine"]!=NSNull.null)) return false;
+  } else return false;
+  if(attempt[@"runtime"]!=NSNull.null&&(![attempt[@"runtime"][@"phase"] isEqual:@"starting"]||
+     ![attempt[@"runtime"][@"pid"] isEqual:actor[@"pid"]]||![attempt[@"runtime"][@"processStartId"] isEqual:actor[@"startId"]])) return false;
+  id data=receipt[@"priorDataClaim"];
+  if(!data||![data isEqual:job.input[@"dataAttempt"]]||(data!=NSNull.null&&
+     (!record(data)||![data[@"phase"] isEqual:@"closed"]||![data[@"profile"] isEqual:closed[@"profile"]]||
+      ![data[@"profileInstance"] isEqual:closed[@"profileInstance"]]||![data[@"profilePathHash"] isEqual:closed[@"profilePathHash"]]||
+      ![@[@"activation.json",@"terminal.json"] containsObject:[data[@"terminal"][@"path"] lastPathComponent]]))) return false;
+  NSString* boot=arbol_exit::bootSession(); if(!boot) return false;
+  if(![boot isEqual:receipt[@"bootSession"]]) return job.within();
+  // The full original identity is queried later, independently of the writer's
+  // live self observation. PID absence alone is never accepted.
+  arbol_boundary::Identity original;
+  if(!receiptIdentity(@{@"pid":actor[@"pid"],@"startId":actor[@"startId"],@"pidVersion":actor[@"pidVersion"],
+    @"uid":actor[@"uid"],@"group":actor[@"group"],@"session":actor[@"session"]},original,true)) return false;
+  arbol_boundary::OriginalExit gone;
+  while(job.within()) { if(gone.absent(original)) return true; usleep(10000); }
+  return false;
+}
+static bool writeExitHistory(int directory,const char* name,NSDictionary* object,ExitInspection& job) {
+  std::string raw=arbol_attempt::bytes(object),temporary=".history-"+std::string(NSUUID.UUID.UUIDString.UTF8String);
+  arbol_exit::NativeFile file; struct stat published{};
+  return !raw.empty()&&job.within()&&arbol_exit::writeNativeFile(directory,temporary,raw,job.deadline,file)&&job.within()&&
+    !renameat(directory,temporary.c_str(),directory,name)&&
+    arbol_exit::publishedNativeFile(directory,name,raw,file,published,job.deadline)&&file.finish()&&job.within();
+}
+
 static bool inspectExit(ExitInspection& job) {
+  using namespace arbol_attempt;
   NSDictionary* input=job.input,*expected=input[@"attempt"]; NSString* leaf=input[@"runtimeLeaf"],*profile=input[@"profile"];
-  bool prior=[input[@"mode"] isEqual:@"prior"],retire=[input[@"mode"] isEqual:@"retire"];
-  if(!job.within()||!arbol_attempt::keys(input,@[@"format",@"mode",@"profile",@"profileInstance",@"profilePathHash",@"runtimeLeaf",@"bundle",@"attempt",@"previous"])||
-     ![input[@"format"] isEqual:@1]||![@[@"prior",@"full",@"retire"] containsObject:input[@"mode"]]||
-     !arbol_attempt::path(profile)||!arbol_attempt::path(leaf)||!arbol_attempt::path(input[@"bundle"])||
-     !arbol_attempt::pattern(input[@"profileInstance"],@"^prf_[A-Za-z0-9_-]{22}$")||
-     ![input[@"profilePathHash"] isEqual:arbol_attempt::digest(profile.UTF8String)]||
+  bool prior=[input[@"mode"] isEqual:@"prior"],hostMode=[input[@"mode"] isEqual:@"host"],
+    retire=[input[@"mode"] isEqual:@"retire"],reserve=[input[@"mode"] isEqual:@"reserve"],withdraw=[input[@"mode"] isEqual:@"withdraw"];
+  if(!job.within()||!keys(input,@[@"format",@"mode",@"profile",@"profileInstance",@"profilePathHash",@"runtimeLeaf",@"bundle",@"attempt",@"previous",@"dataAttempt",@"pending"])||
+     ![input[@"format"] isEqual:@1]||![@[@"prior",@"host",@"full",@"retire",@"reserve",@"withdraw"] containsObject:input[@"mode"]]||
+     !path(profile)||!path(leaf)||!path(input[@"bundle"])||!pattern(input[@"profileInstance"],@"^prf_[A-Za-z0-9_-]{22}$")||
+     ![input[@"profilePathHash"] isEqual:digest(profile.UTF8String)]||
      ![leaf.lastPathComponent isEqual:[input[@"profilePathHash"] substringToIndex:32]]||
-     job.owner.path!=std::string(profile.fileSystemRepresentation)+"/owner.lock") return false;
+     job.owner.path!=std::string(profile.fileSystemRepresentation)+"/owner.lock"||
+     (reserve?(job.nextBuild.fd<0||!record(input[@"pending"])):input[@"pending"]!=NSNull.null)) return false;
   arbol_exit::NativeFile history; struct stat historyIdentity{};
   NSString* state=profile.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent;
   NSString* historyPath=[[state stringByAppendingPathComponent:@"exit-evidence"] stringByAppendingPathComponent:input[@"profilePathHash"]];
+  if(reserve) {
+    // Only private outside-profile attempt metadata is created here. Never
+    // allocate the per-request receipt directory; native host preparation owns it.
+    arbol_exit::NativeFile root,exits; struct stat rootId{},exitsId{},historyId{};
+    if(!arbol_boundary::canonical(state.fileSystemRepresentation)||!arbol_boundary::privateAncestors(std::string(state.fileSystemRepresentation)+"/exit-evidence")) return false;
+    root.fd=open(state.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if(root.fd<0||fstat(root.fd,&rootId)||!S_ISDIR(rootId.st_mode)||rootId.st_uid!=geteuid()||(rootId.st_mode&07777)!=0700||
+       !arbol_exit::privateDirectoryAt(root.fd,"exit-evidence",exitsId)||exitsId.st_dev!=rootId.st_dev) return false;
+    exits.fd=openat(root.fd,"exit-evidence",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if(exits.fd<0||!arbol_exit::privateDirectoryAt(exits.fd,[input[@"profilePathHash"] UTF8String],historyId)||
+       historyId.st_dev!=rootId.st_dev||fsync(exits.fd)||fsync(root.fd)||!exits.finish()||!root.finish()) return false;
+  }
   errno=0; history.fd=open(historyPath.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
   bool historyMissing=history.fd<0&&errno==ENOENT;
   if(!historyMissing&&(history.fd<0||!arbol_boundary::canonical(historyPath.fileSystemRepresentation)||
     fstat(history.fd,&historyIdentity)||!S_ISDIR(historyIdentity.st_mode)||historyIdentity.st_uid!=geteuid()||(historyIdentity.st_mode&07777)!=0700)) return false;
-  arbol_attempt::Claim claim; std::string currentRaw,headRaw; bool absent,headAbsent=true;
+  Claim claim; std::string currentRaw,headRaw,pointerRaw; bool absent,headAbsent=true,pointerAbsent=true;
   if(!claim.acquire(std::string(leaf.fileSystemRepresentation)+"/claim.json",job.deadline)||
-     !arbol_attempt::readAt(claim.at.directory,"claim.json",currentRaw,absent)||
-     (!historyMissing&&!arbol_attempt::readAt(history.fd,"previous-claim.json",headRaw,headAbsent))||!job.within()) return false;
-  NSDictionary* current=absent?nil:arbol_attempt::json(currentRaw),*head=headAbsent?nil:arbol_attempt::json(headRaw);
-  // Long signature/kernel/receipt reads cannot hold the short transition lock
-  // against the real host's H/ACK checks. Owner/old Build stay genuinely held;
-  // reacquire this SAME stable Claim and compare every captured byte before
-  // accepting or mutating anything. This never unlocks an Owner/Build OFD.
+     !readAt(claim.at.directory,"claim.json",currentRaw,absent)||
+     (!historyMissing&&(!readAt(history.fd,"previous-claim.json",headRaw,headAbsent)||
+       !readAt(history.fd,"current-attempt.json",pointerRaw,pointerAbsent)))||!job.within()) return false;
+  NSDictionary* current=absent?nil:json(currentRaw),*head=headAbsent?nil:json(headRaw),*pointer=pointerAbsent?nil:json(pointerRaw);
+  auto sameProfile=[&](NSDictionary* value) { return record(value)&&[value[@"profile"] isEqual:profile]&&
+    [value[@"profileInstance"] isEqual:input[@"profileInstance"]]&&[value[@"profilePathHash"] isEqual:input[@"profilePathHash"]]; };
+  if((current&&!sameProfile(current))||(head&&(!sameProfile(head)||![head[@"phase"] isEqual:@"closed"]))||
+     (pointer&&(!sameProfile(pointer)||![pointer[@"phase"] isEqual:@"pending"]))||
+     ((current||head)&&!pointer)||(pointer&&!immutable(pointer,current?:head))) return false;
+  auto result=[&](NSString* kind,NSDictionary* data,NSString* request) {
+    bool clean=[kind isEqual:@"activated"];
+    NSDictionary* expectation=data?@{@"kind":clean?@"activated":@"terminal",@"path":data[@"terminal"][@"path"],@"digest":data[@"terminal"][@"digest"]}:@{@"kind":@"absent"};
+    job.result=bytes(@{@"format":@1,@"kind":kind,@"clean":@(clean),@"prior":expectation,@"request":request?:(id)NSNull.null});
+    return !job.result.empty()&&job.within();
+  };
+  if(withdraw) {
+    // Owner custody grants cancellation only, never exit. A possible original
+    // actor must still produce native no-use or complete enrolled closure.
+    if(!current||!expected||![current isEqual:expected]||![current[@"stage"] isEqual:@"untransferred"]||
+       ![@[@"pending",@"claimed",@"cancelled"] containsObject:current[@"phase"]]||current[@"terminal"]!=NSNull.null||
+       job.build.path!=std::string([current[@"buildGuard"] UTF8String])||
+       ![input[@"bundle"] isEqual:[current[@"buildRoot"] stringByAppendingPathComponent:@"ArbolBrowser.app"]]||
+       !arbol_boundary::signature([input[@"bundle"] UTF8String],false)) return false;
+    NSMutableDictionary* cancelled=[current mutableCopy]; cancelled[@"phase"]=@"cancelled";
+    if(!record(cancelled)||!job.within()||!replace(claim.at,currentRaw,false,bytes(cancelled))) return false;
+    return result(@"withdrawn",nil,current[@"request"]);
+  }
+  // Long read-only verification yields this same stable short Claim while
+  // preserving actual Owner and every old/data/new Build open description.
   if(flock(claim.fd,LOCK_UN)) return false;
   auto reclaim=[&] {
     while(flock(claim.fd,LOCK_EX|LOCK_NB)) {
       if((errno!=EWOULDBLOCK&&errno!=EAGAIN)||!job.within()) return false; usleep(1000);
     }
-    std::string checked; bool missing;
-    struct stat heldHistory{},namedHistory{};
+    std::string checked; bool missing; struct stat heldHistory{},namedHistory{};
     bool stableHistory=historyMissing||(!fstat(history.fd,&heldHistory)&&!lstat(historyPath.fileSystemRepresentation,&namedHistory)&&
       heldHistory.st_dev==historyIdentity.st_dev&&heldHistory.st_ino==historyIdentity.st_ino&&
       heldHistory.st_dev==namedHistory.st_dev&&heldHistory.st_ino==namedHistory.st_ino&&
       S_ISDIR(namedHistory.st_mode)&&namedHistory.st_uid==geteuid()&&(namedHistory.st_mode&07777)==0700);
-    return job.within()&&stableHistory&&arbol_attempt::unchanged(claim.at)&&
-      arbol_attempt::readAt(claim.at.directory,"claim.json",checked,missing)&&missing==absent&&checked==currentRaw&&
-      (historyMissing||(arbol_attempt::readAt(history.fd,"previous-claim.json",checked,missing)&&missing==headAbsent&&checked==headRaw))&&
+    if(historyMissing) { errno=0; stableHistory=lstat(historyPath.fileSystemRepresentation,&namedHistory)<0&&errno==ENOENT; }
+    return job.within()&&stableHistory&&unchanged(claim.at)&&
+      readAt(claim.at.directory,"claim.json",checked,missing)&&missing==absent&&checked==currentRaw&&
+      (historyMissing||(readAt(history.fd,"previous-claim.json",checked,missing)&&missing==headAbsent&&checked==headRaw&&
+        readAt(history.fd,"current-attempt.json",checked,missing)&&missing==pointerAbsent&&checked==pointerRaw))&&
       (!job.hostState||job.hostState->fatal.load(std::memory_order_acquire)==0);
   };
-  if((current&&(!arbol_attempt::record(current)||![current[@"profileInstance"] isEqual:input[@"profileInstance"]]))||
-     (head&&(!arbol_attempt::record(head)||![head[@"phase"] isEqual:@"closed"]||![head[@"profileInstance"] isEqual:input[@"profileInstance"]]))) return false;
   NSDictionary* closed=current&&[current[@"phase"] isEqual:@"closed"]?current:head;
-  // A real new host may verify its predecessor before touching engine storage.
-  // Only this exact current signed original, with no mutation/admission, gets
-  // that pre-ready route; CLI inspection cannot reinterpret a live claim.
-  if(current&&![current[@"phase"] isEqual:@"closed"]) {
-    bool host=prior&&[current[@"phase"] isEqual:@"claimed"]&&arbol_attempt::currentProcess(current[@"engine"],true)&&
-      [current[@"profile"] isEqual:profile]&&[current[@"profilePathHash"] isEqual:input[@"profilePathHash"]]&&
+  bool unclaimed=current&&[current[@"stage"] isEqual:@"untransferred"]&&current[@"bootstrap"]==NSNull.null&&
+    current[@"engine"]==NSNull.null&&current[@"runtime"]==NSNull.null&&current[@"terminal"]==NSNull.null&&
+    ([current[@"phase"] isEqual:@"cancelled"]||([current[@"phase"] isEqual:@"pending"]&&[current[@"expires"] doubleValue]<=arbol_boundary::clockMs()));
+  if(current&&![current[@"phase"] isEqual:@"closed"]&&!(unclaimed&&(reserve||[current[@"phase"] isEqual:@"cancelled"]))) {
+    bool host=(prior||hostMode)&&[current[@"phase"] isEqual:@"claimed"]&&currentProcess(current[@"engine"],true)&&
       [current[@"expires"] doubleValue]>arbol_boundary::clockMs()&&
-      [@[@"untransferred",@"retained"] containsObject:current[@"stage"]];
+      [current[@"stage"] isEqual:prior?@"untransferred":@"retained"];
     if(!host) return false;
-    if([current[@"stage"] isEqual:@"retained"]) {
-      auto& c=job.hostContext; auto* state=job.hostState;
-      if(!state||!job.hostCapability||!arbol_attempt::immutable(job.hostCapability[@"attempt"],current)||
+    if(hostMode) {
+      auto& c=job.hostContext; auto* shared=job.hostState;
+      if(!shared||!job.hostCapability||!immutable(job.hostCapability[@"attempt"],current)||
          ![job.hostCapability[@"attempt"][@"engine"] isEqual:current[@"engine"]]||
          ![arbol_boundary::capsuleLock(c.owner) isEqual:arbol_boundary::capsuleLock(job.owner)]||
-         state->enrolled.load(std::memory_order_acquire)!=7||state->fatal.load(std::memory_order_acquire)||
-         !state->main.is(c.main)||!state->primary.is(c.primary)||!state->custody.is(c.custody)||
+         shared->enrolled.load(std::memory_order_acquire)!=7||shared->fatal.load(std::memory_order_acquire)||
+         !shared->main.is(c.main)||!shared->primary.is(c.primary)||!shared->custody.is(c.custody)||
          arbol_boundary::current(c.main)!=1||!c.primaryMonitor()||!c.monitor(c.custody,true)||
          !arbol_boundary::lockIdentity(c.owner)||!arbol_boundary::lockIdentity(c.build)||
          !receiptMetadata(job.hostCapability,current,job)) return false;
     }
-  }
-  if(!closed) {
-    if(expected!=(id)NSNull.null||input[@"previous"]!=NSNull.null||retire) return false;
-    // Fresh host preparation reads no engine marker. Its real post-enrollment
-    // native marker comparison and empty/unmanaged checks remain mandatory.
-    if(!prior) {
+  } else if(hostMode) return false;
+  NSDictionary* data=nil,*capability=nil,*receipt=nil,*frontier=nil,*unusedReceipt=nil;
+  bool unused=closed&&[[closed[@"terminal"][@"path"] lastPathComponent] isEqual:@"unused.json"];
+  auto verify=[&] {
+    if(!closed) {
+      if(expected!=(id)NSNull.null||input[@"dataAttempt"]!=NSNull.null||input[@"previous"]!=NSNull.null||retire) return false;
+    } else {
+      if(expected==(id)NSNull.null||![closed isEqual:expected]||!sameProfile(closed)||
+         job.build.path!=std::string([closed[@"buildGuard"] UTF8String])||
+         ![input[@"bundle"] isEqual:[closed[@"buildRoot"] stringByAppendingPathComponent:@"ArbolBrowser.app"]]||
+         !arbol_boundary::signature([input[@"bundle"] UTF8String],false)) return false;
+      if(unused) {
+        if(!verifyUnusedReceipt(closed,unusedReceipt,job)) return false;
+        data=unusedReceipt[@"priorDataClaim"]==NSNull.null?nil:unusedReceipt[@"priorDataClaim"];
+      } else {
+        if(input[@"dataAttempt"]!=NSNull.null) return false;
+        data=closed;
+      }
+      if(data) {
+        const auto& guard=unused?job.dataBuild:job.build;
+        NSString* bundle=[data[@"buildRoot"] stringByAppendingPathComponent:@"ArbolBrowser.app"];
+        if(guard.fd<0||guard.path!=std::string([data[@"buildGuard"] UTF8String])||!arbol_boundary::signature(bundle.UTF8String,false)||
+           !verifyClosedReceipt(data,capability,receipt,frontier,job,guard,bundle)||
+           (!prior&&!receiptMarker(capability,receipt[@"marker"],job))) return false;
+      }
+      if(input[@"previous"]!=NSNull.null) {
+        NSDictionary* previous=input[@"previous"];
+        bool latest=closed[@"runtime"]!=NSNull.null&&runtime(previous,closed)&&sameRuntimeBinding(previous,closed[@"runtime"]);
+        bool writer=data&&data[@"runtime"]!=NSNull.null&&runtime(previous,data)&&sameRuntimeBinding(previous,data[@"runtime"]);
+        // acquireInstance can publish the genuine starting record before the
+        // next native preparation binds it into claim.json. A no-use original
+        // still binds that physical starting identity through its full actor.
+        bool prefix=unused&&runtime(previous,closed)&&[previous[@"phase"] isEqual:@"starting"]&&
+          [previous[@"pid"] isEqual:unusedReceipt[@"actor"][@"pid"]]&&
+          [previous[@"processStartId"] isEqual:unusedReceipt[@"actor"][@"startId"]];
+        if(!latest&&!writer&&!prefix) return false;
+      }
+    }
+    if(!data&&!prior) {
       arbol_exit::NativeFile root; root.fd=open(profile.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
       std::string raw; struct stat marker{}; bool missing;
       if(root.fd<0||!markerAt(root.fd,raw,marker,missing)||!missing||!root.finish()) return false;
     }
-    job.result=arbol_attempt::bytes(@{@"format":@1,@"kind":@"never-opened",@"clean":@NO,@"prior":@{@"kind":@"absent"},@"request":NSNull.null});
-    return !job.result.empty()&&reclaim();
-  }
-  if(expected==(id)NSNull.null||![closed isEqual:expected]||![closed[@"profile"] isEqual:profile]||
-     ![closed[@"profileInstance"] isEqual:input[@"profileInstance"]]||![closed[@"profilePathHash"] isEqual:input[@"profilePathHash"]]||
-     job.build.path!=std::string([closed[@"buildGuard"] UTF8String])||
-     ![input[@"bundle"] isEqual:[closed[@"buildRoot"] stringByAppendingPathComponent:@"ArbolBrowser.app"]]||
-     !arbol_boundary::signature([input[@"bundle"] UTF8String],false)) return false;
-  if(input[@"previous"]!=NSNull.null&&(!arbol_attempt::runtime(input[@"previous"],closed)||
-     !arbol_attempt::sameRuntimeBinding(input[@"previous"],closed[@"runtime"]))) return false;
-  NSDictionary* capability=nil,*receipt=nil,*frontier=nil;
-  if(!verifyClosedReceipt(closed,capability,receipt,frontier,job)||
-     (!prior&&!receiptMarker(capability,receipt[@"marker"],job))) return false;
-  // Revalidate every immutable physical frontier/metadata after the potentially
-  // blocked kernel query; no earlier partial observation can be accepted late.
-  if(!receiptMetadata(capability,closed,job)||!receiptFrontier(capability,frontier,receipt[@"capabilityDigest"],job)||
-     (!prior&&!receiptMarker(capability,receipt[@"marker"],job))||!arbol_attempt::unchanged(claim.at)) return false;
-  if(!reclaim()) return false;
-  std::string checked; bool missing;
-  if(retire) {
-    if(!current||![current isEqual:closed]||historyMissing||!job.within()) return false;
-    // This is a retained exact native CLOSED CLAIM, not a new exit certificate.
-    // Every future use repeats full receipt/marker/original-absence validation.
-    // Write its durable reference before retiring the old reservation, so a
-    // later pending claim cannot erase the last actual data-writer identity.
-    std::string closedRaw=arbol_attempt::bytes(closed);
-    if(!head||![head isEqual:closed]) {
-      NSDictionary* oldReference=head?head[@"terminal"]:nil,*priorReference=capability[@"prior"];
-      if(head&&(![oldReference[@"path"] isEqual:priorReference[@"path"]]||![oldReference[@"digest"] isEqual:priorReference[@"digest"]])) return false;
-      if(!head&&![priorReference[@"kind"] isEqual:@"absent"]) return false;
-      std::string temporary=".previous-"+std::string(NSUUID.UUID.UUIDString.UTF8String); arbol_exit::NativeFile file; struct stat published{};
-      if(!job.within()||!arbol_exit::writeNativeFile(history.fd,temporary,closedRaw,job.deadline,file)||!job.within()||
-         renameat(history.fd,temporary.c_str(),history.fd,"previous-claim.json")||
-         !arbol_exit::publishedNativeFile(history.fd,"previous-claim.json",closedRaw,file,published,job.deadline)||!file.finish()) return false;
+    return job.within();
+  };
+  auto physical=[&] {
+    if(data&&(!receiptMetadata(capability,data,job)||!receiptFrontier(capability,frontier,receipt[@"capabilityDigest"],job)||
+       (!prior&&!receiptMarker(capability,receipt[@"marker"],job)))) return false;
+    if(unused) {
+      std::string raw; NSDictionary* checked=nil; struct stat identity{};
+      if(!exitReceiptAt(closed[@"terminal"][@"path"],raw,checked,identity)||
+         ![digest(raw) isEqual:closed[@"terminal"][@"digest"]]||![checked isEqual:unusedReceipt]) return false;
     }
-    if(!job.within()||!arbol_attempt::readAt(claim.at.directory,"claim.json",checked,missing)||missing||checked!=currentRaw||
-       unlinkat(claim.at.directory,"claim.json",0)||fsync(claim.at.directory)||!arbol_attempt::unchanged(claim.at)||!job.within()) return false;
+    return job.within();
+  };
+  if(!verify()||!physical()||!unchanged(claim.at)||!reclaim()) return false;
+  if(reserve) {
+    NSDictionary* next=input[@"pending"];
+    // This privileged transition is distinct from generic Role::starter. Repeat
+    // all terminal/prior-data/physical checks with this ONE genuine Claim held;
+    // only then can the actual live starter replace the unchanged exact record.
+    if(!verify()||!physical()||!sameProfile(next)||!transition(nil,next,Role::starter)||
+       job.nextBuild.path!=std::string([next[@"buildGuard"] UTF8String])||
+       !arbol_boundary::signature([[next[@"buildRoot"] stringByAppendingPathComponent:@"ArbolBrowser.app"] UTF8String],false)||
+       (current&&[current[@"request"] isEqual:next[@"request"]])||historyMissing) return false;
+    // Persist predecessor first, newest immutable reservation second, and only
+    // then install pending atomically. Interrupted publication fails closed:
+    // a missing/mismatched newest claim cannot fall back to an older witness.
+    if(closed&&(!head||![head isEqual:closed])&&!writeExitHistory(history.fd,"previous-claim.json",closed,job)) return false;
+    if(!writeExitHistory(history.fd,"current-attempt.json",next,job)||!job.within()||
+       !replace(claim.at,currentRaw,absent,bytes(next))) return false;
+  } else if(retire) {
+    if(!current||![current isEqual:closed]||historyMissing||!verify()||
+       !writeExitHistory(history.fd,"previous-claim.json",closed,job)||!job.within()||
+       unlinkat(claim.at.directory,"claim.json",0)||fsync(claim.at.directory)||!unchanged(claim.at)) return false;
   }
-  bool clean=[receipt[@"kind"] isEqual:@"activated-exit"];
-  job.result=arbol_attempt::bytes(@{@"format":@1,@"kind":clean?@"activated":@"terminal",@"clean":@(clean),
-    @"prior":@{@"kind":clean?@"activated":@"terminal",@"path":closed[@"terminal"][@"path"],@"digest":closed[@"terminal"][@"digest"]},
-    @"request":closed[@"request"]});
-  return !job.result.empty()&&job.within()&&(historyMissing||history.finish());
+  NSString* kind=data?([receipt[@"kind"] isEqual:@"activated-exit"]?@"activated":@"terminal"):@"never-opened";
+  return result(kind,data,closed?closed[@"request"]:nil)&&(historyMissing||history.finish());
 }
 static napi_value beginExitInspection(napi_env env,napi_callback_info info) {
-  napi_value args[4]; size_t n=4; void *ownerValue=nullptr,*buildValue=nullptr; std::string input; double deadline;
-  if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok||n!=4||napi_get_value_external(env,args[0],&ownerValue)!=napi_ok||
-     napi_get_value_external(env,args[1],&buildValue)!=napi_ok||!boundedText(env,args[2],input)||
+  napi_value args[6]; size_t n=6; void *ownerValue=nullptr,*buildValue=nullptr; std::string input; double deadline;
+  if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok||n!=6||napi_get_value_external(env,args[0],&ownerValue)!=napi_ok||
+     napi_get_value_external(env,args[1],&buildValue)!=napi_ok||!boundedText(env,args[2],input,65536)||
      napi_get_value_double(env,args[3],&deadline)!=napi_ok||!std::isfinite(deadline)||deadline<=arbol_boundary::clockMs()||
      deadline>arbol_boundary::clockMs()+10000||!arbol_boundary::retainNativeImage()) return fail(env);
   auto* owner=static_cast<HeldLock*>(ownerValue); auto* build=static_cast<HeldLock*>(buildValue);
   if(!liveLocks.count(owner)||!liveLocks.count(build)||owner->mode!=LOCK_EX||build->mode!=LOCK_SH) return fail(env);
-  auto* job=new ExitInspection; job->owner=duplicateHeld(owner); job->build=duplicateHeld(build); job->deadline=deadline; job->input=arbol_attempt::json(input);
-  if(!job->input||!job->within()) { if(job->owner.fd>=0) close(job->owner.fd); if(job->build.fd>=0) close(job->build.fd); delete job; return fail(env); }
+  HeldLock* additional[2]={nullptr,nullptr};
+  for(unsigned i=0;i<2;++i) {
+    napi_valuetype type; void* value=nullptr;
+    if(napi_typeof(env,args[i+4],&type)!=napi_ok) return fail(env);
+    if(type==napi_null) continue;
+    if(napi_get_value_external(env,args[i+4],&value)!=napi_ok) return fail(env);
+    additional[i]=static_cast<HeldLock*>(value);
+    if(!liveLocks.count(additional[i])||additional[i]->mode!=LOCK_SH) return fail(env);
+  }
+  auto* job=new ExitInspection; job->owner=duplicateHeld(owner); job->build=duplicateHeld(build); job->deadline=deadline;
+  // In-process command bytes are ordinary JSON, not a durable canonical exit
+  // certificate. Parse immutable data, then enforce exact envelope keys and
+  // each complete 16 KiB native attempt grammar independently below.
+  NSData* command=[NSData dataWithBytes:input.data() length:input.size()];
+  id parsed=[NSJSONSerialization JSONObjectWithData:command options:0 error:nil];
+  job->input=[parsed isKindOfClass:NSDictionary.class]?parsed:nil;
+  if(additional[0]) job->dataBuild=duplicateHeld(additional[0]);
+  if(additional[1]) job->nextBuild=duplicateHeld(additional[1]);
+  auto closeInputs=[&] { for(auto* lock:{&job->owner,&job->build,&job->dataBuild,&job->nextBuild}) if(lock->fd>=0) close(lock->fd); };
+  if(!job->input||!job->within()||(additional[0]&&job->dataBuild.fd<0)||(additional[1]&&job->nextBuild.fd<0)) {
+    closeInputs(); delete job; return fail(env);
+  }
+  for(NSString* key in @[@"attempt",@"dataAttempt",@"pending"]) if(job->input[key]!=NSNull.null&&
+    (!arbol_attempt::record(job->input[key])||arbol_attempt::bytes(job->input[key]).empty())) { closeInputs(); delete job; return fail(env); }
   // The sole owning thread reads its own custody container and immutable role
   // fields before starting the worker. No worker calls HostCapability::held on
   // a live shared Context (primaryOutside and census maps are not atomic).
-  if([job->input[@"mode"] isEqual:@"prior"]) for(auto* c:nativeCustodies) {
+  if([job->input[@"mode"] isEqual:@"host"]) for(auto* c:nativeCustodies) {
     if(!c->hostRequired||!c->bound||!c->finalization.present()||
        ![c->finalization.value()[@"attempt"][@"profile"] isEqual:job->input[@"profile"]]||
        ![arbol_boundary::capsuleLock(c->context.owner) isEqual:arbol_boundary::capsuleLock(job->owner)]) continue;
@@ -1621,17 +1786,17 @@ static napi_value beginExitInspection(napi_env env,napi_callback_info info) {
   try {
     exitInspections.insert(job);
     if(napi_create_external(env,job,nullptr,nullptr,&out)!=napi_ok) {
-      exitInspections.erase(job); close(job->owner.fd); close(job->build.fd); delete job; return fail(env);
+      exitInspections.erase(job); closeInputs(); delete job; return fail(env);
     }
     job->thread=new std::thread([job] {
       bool ok=false;
       @autoreleasepool { @try { try { ok=inspectExit(*job); } catch(...) {} } @catch(NSException*) {} }
-      if(close(job->owner.fd)) ok=false; if(close(job->build.fd)) ok=false;
+      for(auto* lock:{&job->owner,&job->build,&job->dataBuild,&job->nextBuild}) if(lock->fd>=0&&close(lock->fd)) ok=false;
       job->state.store(ok&&!job->cancelled.load(std::memory_order_acquire)&&arbol_boundary::clockMs()<job->deadline?1:-1,std::memory_order_release);
     });
     try { job->thread->detach(); } catch(...) {}
     return out; // no allocating publication can fail after the worker started
-  } catch(...) { exitInspections.erase(job); close(job->owner.fd); close(job->build.fd); delete job; return fail(env); }
+  } catch(...) { exitInspections.erase(job); closeInputs(); delete job; return fail(env); }
 }
 static ExitInspection* exitInspectionArgument(napi_env env,napi_callback_info info) {
   napi_value arg; void* data=nullptr;

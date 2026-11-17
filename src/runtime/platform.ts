@@ -55,14 +55,16 @@ export interface WatchdogCustody {
 export type PriorMarkerExpectation = Readonly<{ kind: 'absent' } | { kind: 'activated' | 'terminal'; path: string; digest: string }>;
 export interface NativeExitInput {
   readonly format: 1;
-  readonly mode: 'prior' | 'full' | 'retire';
+  readonly mode: 'prior' | 'host' | 'full' | 'retire' | 'reserve' | 'withdraw';
   readonly profile: string; readonly profileInstance: string; readonly profilePathHash: string;
   readonly runtimeLeaf: string; readonly bundle: string;
   readonly attempt: import('./process.js').LaunchAttempt | null;
   readonly previous: import('./instance.js').RuntimeRecord | null;
+  readonly dataAttempt?: import('./process.js').LaunchAttempt | null;
+  readonly pending?: import('./process.js').LaunchAttempt | null;
 }
 export interface ExitInspectionReceipt {
-  readonly kind: 'never-opened' | 'activated' | 'terminal'; readonly clean: boolean;
+  readonly kind: 'never-opened' | 'activated' | 'terminal' | 'withdrawn'; readonly clean: boolean;
   readonly prior: PriorMarkerExpectation; readonly request: string | null;
 }
 const exitInspectionReceipts = new WeakSet<object>();
@@ -85,7 +87,7 @@ export interface PlatformPort {
   /** Actual held owner and independently verified OLD Build; native claims,
    * complete receipts, physical metadata/marker/frontiers and full original
    * absence are verified off the caller event loop under the original bound. */
-  inspectExit(owner: HeldLock, build: HeldLock, input: NativeExitInput, deadline: number): Promise<ExitInspectionReceipt>;
+  inspectExit(owner: HeldLock, build: HeldLock, input: NativeExitInput, deadline: number, guards?: Readonly<{ data?: HeldLock; next?: HeldLock }>): Promise<ExitInspectionReceipt>;
   /** One-use fixed-exec native adoption. No numeric FD or role is accepted. */
   adoptHostBuild(requestPath: string, guard: string, bundle: string): HeldLock;
   /** Actual adopted original only: authentic no-use terminal or retained real
@@ -120,7 +122,7 @@ export interface PlatformPort {
   peerIdentity(socketFd: number): ProcessIdentity;
 }
 interface NativeSupport {
-  beginExitInspection(owner: object, build: object, input: string, nativeDeadline: number): object;
+  beginExitInspection(owner: object, build: object, input: string, nativeDeadline: number, data: object | null, next: object | null): object;
   pollExitInspection(handle: object): string | null;
   cancelExitInspection(handle: object): void;
   beginHostSessionUse(handle: object): object;
@@ -331,14 +333,19 @@ export function loadPlatform(): PlatformPort {
       if (!actual || (owner && !actualOwner)) throw unavailable('browser');
       build.assertIdentity(); owner?.assertIdentity(); return call(() => native.terminateAdoptedHost(actual, actualOwner ?? null));
     },
-    async inspectExit(owner: HeldLock, build: HeldLock, input: NativeExitInput, deadline: number): Promise<ExitInspectionReceipt> {
+    async inspectExit(owner: HeldLock, build: HeldLock, input: NativeExitInput, deadline: number, guards?: Readonly<{ data?: HeldLock; next?: HeldLock }>): Promise<ExitInspectionReceipt> {
       const actualOwner = locks.get(owner), actualBuild = locks.get(build);
       if (!actualOwner || !actualBuild || !Number.isFinite(deadline)) throw unavailable('profile');
       owner.assertIdentity(); build.assertIdentity();
       const nativeNow = call(() => native.continuousTime()), sampled = performance.now();
       if (sampled >= deadline) throw unavailable('profile');
       const nativeDeadline = nativeNow + Math.min(10000, deadline - sampled);
-      const handle = call(() => native.beginExitInspection(actualOwner, actualBuild, JSON.stringify(input), nativeDeadline));
+      const actualData = guards?.data ? locks.get(guards.data) : null, actualNext = guards?.next ? locks.get(guards.next) : null;
+      if ((guards?.data && !actualData) || (guards?.next && !actualNext)) throw unavailable('profile');
+      guards?.data?.assertIdentity(); guards?.next?.assertIdentity();
+      const handle = call(() => native.beginExitInspection(actualOwner, actualBuild,
+        JSON.stringify({ ...input, dataAttempt: input.dataAttempt ?? null, pending: input.pending ?? null }), nativeDeadline,
+        actualData ?? null, actualNext ?? null));
       try {
         while (performance.now() < deadline && call(() => native.continuousTime()) < nativeDeadline) {
           const raw = call(() => native.pollExitInspection(handle));
@@ -346,14 +353,14 @@ export function loadPlatform(): PlatformPort {
             if (typeof raw !== 'string' || !raw.length || Buffer.byteLength(raw) > 16384) throw unavailable('profile');
             const value = JSON.parse(raw) as ExitInspectionReceipt & { format: number };
             if (!value || Object.keys(value).sort().join(',') !== 'clean,format,kind,prior,request' || value.format !== 1 ||
-                !['never-opened', 'activated', 'terminal'].includes(value.kind) || typeof value.clean !== 'boolean' ||
-                value.clean !== (value.kind === 'activated') || (value.request !== null && !/^req_[A-Za-z0-9_-]{22}$/.test(value.request)))
+                !['never-opened', 'activated', 'terminal', 'withdrawn'].includes(value.kind) || typeof value.clean !== 'boolean' ||
+                value.clean !== (value.kind === 'activated') || (value.kind === 'withdrawn') !== (input.mode === 'withdraw') || (value.request !== null && !/^req_[A-Za-z0-9_-]{22}$/.test(value.request)))
               throw unavailable('profile');
             const prior = value.prior;
             if (!prior || (prior.kind === 'absent' ? Object.keys(prior).join(',') !== 'kind' :
                 !['activated', 'terminal'].includes(prior.kind) || Object.keys(prior).sort().join(',') !== 'digest,kind,path' ||
                 !isAbsolute(prior.path) || !/^[0-9a-f]{64}$/.test(prior.digest))) throw unavailable('profile');
-            owner.assertIdentity(); build.assertIdentity();
+            owner.assertIdentity(); build.assertIdentity(); guards?.data?.assertIdentity(); guards?.next?.assertIdentity();
             if (performance.now() >= deadline || call(() => native.continuousTime()) >= nativeDeadline) throw unavailable('profile');
             const result: ExitInspectionReceipt = Object.freeze({ kind: value.kind, clean: value.clean,
               prior: Object.freeze({ ...prior }), request: value.request });

@@ -9,7 +9,7 @@ import { assertProfile, readJson, type ProfileSnapshot } from '../profiles/recor
 import { statOrAbsent } from '../profiles/paths.js';
 import { ownerLock, withOwnerLockForCustody, type OwnerLease } from '../profiles/locking.js';
 import { acquireBuildLease, withBuildLockForCustody, type BuildLease } from './build-lease.js';
-import { verifyPackagedHost, type VerifiedHost } from './authorities.js';
+import { assertVerifiedHost, verifyPackagedHost, type VerifiedHost } from './authorities.js';
 import { assertPlatform, assertExitInspectionReceipt, type PlatformPort, type ExitInspectionReceipt, type PriorMarkerExpectation } from './platform.js';
 import { withLaunchAttempt, type LaunchAttempt } from './process.js';
 import { now, assertTime, runtimeLocation, type RuntimeRecord } from './instance.js';
@@ -25,6 +25,13 @@ export interface ProductionExitAuthority extends ExitAuthority, HostPreviousExit
   /** Retires only the independently verified exact closed reservation, retaining
    * its native closed-claim history outside profile and transient socket roots. */
   retire(profile: ProfileSnapshot, owner: OwnerLease, deadline: number): Promise<void>;
+  /** Private native admission under the actual temporary Owner and selected
+   * Build. The caller releases temporary Owner before LaunchServices. */
+  reserve(profile: ProfileSnapshot, owner: OwnerLease, host: VerifiedHost, build: BuildLease,
+    pending: LaunchAttempt, deadline: number): Promise<void>;
+  /** Cancellation is not an exit receipt. A possible claimed original still
+   * needs independent native terminal evidence and later original absence. */
+  withdraw(profile: ProfileSnapshot, owner: OwnerLease, deadline: number): Promise<void>;
 }
 const authorities = new WeakSet<object>();
 export function assertProductionExitAuthority(value: ProductionExitAuthority): void {
@@ -44,72 +51,84 @@ function closedCandidate(value: unknown, profile: ProfileSnapshot, hash: string)
       ![attempt.sourceDigest, attempt.productDigest, attempt.candidateDigest, attempt.terminal.digest].every(value => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value)))
     throw unavailable('profile');
   const prefix = join(profile.paths.state, 'exit-evidence', hash, attempt.request);
-  if (![join(prefix, 'activation.json'), join(prefix, 'terminal.json')].includes(attempt.terminal.path)) throw unavailable('profile');
+  if (![join(prefix, 'activation.json'), join(prefix, 'terminal.json'), join(prefix, 'unused.json')].includes(attempt.terminal.path)) throw unavailable('profile');
   return attempt;
 }
 /** Build selection is the current CLI location only. A previous instance's
  * signed package and original stable Build guard are always proved separately. */
 export function createProductionExitAuthority(platform: PlatformPort, selection: BuildSelection): ProductionExitAuthority {
   assertPlatform(platform);
-  const priorProofs = new WeakMap<OwnerLease, { candidate: string; host: VerifiedHost; build: BuildLease }>();
+  type OldProof = { host: VerifiedHost; build: BuildLease };
+  const priorProofs = new WeakMap<OwnerLease, Map<string, OldProof>>();
   const inspect = async (profile: ProfileSnapshot, previous: RuntimeRecord | undefined, owner: OwnerLease,
-    mode: 'prior' | 'full' | 'retire', deadline: number, currentBuild?: BuildLease): Promise<ExitInspectionReceipt> => {
+    mode: 'prior' | 'host' | 'full' | 'retire' | 'reserve' | 'withdraw', deadline: number, currentBuild?: BuildLease,
+    pending?: LaunchAttempt): Promise<ExitInspectionReceipt> => {
     assertTime(deadline); await owner.assert(); await assertProfile(profile);
     if (owner.profile !== profile) throw unavailable('profile');
     const location = await runtimeLocation(profile, true); if (!location) throw unavailable('profile');
     const current = await withLaunchAttempt(profile, platform, deadline, transaction => transaction.current);
-    let candidate: LaunchAttempt | undefined;
-    if (current?.phase === 'closed') candidate = closedCandidate(current, profile, location.hash);
+    // Pre-arm reads outside-profile proof only; marker inspection is explicitly
+    // behind the actual native enrolled host capability in the separate mode.
+    const actualMode = mode === 'prior' && current?.stage === 'retained' ? 'host' : mode;
+    let candidate: LaunchAttempt | undefined, dataAttempt: LaunchAttempt | undefined;
+    if (mode === 'withdraw') candidate = current;
+    else if (current?.phase === 'closed') candidate = closedCandidate(current, profile, location.hash);
     else {
       const path = join(profile.paths.state, 'exit-evidence', location.hash, 'previous-claim.json');
       if (await statOrAbsent(path)) candidate = closedCandidate((await readJson(path, 16384)).value, profile, location.hash);
     }
-    let build: BuildLease | undefined, release = false;
-    try {
-      if (candidate) {
-        const oldSelection: BuildSelection = Object.freeze({ build: candidate.build, directory: candidate.buildRoot,
-          guard: candidate.buildGuard, explicit: true });
-        const retained = mode === 'prior' ? priorProofs.get(owner) : undefined;
-        if (retained) {
-          if (retained.candidate !== JSON.stringify(candidate)) throw unavailable('profile');
-          if (retained.host.signed.snapshotDigest !== candidate.candidateDigest ||
-              retained.host.identity.sourceDigest !== candidate.sourceDigest || retained.host.identity.productDigest !== candidate.productDigest ||
-              retained.host.policy.stateRoot !== profile.paths.state) throw unavailable('profile');
-          assertTime(deadline); build = retained.build;
-          // Its exact old guard has remained held since genuine pre-arm trust.
-          // Native rechecks signature/claim/receipt/current bytes off-thread;
-          // no post-arm codesign child or synchronous whole-payload hash.
-          await build.assert();
-        } else {
-          if (mode === 'prior' && current && current.stage !== 'untransferred') throw unavailable('profile');
-          build = await acquireBuildLease(oldSelection, platform); release = true;
-          const payload = join(candidate.buildRoot, 'ArbolBrowser.app/Contents/Resources/browser');
-          const oldHost = await verifyPackagedHost(oldSelection, payload, deadline);
-          if (oldHost.policy.stateRoot !== profile.paths.state || oldHost.signed.snapshotDigest !== candidate.candidateDigest ||
-              oldHost.identity.sourceDigest !== candidate.sourceDigest || oldHost.identity.productDigest !== candidate.productDigest)
-            throw unavailable('profile');
-          await oldHost.assertTrusted(deadline); await build.assert();
-          if (mode === 'prior') {
-            priorProofs.set(owner, { candidate: JSON.stringify(candidate), host: oldHost, build }); release = false;
-          }
-        }
-      } else {
-        if (previous || mode === 'retire') throw unavailable('profile');
-        build = currentBuild ?? await acquireBuildLease(selection, platform); release = !currentBuild;
+    if (candidate?.terminal && basename(candidate.terminal.path) === 'unused.json') {
+      // Selecting the old data Build is not accepting a certificate. Native
+      // rereads the exact witness/digest and validates its direct binding and
+      // full data-writer proof, actual marker and genuine independent guard.
+      const receipt = (await readJson(candidate.terminal.path, 262144)).value as { priorDataClaim?: unknown };
+      if (receipt.priorDataClaim !== null) dataAttempt = closedCandidate(receipt.priorDataClaim, profile, location.hash);
+      if (dataAttempt && basename(dataAttempt.terminal!.path) === 'unused.json') throw unavailable('profile');
+    }
+    const release: BuildLease[] = [];
+    const oldProof = async (attempt: LaunchAttempt): Promise<OldProof> => {
+      const key = JSON.stringify(attempt), retained = priorProofs.get(owner)?.get(key);
+      if (retained) {
+        await retained.build.assert(); assertTime(deadline); return retained;
       }
-      const actualBuild = build, physicalLeaf = await realpath(location.leaf);
+      if (actualMode === 'host') throw unavailable('profile');
+      const oldSelection: BuildSelection = Object.freeze({ build: attempt.build, directory: attempt.buildRoot,
+        guard: attempt.buildGuard, explicit: true });
+      const build = await acquireBuildLease(oldSelection, platform); release.push(build);
+      const host = await verifyPackagedHost(oldSelection, join(attempt.buildRoot, 'ArbolBrowser.app/Contents/Resources/browser'), deadline);
+      if (host.policy.stateRoot !== profile.paths.state || host.signed.snapshotDigest !== attempt.candidateDigest ||
+          host.identity.sourceDigest !== attempt.sourceDigest || host.identity.productDigest !== attempt.productDigest) throw unavailable('profile');
+      await host.assertTrusted(deadline); await build.assert();
+      if (actualMode === 'prior') {
+        const proofs = priorProofs.get(owner) ?? new Map<string, OldProof>(); proofs.set(key, { host, build }); priorProofs.set(owner, proofs);
+        release.splice(release.indexOf(build), 1);
+      }
+      return { host, build };
+    };
+    try {
+      const build = candidate ? (await oldProof(candidate)).build : currentBuild ?? await acquireBuildLease(selection, platform);
+      if (!candidate && !currentBuild) release.push(build);
+      const dataBuild = dataAttempt ? (await oldProof(dataAttempt)).build : undefined;
+      const physicalLeaf = await realpath(location.leaf);
       const result = await withOwnerLockForCustody(owner, platform, heldOwner =>
-        withBuildLockForCustody(actualBuild, platform, heldBuild => platform.inspectExit(heldOwner, heldBuild, {
-          format: 1, mode, profile: profile.paths.root, profileInstance: profile.record.instance,
-          profilePathHash: location.hash, runtimeLeaf: physicalLeaf, bundle: join(actualBuild.selection.directory, 'ArbolBrowser.app'),
-          attempt: candidate ?? null, previous: previous ?? null,
-        }, deadline)));
-      assertExitInspectionReceipt(result); await owner.assert(); await actualBuild.assert(); await location.assert(); assertTime(deadline);
-      if (mode === 'prior' && current?.stage === 'retained' && priorProofs.get(owner)?.build === actualBuild) {
-        priorProofs.delete(owner); release = true;
+        withBuildLockForCustody(build, platform, async heldBuild => {
+          const invoke = (data?: import('./platform.js').HeldLock, next?: import('./platform.js').HeldLock) => platform.inspectExit(heldOwner, heldBuild, {
+            format: 1, mode: actualMode, profile: profile.paths.root, profileInstance: profile.record.instance,
+            profilePathHash: location.hash, runtimeLeaf: physicalLeaf, bundle: join(build.selection.directory, 'ArbolBrowser.app'),
+            attempt: candidate ?? null, previous: previous ?? null, dataAttempt: dataAttempt ?? null, pending: pending ?? null,
+          }, deadline, { ...(data ? { data } : {}), ...(next ? { next } : {}) });
+          const withNext = (data?: import('./platform.js').HeldLock) => actualMode === 'reserve' && currentBuild ?
+            withBuildLockForCustody(currentBuild, platform, next => invoke(data, next)) : invoke(data);
+          return dataBuild ? withBuildLockForCustody(dataBuild, platform, data => withNext(data)) : withNext();
+        }));
+      assertExitInspectionReceipt(result); await owner.assert(); await build.assert(); await dataBuild?.assert();
+      await currentBuild?.assert(); await location.assert(); assertTime(deadline);
+      if (actualMode === 'host') {
+        const proofs = priorProofs.get(owner); priorProofs.delete(owner);
+        for (const proof of proofs?.values() ?? []) release.push(proof.build);
       }
       return result;
-    } finally { if (release) build?.release(); }
+    } finally { for (const build of new Set(release)) build.release(); }
   };
   const withOwner = async <T>(profile: ProfileSnapshot, supplied: OwnerLease | undefined, deadline: number,
     operation: (owner: OwnerLease) => Promise<T>): Promise<T> => {
@@ -158,6 +177,17 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
         await setTimeout(Math.min(10, Math.max(1, deadline - now())));
       }
       throw unavailable('profile');
+    },
+    async reserve(profile: ProfileSnapshot, owner: OwnerLease, host: VerifiedHost, build: BuildLease,
+      pending: LaunchAttempt, deadline: number) {
+      assertVerifiedHost(host, deadline); await host.assertTrusted(deadline); await build.assert();
+      if (build.selection.directory !== host.identity.layout.buildRoot || pending.buildRoot !== build.selection.directory ||
+          pending.candidateDigest !== host.signed.snapshotDigest || pending.sourceDigest !== host.identity.sourceDigest ||
+          pending.productDigest !== host.identity.productDigest) throw unavailable('profile');
+      await inspect(profile, undefined, owner, 'reserve', deadline, build, pending);
+    },
+    async withdraw(profile: ProfileSnapshot, owner: OwnerLease, deadline: number) {
+      await inspect(profile, undefined, owner, 'withdraw', deadline);
     },
     async retire(profile: ProfileSnapshot, owner: OwnerLease, deadline: number) {
       await inspect(profile, undefined, owner, 'retire', deadline);
