@@ -6,7 +6,7 @@ import { assertProfile } from '../profiles/records.js';
 import { withOwnerLockForCustody, type OwnerLease } from '../profiles/locking.js';
 import { terminateAdoptedBuild, withBuildLockForCustody, type BuildLease } from './build-lease.js';
 import { assertVerifiedHost, bindArmedHost, type VerifiedHost } from './authorities.js';
-import { assertPlatform, assertWatchdogCustody, type PlatformPort, type WatchdogCustody, type PriorMarkerExpectation } from './platform.js';
+import { assertPlatform, assertWatchdogCustody, type PlatformPort, type WatchdogCustody, type PriorMarkerExpectation, type HostStartupStage } from './platform.js';
 import { assertTime, type InstanceOwner } from './instance.js';
 import { claimedHostAttempt } from './process.js';
 import type { NativeBoundaryPreparation } from './bootstrap.js';
@@ -35,7 +35,15 @@ export interface HostCustody {
   assertMarker(): void;
   terminate(): never;
 }
-const receipts = new WeakMap<HostCustody, { native: WatchdogCustody; watchdog?: NativeWatchdog }>();
+const receipts = new WeakMap<HostCustody, { native: WatchdogCustody; platform: PlatformPort; watchdog?: NativeWatchdog }>();
+/** Observe through only the actual receipt's original provider/handle. This
+ * performs no admission, custody assertion, Claim operation or fatal action. */
+export function noteHostStartup(custody: HostCustody | undefined, stage: HostStartupStage): void {
+  try {
+    const actual = custody && receipts.get(custody);
+    if (actual) actual.platform.noteHostStartup(actual.native, stage);
+  } catch { /* Diagnostics cannot replace the actual result or failure. */ }
+}
 const preparations = new WeakSet<InstanceOwner>();
 export function isHostCustody(value: unknown): value is HostCustody {
   return typeof value === 'object' && value !== null && receipts.has(value as HostCustody);
@@ -171,5 +179,5 @@ export async function prepareHostCustody(host: VerifiedHost, instance: InstanceO
     },
     terminate(): never { return native.terminate(); },
   });
-  receipts.set(receipt, { native }); return receipt;
+  receipts.set(receipt, { native, platform }); return receipt;
 }

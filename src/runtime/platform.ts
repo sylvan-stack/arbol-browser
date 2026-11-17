@@ -95,7 +95,13 @@ export function assertSystemClipboardProtection(value: SystemClipboardProtection
   if (!actual || actual.custody !== custody) throw unavailable('browser');
   actual.check();
 }
+const hostStartupStages = Object.freeze(['arm-readback', 'native-install-snapshot', 'native-feature-addon-preflight',
+  'engine-authority', 'owned-lease-policy', 'engine-owner-policy', 'marker-read',
+  'existing-marker-compatibility', 'fresh-marker-compatibility', 'verified-prior-exit', 'native-marker-permit'] as const);
+export type HostStartupStage = typeof hostStartupStages[number];
 export interface PlatformPort {
+  /** Warning-only finite local milestone on the genuine original native handle. */
+  noteHostStartup(custody: WatchdogCustody, stage: HostStartupStage): void;
   /** Before app readiness, actual Sessions and all chrome/website creation. */
   protectSystemClipboard(custody: HostCustody, deadline: number): Promise<SystemClipboardProtection>;
   /** Actual held owner and independently verified OLD Build; native claims,
@@ -136,6 +142,7 @@ export interface PlatformPort {
   peerIdentity(socketFd: number): ProcessIdentity;
 }
 interface NativeSupport {
+  noteHostStartup?(custody: object, stage: number): void;
   beginHostClipboard(custody: object): object;
   finishHostClipboard(custody: object, preparation: object): boolean;
   assertHostClipboard(custody: object, preparation: object): void;
@@ -307,6 +314,12 @@ export function loadPlatform(): PlatformPort {
       custodyReceipts.add(receipt); custodyHandles.set(receipt, handle); return receipt;
   };
   const port: PlatformPort = Object.freeze({
+    noteHostStartup(custody: WatchdogCustody, stage: HostStartupStage): void {
+      try {
+        const handle = custodyHandles.get(custody), index = hostStartupStages.indexOf(stage);
+        if (handle && index >= 0 && typeof native.noteHostStartup === 'function') native.noteHostStartup(handle, index);
+      } catch { /* Warning-only: preserve the actual operation and its error. */ }
+    },
     async protectSystemClipboard(custody: HostCustody, deadline: number): Promise<SystemClipboardProtection> {
       assertHostCustody(custody);
       const actual = hostHandover;

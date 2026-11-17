@@ -75,15 +75,23 @@ async function replaceMarker(owner: OwnerLease, expected: StoredMarker | undefin
 }
 /** Dirty markers are readable only by an explicitly allowed reader/epoch.
  * No major-version, management-format or lexical-version inference is used. */
-export async function prepareEngine(owner: OwnerLease, authority: EngineAuthority): Promise<EngineTransaction> {
+export type EnginePreparationStage = 'engine-owner-policy' | 'marker-read' | 'existing-marker-compatibility' |
+  'fresh-marker-compatibility' | 'verified-prior-exit' | 'native-marker-permit';
+export async function prepareEngine(owner: OwnerLease, authority: EngineAuthority,
+  observation?: (stage: EnginePreparationStage) => void): Promise<EngineTransaction> {
+  // The production caller closes over its original custody only. Foundation
+  // supplies nothing; this helper never participates in a check or failure.
+  const note = (stage: EnginePreparationStage) => { try { observation?.(stage); } catch { /* warning only */ } };
   try {
     // Consume before the first await. Failed preparation also requires a fresh
     // ownership transaction; no same-lease retry may race a prior continuation.
     if (preparedOwners.has(owner)) throw profileUnavailable();
     preparedOwners.add(owner);
+    note('engine-owner-policy');
     await owner.assert();
     const profile = owner.profile;
     await authority.assertTrusted();
+    note('marker-read');
     const previous = await storedMarker(profile);
     // Snapshot verified inputs: later caller mutation must not change the transaction.
     const manifest: Contract<'native.BuildCompatibility'> = structuredClone(authority.manifest);
@@ -92,19 +100,23 @@ export async function prepareEngine(owner: OwnerLease, authority: EngineAuthorit
         !manifest.compatibleReaderKeys.includes(manifest.writerKey) || !manifest.readableDataEpochs.includes(manifest.dataEpoch))
       throw profileUnavailable();
     if (previous) {
+      note('existing-marker-compatibility');
       if (!manifest.readableDataEpochs.includes(previous.marker.dataEpoch) ||
           !manifest.compatibleReaderKeys.includes(previous.marker.requiredReader)) throw profileUnavailable();
     } else {
+      note('fresh-marker-compatibility');
       // Missing marker never adopts existing native storage, even after a crash.
       if (manifest.dataEpoch !== 1 || !await emptyDirectory(profile.paths.data) ||
           !await emptyDirectory(profile.paths.userData)) throw profileUnavailable();
     }
+    note('verified-prior-exit');
     await authority.assertPreviousEngineExited(profile);
     await owner.assert(); await assertMarker(profile, previous);
     const dirty: EngineMarker = { format: 1, profileInstance: profile.record.instance, engine: 'chromium',
       dataEpoch: manifest.dataEpoch, lastWriterBuild: build, lastWriterChromium: manifest.runtime.chromium,
       lastWriterElectron: manifest.runtime.electron, requiredReader: manifest.writerKey, cleanExit: false };
     if (!validator('profile.EngineMarker')(dirty)) throw profileUnavailable();
+    note('native-marker-permit');
     const mutation = await authority.beginMutation?.(owner, Object.freeze({ ...dirty }));
     let current: StoredMarker;
     try { current = await replaceMarker(owner, previous, dirty); mutation?.accept(); }

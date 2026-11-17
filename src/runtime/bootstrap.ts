@@ -1,4 +1,4 @@
-import { prepareArmedHostSnapshot, type HostCustody } from './custody.js';
+import { noteHostStartup, prepareArmedHostSnapshot, type HostCustody } from './custody.js';
 import { unavailable } from '../contracts/errors.js';
 import type { CommandPorts } from './ports.js';
 
@@ -129,7 +129,9 @@ export async function installNativeBoundary(prepared: NativeBoundaryPreparation,
     if (custody) {
       if (custody.host.signed.bundle !== prepared.trust.bundle || custody.host.signed.snapshotDigest !== prepared.trust.snapshotDigest)
         return custody.terminate();
+      noteHostStartup(custody, 'native-install-snapshot');
       const proof = await prepareArmedHostSnapshot(custody, prepared.trust, 'native-install', prepared, deadline);
+      noteHostStartup(custody, 'native-feature-addon-preflight');
       features.authorizeHostFeatureArguments(custody);
       native = preflight.preflightArmedNative(prepared.trust, proof, prepared, reason => guard.fail(reason), watchdog);
     } else {

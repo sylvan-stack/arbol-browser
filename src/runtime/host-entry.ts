@@ -11,9 +11,9 @@ import { consumeSelection, type BuildSelection } from './selection.js';
 import { validator } from '../contracts/schema.js';
 import { unavailable } from '../contracts/errors.js';
 import { adoptHostBuildLease, captureHostBuild, terminateCapturedHostBuild, type CapturedHostBuild, type BuildLease } from './build-lease.js';
-import { assertTrustedHost, assertVerifiedHost, assertHostEngineAuthority, type VerifiedHost } from './authorities.js';
+import { assertTrustedHost, assertHostEngineAuthority, type VerifiedHost } from './authorities.js';
 import { claimedHostAttempt } from './process.js';
-import { prepareHostCustody, abortUnadmittedHost, type HostCustody } from './custody.js';
+import { noteHostStartup, prepareHostCustody, abortUnadmittedHost, type HostCustody } from './custody.js';
 import type { NativeBoundaryPreparation } from './bootstrap.js';
 import type { NativeWatchdog } from '../native/watchdog.js';
 import type { OwnerLease } from '../profiles/locking.js';
@@ -118,9 +118,10 @@ export async function prepareHost(actualApp: ProfileApp, owned: OwnedHost, autho
   const { instance, buildGuard, custody } = owned;
   if (actualApp.isReady()) return custody.terminate();
   try {
+    noteHostStartup(custody, 'owned-lease-policy');
     await instance.owner.assert(); await buildGuard.assert(); custody.assertRetained();
     if (authority.build !== instance.record.build) return custody.terminate();
-    const engine = await prepareEngine(instance.owner, authority);
+    const engine = await prepareEngine(instance.owner, authority, stage => noteHostStartup(custody, stage));
     custody.assertRetained(); custody.assertMarker();
     const binding = await configureProfileSession(actualApp, engine, custody);
     if (actualApp.isReady()) return custody.terminate();
@@ -242,6 +243,7 @@ export async function runHostEntry(): Promise<void> {
       hidePages() { const window = state.shell?.host.window; if (window && !window.isDestroyed()) window.hide(); },
     });
     boundary = await owned.installNative(effects, deadline);
+    noteHostStartup(owned.custody, 'engine-authority');
     const engine = authorities.createHostEngineAuthority(host, owned.custody, previous);
     const prepared = await prepareHost(app, owned, engine);
     prepared.custody.assertRetained(); assertTime(deadline);

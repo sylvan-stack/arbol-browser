@@ -1,6 +1,7 @@
 // Private process support only (BRW-0.14, BRW-1.7, BRW-3.11), not native input ABI.
 #import <Foundation/Foundation.h>
 #include <node_api.h>
+#include <os/log.h>
 #include "../../watchdog/boundary.hpp"
 #include "attempt.hpp"
 #include "../../watchdog/exit.hpp"
@@ -614,6 +615,28 @@ static Custody* custodyArgument(napi_env env, napi_value value) {
   void* data = nullptr; if (napi_get_value_external(env,value,&data) != napi_ok) return nullptr;
   auto* c = static_cast<Custody*>(data); return nativeCustodies.count(c) ? c : nullptr;
 }
+// Fixed local milestones only. Neither an observation failure nor a valid
+// handle can acquire admission, a Claim, or change retained native state.
+static const char* const hostStartupStages[]={"arm-readback","native-install-snapshot","native-feature-addon-preflight",
+  "engine-authority","owned-lease-policy","engine-owner-policy","marker-read","existing-marker-compatibility",
+  "fresh-marker-compatibility","verified-prior-exit","native-marker-permit"};
+static void observeHostStartup(Custody* c,int stage) noexcept {
+  int saved=errno;
+  @autoreleasepool { @try { try {
+    if(c&&nativeCustodies.count(c)&&stage>=0&&stage<(int)(sizeof(hostStartupStages)/sizeof(hostStartupStages[0]))&&
+       c->continuousBuild&&c->hostRequired&&c->bound&&c->finalization.present()&&
+       getpid()==c->context.main.pid&&arbol_boundary::current(c->context.main)==1&&
+       arbol_boundary::lockIdentity(c->context.owner)&&arbol_boundary::lockIdentity(c->context.build))
+      os_log_with_type(OS_LOG_DEFAULT,OS_LOG_TYPE_DEFAULT,"arbol-browser retained-stage %{public}s",hostStartupStages[stage]);
+  } catch(...) {} } @catch(NSException*) {} }
+  errno=saved;
+}
+static napi_value noteHostStartup(napi_env env,napi_callback_info info) {
+  napi_value args[2],out; size_t count=2; int stage;
+  if(napi_get_cb_info(env,info,&count,args,nullptr,nullptr)==napi_ok&&count==2&&integer(env,args[1],&stage))
+    observeHostStartup(custodyArgument(env,args[0]),stage);
+  napi_get_undefined(env,&out); return out;
+}
 static arbol_boundary::Lock duplicateHeld(HeldLock* held) {
   struct stat st{}; if (!held || !liveLocks.count(held) || !matches(held,&st)) return {};
   int fd = fcntl(held->fd,F_DUPFD_CLOEXEC,10); if (fd < 0) return {};
@@ -847,7 +870,8 @@ static napi_value watchdogBind(napi_env env,napi_callback_info info) {
        !arbol_attempt::replace(claim.at,raw,false,arbol_attempt::bytes(next))) return fail(env);
     c->finalization.shared()->transfer.store(2,std::memory_order_release);
   }
-  c->bound=true; napi_value out; napi_get_undefined(env,&out); return out;
+  c->bound=true; observeHostStartup(c,0);
+  napi_value out; napi_get_undefined(env,&out); return out;
 }
 
 // Only the genuine prearmed host capability can own this one-shot mutation.
@@ -2004,6 +2028,7 @@ static napi_value cancelExitInspection(napi_env env,napi_callback_info info) {
 
 static napi_value init(napi_env env, napi_value exports) {
   napi_property_descriptor properties[] = {
+    {"noteHostStartup",nullptr,noteHostStartup,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"publishHostReady",nullptr,publishHostReady,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"terminateAdoptedHost",nullptr,terminateAdoptedHost,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"beginExitInspection",nullptr,beginExitInspection,nullptr,nullptr,nullptr,napi_default,nullptr},
