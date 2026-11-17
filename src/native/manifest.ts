@@ -7,9 +7,10 @@ import type { Contract } from '../contracts/generated.js';
 import { validator } from '../contracts/schema.js';
 
 // Trust covers physical signed bytes, including ASAR archives, on every check.
-// This mandatory Electron builtin leaves the process-wide filesystem view alone.
+// Browser verification uses the mandatory unpatched Electron builtin. The Node
+// CLI has an unpatched filesystem already and never imports Electron code.
 const { constants, lstatSync, openSync, fstatSync, readFileSync, closeSync, readdirSync, readlinkSync, realpathSync } =
-  createRequire(import.meta.url)('original-fs') as typeof import('node:fs');
+  createRequire(import.meta.url)(process.type === 'browser' ? 'original-fs' : 'node:fs') as typeof import('node:fs');
 
 export const publisher = Object.freeze({ team: '7V372XL59S', bundleIdentifier: 'com.sylvan-stack.arbol-browser.native-candidate',
   requirement: 'anchor apple generic and certificate leaf[subject.OU] = "7V372XL59S" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists' });
@@ -32,7 +33,7 @@ export function stable(value: unknown): string {
   if (value && typeof value === 'object') return `{${Object.entries(value).sort(([a], [b]) => a.localeCompare(b, 'en')).map(([key, v]) => `${JSON.stringify(key)}:${stable(v)}`).join(',')}}`;
   return JSON.stringify(value);
 }
-function signature(path: string, outer = false): void {
+function signature(path: string, outer = false, jit = false): void {
   const requirement = publisher.requirement + (outer ? ` and identifier "${publisher.bundleIdentifier}"` : '');
   const result = spawnSync('/usr/bin/codesign', ['--verify', '--strict', '--deep', '-R', `=${requirement}`, path],
     { timeout: 5000, maxBuffer: nativeLimit, env: { PATH: '/usr/bin:/bin' }, encoding: 'utf8' });
@@ -42,6 +43,9 @@ function signature(path: string, outer = false): void {
       !details.stderr.includes('runtime)') || !details.stderr.includes('Timestamp=')) refuse();
   const ent = spawnSync('/usr/bin/codesign', ['-d', '--entitlements', ':-', path], { timeout: 5000, maxBuffer: nativeLimit, encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
   if (ent.error || ent.status !== 0 || /com\.apple\.security\.(?:cs\.(?:disable-library-validation|allow-unsigned-executable-memory|allow-dyld-environment-variables)|get-task-allow)/.test(ent.stdout + ent.stderr)) refuse();
+  const keys = [...ent.stdout.matchAll(/<key>([^<]+)<\/key>/g)].map(match => match[1]);
+  if (keys.length > 1 || keys.some(key => key !== 'com.apple.security.cs.allow-jit' || !jit) ||
+      (keys.length && !/<key>com\.apple\.security\.cs\.allow-jit<\/key>\s*<true\s*\/>/.test(ent.stdout))) refuse();
 }
 export interface CandidateTrust {
   readonly bundle: string;
@@ -50,6 +54,10 @@ export interface CandidateTrust {
   /** Cryptographic identity only. It cannot assert previous exit or production qualification. */
   assertIdentity(): void;
 }
+/** Independently verified signed bytes, without the installed Native brand.
+ * Node clients may verify two different retained Builds. Only the host's one
+ * verifyNativeCandidate result is eligible for addon/watchdog installation. */
+export type SignedBundle = CandidateTrust;
 let attemptedTrust = false, poisonedTrust = false;
 let trustedCandidate: CandidateTrust | undefined;
 /** Complete physical signed bundle, including the outer seal and directories.
@@ -84,14 +92,7 @@ export function assertCandidateTrust(value: CandidateTrust): void {
   if (poisonedTrust || value !== trustedCandidate) refuse();
   value.assertIdentity();
 }
-export function verifyNativeCandidate(bundle: string): CandidateTrust {
-  if (poisonedTrust) refuse();
-  if (trustedCandidate) {
-    if (resolve(bundle) !== trustedCandidate.bundle) { poisonedTrust = true; return refuse(); }
-    trustedCandidate.assertIdentity(); return trustedCandidate;
-  }
-  if (attemptedTrust) refuse(); attemptedTrust = true;
-  try {
+export function verifySignedBundle(bundle: string): SignedBundle {
   if (!bundle.endsWith('.app') || realpathSync(bundle) !== resolve(bundle)) refuse();
   const root = resolve(bundle);
   const check = (): Compatibility => {
@@ -116,7 +117,8 @@ export function verifyNativeCandidate(bundle: string): CandidateTrust {
           const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
           try {
             const magic = readFileSync(fd).subarray(0, 4).toString('hex');
-            if (['cffaedfe', 'cefaedfe', 'feedfacf', 'cafebabe', 'bebafeca'].includes(magic)) signature(path);
+            if (['cffaedfe', 'cefaedfe', 'feedfacf', 'cafebabe', 'bebafeca'].includes(magic))
+              signature(path, false, key.startsWith('Contents/Resources/browser/runtime/Electron.app/') && key.includes('/Contents/MacOS/'));
           } finally { closeSync(fd); }
         } else refuse();
         if (Object.keys(inventory).length > 4096) refuse();
@@ -133,15 +135,24 @@ export function verifyNativeCandidate(bundle: string): CandidateTrust {
   // Snapshot validation cannot be bypassed by mutation through a caller-held object.
   function frozen<T>(value: T): T { if (value && typeof value === 'object') { for (const entry of Object.values(value)) frozen(entry); Object.freeze(value); } return value; }
   const manifest = frozen(initial);
-  trustedCandidate = Object.freeze({ bundle: root, manifest,
+  let poisoned = false;
+  return Object.freeze({ bundle: root, manifest,
     snapshotDigest: createHash('sha256').update(before).digest('hex'),
     assertIdentity() {
       try {
-        if (poisonedTrust || realpathSync(root) !== root || completeSnapshot(root) !== before ||
+        if (poisoned || realpathSync(root) !== root || completeSnapshot(root) !== before ||
             stable(boundedJson(join(root, 'Contents/Resources/native-compatibility.json'))) !== encoded) refuse();
-      } catch { poisonedTrust = true; return refuse(); }
+      } catch { poisoned = true; return refuse(); }
     } });
-  return trustedCandidate;
-  } catch { poisonedTrust = true; return refuse(); }
+}
+export function verifyNativeCandidate(bundle: string): CandidateTrust {
+  if (poisonedTrust) refuse();
+  if (trustedCandidate) {
+    if (resolve(bundle) !== trustedCandidate.bundle) { poisonedTrust = true; return refuse(); }
+    trustedCandidate.assertIdentity(); return trustedCandidate;
+  }
+  if (attemptedTrust) refuse(); attemptedTrust = true;
+  try { trustedCandidate = verifySignedBundle(bundle); return trustedCandidate; }
+  catch { poisonedTrust = true; return refuse(); }
 }
 
