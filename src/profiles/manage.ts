@@ -8,7 +8,7 @@ import { validator } from '../contracts/schema.js';
 import type { ProfilePort, Stdio } from '../runtime/ports.js';
 import { loadPlatform, type PlatformPort } from '../runtime/platform.js';
 import { createProfile, managedProfiles } from './create.js';
-import { registryLock, ownerLock, lockDeadline } from './locking.js';
+import { registryLock, ownerLock, lockDeadline, type OwnerLease, type RegistryLease } from './locking.js';
 import { readProfile, assertProfile, readJson, type ProfileSnapshot } from './records.js';
 import { profilePaths, profileId, profileUnavailable, stateDirectory, registryExists, statOrAbsent,
   privateFile, ownerUid, assertDirectory, sameIdentity, identity, syncDirectory } from './paths.js';
@@ -16,9 +16,12 @@ import { profilePaths, profileId, profileUnavailable, stateDirectory, registryEx
 /** ABR-3 supplies verified runtime/peer/process-tree inspection. A boolean from a
  * runtime record alone is not evidence. running must revalidate after awaits. */
 export interface ProfileRuntimePort {
-  running(profile: ProfileSnapshot, ownerAvailable: boolean): Promise<boolean>;
+  running(profile: ProfileSnapshot, ownerAvailable: boolean, owner?: OwnerLease, registry?: RegistryLease): Promise<boolean>;
   /** Caller retains owner + registry; confirm all previous owned helpers are gone. */
-  assertClosed(profile: ProfileSnapshot): Promise<void>;
+  assertClosed(profile: ProfileSnapshot, owner?: OwnerLease, registry?: RegistryLease, purpose?: 'remove'): Promise<void>;
+  /** Production coordinates exact runtime archive and the actual profile detach
+   * under the same genuine Claim/Owner/Registry. Uncertainty retains guards. */
+  detach?(profile: ProfileSnapshot, owner: OwnerLease, registry: RegistryLease, retired: string): Promise<'detached' | 'uncertain'>;
 }
 async function noRuntimeFootprint(profile: ProfileSnapshot): Promise<void> {
   // Listing does not read engine.json, cookies, storage or page content.
@@ -81,6 +84,7 @@ async function existingRegistry(state: string, platform: PlatformPort, deadline:
   privateFile(stat);
   return registryLock(state, platform, false, deadline);
 }
+const retainedRemovals = new Set<{ owner: OwnerLease; registry: RegistryLease }>();
 export function createProfileService(options: {
   state?: string; platform?: () => PlatformPort; runtime?: ProfileRuntimePort;
 } = {}): ProfilePort {
@@ -102,7 +106,7 @@ export function createProfileService(options: {
         for (const profile of records) {
           const owner = await ownerLock(profile, os, false);
           try {
-            const running = await runtime.running(profile, owner !== null);
+            const running = await runtime.running(profile, owner !== null, owner ?? undefined, registry);
             // A verified running host cannot coexist with our exclusive owner lock.
             if (owner && running) throw profileUnavailable();
             if (!owner && !running) throw profileUnavailable();
@@ -121,19 +125,25 @@ export function createProfileService(options: {
       await validateRemovalMarker(selected);
       await confirmRemoval(id, io);
       const os = platform(), registry = await existingRegistry(state, os, lockDeadline());
+      let uncertain = false;
       try {
         await assertProfile(selected);
         const owner = await ownerLock(selected, os, false);
         if (!owner) throw profileUnavailable();
         try {
           await validateRemovalMarker(selected);
-          await runtime.assertClosed(selected);
+          await runtime.assertClosed(selected, owner, registry, 'remove');
           await registry.assert(); await owner.assert();
           const lockStat = await lstat(selected.paths.owner); privateFile(lockStat);
           const retired = join(selected.paths.profiles, `.deleting-${randomBytes(16).toString('hex')}`);
           // Detach the published name first. Waiting starters must revalidate the
           // original pathname/instance and refuse; no removed profile is reopened.
-          os.publishDirectory(selected.paths.root, retired);
+          if (runtime.detach) {
+            const result = await runtime.detach(selected, owner, registry, retired);
+            if (result !== 'detached') {
+              uncertain = true; retainedRemovals.add({ owner, registry }); throw profileUnavailable();
+            }
+          } else os.publishDirectory(selected.paths.root, retired);
           await syncDirectory(selected.paths.profiles);
           await assertDirectory(retired, selected.rootIdentity);
           const retiredLock = await lstat(join(retired, 'owner.lock')); privateFile(retiredLock);
@@ -149,8 +159,8 @@ export function createProfileService(options: {
           await syncDirectory(retired); await syncDirectory(selected.paths.profiles);
           await registry.assert(); await assertDirectory(retired, selected.rootIdentity);
           return { profile: id, dataRemoved: true as const };
-        } finally { owner.release(); }
-      } finally { registry.release(); }
+        } finally { if (!uncertain) owner.release(); }
+      } finally { if (!uncertain) registry.release(); }
     }),
   });
 }

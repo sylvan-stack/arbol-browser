@@ -4,7 +4,7 @@ import { unavailable, BrowserFailure } from '../contracts/errors.js';
 import { preflightPageAdmission } from './bootstrap.js';
 import { isHostCustody } from './custody.js';
 import { isProductionExitAuthority, type ProductionExitAuthority } from './exit.js';
-import { assertProductionCloseReady } from './process.js';
+import { archiveRemovedRuntime, assertProductionCloseReady } from './process.js';
 import { assertPlatform, type PlatformPort, type GroupProcess } from './platform.js';
 import type { BuildSelection } from './selection.js';
 import { requestManagementClose, reserveManagementClose, openProtectedReady, connectRuntime, type Request, type ManagementCloseOpportunity, type RuntimeClient, type Endpoint, type TransportServer, type ConnectionContext } from './transport.js';
@@ -13,7 +13,7 @@ import { runtimeLocation, readRuntime, originalAlive, now, startupDeadline, neve
 import { assertProfile, type ProfileSnapshot } from '../profiles/records.js';
 import { profileUnavailable, statOrAbsent, stateDirectory } from '../profiles/paths.js';
 import { selectProfile } from '../profiles/create.js';
-import { ownerLock } from '../profiles/locking.js';
+import { ownerLock, type OwnerLease, type RegistryLease } from '../profiles/locking.js';
 import type { ProfileRuntimePort } from '../profiles/manage.js';
 import type { ProcessPort, Stdio } from './ports.js';
 import type { HostPreparation } from './host-entry.js';
@@ -68,23 +68,52 @@ async function assertNoSockets(profile: ProfileSnapshot): Promise<void> {
 }
 export function createProfileRuntime(platform: PlatformPort, selection: BuildSelection,
   exits: PreviousExit = neverOpenedExit): ProfileRuntimePort {
-  const assertClosed = async (profile: ProfileSnapshot) => {
+  const production = isProductionExitAuthority(exits);
+  const assertLeases = async (profile: ProfileSnapshot, owner: OwnerLease | undefined, registry: RegistryLease | undefined) => {
+    if (!owner || !registry || owner.profile !== profile || registry.state !== profile.paths.state || registry.platform !== platform)
+      throw profileUnavailable();
+    await registry.assert(); await owner.assert(); await assertProfile(profile);
+  };
+  const assertClosed = async (profile: ProfileSnapshot, owner?: OwnerLease, registry?: RegistryLease, purpose?: 'remove') => {
+    const deadline = now() + 10000;
+    if (production) await assertLeases(profile, owner, registry);
     const location = await runtimeLocation(profile), record = location ? await readRuntime(location) : undefined;
     if (record && originalAlive(record, platform)) throw profileUnavailable();
-    await exits.assertExited(profile, record);
+    if (isProductionExitAuthority(exits)) {
+      if (purpose === 'remove') await exits.withdraw(profile, owner!, deadline);
+      // The caller's genuine Owner remains held. Native inspects duplicates of
+      // that exact description; no reacquisition/deadlock or lock-as-exit proof.
+      for (;;) {
+        try { await exits.assertClosedUnderOwner(profile, record, owner!, deadline); break; }
+        catch { assertTime(deadline); if (purpose !== 'remove') throw profileUnavailable(); }
+        await setTimeout(Math.min(10, Math.max(1, deadline - now())));
+      }
+      await assertLeases(profile, owner, registry);
+    } else await exits.assertExited(profile, record, owner);
     if (!record) await assertNoSockets(profile);
     await assertProfile(profile);
     if (location && JSON.stringify(record) !== JSON.stringify(await readRuntime(location))) throw profileUnavailable();
     if (record && originalAlive(record, platform)) throw profileUnavailable();
   };
   return Object.freeze({ assertClosed,
-    async running(profile: ProfileSnapshot, ownerAvailable: boolean) {
-      if (ownerAvailable) { await assertClosed(profile); return false; }
+    ...(isProductionExitAuthority(exits) ? {
+      async detach(profile: ProfileSnapshot, owner: OwnerLease, registry: RegistryLease, retired: string) {
+        await assertLeases(profile, owner, registry);
+        return archiveRemovedRuntime(profile, owner, registry, platform, exits, now() + 10000, retired);
+      },
+    } : {}),
+    async running(profile: ProfileSnapshot, ownerAvailable: boolean, owner?: OwnerLease, registry?: RegistryLease) {
+      if (production && (!registry || registry.state !== profile.paths.state || registry.platform !== platform)) throw profileUnavailable();
+      if (registry) await registry.assert();
+      if (ownerAvailable) { await assertClosed(profile, owner, registry); return false; }
+      if (owner) throw profileUnavailable();
       const location = await runtimeLocation(profile), record = location ? await readRuntime(location) : undefined;
       if (!location || !record || !originalAlive(record, platform)) throw profileUnavailable();
-      const client = await connectRuntime(location, record, 'management', { ...selection, explicit: false }, platform, now() + 2000, 'Profile inspection');
+      const deadline = now() + 5000;
+      if (isProductionExitAuthority(exits)) await assertProductionCloseReady(profile, record, selection, platform, exits, deadline);
+      const client = await connectRuntime(location, record, 'management', { ...selection, explicit: false }, platform, deadline, 'Profile inspection');
       try {
-        await assertProfile(profile);
+        await registry?.assert(); await assertProfile(profile);
         if (JSON.stringify(record) !== JSON.stringify(await readRuntime(location)) || !originalAlive(record, platform)) throw profileUnavailable();
         return true;
       } finally { client.close(); }

@@ -4,22 +4,39 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from './parse.js';
-import { publicFailure, type ExitCode } from '../contracts/errors.js';
+import { publicFailure, unavailable, type ExitCode } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
 import type { Contract } from '../contracts/generated.js';
 import type { CommandPorts, Stdio, PackageMetadata } from '../runtime/ports.js';
-import { consumeSelection, type BuildSelection } from '../runtime/selection.js';
+import { consumePackagedSelection, type BuildSelection } from '../runtime/selection.js';
 
 // All native/profile/runtime work is lazy. info remains metadata only.
 const defaultPorts = Object.freeze({}) as CommandPorts;
 async function productionPorts(selection: BuildSelection): Promise<CommandPorts> {
-  const [{ createProfileService }, { loadPlatform }, { createProcessService, createProfileRuntime }] = await Promise.all([
+  const [{ createProfileService }, { loadPlatform }, { createProcessService, createProfileRuntime },
+    { verifyPackagedHost }, { createProductionExitAuthority }, { createProductionProcessIntegration }] = await Promise.all([
     import('../profiles/manage.js'), import('../runtime/platform.js'), import('../runtime/lifecycle.js'),
+    import('../runtime/authorities.js'), import('../runtime/exit.js'), import('../runtime/process.js'),
   ]);
-  const platform = loadPlatform();
+  const payload = resolve(fileURLToPath(new URL('../../', import.meta.url)));
+  const deadline = performance.now() + 30000;
+  // Verify the real current outer/payload before loading its native support.
+  // The fixed packaged entry must be running as the exact stock engine in
+  // Node mode; no system Node, older Foundation or ad hoc helper substitution.
+  const host = await verifyPackagedHost(selection, payload, deadline);
+  const address = new URL('../native/manifest.js', import.meta.url).href;
+  const { pinnedRuntime } = await import(address) as typeof import('../native/manifest.js');
+  if (process.type === 'browser' || resolve(process.execPath) !== host.identity.layout.engine ||
+      process.versions.electron !== pinnedRuntime.electron || process.versions.node !== pinnedRuntime.node ||
+      process.versions.modules !== pinnedRuntime.modules || process.versions.napi !== pinnedRuntime.napi ||
+      process.platform !== pinnedRuntime.platform || process.arch !== pinnedRuntime.arch) throw unavailable('browser');
+  await host.assertTrusted(deadline);
+  const platform = loadPlatform(), exits = createProductionExitAuthority(platform, selection);
+  const integration = createProductionProcessIntegration(host, selection, platform, exits);
+  const state = host.policy.stateRoot;
   return Object.freeze({
-    profiles: createProfileService({ platform: () => platform, runtime: createProfileRuntime(platform, selection) }),
-    process: createProcessService({ selection, platform: () => platform }),
+    profiles: createProfileService({ state, platform: () => platform, runtime: createProfileRuntime(platform, selection, exits) }),
+    process: createProcessService({ state, selection, platform: () => platform, integration, exits }),
   });
 }
 
@@ -37,10 +54,11 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
   const mcp = args[0] === 'mcp';
   try {
     const command = parse(args);
+    if (ports === defaultPorts && command.kind === 'mcp') throw unavailable('browser');
     let activePorts = ports;
     if (ports === defaultPorts && command.kind !== 'info') {
       const metadata = await componentInfo();
-      const selection = consumeSelection(metadata.build, resolve(fileURLToPath(new URL('../../', import.meta.url))));
+      const selection = consumePackagedSelection(metadata.build, resolve(fileURLToPath(new URL('../../', import.meta.url))));
       activePorts = await productionPorts(selection);
     }
     if (command.kind === 'mcp') { await activePorts.process.mcp(command.profile, io); return 0; }
@@ -77,5 +95,10 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  process.exitCode = await runCli(process.argv.slice(2));
+  // A legacy bundled launcher must enter the physical tsc graph as well.
+  // The thin compiler entry uses this same module; its import cannot trigger
+  // this guard again because argv[1] remains main.mjs.
+  const address = new URL('./main.js', import.meta.url).href;
+  const entry = import.meta.url === address ? { runCli } : await import(address) as { runCli: typeof runCli };
+  process.exitCode = await entry.runCli(process.argv.slice(2));
 }
