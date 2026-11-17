@@ -15,22 +15,40 @@ function dimensions(png: Buffer): { width: number; height: number } {
 /** Mask the full conservative axis-aligned envelope of each root-frame quad,
  * with outward rounding/padding before any resize to avoid edge interpolation.
  * Unbound/OOPIF transforms never reach this function. */
-function mask(bitmap: Buffer, width: number, height: number, stamp: CaptureStamp): void {
-  const view = stamp.layout.cssVisualViewport, sx = width / view.clientWidth, sy = height / view.clientHeight;
-  if (bitmap.length !== width * height * 4 || !Number.isFinite(sx) || !Number.isFinite(sy)) throw classifiedRefusal();
+function mask(bitmap: Buffer, width: number, height: number, stamp: CaptureStamp, guard: () => void): void {
+  const view = stamp.viewport, sx = width / view.width, sy = height / view.height;
+  if (bitmap.length !== width * height * 4 || ![sx, sy].every(Number.isFinite) || sx < 0.125 || sy < 0.125 || sx > 8 || sy > 8 ||
+      Math.abs(sx - sy) > Math.max(1 / view.width, 1 / view.height) || stamp.boxes.length > 5000) throw classifiedRefusal();
+  const rectangles: { left: number; right: number; top: number; bottom: number }[] = [];
+  const clip = (value: number, limit: number) => Math.max(0, Math.min(limit, value));
+  let work = 0;
+  // Charge the product before the first bitmap write. Overlapping rectangles
+  // consume work again; a large mask census cannot multiply a bounded bitmap
+  // into unbounded synchronous CPU work past cancellation/watchdog deadlines.
   for (const quad of stamp.boxes) {
-    if (quad.length !== 8 || !quad.every(Number.isFinite)) throw classifiedRefusal();
+    guard(); if (quad.length !== 8 || !quad.every(Number.isFinite)) throw classifiedRefusal();
     const xs = quad.filter((_value, index) => index % 2 === 0), ys = quad.filter((_value, index) => index % 2 === 1);
-    const left = Math.max(0, Math.floor((Math.min(...xs) - view.pageX) * sx) - 2);
-    const right = Math.min(width, Math.ceil((Math.max(...xs) - view.pageX) * sx) + 2);
-    const top = Math.max(0, Math.floor((Math.min(...ys) - view.pageY) * sy) - 2);
-    const bottom = Math.min(height, Math.ceil((Math.max(...ys) - view.pageY) * sy) + 2);
-    for (let y = top; y < bottom; y++) for (let x = left; x < right; x++) {
-      const offset = (y * width + x) * 4;
-      bitmap[offset] = 0; bitmap[offset + 1] = 0; bitmap[offset + 2] = 0; bitmap[offset + 3] = 255;
+    const left = clip(Math.floor((Math.min(...xs) - view.x) * sx) - 2, width);
+    const right = clip(Math.ceil((Math.max(...xs) - view.x) * sx) + 2, width);
+    const top = clip(Math.floor((Math.min(...ys) - view.y) * sy) - 2, height);
+    const bottom = clip(Math.ceil((Math.max(...ys) - view.y) * sy) + 2, height);
+    if (![left, right, top, bottom].every(Number.isSafeInteger) || right < left || bottom < top ||
+        (work += (right - left) * (bottom - top)) > 33554432) throw classifiedRefusal();
+    rectangles.push({ left, right, top, bottom });
+  }
+  for (const { left, right, top, bottom } of rectangles) {
+    guard();
+    for (let y = top; y < bottom; y++) {
+      if ((y - top) % 64 === 0) guard();
+      for (let x = left; x < right; x++) {
+        const offset = (y * width + x) * 4;
+        bitmap[offset] = 0; bitmap[offset + 1] = 0; bitmap[offset + 2] = 0; bitmap[offset + 3] = 255;
+      }
     }
   }
+  guard();
 }
+
 /** Only memory-owned buffers exist. In particular, no raw PNG/base64, cached
  * page data or unmasked fallback survives a failed proof or authority check. */
 export async function captureViewport(proof: CaptureProof, stamp: CaptureStamp, snapshot: string): Promise<Contract<'browser.ScreenshotPayload'>> {
@@ -46,7 +64,7 @@ export async function captureViewport(proof: CaptureProof, stamp: CaptureStamp, 
     image = nativeImage.createFromBuffer(raw); proof.guard();
     const actual = image.getSize();
     if (image.isEmpty() || actual.width !== width || actual.height !== height) throw classifiedRefusal();
-    bitmap = image.toBitmap(); mask(bitmap, width, height, stamp);
+    bitmap = image.toBitmap(); mask(bitmap, width, height, stamp, proof.guard);
     masked = nativeImage.createFromBitmap(bitmap, { width, height, scaleFactor: 1 });
     const scale = Math.min(1, 2048 / width, 2048 / height, Math.sqrt(2097152 / (width * height)));
     if (scale < 1) masked = masked.resize({ width: Math.max(1, Math.floor(width * scale)), height: Math.max(1, Math.floor(height * scale)), quality: 'best' });

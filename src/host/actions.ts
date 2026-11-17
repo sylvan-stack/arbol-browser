@@ -105,15 +105,26 @@ export class ActionQueue implements HandoffOperations {
       task.safeResolve(); this.tasks.delete(task);
     }
   }
+  /** Logical wrapper exit/cancellation is not physical capture settlement.
+   * Only this exact original surface's terminal retirement can discharge an
+   * orphaned reservation; a replacement tab/page cannot free it. */
+  private retiredCaptures(): void {
+    for (const [target, task] of this.captures) {
+      if (task.stamp.document.page.retirement()?.phase !== 'retired') continue;
+      this.captures.delete(target); task.captureHeld = false; task.retired = true;
+      this.cancelTask(task, 'control_changed');
+    }
+  }
   run<T>(stamp: AuthorityStamp, operation: string, options: { request: string; mutation: boolean; screenshot?: boolean; snapshot?: string;
     deadline: number; signal: AbortSignal }, work: (execution: ActionExecution) => Promise<T>): Promise<ActionCompletion<T>> {
     this.authority.check(stamp, options.mutation);
+    this.retiredCaptures();
     if ([...this.tasks].some(task => task.stamp.attachment === stamp.attachment && task.request === options.request))
       throw refused('control_refused');
     if (options.mutation) {
       if (this.captures.has(stamp.target)) throw refused('control_refused');
       if (!options.snapshot) throw refused('control_refused'); this.authority.requireSnapshot(options.snapshot, stamp);
-    } else if (this.reads >= 4 || (options.screenshot && this.screenshots >= 1)) throw refused('control_refused');
+    } else if (this.reads >= 4 || (options.screenshot && (this.screenshots >= 1 || this.captures.size !== 0))) throw refused('control_refused');
     if (options.signal.aborted || performance.now() >= options.deadline) throw refused('control_refused');
     let slot = this.slots.get(stamp.target);
     if (options.mutation && slot?.active && slot.waiting.length >= 4) throw refused('control_refused');
@@ -234,9 +245,10 @@ export class ActionQueue implements HandoffOperations {
    * reservation precedes every engine-state change and includes orphaned issued
    * work and waiting mutations on the literal original tab. */
   reserveCapture(execution: ActionExecution): CaptureReservation {
+    this.retiredCaptures();
     const task = this.executions.get(execution), target = execution.stamp.target;
     if (!task || !this.tasks.has(task) || !task.started || task.workDone || task.mutation || !task.screenshot ||
-        this.captures.has(target) || this.slots.has(target) ||
+        this.captures.size !== 0 || this.slots.has(target) ||
         [...this.tasks].some(other => other !== task && other.stamp.target === target &&
           (other.mutation || other.issued.size > 0 || other.sequences.size > 0)) ||
         [...this.preparations].some(other => other.target === target)) throw refused('control_refused');
@@ -334,8 +346,13 @@ export class ActionQueue implements HandoffOperations {
     return task?.action ? { action: task.action, status: task.settled ? 'completed' : task.dispatched ? 'outcome_unknown' : 'not_dispatched' } : undefined;
   }
   retired(target: TabTarget): void {
-    this.captures.delete(target);
-    for (const task of [...this.tasks]) if (task.stamp.target === target) { task.retired = true; this.cancelTask(task, 'control_changed'); }
+    this.retiredCaptures();
+    for (const task of [...this.tasks]) if (task.stamp.target === target) {
+      // A stale logical retirement callback cannot discharge actual capture
+      // work on an original surface which has not physically retired.
+      if (task.captureHeld) continue;
+      task.retired = true; this.cancelTask(task, 'control_changed');
+    }
     this.slots.delete(target); this.interrupted.delete(target);
     for (const preparation of [...this.preparations]) if (preparation.target === target) {
       preparation.retired = true; this.preparations.delete(preparation); preparation.controller.abort();
