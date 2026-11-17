@@ -204,29 +204,29 @@ function asyncDirectoryRead(directory: import('node:fs').Dir): Promise<import('n
 function asyncDirectoryClose(directory: import('node:fs').Dir): Promise<void> {
   return new Promise((resolve, reject) => directory.close(error => error ? reject(error) : resolve()));
 }
-async function asynchronousNames(path: string, expected: PhysicalEntry, deadline: number): Promise<string[]> {
-  budget(deadline); directoryPath(path);
+async function asynchronousNames(path: string, expected: PhysicalEntry, active: () => void, poison: () => void): Promise<string[]> {
+  active(); directoryPath(path);
   const maximum = expected.children?.length;
   if (expected.kind !== 'directory' || maximum === undefined || maximum > completeEntryLimit) refuse();
   const before = await asyncLstat(path);
   if (!before.isDirectory() || physicalStamp(before) !== expected.stamp || await asyncRealpath(path) !== path) refuse();
   const names: string[] = [], seen = new Set<string>(); let directory: import('node:fs').Dir | undefined;
   try {
-    budget(deadline); directory = await asyncDirectory(path); budget(deadline);
+    active(); directory = await asyncDirectory(path); active();
     if (!sameDirectoryPath(directory, path)) refuse();
     for (let index = 0; index <= maximum; ++index) {
-      budget(deadline); const entry = await asyncDirectoryRead(directory); budget(deadline);
+      active(); const entry = await asyncDirectoryRead(directory); active();
       if (!entry) {
         const after = await asyncLstat(path);
         if (!after.isDirectory() || physicalStamp(after) !== expected.stamp || await asyncRealpath(path) !== path) refuse();
-        budget(deadline); return names.sort();
+        active(); return names.sort();
       }
       if (names.length === maximum) refuse();
       const name = directoryName(entry.name, path); if (seen.has(name)) refuse();
       seen.add(name); names.push(name);
     }
     return refuse();
-  } finally { if (directory) await asyncDirectoryClose(directory); budget(deadline); }
+  } catch (error) { poison(); throw error; } finally { if (directory) await asyncDirectoryClose(directory); active(); }
 }
 
 function asyncLink(path: string): Promise<string> {
@@ -248,53 +248,76 @@ function asyncRead(fd: number, buffer: Buffer, length: number, position: number)
 async function compareCompleteSnapshot(signed: SignedBundle, snapshot: FrozenSnapshot, deadline: number): Promise<void> {
   const root = signed.bundle, entries: Record<string, string> = Object.create(null), keys = Object.keys(snapshot.physical).sort();
   if (keys.length > 4097) refuse();
-  const check = async (key: string, topology: boolean): Promise<import('node:fs').BigIntStats> => {
-    budget(deadline); if (snapshot.poisoned) refuse();
-    const expected = snapshot.physical[key]; if (!expected) refuse();
-    const path = key ? join(root, key) : root, stat = await asyncLstat(path);
-    budget(deadline);
-    if (physicalStamp(stat) !== expected.stamp ||
-        (expected.kind === 'directory' ? !stat.isDirectory() : expected.kind === 'file' ? !stat.isFile() : !stat.isSymbolicLink())) refuse();
-    if (expected.kind === 'symlink') {
-      const link = await asyncLink(path), target = await asyncRealpath(path); budget(deadline);
-      if (link !== expected.link || target !== expected.target || !target.startsWith(root + sep) ||
-          !resolve(dirname(path), link).startsWith(root + sep) || await asyncLink(path) !== link) refuse();
-    } else {
-      if (await asyncRealpath(path) !== path) refuse();
-      if (topology && expected.kind === 'directory' && stable(await asynchronousNames(path, expected, deadline)) !== stable(expected.children)) refuse();
-    }
-    budget(deadline); return stat;
+  const poison = (): void => {
+    snapshot.poisoned = true; if (signed === trustedCandidate) poisonedTrust = true;
   };
-  for (const key of keys) {
+  const active = (): void => { budget(deadline); if (snapshot.poisoned) refuse(); };
+  // Claim only original frozen keys. First failure closes admission; all active
+  // jobs settle (including descriptor cleanup) before this phase can finish.
+  const phase = async (job: (key: string) => Promise<void>): Promise<void> => {
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      try {
+        while (next < keys.length) {
+          active(); const key = keys[next++]!;
+          await job(key);
+        }
+      } catch (error) { poison(); throw error; }
+    };
+    const outcomes = await Promise.allSettled(Array.from({ length: Math.min(4, keys.length) }, () => worker()));
+    if (outcomes.some(outcome => outcome.status === 'rejected')) refuse();
+    active();
+  };
+  const check = async (key: string, topology: boolean): Promise<import('node:fs').BigIntStats> => {
+    active();
+    try {
+      const expected = snapshot.physical[key]; if (!expected) refuse();
+      const path = key ? join(root, key) : root, stat = await asyncLstat(path);
+      active();
+      if (physicalStamp(stat) !== expected.stamp ||
+          (expected.kind === 'directory' ? !stat.isDirectory() : expected.kind === 'file' ? !stat.isFile() : !stat.isSymbolicLink())) refuse();
+      if (expected.kind === 'symlink') {
+        const link = await asyncLink(path), target = await asyncRealpath(path); active();
+        if (link !== expected.link || target !== expected.target || !target.startsWith(root + sep) ||
+            !resolve(dirname(path), link).startsWith(root + sep) || await asyncLink(path) !== link) refuse();
+      } else {
+        if (await asyncRealpath(path) !== path) refuse();
+        if (topology && expected.kind === 'directory' && stable(await asynchronousNames(path, expected, active, poison)) !== stable(expected.children)) refuse();
+      }
+      active(); return stat;
+    } catch (error) { poison(); throw error; }
+  };
+  await phase(async key => {
     const expected = snapshot.physical[key]!, path = key ? join(root, key) : root;
     const named = await check(key, true);
-    if (!key) continue;
+    if (!key) return;
     if (expected.kind === 'directory') entries[key] = `directory:${named.mode & 0o7777n}`;
     else if (expected.kind === 'symlink') entries[key] = `symlink:${expected.link}`;
     else {
       let fd: number | undefined;
       try {
-        fd = await asyncOpen(path); budget(deadline);
+        fd = await asyncOpen(path); active();
         const first = await asyncStat(fd);
         if (!first.isFile() || first.nlink !== 1n || physicalStamp(first) !== expected.stamp || first.size < 0n || first.size > BigInt(Number.MAX_SAFE_INTEGER)) refuse();
         const size = Number(first.size);
         const hash = createHash('sha256'), buffer = Buffer.alloc(65536); let position = 0;
         while (position < size) {
-          budget(deadline); const count = await asyncRead(fd, buffer, Math.min(buffer.length, size - position), position);
-          budget(deadline); if (count < 1) refuse(); hash.update(buffer.subarray(0, count)); position += count;
+          active(); const count = await asyncRead(fd, buffer, Math.min(buffer.length, size - position), position);
+          active(); if (count < 1) refuse(); hash.update(buffer.subarray(0, count)); position += count;
         }
         if (await asyncRead(fd, buffer, 1, position) !== 0 || physicalStamp(await asyncStat(fd)) !== expected.stamp) refuse();
-        await check(key, false); budget(deadline);
+        await check(key, false); active();
         entries[key] = `file:${first.mode & 0o7777n}:${hash.digest('hex')}`;
-      } finally { if (fd !== undefined) await asyncClose(fd); }
+      } catch (error) { poison(); throw error; } finally { if (fd !== undefined) await asyncClose(fd); }
     }
     await check(key, true);
-  }
+  });
+  active();
   if (stable(entries) !== snapshot.encoded) refuse();
   // Full final physical/topology sweep after hashing, not a partial prefix or
   // an early metadata sample accepted after a slow file operation.
-  for (const key of keys) await check(key, true);
-  budget(deadline); if (snapshot.poisoned) refuse();
+  await phase(async key => { await check(key, true); });
+  active();
 }
 export async function compareSignedSnapshot(signed: SignedBundle, deadline: number): Promise<SignedSnapshotComparison> {
   const snapshot = signedSnapshots.get(signed);
