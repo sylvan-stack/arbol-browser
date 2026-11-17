@@ -1,0 +1,244 @@
+#pragma once
+// One native grammar/transaction for the CLI addon and signed fixed-exec outer.
+// These are intent records, never watchdog, engine-exit or flush certificates.
+#include "../../watchdog/boundary.hpp"
+#include <CommonCrypto/CommonDigest.h>
+#include <cmath>
+namespace arbol_attempt {
+using arbol_boundary::Identity;
+constexpr size_t limit = 16384;
+inline bool keys(NSDictionary* object, NSArray* expected) {
+  return [object isKindOfClass:NSDictionary.class] && [[NSSet setWithArray:object.allKeys] isEqual:[NSSet setWithArray:expected]];
+}
+inline bool pattern(id value, NSString* expression) {
+  if (![value isKindOfClass:NSString.class]) return false;
+  return [[NSRegularExpression regularExpressionWithPattern:expression options:0 error:nil]
+    numberOfMatchesInString:value options:0 range:NSMakeRange(0, [value length])] == 1;
+}
+inline bool path(id value) {
+  return [value isKindOfClass:NSString.class] && [value length] > 0 && [value length] < PATH_MAX &&
+    [value hasPrefix:@"/"] && [value rangeOfCharacterFromSet:[NSCharacterSet characterSetWithRange:NSMakeRange(0,1)]].location == NSNotFound &&
+    [value isEqual:[value stringByStandardizingPath]];
+}
+inline bool uintNumber(id value, uint64_t& out) {
+  if (![value isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID()) return false;
+  double n = [value doubleValue]; if (!std::isfinite(n) || n < 0 || n > 9007199254740991.0 || n != floor(n)) return false;
+  out = (uint64_t)n; return true;
+}
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+inline NSString* digest(const std::string& bytes) {
+  unsigned char hash[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(bytes.data(),(CC_LONG)bytes.size(),hash);
+  NSMutableString* value = [NSMutableString new]; for (unsigned char byte : hash) [value appendFormat:@"%02x",byte]; return value;
+}
+#pragma clang diagnostic pop
+inline bool process(NSDictionary* p) {
+  uint64_t pid, uid, version, group, session, parentVersion;
+  return keys(p,@[@"pid",@"uid",@"startId",@"pidVersion",@"group",@"session",@"parentStartId",@"parentPidVersion",@"executable"]) &&
+    uintNumber(p[@"pid"],pid) && pid > 1 && pid <= INT_MAX && uintNumber(p[@"uid"],uid) && uid == geteuid() &&
+    uintNumber(p[@"pidVersion"],version) && version > 0 && version <= INT_MAX && uintNumber(p[@"group"],group) && group > 0 && group <= INT_MAX &&
+    uintNumber(p[@"session"],session) && session > 0 && session <= INT_MAX &&
+    uintNumber(p[@"parentPidVersion"],parentVersion) && parentVersion <= INT_MAX &&
+    pattern(p[@"startId"],@"^[1-9][0-9]{0,19}$") && pattern(p[@"parentStartId"],@"^(0|[1-9][0-9]{0,19})$") && path(p[@"executable"]);
+}
+inline NSDictionary* processRecord(int pid) {
+  arbol_boundary::Info details{}; Identity id; std::string image;
+  if (arbol_boundary::observe(pid,id,&details) != 1 || !arbol_boundary::executable(id,image)) return nil;
+  int session = getsid(pid); if (session < 1 || id.uid != geteuid()) return nil;
+  return @{@"pid":@(id.pid),@"uid":@(id.uid),@"startId":[NSString stringWithUTF8String:std::to_string(id.start).c_str()],
+    @"pidVersion":@(id.version),@"group":@(id.group),@"session":@(session),
+    @"parentStartId":[NSString stringWithUTF8String:std::to_string(details.unique.parent).c_str()],
+    @"parentPidVersion":@(details.unique.originalParentVersion),@"executable":[NSString stringWithUTF8String:image.c_str()]};
+}
+inline bool currentProcess(NSDictionary* p, bool self = false) {
+  if (!process(p) || (self && [p[@"pid"] intValue] != getpid())) return false;
+  NSDictionary* now = processRecord([p[@"pid"] intValue]);
+  return now && [now isEqual:p];
+}
+inline bool runtime(NSDictionary* p, NSDictionary* attempt) {
+  if (p == (id)NSNull.null) return true;
+  if (!keys(p,@[@"wire",@"profile",@"profileInstance",@"profilePathHash",@"instance",@"nonce",@"pid",@"processStartId",@"build",@"contract",@"phase",@"agentSocket",@"managementSocket"])) return false;
+  uint64_t pid, wire, contract;
+  NSString* id = [attempt[@"profile"] lastPathComponent];
+  return uintNumber(p[@"wire"],wire) && wire == 1 && uintNumber(p[@"contract"],contract) && contract == 1 && [p[@"profile"] isEqual:id] &&
+    [p[@"profileInstance"] isEqual:attempt[@"profileInstance"]] && [p[@"profilePathHash"] isEqual:attempt[@"profilePathHash"]] &&
+    [p[@"build"] isEqual:attempt[@"build"]] && pattern(p[@"instance"],@"^ins_[A-Za-z0-9_-]{22}$") &&
+    pattern(p[@"nonce"],@"^[A-Za-z0-9_-]{43}$") && uintNumber(p[@"pid"],pid) && pid > 1 && pid <= INT_MAX &&
+    pattern(p[@"processStartId"],@"^[1-9][0-9]{0,19}$") &&
+    [@[@"starting",@"ready",@"closing"] containsObject:p[@"phase"]] && path(p[@"agentSocket"]) && path(p[@"managementSocket"]);
+}
+inline bool record(NSDictionary* p) {
+  uint64_t format;
+  if (!keys(p,@[@"format",@"request",@"nonce",@"profile",@"profileInstance",@"profilePathHash",@"build",@"buildRoot",@"buildGuard",
+    @"sourceDigest",@"productDigest",@"candidateDigest",@"expires",@"starter",@"phase",@"stage",@"bootstrap",@"engine",@"runtime",@"terminal"]) || !uintNumber(p[@"format"],format) || format != 1) return false;
+  if (!pattern(p[@"request"],@"^req_[A-Za-z0-9_-]{22}$") || !pattern(p[@"nonce"],@"^[A-Za-z0-9_-]{43}$") ||
+      !path(p[@"profile"]) || !pattern(p[@"profileInstance"],@"^prf_[A-Za-z0-9_-]{22}$") ||
+      !pattern(p[@"build"],@"^[1-9a-f][0-9a-f]{0,15}$") || !path(p[@"buildRoot"]) || !path(p[@"buildGuard"]) || !process(p[@"starter"])) return false;
+  for (NSString* key in @[@"profilePathHash",@"sourceDigest",@"productDigest",@"candidateDigest"])
+    if (!pattern(p[key],@"^[0-9a-f]{64}$")) return false;
+  if (![p[@"profilePathHash"] isEqual:digest([p[@"profile"] UTF8String])]) return false;
+  id expires = p[@"expires"];
+  if (![expires isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)expires) == CFBooleanGetTypeID() ||
+      !std::isfinite([expires doubleValue]) || [expires doubleValue] <= 0) return false;
+  if (![@[@"pending",@"claimed",@"ready",@"closing",@"cancelled",@"closed"] containsObject:p[@"phase"]] ||
+      ![@[@"untransferred",@"transferring",@"retained",@"mutation-started",@"marker-bound",@"admitted"] containsObject:p[@"stage"]]) return false;
+  if ((p[@"bootstrap"] != NSNull.null && !process(p[@"bootstrap"])) ||
+      (p[@"engine"] != NSNull.null && !process(p[@"engine"])) || !runtime(p[@"runtime"],p)) return false;
+  NSString* component = [p[@"buildRoot"] stringByDeletingLastPathComponent];
+  if (![[component lastPathComponent] isEqual:@"arbol-browser"] || ![[p[@"buildRoot"] lastPathComponent] isEqual:p[@"build"]] ||
+      ![p[@"buildGuard"] isEqual:[[component stringByAppendingPathComponent:@".uses"] stringByAppendingPathComponent:p[@"build"]]]) return false;
+  if ([p[@"phase"] isEqual:@"pending"] && (p[@"bootstrap"] != NSNull.null || p[@"engine"] != NSNull.null || p[@"runtime"] != NSNull.null || p[@"terminal"] != NSNull.null || ![p[@"stage"] isEqual:@"untransferred"])) return false;
+  if (p[@"engine"] != NSNull.null) {
+    NSDictionary* a = p[@"bootstrap"], *b = p[@"engine"];
+    if (a == (id)NSNull.null || ![a[@"pid"] isEqual:b[@"pid"]] || ![a[@"uid"] isEqual:b[@"uid"]] ||
+        ![a[@"startId"] isEqual:b[@"startId"]] || ![a[@"group"] isEqual:b[@"group"]] || ![a[@"session"] isEqual:b[@"session"]]) return false;
+  }
+  if ([p[@"phase"] isEqual:@"claimed"] && p[@"bootstrap"] == NSNull.null) return false;
+  if ([p[@"phase"] isEqual:@"ready"] && (p[@"engine"] == NSNull.null || p[@"runtime"] == NSNull.null ||
+      ![p[@"runtime"][@"phase"] isEqual:@"ready"] || ![p[@"stage"] isEqual:@"admitted"])) return false;
+  if (p[@"runtime"] != NSNull.null && (p[@"engine"] == NSNull.null ||
+      ![p[@"runtime"][@"pid"] isEqual:p[@"engine"][@"pid"]] || ![p[@"runtime"][@"processStartId"] isEqual:p[@"engine"][@"startId"]])) return false;
+  if (p[@"terminal"] != NSNull.null && !keys(p[@"terminal"],@[@"path",@"digest"])) return false;
+  if (p[@"terminal"] != NSNull.null && (!path(p[@"terminal"][@"path"]) || !pattern(p[@"terminal"][@"digest"],@"^[0-9a-f]{64}$"))) return false;
+  return true;
+}
+inline bool immutable(NSDictionary* a, NSDictionary* b) {
+  for (NSString* key in @[@"format",@"request",@"nonce",@"profile",@"profileInstance",@"profilePathHash",@"build",@"buildRoot",@"buildGuard",
+      @"sourceDigest",@"productDigest",@"candidateDigest",@"expires",@"starter"])
+    if (![a[key] isEqual:b[key]]) return false;
+  return true;
+}
+inline bool sameFile(const struct stat& a, const struct stat& b) {
+  return a.st_dev == b.st_dev && a.st_ino == b.st_ino && a.st_mode == b.st_mode && a.st_uid == b.st_uid &&
+    a.st_nlink == 1 && b.st_nlink == 1 && a.st_size == b.st_size &&
+    a.st_mtimespec.tv_sec == b.st_mtimespec.tv_sec && a.st_mtimespec.tv_nsec == b.st_mtimespec.tv_nsec &&
+    a.st_ctimespec.tv_sec == b.st_ctimespec.tv_sec && a.st_ctimespec.tv_nsec == b.st_ctimespec.tv_nsec;
+}
+inline bool privateFile(const struct stat& s) { return S_ISREG(s.st_mode) && s.st_uid == geteuid() && (s.st_mode & 07777) == 0600 && s.st_nlink == 1; }
+inline bool readAt(int directory, const std::string& name, std::string& bytes, bool& absent) {
+  absent = false; bytes.clear();
+  int fd = openat(directory,name.c_str(),O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
+  if (fd < 0) { absent = errno == ENOENT; return absent; }
+  struct stat first{}, named{}, last{}, after{};
+  bool valid = !fstat(fd,&first) && !fstatat(directory,name.c_str(),&named,AT_SYMLINK_NOFOLLOW) && privateFile(first) && sameFile(first,named) && first.st_size > 0 && first.st_size <= (off_t)limit;
+  char data[4096];
+  while (valid && bytes.size() <= (size_t)first.st_size) {
+    ssize_t n = read(fd,data,std::min(sizeof(data),(size_t)first.st_size+1-bytes.size()));
+    if (n > 0) bytes.append(data,(size_t)n); else if (!n) break; else if (errno != EINTR) valid = false;
+  }
+  valid = valid && bytes.size() == (size_t)first.st_size && !fstat(fd,&last) && !fstatat(directory,name.c_str(),&after,AT_SYMLINK_NOFOLLOW) && sameFile(first,last) && sameFile(last,after);
+  if (close(fd)) valid = false; return valid;
+}
+inline NSDictionary* json(const std::string& bytes) {
+  if (bytes.empty() || bytes.size() > limit) return nil;
+  NSData* data = [NSData dataWithBytes:bytes.data() length:bytes.size()];
+  id object = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+  return [object isKindOfClass:NSDictionary.class] ? object : nil;
+}
+inline std::string bytes(NSDictionary* object) {
+  NSData* data = [NSJSONSerialization dataWithJSONObject:object options:NSJSONWritingSortedKeys error:nil];
+  if (!data || !data.length || data.length >= limit) return {};
+  return std::string((const char*)data.bytes,data.length) + "\n";
+}
+struct Location {
+  int directory = -1, lock = -1; struct stat identity{}, lockIdentity{}; std::string path;
+  Location() = default; Location(const Location&) = delete; Location& operator=(const Location&) = delete;
+  ~Location() { if (directory >= 0) close(directory); } // directory only; never owns the borrowed lock
+};
+inline bool location(const std::string& lockPath, int lockFd, Location& out) {
+  size_t slash = lockPath.rfind('/'); if (slash == std::string::npos || lockPath.substr(slash+1) != "claim.lock") return false;
+  std::string lexical = lockPath.substr(0,slash); char physical[PATH_MAX]{};
+  if (!realpath(lexical.c_str(),physical)) return false; out.path = physical;
+  std::string prefix = "/private/tmp/ab-" + std::to_string(geteuid()) + "/";
+  if (out.path.rfind(prefix,0) || out.path.size() != prefix.size()+32) return false;
+  for (char ch : out.path.substr(prefix.size())) if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) return false;
+  if (lexical != out.path && lexical != "/tmp/" + out.path.substr(std::string("/private/tmp/").size())) return false;
+  struct stat system{},parent{}; std::string parentPath = out.path.substr(0,out.path.rfind('/'));
+  if (lstat("/private/tmp",&system) || !S_ISDIR(system.st_mode) || system.st_uid != 0 || (system.st_mode & 01777) != 01777 ||
+      lstat(parentPath.c_str(),&parent) || !S_ISDIR(parent.st_mode) || parent.st_uid != geteuid() || (parent.st_mode & 07777) != 0700) return false;
+  out.directory = open(out.path.c_str(),O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+  if (out.directory < 0) return false;
+  struct stat named{};
+  bool valid = !fstat(out.directory,&out.identity) && !lstat(out.path.c_str(),&named) && S_ISDIR(out.identity.st_mode) &&
+    out.identity.st_uid == geteuid() && (out.identity.st_mode & 07777) == 0700 && out.identity.st_dev == named.st_dev && out.identity.st_ino == named.st_ino;
+  struct stat lockNamed{}; char heldPath[PATH_MAX]{};
+  valid = valid && lockFd >= 0 && !fstat(lockFd,&out.lockIdentity) && !fstatat(out.directory,"claim.lock",&lockNamed,AT_SYMLINK_NOFOLLOW) &&
+    privateFile(out.lockIdentity) && sameFile(out.lockIdentity,lockNamed) && !fcntl(lockFd,F_GETPATH,heldPath) &&
+    out.path + "/claim.lock" == heldPath;
+  out.lock = lockFd;
+  if (!valid) { close(out.directory); out.directory = -1; } return valid;
+}
+inline bool unchanged(const Location& location) {
+  struct stat current{}, held{}, lock{}, lockNamed{};
+  return location.directory >= 0 && !fstat(location.directory,&held) && !lstat(location.path.c_str(),&current) &&
+    S_ISDIR(current.st_mode) && current.st_dev == location.identity.st_dev && current.st_ino == location.identity.st_ino &&
+    held.st_dev == current.st_dev && held.st_ino == current.st_ino && current.st_uid == geteuid() && (current.st_mode & 07777) == 0700 &&
+    !fstat(location.lock,&lock) && !fstatat(location.directory,"claim.lock",&lockNamed,AT_SYMLINK_NOFOLLOW) &&
+    privateFile(lock) && sameFile(lock,lockNamed) && lock.st_dev == location.lockIdentity.st_dev && lock.st_ino == location.lockIdentity.st_ino;
+}
+inline bool replace(const Location& at, const std::string& expected, bool absent, const std::string& next) {
+  if (!unchanged(at) || !record(json(next))) return false;
+  NSString* pathHash = json(next)[@"profilePathHash"];
+  if (at.path.substr(at.path.rfind('/')+1) != std::string([pathHash UTF8String]).substr(0,32)) return false;
+  bool missing; std::string actual;
+  if (!readAt(at.directory,"claim.json",actual,missing) || missing != absent || (!absent && actual != expected)) return false;
+  NSString* name = [@".claim-" stringByAppendingString:NSUUID.UUID.UUIDString]; const char* filename = name.UTF8String;
+  int fd = openat(at.directory,filename,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC,0600);
+  if (fd < 0) return false;
+  bool valid = !fchmod(fd,0600); size_t offset = 0;
+  while (valid && offset < next.size()) { ssize_t n = write(fd,next.data()+offset,next.size()-offset); if (n > 0) offset += (size_t)n; else if (n < 0 && errno == EINTR) continue; else valid = false; }
+  if (valid) valid = !fsync(fd); if (close(fd)) valid = false;
+  if (valid) valid = unchanged(at) && readAt(at.directory,"claim.json",actual,missing) && missing == absent && (absent || actual == expected);
+  if (valid) valid = !renameat(at.directory,filename,at.directory,"claim.json") && !fsync(at.directory) && unchanged(at);
+  if (!valid) (void)unlinkat(at.directory,filename,0);
+  return valid;
+}
+enum class Role { starter, bootstrap, engine, terminal };
+inline NSInteger stage(NSDictionary* p) {
+  return [@[@"untransferred",@"transferring",@"retained",@"mutation-started",@"marker-bound",@"admitted"] indexOfObject:p[@"stage"]];
+}
+inline bool sameRuntimeBinding(id old, id next) {
+  if (old == NSNull.null) return next == NSNull.null || [next[@"phase"] isEqual:@"starting"];
+  if (next == NSNull.null) return false;
+  for (NSString* key in @[@"wire",@"profile",@"profileInstance",@"profilePathHash",@"instance",@"nonce",@"pid",@"processStartId",@"build",@"contract",@"agentSocket",@"managementSocket"])
+    if (![old[key] isEqual:next[key]]) return false;
+  NSInteger a = [@[@"starting",@"ready",@"closing"] indexOfObject:old[@"phase"]];
+  NSInteger b = [@[@"starting",@"ready",@"closing"] indexOfObject:next[@"phase"]];
+  return b >= a;
+}
+inline bool transition(NSDictionary* old, NSDictionary* next, Role role) {
+  if (!record(next) || (old && !record(old))) return false; double now = arbol_boundary::clockMs();
+  NSString* phase = next[@"phase"];
+  if (!old || ![old[@"request"] isEqual:next[@"request"]]) {
+    bool unused = old && [old[@"phase"] isEqual:@"cancelled"] && old[@"bootstrap"] == NSNull.null && old[@"engine"] == NSNull.null;
+    // A serialized label is not independent exit authority. Reuse of a closed
+    // claimed family needs the separate native exit verifier, not this generic
+    // starter JSON transaction. Unclaimed cancelled intent has no engine.
+    if (role != Role::starter || ![phase isEqual:@"pending"] || (old && !unused) ||
+        !currentProcess(next[@"starter"],true) || [next[@"expires"] doubleValue] <= now || [next[@"expires"] doubleValue] > now+30000) return false;
+    return true;
+  }
+  if (!immutable(old,next) || [old[@"phase"] isEqual:@"closed"]) return false;
+  if ([old[@"phase"] isEqual:@"cancelled"] && ![phase isEqual:@"closed"]) return false;
+  if ([phase isEqual:@"cancelled"] && role == Role::starter) {
+    if (!currentProcess(old[@"starter"],true) && [old[@"expires"] doubleValue] > now) return false;
+    for (NSString* key in @[@"stage",@"bootstrap",@"engine",@"runtime",@"terminal"]) if (![old[key] isEqual:next[key]]) return false;
+    return true;
+  }
+  if (role == Role::bootstrap && [old[@"phase"] isEqual:@"pending"] && [phase isEqual:@"claimed"] &&
+      [old[@"expires"] doubleValue] > now && currentProcess(old[@"starter"]) && currentProcess(next[@"bootstrap"],true) &&
+      [next[@"stage"] isEqual:@"untransferred"] && next[@"engine"] == NSNull.null && next[@"runtime"] == NSNull.null && next[@"terminal"] == NSNull.null) return true;
+  bool enginePhase = ([old[@"phase"] isEqual:@"claimed"] && ([@[@"claimed",@"ready",@"closing"] containsObject:phase])) ||
+    ([old[@"phase"] isEqual:@"ready"] && [phase isEqual:@"closing"]);
+  if (role == Role::engine && enginePhase &&
+      (![old[@"phase"] isEqual:@"claimed"] || [old[@"expires"] doubleValue] > now) &&
+      [old[@"bootstrap"] isEqual:next[@"bootstrap"]] && currentProcess(next[@"engine"],true) &&
+      (old[@"engine"] == NSNull.null || [old[@"engine"] isEqual:next[@"engine"]]) &&
+      sameRuntimeBinding(old[@"runtime"],next[@"runtime"]) && stage(next) >= stage(old) && stage(next) <= stage(old)+1 &&
+      next[@"terminal"] == NSNull.null) return true;
+  // Only a native custody/exit verifier calls this role after actual evidence.
+  return role == Role::terminal && [phase isEqual:@"closed"] && next[@"terminal"] != NSNull.null &&
+    [old[@"stage"] isEqual:next[@"stage"]] && [old[@"bootstrap"] isEqual:next[@"bootstrap"]] &&
+    [old[@"engine"] isEqual:next[@"engine"]] && [old[@"runtime"] isEqual:next[@"runtime"]];
+}
+} // namespace arbol_attempt

@@ -2,6 +2,7 @@
 #import <Foundation/Foundation.h>
 #include <node_api.h>
 #include "../../watchdog/boundary.hpp"
+#include "attempt.hpp"
 #include <set>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -219,6 +220,75 @@ static napi_value publishDirectory(napi_env env, napi_callback_info info) {
   napi_value out; napi_get_undefined(env, &out); return out;
 }
 
+static bool boundedText(napi_env env, napi_value value, std::string& out) {
+  size_t length = 0, written = 0;
+  if (napi_get_value_string_utf8(env,value,nullptr,0,&length) != napi_ok || !length || length > arbol_attempt::limit) return false;
+  out.resize(length+1);
+  if (napi_get_value_string_utf8(env,value,out.data(),out.size(),&written) != napi_ok || written != length) return false;
+  out.resize(length); return out.find('\0') == std::string::npos;
+}
+static HeldLock* claimLock(napi_env env, napi_value value) {
+  void* data = nullptr; struct stat st{};
+  if (napi_get_value_external(env,value,&data) != napi_ok) return nullptr;
+  auto* lock = static_cast<HeldLock*>(data);
+  return liveLocks.count(lock) && lock->mode == LOCK_EX && matches(lock,&st) ? lock : nullptr;
+}
+static napi_value continuousTime(napi_env env, napi_callback_info) {
+  double value = arbol_boundary::clockMs(); napi_value out;
+  if (!std::isfinite(value) || value < 0 || value > 9007199254740991.0 || napi_create_double(env,value,&out) != napi_ok) return fail(env);
+  return out;
+}
+static napi_value processProvenance(napi_env env, napi_callback_info info) {
+  napi_value arg; int pid; arbol_boundary::Identity id;
+  if (!argument(env,info,&arg) || !integer(env,arg,&pid) || pid < 2) return fail(env);
+  int state = arbol_boundary::observe(pid,id); if (state < 0) return fail(env);
+  if (!state) { napi_value out; napi_get_null(env,&out); return out; }
+  @autoreleasepool { @try {
+    NSDictionary* record = arbol_attempt::processRecord(pid);
+    if (!arbol_attempt::process(record)) return fail(env);
+    napi_value out; if (napi_create_object(env,&out) != napi_ok) return fail(env);
+    for (NSString* key in @[@"pid",@"uid",@"pidVersion",@"group",@"session",@"parentPidVersion"])
+      if (!property(env,out,key.UTF8String,number(env,[record[key] unsignedIntValue]))) return fail(env);
+    for (NSString* key in @[@"startId",@"parentStartId",@"executable"])
+      if (!property(env,out,key.UTF8String,text(env,[record[key] UTF8String]))) return fail(env);
+    return out;
+  } @catch (NSException*) { return fail(env); } }
+}
+static bool attemptAt(const arbol_attempt::Location& at, NSDictionary* value) {
+  return arbol_attempt::record(value) && at.path.substr(at.path.rfind('/')+1) == std::string([value[@"profilePathHash"] UTF8String]).substr(0,32);
+}
+static napi_value readLaunchAttempt(napi_env env, napi_callback_info info) {
+  napi_value arg; if (!argument(env,info,&arg)) return fail(env);
+  auto* lock = claimLock(env,arg); if (!lock) return fail(env);
+  @autoreleasepool { @try {
+    arbol_attempt::Location at;
+    if (!arbol_attempt::location(lock->path,lock->fd,at)) return fail(env);
+    bool absent; std::string raw;
+    if (!arbol_attempt::readAt(at.directory,"claim.json",raw,absent) || !arbol_attempt::unchanged(at) ||
+        (!absent && !attemptAt(at,arbol_attempt::json(raw)))) return fail(env);
+    if (absent) { napi_value out; napi_get_null(env,&out); return out; }
+    return text(env,raw);
+  } @catch (NSException*) { return fail(env); } }
+}
+static napi_value writeLaunchAttempt(napi_env env, napi_callback_info info) {
+  napi_value args[3]; size_t n = 3; std::string expected,next; napi_valuetype kind;
+  if (napi_get_cb_info(env,info,&n,args,nullptr,nullptr) != napi_ok || n != 3 ||
+      napi_typeof(env,args[1],&kind) != napi_ok || (kind != napi_null && !boundedText(env,args[1],expected)) ||
+      !boundedText(env,args[2],next)) return fail(env);
+  auto* lock = claimLock(env,args[0]); if (!lock) return fail(env);
+  @autoreleasepool { @try {
+    arbol_attempt::Location at;
+    if (!arbol_attempt::location(lock->path,lock->fd,at)) return fail(env);
+    bool absent; std::string raw;
+    if (!arbol_attempt::readAt(at.directory,"claim.json",raw,absent) || absent != (kind == napi_null) ||
+        (!absent && raw != expected) || !attemptAt(at,arbol_attempt::json(next)) ||
+        !arbol_attempt::transition(absent ? nil : arbol_attempt::json(raw),arbol_attempt::json(next),arbol_attempt::Role::starter) ||
+        !arbol_attempt::replace(at,raw,absent,next)) return fail(env);
+    struct stat current{}; if (!matches(lock,&current)) return fail(env);
+    napi_value out; napi_get_undefined(env,&out); return out;
+  } @catch (NSException*) { return fail(env); } }
+}
+
 // Process-lifetime native custody is intentionally not garbage-collected. Once
 // created it has no unlock/disarm export; retained originals survive JS failure.
 struct Custody { arbol_boundary::Context context; int capsule=-1; bool bound = false; };
@@ -305,6 +375,10 @@ static napi_value terminateProfileNow(napi_env env,napi_callback_info info) {
 }
 static napi_value init(napi_env env, napi_value exports) {
   napi_property_descriptor properties[] = {
+    {"continuousTime",nullptr,continuousTime,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"processProvenance",nullptr,processProvenance,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"readLaunchAttempt",nullptr,readLaunchAttempt,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"writeLaunchAttempt",nullptr,writeLaunchAttempt,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"terminateProfileNow",nullptr,terminateProfileNow,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"prepareWatchdogCustody",nullptr,prepareWatchdogCustody,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"custodyDescriptors",nullptr,custodyDescriptors,nullptr,nullptr,nullptr,napi_default,nullptr},
