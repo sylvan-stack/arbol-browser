@@ -5,6 +5,7 @@ import { assertProductionSessions, type ProfileSessions } from '../profiles/sess
 import type { HostCustody } from '../runtime/custody.js';
 import { assertNativeFailureBoundary } from '../runtime/bootstrap.js';
 import { assertNativeFeatures } from '../native/features.js';
+import { assertSystemClipboardProtection, type SystemClipboardProtection } from '../runtime/platform.js';
 import { staleSnapshot, type TabAuthority } from './authority.js';
 import type { HostDocument, HostDocuments } from './documents.js';
 import type { InspectionFrame, PageReadiness } from './readiness.js';
@@ -47,11 +48,10 @@ function acknowledge(value: unknown): void {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length) throw staleSnapshot();
 }
 
-/** Source contribution for ABR-30 composition, never an installed Session or a
- * successful admission default. In particular, consent handlers do NOT enforce
- * Chromium's transient-activation synchronous script copy/cut path. That real
- * process-wide protection must come from the native provider. Until verified,
- * assertAgentAdmission explicitly refuses agent admission. */
+/** ABR-30 installs the genuine native process protection before any Session,
+ * chrome or website, then binds this original-page provider. Consent handlers
+ * alone never enforce transient-activation script copy/cut. This constructor
+ * requires the native handle; no caller-created flag can open admission. */
 export class HostCapabilities {
   private readonly records = new Map<TabTarget, PageRecord>();
   private readonly contents = new WeakMap<WebContents, PageRecord>();
@@ -63,7 +63,8 @@ export class HostCapabilities {
   private readonly extensionList;
   private readonly removeDocuments: () => void;
   constructor(readonly authority: TabAuthority, readonly documents: HostDocuments, readonly readiness: PageReadiness,
-    readonly sessions: ProfileSessions, readonly custody: HostCustody, private readonly userPolicy?: UserPermissionPolicy) {
+    readonly sessions: ProfileSessions, readonly custody: HostCustody, private readonly clipboardProtection: SystemClipboardProtection,
+    private readonly userPolicy?: UserPermissionPolicy) {
     if (authority.documents !== documents || readiness.documents !== documents || readiness.boundary !== authority.boundary ||
         sessions.website === sessions.shell || installed.has(sessions.website)) throw unavailableBoundary();
     const website = sessions.website;
@@ -124,6 +125,7 @@ export class HostCapabilities {
     try {
       assertNativeFailureBoundary(this.authority.boundary); assertNativeFeatures();
       assertProductionSessions(this.sessions, this.custody); this.authority.assertHealthy();
+      assertSystemClipboardProtection(this.clipboardProtection, this.custody);
       const website = this.sessions.website;
       if (website.setPermissionRequestHandler !== this.requestHandler || website.setPermissionCheckHandler !== this.checkHandler ||
           website.setDisplayMediaRequestHandler !== this.captureHandler || website.extensions !== this.extensions ||
@@ -290,12 +292,13 @@ export class HostCapabilities {
     }
     if (seen.size !== receipt.frames.length) throw unavailableBoundary(); guard(); this.original(record);
   }
-  /** Deliberately no caller-created boolean/receipt can fill the missing sync
-   * clipboard boundary. Keep this leaf and production admission incomplete. */
-  assertAgentAdmission(receipt: HostDocument, frames: readonly InspectionFrame[], guard: () => void): never {
+  /** The exact process guard is a capability prerequisite, not action/grant
+   * authority. Original document/frame/chooser and execution guards still own
+   * page admission. ABR-30 separately refuses Browser-owned destructive Cut. */
+  assertAgentAdmission(receipt: HostDocument, frames: readonly InspectionFrame[], guard: () => void): void {
     this.assertChooserCoverage(receipt, frames, guard);
-    throw new BrowserFailure({ code: 'unsupported', message: 'Synchronous clipboard copy/cut enforcement is unavailable.', retryable: false,
-      remedy: 'Use Take control or a complete qualified browser Build.' });
+    guard(); assertSystemClipboardProtection(this.clipboardProtection, this.custody); guard();
+    this.documents.assertCurrent(this.documents.target(receipt), receipt);
   }
   close(): void {
     if (this.closed) return; this.closed = true; this.removeDocuments();
