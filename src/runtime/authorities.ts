@@ -1,6 +1,5 @@
 /** Node-safe physical package identity. Cryptographic authority is established
  * separately; an editable metadata object or launcher environment is no trust. */
-import { createRequire } from 'node:module';
 import { join, isAbsolute, resolve, dirname, basename } from 'node:path';
 import { userInfo } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -13,8 +12,9 @@ import { directory, assertDirectory } from '../profiles/paths.js';
 import { assertHostCustody } from './custody.js';
 import type { SignedBundle } from '../native/manifest.js';
 
-const { constants, promises: { open, realpath, lstat } } = createRequire(import.meta.url)(
-  process.type === 'browser' ? 'original-fs' : 'node:fs') as typeof import('node:fs');
+const physicalFS = process.getBuiltinModule(typeof process.versions.electron === 'string' ? 'original-fs' : 'fs') as typeof import('node:fs') | undefined;
+if (!physicalFS || !physicalFS.promises || typeof physicalFS.promises.open !== 'function') throw unavailable('browser');
+const { constants, promises: { open, realpath, lstat } } = physicalFS;
 
 export interface PackagedIdentity {
   readonly layout: PackagedLayout;

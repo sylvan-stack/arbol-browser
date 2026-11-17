@@ -7,7 +7,7 @@ import { resolve, join, relative, dirname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { root, inventory, inventoryDigest } from './package-base.mjs';
 import { hash, canonical, exactFile, json, privateDirectory, writeExclusive, assertHostIsolation,
-  currentHostCompilation, acceptedHostProduct, prepareUnsignedHost, refreshHostRecords } from './package-host.mjs';
+  currentHostCompilation, acceptedHostProduct, prepareUnsignedHost, refreshHostRecords, assertPhysicalCap } from './package-host.mjs';
 const identity = 'F1B6782A3BACC18E73FE08CA424C0A81450A982C';
 const publisher = Object.freeze({ team: '7V372XL59S', bundleIdentifier: 'com.sylvan-stack.arbol-browser.native-candidate',
   requirement: 'anchor apple generic and certificate leaf[subject.OU] = "7V372XL59S" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists' });
@@ -25,7 +25,7 @@ async function absent(path) {
  * record alone cannot authorize substitutions in Electron, dependencies or JS. */
 export async function signHost({ bundle, runtimeArchive, review }) {
   if (process.platform !== 'darwin' || process.arch !== 'arm64' || resolve(bundle) !== bundle ||
-      !bundle.endsWith('/ArbolBrowser.app') || await realpath(bundle) !== bundle || bundle.startsWith(root + sep)) fail();
+      !(bundle.endsWith('/ArbolBrowser.app') || /^\.host-preparation-[A-Za-z0-9_-]{22}\.app$/.test(bundle.split('/').at(-1))) || await realpath(bundle) !== bundle || bundle.startsWith(root + sep)) fail();
   await privateDirectory(bundle); await privateDirectory(dirname(bundle));
   const unsigned = await json(bundle + '.unsigned.json'), staged = unsigned.value;
   const compiled = await currentHostCompilation(), accepted = await acceptedHostProduct(review, compiled);
@@ -35,6 +35,7 @@ export async function signHost({ bundle, runtimeArchive, review }) {
       canonical(staged.sourceIdentity) !== canonical(compiled.sourceIdentity) ||
       canonical(staged.compilerInputs) !== canonical(compiled.record.compilerInputs)) fail();
   await assertHostIsolation(staged.buildRoot, staged.stateRoot);
+  if (!bundle.endsWith('/ArbolBrowser.app') && dirname(bundle) !== staged.buildRoot) fail();
   if (!await absent(join(bundle, 'Contents/_CodeSignature')) || !await absent(bundle + '.signing-attempt.json')) fail();
   const comparison = await mkdtemp(join(dirname(bundle), '.host-sign-inputs-')); await chmod(comparison, 0o700);
   const expected = await prepareUnsignedHost({ out: join(comparison, 'ArbolBrowser.app'), buildRoot: staged.buildRoot,
@@ -86,7 +87,7 @@ export async function signHost({ bundle, runtimeArchive, review }) {
     for (const name of Object.keys(actual)) if (!(name in expected.record.files) && !signatureResource(name)) fail();
     return actual;
   }
-  await assertUnchangedResources();
+  await assertUnchangedResources(); await assertPhysicalCap(bundle); await assertPhysicalCap(join(bundle, 'Contents/Resources/browser'));
   sign(bundle);
   const audit = [];
   for (const path of [...leaves, ...bundles, join(bundle, 'Contents/MacOS/arbol-browser-native'), bundle]) {
@@ -112,6 +113,7 @@ export async function signHost({ bundle, runtimeArchive, review }) {
     productOutputs: staged.productOutputs, compilerInputs: staged.compilerInputs, reviewHandover: review, reviewDigest: accepted.digest,
     unsignedDigest: unsigned.sha256, compileDigest: compiled.digest, metadataDigest: records.policy.metadataDigest,
     compatibilityDigest: records.policy.compatibilityDigest, policyDigest: (await exactFile(join(bundle, 'Contents/Resources/host-policy.json'))).sha256,
+    physicalEntries: { bundle: await assertPhysicalCap(bundle), payload: await assertPhysicalCap(join(bundle, 'Contents/Resources/browser')) },
     files: finalFiles, payloadDigest: inventoryDigest(finalFiles), objects: audit, libraryValidationDisabled: false,
     qualification: 'unexecuted', unavailable: ['ABR-12 actual product/readiness/failure/race/persistence/close qualification', 'ABR-30 inspection and agent effects', 'ABR-25 distribution/notarization/release qualification'] };
   await writeExclusive(bundle + '.signature-audit.json', JSON.stringify(result, null, 2) + '\n');

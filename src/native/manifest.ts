@@ -1,5 +1,4 @@
 /** The publisher anchor is source policy, never derived from a running package. */
-import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
@@ -10,8 +9,13 @@ import { validator } from '../contracts/schema.js';
 // Trust covers physical signed bytes, including ASAR archives, on every check.
 // Browser verification uses the mandatory unpatched Electron builtin. The Node
 // CLI has an unpatched filesystem already and never imports Electron code.
-const { constants, lstatSync, openSync, fstatSync, readSync, closeSync, opendirSync, readlinkSync, realpathSync } =
-  createRequire(import.meta.url)(process.type === 'browser' ? 'original-fs' : 'node:fs') as typeof import('node:fs');
+// NodeMain uses the same ASAR wrapper as the browser. Builtin-only access
+// cannot resolve an ambient original-fs package; actual Electron must provide
+// its genuine unpatched builtin or refuse. Plain Node retains its own fs.
+const physicalFS = process.getBuiltinModule(typeof process.versions.electron === 'string' ? 'original-fs' : 'fs') as typeof import('node:fs') | undefined;
+if (!physicalFS || typeof physicalFS.openSync !== 'function' || !physicalFS.promises ||
+    typeof physicalFS.promises.open !== 'function') throw new Error('native_candidate_unavailable');
+const { constants, lstatSync, openSync, fstatSync, readSync, closeSync, opendirSync, readlinkSync, realpathSync } = physicalFS;
 
 export const publisher = Object.freeze({ team: '7V372XL59S', bundleIdentifier: 'com.sylvan-stack.arbol-browser.native-candidate',
   requirement: 'anchor apple generic and certificate leaf[subject.OU] = "7V372XL59S" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists' });
@@ -128,7 +132,7 @@ function physicalStamp(stat: import('node:fs').BigIntStats): string {
 }
 // Capture the actual unpatched implementation once, in this canonical module.
 // These callbacks perform filesystem work off the browser heartbeat thread.
-const originalAsyncFS = createRequire(import.meta.url)(process.type === 'browser' ? 'original-fs' : 'node:fs') as typeof import('node:fs');
+const originalAsyncFS = physicalFS;
 const asynchronousFS = Object.freeze({ lstat: originalAsyncFS.lstat, fstat: originalAsyncFS.fstat, open: originalAsyncFS.open,
   close: originalAsyncFS.close, read: originalAsyncFS.read, opendir: originalAsyncFS.opendir, readlink: originalAsyncFS.readlink, realpath: originalAsyncFS.realpath });
 function asyncLstat(path: string): Promise<import('node:fs').BigIntStats> {

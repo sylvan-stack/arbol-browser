@@ -13,7 +13,8 @@
   },
   "scripts": {
     "compile": "node scripts/compile.mjs",
-    "package:candidate": "node scripts/package-base.mjs"
+    "package:candidate": "node scripts/package-base.mjs",
+    "package:host": "node scripts/package-host.mjs --allocated"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.2",

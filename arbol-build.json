@@ -7,7 +7,7 @@
     "npm ci --ignore-scripts --no-audit --no-fund",
     "node node_modules/electron/install.js",
     "npm run compile",
-    "npm run package:candidate -- --out \"$ARBOL_BUILD_DIR\" --build \"$ARBOL_BUILD_NUMBER\""
+    "npm run package:host"
   ],
   "checks": [
     {

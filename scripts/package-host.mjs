@@ -1,9 +1,11 @@
 /** Fresh unsigned host preparation. Importing this module never stages/signs,
  * starts a product or changes the Build registry. ABR-12 owns actual execution. */
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createRequire } from 'node:module';
+import { transform } from 'esbuild';
+import { createHash, randomBytes } from 'node:crypto';
 import { constants } from 'node:fs';
-import { open, readFile, writeFile, lstat, realpath, readdir, mkdir, mkdtemp, cp, chmod } from 'node:fs/promises';
+import { open, readFile, writeFile, lstat, realpath, readdir, mkdir, mkdtemp, cp, chmod, link, unlink } from 'node:fs/promises';
 import { userInfo } from 'node:os';
 import { join, dirname, resolve, sep, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -104,11 +106,28 @@ export async function currentHostCompilation() {
   const sourceIdentity = { repositoryDigest: hash(await realpath(root)), branch: git(['rev-parse', '--abbrev-ref', 'HEAD']),
     commit: git(['rev-parse', 'HEAD']), uncommittedChanges: git(['status', '--porcelain']) !== '' };
   if (sourceIdentity.uncommittedChanges || canonical(record.sourceIdentity) !== canonical(sourceIdentity)) fail('Host source is not the exact compiled committed Build source');
-  await validateNativeCompilation(); await validateWatchdogCompilation();
+  const native = await validateNativeCompilation(), watchdog = await validateWatchdogCompilation();
   const platformURL = new URL('./compile-platform.mjs', import.meta.url).href;
   const platform = await import(platformURL);
   if (typeof platform.validatePlatformCompilation !== 'function') fail('Platform compiler closure unavailable');
-  await platform.validatePlatformCompilation();
+  const support = await platform.validatePlatformCompilation();
+  // Purpose-limited large private compiler evidence, distinct from every small
+  // policy/command and actual runtime manifest bound. Compare complete bytes
+  // through compact reviewed frontiers, not editable summary assertions.
+  const details = JSON.parse((await exactFile(join(root, 'dist/compiler-input-details.json'), 8388608)).bytes.toString('utf8'));
+  const nativeSources = ['ownership', 'integrity', 'bindings', 'accessibility', 'text-input', 'responder', 'interaction'].map(name => `native/${name}.mm`);
+  const nativeSDK = await platform.captureCompilerInputs(nativeSources), runtimeProjection = await installedRuntimeProjection();
+  const frontier = input => ({ digest: hash(canonical(input)), files: Object.keys(input.files).length, policy: input.policy, providers: input.providers });
+  if (canonical(details.native) !== canonical(native.input) || canonical(details.platform) !== canonical(support.input) ||
+      canonical(details.watchdog) !== canonical(watchdog.input) || canonical(details.nativeSDK) !== canonical(nativeSDK) ||
+      canonical(details.runtimeProjection) !== canonical(runtimeProjection)) fail('Actual compiler/package input evidence changed');
+  for (const [name, digest] of Object.entries(details.vendorInputs)) {
+    if (!name.startsWith('node_modules/') || name.split('/').includes('..') || hash(await readFile(join(root, name))) !== digest)
+      fail('Actual vendor compiler input changed');
+  }
+  const actualInputs = { native: native.input, nativeSDK: frontier(nativeSDK), platform: frontier(support.input), watchdog: frontier(watchdog.input),
+    runtimeProjection: compactRuntimeProjection(runtimeProjection), vendorInputs: { digest: hash(canonical(details.vendorInputs)), files: Object.keys(details.vendorInputs).length } };
+  if (canonical(record.compilerInputs) !== canonical(actualInputs)) fail('Reviewed compiler frontier differs');
   return { record, digest: compiled.sha256, sourceIdentity, productSources, productOutputs: actualOutputs };
 }
 // Review authority is an already published exact Forester hand-over, never
@@ -161,6 +180,82 @@ async function stockRuntime(archive, scratch) {
   if ((await exactFile(join(out, 'version'))).bytes.toString('utf8').trim().replace(/^v/, '') !== hostRuntime.electron) fail('Stock Electron version differs');
   await inventory(out); return out; // validates every symlink remains in extraction
 }
+export const runtimeMetadataOnly = name => /(?:\.d\.(?:ts|cts|mts)|\.(?:js|cjs|mjs|ts|cts|mts)\.map)$/.test(name);
+/** Preserve every JS/JSON/unknown asset and original package/provider path.
+ * Only audited declarations and explicit compiler source maps are omitted. */
+export async function dependencyProjection(directory) {
+  const pkg = (await json(join(directory, 'package.json'))).value;
+  const targets = [];
+  function inspect(value, types = false) {
+    if (typeof value === 'string') {
+      if (!types) { targets.push(value); if (runtimeMetadataOnly(value)) fail('Metadata class is a live package target'); }
+    } else if (Array.isArray(value)) for (const item of value) inspect(item, types);
+    else if (value && typeof value === 'object') for (const [key, item] of Object.entries(value)) {
+      const typeCondition = types || /^(?:types|typings)(?:@|$)/.test(key);
+      if (!typeCondition && runtimeMetadataOnly(key)) fail('Metadata class is a live package alias');
+      inspect(item, typeCondition);
+    }
+  }
+  for (const name of ['main', 'module', 'bin', 'exports', 'imports', 'browser']) inspect(pkg[name]);
+  const kept = Object.create(null), omitted = Object.create(null), entries = [];
+  async function walk(path) {
+    for (const name of (await readdir(path)).sort()) {
+      if (path === directory && name === 'node_modules') continue; // each locked nested package is independently projected
+      const full = join(path, name), local = full.slice(directory.length + 1), stat = await lstat(full);
+      if (stat.isDirectory()) { entries.push(local); await walk(full); }
+      else if (stat.isSymbolicLink()) {
+        if (!(await realpath(full)).startsWith(directory + sep) || runtimeMetadataOnly(local)) fail('Unsupported projected dependency link');
+        entries.push(local); kept[local] = hash('symlink\0' + await (await import('node:fs/promises')).readlink(full));
+      } else if (stat.isFile()) {
+        const raw = await readFile(full), digest = hash(raw);
+        if (runtimeMetadataOnly(local)) { omitted[local] = digest; continue; }
+        if (/\.(?:js|cjs|mjs)$/.test(local)) {
+          // Parse/print strips sourceMappingURL comments. A remaining reference
+          // is a possible real dynamic side asset and must be preserved/reviewed.
+          const code = (await transform(raw.toString('utf8'), { loader: 'js', format: 'esm', legalComments: 'none', minifyWhitespace: true })).code;
+          for (const match of code.matchAll(/["']([^"'\r\n]+)["']/g))
+            if (runtimeMetadataOnly(match[1])) fail('Possible live metadata side asset requires exact review');
+        }
+        entries.push(local); kept[local] = digest;
+      } else fail('Unsupported dependency object');
+    }
+  }
+  await walk(directory);
+  return { manifest: hash(canonical(pkg)), targets, kept, omitted, entries };
+}
+export function dependencyFrontier(proof) {
+  return { digest: hash(canonical(proof)), manifest: proof.manifest, kept: Object.keys(proof.kept).length,
+    omitted: Object.keys(proof.omitted).length, entries: proof.entries.length };
+}
+export function compactRuntimeProjection(proof) {
+  return { digest: hash(canonical(proof)), physicalEntries: proof.physicalEntries, entriesDigest: proof.entriesDigest,
+    packages: Object.fromEntries(Object.entries(proof.packages).map(([name, value]) => [name, dependencyFrontier(value)])) };
+}
+export async function installedRuntimeProjection() {
+  const lock = (await json(join(root, 'package-lock.json'))).value, packages = {}, paths = new Set(['node_modules']);
+  for (const [name, entry] of Object.entries(lock.packages).sort(([a], [b]) => a.localeCompare(b, 'en'))) {
+    if (!name || entry.dev) continue;
+    const proof = await dependencyProjection(join(root, name)); packages[name] = proof;
+    for (const local of ['', ...proof.entries]) {
+      let path = local ? `${name}/${local}` : name;
+      for (;;) { paths.add(path); const parent = dirname(path); if (parent === '.' || parent === path) break; path = parent; }
+    }
+  }
+  return { packages, physicalEntries: paths.size, entriesDigest: hash(canonical([...paths].sort())) };
+}
+export async function assertPhysicalCap(directory) {
+  let count = 0;
+  async function walk(path) {
+    for (const name of await readdir(path)) {
+      if (++count > 4096) fail('Actual host physical entry cap exceeded');
+      const full = join(path, name), stat = await lstat(full);
+      if (stat.isDirectory()) await walk(full);
+      else if (stat.isSymbolicLink()) { if (!(await realpath(full)).startsWith(directory + sep)) fail('Escaping host link'); }
+      else if (!stat.isFile()) fail('Unsupported physical host entry');
+    }
+  }
+  await walk(directory); return count;
+}
 async function productionDependencies(payload, scratch) {
   const lock = (await json(join(root, 'package-lock.json'))).value, archives = [];
   for (const [name, entry] of Object.entries(lock.packages).sort(([a], [b]) => a.localeCompare(b, 'en'))) {
@@ -176,9 +271,14 @@ async function productionDependencies(payload, scratch) {
     const archive = join(scratch, `dependency-${archives.length}.tgz`); await writeExclusive(archive, bytes);
     const listing = command('/usr/bin/tar', ['-tzf', archive]);
     if (listing.split('\n').filter(Boolean).some(path => !path.startsWith('package/') || path.split('/').includes('..'))) fail('Unsafe pinned archive path');
-    const target = join(payload, name); await mkdir(target, { recursive: true, mode: 0o700 });
-    command('/usr/bin/tar', ['-xzf', archive, '--strip-components', '1', '-C', target]);
-    archives.push({ name, resolved: entry.resolved, integrity: entry.integrity, sha256: hash(bytes) });
+    const extracted = join(scratch, `dependency-${archives.length}`); await mkdir(extracted, { mode: 0o700 });
+    command('/usr/bin/tar', ['-xzf', archive, '--strip-components', '1', '-C', extracted]);
+    const projection = await dependencyProjection(extracted);
+    const target = join(payload, name); await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+    await cp(extracted, target, { recursive: true, force: false, errorOnExist: true, verbatimSymlinks: true,
+      filter: async path => !(await lstat(path)).isFile() || !runtimeMetadataOnly(path) });
+    await writeExclusive(join(scratch, `dependency-${archives.length}.projection.json`), JSON.stringify(projection, null, 2) + '\n');
+    archives.push({ name, resolved: entry.resolved, integrity: entry.integrity, sha256: hash(bytes), projection: dependencyFrontier(projection) });
   }
   return archives;
 }
@@ -216,7 +316,7 @@ export async function prepareUnsignedHost({ out, buildRoot, stateRoot, runtimeAr
   if (process.platform !== 'darwin' || process.arch !== 'arm64' || !['blocked', 'isolated-qualification'].includes(purpose)) fail('Unsupported host preparation');
   await assertHostIsolation(buildRoot, stateRoot);
   const bundle = resolve(out);
-  if (bundle !== out || !bundle.endsWith('/ArbolBrowser.app') || inside(bundle, root) || inside(bundle, stateRoot) || inside(stateRoot, bundle)) fail('Invalid fresh outer destination');
+  if (bundle !== out || !(basename(bundle) === 'ArbolBrowser.app' || (dirname(bundle) === buildRoot && /^\.host-preparation-[A-Za-z0-9_-]{22}\.app$/.test(basename(bundle)))) || inside(bundle, root) || inside(bundle, stateRoot) || inside(stateRoot, bundle)) fail('Invalid fresh outer destination');
   await privateDirectory(dirname(bundle));
   const compiled = await currentHostCompilation();
   const accepted = purpose === 'isolated-qualification' ? await acceptedHostProduct(review, compiled) : undefined;
@@ -233,6 +333,8 @@ export async function prepareUnsignedHost({ out, buildRoot, stateRoot, runtimeAr
   await mkdir(join(payload, 'runtime')); await cp(join(stock, 'Electron.app'), join(payload, 'runtime/Electron.app'), copy);
   for (const name of ['LICENSE', 'LICENSES.chromium.html']) await cp(join(stock, name), join(payload, 'runtime', name), copy);
   const dependencies = await productionDependencies(payload, scratch);
+  const projected = Object.fromEntries(dependencies.map(entry => [entry.name, entry.projection]));
+  if (canonical(projected) !== canonical(compiled.record.compilerInputs.runtimeProjection.packages)) fail('Pinned package projection differs from reviewed compiler inputs');
   const pkg = (await json(join(root, 'package.json'))).value;
   await writeExclusive(join(payload, 'package.json'), JSON.stringify({ name: pkg.name, version: pkg.version, type: 'module', private: true }) + '\n');
   await mkdir(join(payload, 'bin')); await writeExclusive(join(payload, 'bin/arbol-browser'), hostLauncher('..'), 0o755);
@@ -249,7 +351,8 @@ export async function prepareUnsignedHost({ out, buildRoot, stateRoot, runtimeAr
   await refreshHostRecords(bundle, staged);
   if ((await currentHostCompilation()).digest !== compiled.digest) fail('Source/compile changed during preparation');
   await assertHostIsolation(buildRoot, stateRoot);
-  const record = { ...staged, files: await inventory(bundle) };
+  const physicalEntries = { bundle: await assertPhysicalCap(bundle), payload: await assertPhysicalCap(payload) };
+  const record = { ...staged, physicalEntries, files: await inventory(bundle) };
   await writeExclusive(bundle + '.unsigned.json', JSON.stringify(record, null, 2) + '\n');
   return Object.freeze({ bundle, record, scratch });
 }
@@ -265,11 +368,123 @@ exec /usr/bin/env -i PATH=/usr/bin:/bin ELECTRON_RUN_AS_NODE=1 "$payload/runtime
 `;
 }
 
+export const preservedStockArchive = '/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-47-20261116-n5ckcn_3/build-attempt-02/electron-cache/d6975f2bc592464edd7378c436d8aab1d9d0bf7a48a3619bbd8b006d1490565a/electron-v45.3.2-darwin-arm64.zip';
+/** Ordinary authentic Arbol Building adapter. Only its two actual injected
+ * inputs are accepted; source comes from original build.json, never invented
+ * environment metadata. Does not select, activate or mark a Build working. */
+export async function prepareAllocatedHost(environment = process.env) {
+  const buildRoot = environment.ARBOL_BUILD_DIR, build = environment.ARBOL_BUILD_NUMBER;
+  if (typeof buildRoot !== 'string' || typeof build !== 'string' || resolve(buildRoot) !== buildRoot ||
+      basename(buildRoot) !== build || basename(dirname(buildRoot)) !== 'arbol-browser' || !/^[1-9a-f][0-9a-f]{0,15}$/.test(build))
+    fail('Authentic allocated Arbol Building inputs required');
+  await privateDirectory(buildRoot); await privateDirectory(dirname(buildRoot));
+  if ((await readdir(buildRoot)).sort().join(',') !== 'build.json,build.log') fail('Allocated Build is not fresh and unselected');
+  const allocation = await json(join(buildRoot, 'build.json')), record = allocation.value;
+  const pkg = (await json(join(root, 'package.json'))).value, compiled = await currentHostCompilation();
+  if (record.component !== 'arbol-browser' || record.build !== build || record.status !== 'building' || record.entry !== 'bin/arbol-browser' ||
+      record.packageVersion !== pkg.version || record.contract !== 1 || record.dataFormat !== 1 || !Array.isArray(record.checks) || record.checks.length ||
+      !record.source || Object.keys(record.source).sort().join(',') !== 'branch,commit,repository,uncommittedChanges' ||
+      record.source.repository !== await realpath(root) || record.source.branch !== compiled.sourceIdentity.branch ||
+      record.source.commit !== compiled.sourceIdentity.commit || record.source.uncommittedChanges !== false || compiled.sourceIdentity.uncommittedChanges)
+    fail('Allocated Building/source does not match current committed compilation');
+  const stateRoot = join(dirname(dirname(dirname(buildRoot))), 'browser-state');
+  const account = userInfo(), home = await realpath(account.homedir);
+  for (const name of ['builds', 'browser']) {
+    const protectedRoot = await protectedPath(join(home, 'Library/Application Support/Arbol', name));
+    for (const path of [buildRoot, stateRoot]) if (inside(path, protectedRoot) || inside(protectedRoot, path)) fail('Owner installation is not isolated qualification');
+  }
+  try { await mkdir(stateRoot, { mode: 0o700 }); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+  await assertHostIsolation(buildRoot, stateRoot);
+  const review = command('/usr/bin/git', ['-C', foresterRoot, 'rev-parse', 'refs/remotes/origin/main']).trim();
+  await acceptedHostProduct(review, compiled);
+  // Load only the exact just-validated compiled private lock provider. This
+  // branch is actual future Build execution, never invoked by static compile.
+  const support = createRequire(import.meta.url)(join(root, 'dist/native/platform.node'));
+  for (const name of ['trySharedLock', 'assertLock', 'releaseLock', 'publishDirectory']) if (typeof support[name] !== 'function') fail('Actual native Build provider unavailable');
+  const uses = join(dirname(buildRoot), '.uses');
+  try { await mkdir(uses, { mode: 0o700 }); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+  const usesIdentity = await privateDirectory(uses), guardPath = join(uses, build);
+  const creator = await open(guardPath, constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
+  let log, held, guardIdentity, logIdentity, ownEntry, published = false, failure, signed, staged;
+  const same = (a, b) => a.dev === b.dev && a.ino === b.ino && a.uid === b.uid && a.mode === b.mode && a.nlink === b.nlink;
+  async function assertAllocation() {
+    await assertHostIsolation(buildRoot, stateRoot);
+    if ((await json(join(buildRoot, 'build.json'))).sha256 !== allocation.sha256 || canonical(await privateDirectory(uses)) !== canonical(usesIdentity))
+      fail('Original Building/guard directory changed');
+    const named = await lstat(guardPath, { bigint: true }), actual = await creator.stat({ bigint: true });
+    if (!same(guardIdentity, named) || !same(guardIdentity, actual)) fail('Original stable Build guard changed');
+    const kernel = support.assertLock(held);
+    if (kernel.device !== String(actual.dev) || kernel.inode !== String(actual.ino) || kernel.uid !== Number(actual.uid)) fail('Actual shared kernel guard differs');
+    const currentLog = await log.stat({ bigint: true }), namedLog = await lstat(join(buildRoot, 'build.log'), { bigint: true });
+    if (!same(logIdentity, currentLog) || !same(logIdentity, namedLog) || currentLog.size < logIdentity.size) fail('Original append-only Build log changed');
+    if ((await currentHostCompilation()).digest !== compiled.digest) fail('Compiled source changed while preparing Build');
+  }
+  async function syncDirectory(path) { const fd = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW); try { await fd.sync(); } finally { await fd.close(); } }
+  async function withdrawOwnEntry() {
+    if (!published || !ownEntry) return;
+    const path = join(buildRoot, 'bin/arbol-browser'), current = await lstat(path, { bigint: true });
+    if (current.dev !== ownEntry.dev || current.ino !== ownEntry.ino || current.uid !== ownEntry.uid || !current.isFile()) fail('Entry withdrawal identity uncertain');
+    await unlink(path); await syncDirectory(dirname(path)); published = false;
+  }
+  try {
+    log = await open(join(buildRoot, 'build.log'), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    guardIdentity = await creator.stat({ bigint: true }); logIdentity = await log.stat({ bigint: true });
+    if (!guardIdentity.isFile() || guardIdentity.uid !== BigInt(account.uid) || guardIdentity.nlink !== 1n || (guardIdentity.mode & 0o7777n) !== 0o600n ||
+        !logIdentity.isFile() || logIdentity.uid !== BigInt(account.uid) || logIdentity.nlink !== 1n || (logIdentity.mode & 0o7777n) !== 0o600n)
+      fail('Unsafe original Building guard/log');
+    held = support.trySharedLock(guardPath); if (!held) fail('Build is exclusively protected');
+    await assertAllocation();
+    const bundle = join(buildRoot, `.host-preparation-${randomBytes(16).toString('base64url')}.app`);
+    staged = await prepareUnsignedHost({ out: bundle, buildRoot, stateRoot, runtimeArchive: preservedStockArchive, review, purpose: 'isolated-qualification' });
+    const signerURL = new URL('./sign-host.mjs', import.meta.url).href;
+    const signer = await import(signerURL);
+    signed = await signer.signHost({ bundle, runtimeArchive: preservedStockArchive, review });
+    await assertAllocation();
+    const source = await lstat(bundle, { bigint: true }), parent = await lstat(buildRoot, { bigint: true });
+    if (!source.isDirectory() || source.dev !== parent.dev) fail('Sealed app is not on actual Building device');
+    // The existing genuine Native primitive is same-parent RENAME_EXCL.
+    // Its hidden source and fixed installed destination share this exact parent.
+    const installed = join(buildRoot, 'ArbolBrowser.app'); support.publishDirectory(bundle, installed);
+    await syncDirectory(buildRoot);
+    const actual = await lstat(installed, { bigint: true });
+    if (actual.dev !== source.dev || actual.ino !== source.ino || actual.uid !== source.uid ||
+        canonical(await inventory(installed)) !== canonical(signed.files)) fail('Installed outer differs from sealed original');
+    command('/usr/bin/codesign', ['--verify', '--strict', '--deep', '-R', `=anchor apple generic and certificate leaf[subject.OU] = "7V372XL59S" and identifier "com.sylvan-stack.arbol-browser.native-candidate"`, installed]);
+    const payload = join(installed, 'Contents/Resources/browser');
+    const metadata = await json(join(payload, 'metadata.json')), policy = await json(join(installed, 'Contents/Resources/host-policy.json'));
+    if (metadata.value.component.build !== build || metadata.value.sourceDigest !== compiled.record.sourceDigest ||
+        policy.value.buildRoot !== buildRoot || policy.value.stateRoot !== stateRoot || policy.value.reviewDigest !== signed.reviewDigest ||
+        policy.value.productDigest !== compiled.record.productDigest) fail('Installed Build metadata differs');
+    await assertPhysicalCap(installed); await assertPhysicalCap(payload); await assertAllocation();
+    const bin = join(buildRoot, 'bin'); await mkdir(bin, { mode: 0o700 });
+    const temporary = join(bin, `.entry-${randomBytes(16).toString('hex')}`), entry = join(bin, 'arbol-browser');
+    await writeExclusive(temporary, hostLauncher(), 0o755); ownEntry = await lstat(temporary, { bigint: true });
+    await assertAllocation();
+    // Atomic no-replacement publication of complete synced entry bytes, last.
+    await link(temporary, entry); published = true;
+    await unlink(temporary); await syncDirectory(bin); await syncDirectory(buildRoot);
+    const final = await lstat(entry, { bigint: true });
+    if (final.dev !== ownEntry.dev || final.ino !== ownEntry.ino || final.nlink !== 1n || (final.mode & 0o7777n) !== 0o755n ||
+        (await exactFile(entry)).sha256 !== hash(hostLauncher())) fail('Final own entry identity differs');
+    await assertAllocation();
+  } catch (error) { failure = error; }
+  // No finally error may leave this writer's entry visible on a failed Build.
+  try { if (held) support.releaseLock(held); } catch (error) { failure ??= error; }
+  try { await creator.close(); } catch (error) { failure ??= error; }
+  try { await log?.close(); } catch (error) { failure ??= error; }
+  if (failure) { await withdrawOwnEntry(); throw failure; }
+  return { build, buildRoot, source: record.source, productDigest: compiled.record.productDigest, reviewHandover: review,
+    sealedFiles: signed.payloadDigest, qualification: 'unexecuted', status: 'building' };
+}
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const args = process.argv.slice(2);
+  if (args.length === 1 && args[0] === '--allocated') {
+    console.log(JSON.stringify(await prepareAllocatedHost()));
+  } else {
   if (args.length !== 12 || args.filter((_arg, index) => index % 2 === 0).join(',') !==
       '--out,--build-root,--state-root,--runtime-archive,--review-handover,--purpose')
     fail('Usage: package-host.mjs --out <fresh.app> --build-root <allocated-Build> --state-root <isolated-state> --runtime-archive <pinned.zip> --review-handover <Forester-commit> --purpose <blocked|isolated-qualification>');
   const result = await prepareUnsignedHost({ out: args[1], buildRoot: args[3], stateRoot: args[5], runtimeArchive: args[7], review: args[9], purpose: args[11] });
   console.log(JSON.stringify({ bundle: result.bundle, qualification: 'unexecuted', purpose: result.record.purpose }));
+  }
 }
