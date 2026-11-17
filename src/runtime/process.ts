@@ -8,7 +8,7 @@ import { unavailable } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
 import { assertProfile, type ProfileSnapshot } from '../profiles/records.js';
 import { assertPlatform, type HeldLock, type PlatformPort, type ProcessProvenance } from './platform.js';
-import { assertVerifiedHost, type VerifiedHost } from './authorities.js';
+import { assertTrustedHost, assertVerifiedHost, type VerifiedHost } from './authorities.js';
 import { assertTime, now, runtimeLocation, type RuntimeLocation, type RuntimeRecord } from './instance.js';
 import { createStarter, type LaunchAttemptPort } from './start.js';
 import type { ProcessIntegration } from './lifecycle.js';
@@ -173,7 +173,7 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
   const pending = new Map<string, LaunchAttempt>();
   return Object.freeze({
     async reserve(profile: ProfileSnapshot, request: string, deadline: number, heldBuild?: import('./start.js').BuildGuard) {
-      assertVerifiedHost(host, deadline); await host.assertTrusted(deadline);
+      await assertTrustedHost(host, deadline);
       const next = await pendingLaunchAttempt(profile, host, platform, request, deadline);
       if (pending.has(request)) throw unavailable('browser'); pending.set(request, next);
       // Every production reservation, including the first and an expired

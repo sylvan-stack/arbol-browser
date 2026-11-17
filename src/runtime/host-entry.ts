@@ -11,7 +11,7 @@ import { consumeSelection, type BuildSelection } from './selection.js';
 import { validator } from '../contracts/schema.js';
 import { unavailable } from '../contracts/errors.js';
 import { adoptHostBuildLease, captureHostBuild, terminateCapturedHostBuild, type CapturedHostBuild, type BuildLease } from './build-lease.js';
-import { assertVerifiedHost, assertHostEngineAuthority, type VerifiedHost } from './authorities.js';
+import { assertTrustedHost, assertVerifiedHost, assertHostEngineAuthority, type VerifiedHost } from './authorities.js';
 import { claimedHostAttempt } from './process.js';
 import { prepareHostCustody, abortUnadmittedHost, type HostCustody } from './custody.js';
 import type { NativeBoundaryPreparation } from './bootstrap.js';
@@ -65,7 +65,7 @@ export async function prepareOwnedHost(actualApp: ProfileApp, request: HostReque
   const bootstrap = await import(bootstrapURL) as typeof import('./bootstrap.js');
   bootstrap.assertNativeBoundaryPreparation(native);
   const platform = native.platform;
-  assertVerifiedHost(host, deadline); await host.assertTrusted(deadline);
+  await assertTrustedHost(host, deadline);
   if (native.trust.bundle !== host.signed.bundle || native.trust.snapshotDigest !== host.signed.snapshotDigest ||
       request.selection.build !== host.identity.layout.build || request.selection.directory !== host.identity.layout.buildRoot)
     throw unavailable('browser');

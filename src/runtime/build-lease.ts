@@ -5,7 +5,7 @@ import { directory, assertDirectory, privateFile, sameIdentity, identity, profil
 import type { PlatformPort, HeldLock } from './platform.js';
 import type { BuildSelection } from './selection.js';
 import type { BuildGuard } from './start.js';
-import { assertVerifiedHost, type VerifiedHost } from './authorities.js';
+import { assertTrustedHost, type VerifiedHost } from './authorities.js';
 import { assertPlatform } from './platform.js';
 import { withOwnerLockForCustody, type OwnerLease } from '../profiles/locking.js';
 
@@ -72,8 +72,12 @@ export async function adoptHostBuildLease(host: VerifiedHost, platform: Platform
         original.bundle !== layout.bundle || original.selection.build !== selection.build ||
         original.selection.directory !== selection.directory || original.selection.guard !== selection.guard) return terminateCapturedHostBuild(token);
     original.binding = true;
-    assertVerifiedHost(host, deadline); await host.assertTrusted(deadline);
     const held = original.held;
+    const assertOriginal = () => {
+      const current = held.assertIdentity(), expected = host.guardIdentity;
+      if (current.device !== expected.device || current.inode !== expected.inode || current.uid !== expected.uid) throw profileUnavailable();
+    };
+    assertOriginal(); await assertTrustedHost(host, deadline); assertOriginal();
     const lease: BuildLease = Object.freeze({ selection,
       async assert() {
         const current = held.assertIdentity(), expected = host.guardIdentity;
@@ -82,7 +86,7 @@ export async function adoptHostBuildLease(host: VerifiedHost, platform: Platform
       },
       release(): never { throw profileUnavailable(); },
     });
-    buildDescriptions.set(lease, { platform, held }); await lease.assert(); return lease;
+    buildDescriptions.set(lease, { platform, held }); assertOriginal(); return lease;
   } catch { return terminateCapturedHostBuild(token); }
 }
 /** Reacquire the launcher's exact stable .uses/<hex> shared kernel flock.

@@ -156,6 +156,13 @@ export function assertVerifiedHost(value: VerifiedHost, deadline: number): void 
   if (!verifiedHosts.has(value)) throw unavailable('browser');
   assertBudget(deadline); value.signed.assertIdentity(deadline); assertBudget(deadline);
 }
+/** One current complete verification at a boundary that otherwise repeated the
+ * same snapshot scan immediately before assertTrusted. Brand and cutoff are
+ * checked here; assertTrusted retains the independent full physical proof. */
+export async function assertTrustedHost(value: VerifiedHost, deadline: number): Promise<void> {
+  if (!verifiedHosts.has(value)) throw unavailable('browser');
+  assertBudget(deadline); await value.assertTrusted(deadline); assertBudget(deadline);
+}
 function assertBudget(deadline: number): void {
   if (!Number.isFinite(deadline) || performance.now() >= deadline) throw unavailable('browser');
 }
@@ -237,7 +244,7 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
       if (!verifiedHosts.has(result)) throw unavailable('browser');
       const custody = armedHosts.get(result);
       try {
-        assertBudget(limit); if (custody) assertHostCustody(custody); else signed.assertIdentity(limit);
+        assertBudget(limit); if (custody) assertHostCustody(custody);
         if ((await physicalJson(policyFile, 1048576, limit)).digest !== rawPolicy.digest ||
             (await physicalJson(join(payload, 'metadata.json'), 1048576, limit)).digest !== identity.metadataDigest ||
             (await physicalJson(join(layout.bundle, 'Contents/Resources/native-compatibility.json'), 1048576, limit)).digest !== compatibility.digest)
