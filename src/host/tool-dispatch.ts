@@ -13,7 +13,7 @@ import { pressTrusted } from '../automation/keyboard.js';
 import { typeTrusted } from '../automation/typing.js';
 import { scrollTrusted } from '../automation/scroll.js';
 import { dragTrusted } from '../automation/drag.js';
-import { retireUnsettled, settledResult } from '../automation/outcomes.js';
+import { settledResult } from '../automation/outcomes.js';
 
 export type HostToolOperation = OwnershipOperations['agent'];
 export interface HostToolProviders {
@@ -28,22 +28,20 @@ export function createTrustedActionTools(inspection: SnapshotInspection): { read
   const agent: HostToolOperation = async (request, execution) => {
     if (closed) throw unavailable('browser');
     const params = request.params;
-    try {
-      let result;
-      switch (params.name) {
-        case 'browser_navigate': result = await navigateTrusted(inspection, execution, params.arguments); break;
-        case 'browser_click': result = await clickTrusted(inspection, execution, params.arguments); break;
-        case 'browser_press_key': result = await pressTrusted(inspection, execution, params.arguments); break;
-        case 'browser_type': result = await typeTrusted(inspection, execution, params.arguments); break;
-        case 'browser_scroll': result = await scrollTrusted(inspection, execution, params.arguments); break;
-        case 'browser_drag': result = await dragTrusted(inspection, execution, params.arguments); break;
-        default: throw unavailable('browser');
-      }
-      if (closed) throw unavailable('browser');
-      return settledResult(inspection, execution, result);
-    } catch (error) {
-      retireUnsettled(inspection, execution, request.id); throw error;
+    let result;
+    switch (params.name) {
+      case 'browser_navigate': result = await navigateTrusted(inspection, execution, params.arguments); break;
+      case 'browser_click': result = await clickTrusted(inspection, execution, params.arguments); break;
+      case 'browser_press_key': result = await pressTrusted(inspection, execution, params.arguments); break;
+      case 'browser_type': result = await typeTrusted(inspection, execution, params.arguments); break;
+      case 'browser_scroll': result = await scrollTrusted(inspection, execution, params.arguments); break;
+      case 'browser_drag': result = await dragTrusted(inspection, execution, params.arguments); break;
+      default: throw unavailable('browser');
     }
+    if (closed) throw unavailable('browser');
+    // The existing protected host records this real failure before its own
+    // canonical Take/cancel/deadline path. Do not race it from this provider.
+    return settledResult(inspection, execution, result);
   };
   return Object.freeze({ agent, close() { closed = true; } });
 }
