@@ -28,6 +28,8 @@ export function assertWatchdogCustody(value: WatchdogCustody): void {
   if (!custodyReceipts.has(value)) throw unavailable('browser');
 }
 export interface PlatformPort {
+  /** One-use fixed-exec native adoption. No numeric FD or role is accepted. */
+  adoptHostBuild(requestPath: string, guard: string, bundle: string): HeldLock;
   /** Kernel continuous time shared by native outer, host and both monitors. */
   continuousTime(): number;
   processProvenance(pid: number): ProcessProvenance | null;
@@ -50,6 +52,7 @@ export interface PlatformPort {
   peerIdentity(socketFd: number): ProcessIdentity;
 }
 interface NativeSupport {
+  adoptHostBuild(requestPath: string, guard: string, bundle: string): object;
   continuousTime(): number;
   processProvenance(pid: number): ProcessProvenance | null;
   readLaunchAttempt(handle: object): string | null;
@@ -84,14 +87,31 @@ export function loadPlatform(): PlatformPort {
   let native: NativeSupport;
   try {
     native = createRequire(import.meta.url)(fileURLToPath(new URL('../../native/platform.node', import.meta.url)));
-    for (const name of ['continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
+    for (const name of ['adoptHostBuild', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
       if (typeof native[name] !== 'function') throw new Error('Missing process support');
   } catch { throw unavailable('profile'); }
   const call = <T>(operation: () => T): T => {
     try { return operation(); } catch { throw unavailable('profile'); }
   };
   const locks = new WeakMap<HeldLock, object>();
+  const wrapLock = (handle: object, retained = false): HeldLock => {
+    let released = false;
+    const lease: HeldLock = Object.freeze({
+      assertIdentity: () => { if (released) throw unavailable('profile'); return call(() => native.assertLock(handle)); },
+      release: () => {
+        if (retained) throw unavailable('profile');
+        if (!released) { call(() => native.releaseLock(handle)); released = true; }
+      },
+    });
+    locks.set(lease, handle); return lease;
+  };
   const port: PlatformPort = Object.freeze({
+    adoptHostBuild(requestPath: string, guard: string, bundle: string): HeldLock {
+      if (process.type !== 'browser' || ![requestPath, guard, bundle].every(path => isAbsolute(path) && !path.includes('\0')))
+        throw unavailable('browser');
+      const lease = wrapLock(call(() => native.adoptHostBuild(requestPath, guard, bundle)), true);
+      lease.assertIdentity(); return lease;
+    },
     continuousTime(): number {
       const value = call(() => native.continuousTime());
       if (!Number.isFinite(value) || value < 0 || value > Number.MAX_SAFE_INTEGER) throw unavailable('profile');
@@ -140,12 +160,7 @@ export function loadPlatform(): PlatformPort {
       if (!isAbsolute(path) || path.includes('\0')) throw unavailable('profile');
       const handle = call(() => native[method](path));
       if (handle === null) return null;
-      let released = false;
-      const lease: HeldLock = Object.freeze({
-        assertIdentity: () => { if (released) throw unavailable('profile'); return call(() => native.assertLock(handle)); },
-        release: () => { if (!released) { released = true; call(() => native.releaseLock(handle)); } },
-      });
-      locks.set(lease, handle); return lease;
+      return wrapLock(handle);
     }])) as Pick<PlatformPort, 'tryLock' | 'trySharedLock'>,
     groupCensus: (group: number) => call(() => native.groupCensus(group)),
     processIdentity: (pid: number) => call(() => native.processIdentity(pid)),

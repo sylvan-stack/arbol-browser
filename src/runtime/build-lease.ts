@@ -1,9 +1,12 @@
 import { basename, dirname, join, resolve } from 'node:path';
 import { lstat } from 'node:fs/promises';
+import { performance } from 'node:perf_hooks';
 import { directory, assertDirectory, privateFile, sameIdentity, identity, profileUnavailable } from '../profiles/paths.js';
 import type { PlatformPort, HeldLock } from './platform.js';
 import type { BuildSelection } from './selection.js';
 import type { BuildGuard } from './start.js';
+import { assertVerifiedHost, type VerifiedHost } from './authorities.js';
+import { assertPlatform } from './platform.js';
 
 export interface BuildLease extends BuildGuard {
   readonly selection: BuildSelection;
@@ -19,6 +22,29 @@ export async function withBuildLockForCustody<T>(lease: BuildLease, platform: Pl
   await lease.assert();
   if (buildDescriptions.get(lease) !== source) throw profileUnavailable();
   source.held.assertIdentity(); return handover(source.held);
+}
+/** Host-only continuous outer description. This is deliberately separate from
+ * the Node starter's ordinary independently acquired shared guard below. The
+ * native original cannot be released in a running main or by GC; the OS closes
+ * it at actual process death, and armed custody owns its duplicated copies. */
+export async function adoptHostBuildLease(host: VerifiedHost, platform: PlatformPort,
+  requestPath: string, deadline: number): Promise<BuildLease> {
+  assertPlatform(platform); assertVerifiedHost(host, deadline); await host.assertTrusted(deadline);
+  const layout = host.identity.layout;
+  const selection: BuildSelection = Object.freeze({ build: layout.build, directory: layout.buildRoot,
+    guard: join(dirname(layout.buildRoot), '.uses', layout.build), explicit: true });
+  const held = platform.adoptHostBuild(requestPath, selection.guard, layout.bundle);
+  const lease: BuildLease = Object.freeze({ selection,
+    async assert() {
+      const current = held.assertIdentity(), expected = host.guardIdentity;
+      if (current.device !== expected.device || current.inode !== expected.inode || current.uid !== expected.uid) throw profileUnavailable();
+      // A later identity check gets an operation budget; it does not renew the
+      // independently fixed launch-attempt admission expiry.
+      await host.assertTrusted(performance.now() + 5000); held.assertIdentity();
+    },
+    release(): never { throw profileUnavailable(); },
+  });
+  buildDescriptions.set(lease, { platform, held }); await lease.assert(); return lease;
 }
 /** Reacquire the launcher's exact stable .uses/<hex> shared kernel flock.
  * This is Build-use protection, never publisher/native/engine compatibility

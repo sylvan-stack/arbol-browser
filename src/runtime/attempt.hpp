@@ -210,7 +210,8 @@ inline bool transition(NSDictionary* old, NSDictionary* next, Role role) {
   if (!record(next) || (old && !record(old))) return false; double now = arbol_boundary::clockMs();
   NSString* phase = next[@"phase"];
   if (!old || ![old[@"request"] isEqual:next[@"request"]]) {
-    bool unused = old && [old[@"phase"] isEqual:@"cancelled"] && old[@"bootstrap"] == NSNull.null && old[@"engine"] == NSNull.null;
+    bool unused = old && [old[@"phase"] isEqual:@"cancelled"] && [old[@"stage"] isEqual:@"untransferred"] &&
+      old[@"bootstrap"] == NSNull.null && old[@"engine"] == NSNull.null && old[@"runtime"] == NSNull.null && old[@"terminal"] == NSNull.null;
     // A serialized label is not independent exit authority. Reuse of a closed
     // claimed family needs the separate native exit verifier, not this generic
     // starter JSON transaction. Unclaimed cancelled intent has no engine.
@@ -240,5 +241,61 @@ inline bool transition(NSDictionary* old, NSDictionary* next, Role role) {
   return role == Role::terminal && [phase isEqual:@"closed"] && next[@"terminal"] != NSNull.null &&
     [old[@"stage"] isEqual:next[@"stage"]] && [old[@"bootstrap"] isEqual:next[@"bootstrap"]] &&
     [old[@"engine"] isEqual:next[@"engine"]] && [old[@"runtime"] isEqual:next[@"runtime"]];
+}
+// Short arbitration owned by a native transition. It never borrows startup.lock
+// and never creates, unlinks or replaces the stable transition-lock inode.
+struct Claim {
+  int fd = -1; Location at;
+  ~Claim() { if (fd >= 0) close(fd); }
+  bool acquire(const std::string& requestPath, double deadline) {
+    size_t slash = requestPath.rfind('/'); if (slash == std::string::npos) return false;
+    std::string path = requestPath.substr(0,slash) + "/claim.lock";
+    fd = open(path.c_str(),O_RDWR|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
+    if (fd < 0 || !location(path,fd,at)) return false;
+    while (flock(fd,LOCK_EX|LOCK_NB)) {
+      if ((errno != EWOULDBLOCK && errno != EAGAIN) || arbol_boundary::clockMs() >= deadline) return false;
+      usleep(1000);
+    }
+    return arbol_boundary::clockMs() < deadline && unchanged(at);
+  }
+  bool read(std::string& raw, NSDictionary* __strong& value) {
+    bool absent;
+    if (!readAt(at.directory,"claim.json",raw,absent) || absent || !unchanged(at) || !record(value=json(raw))) return false;
+    return at.path.substr(at.path.rfind('/')+1) == std::string([value[@"profilePathHash"] UTF8String]).substr(0,32);
+  }
+};
+inline bool launchRequest(const Claim& claim, const std::string& requestPath, NSDictionary* attempt) {
+  std::string filename = "launch-" + std::string([attempt[@"request"] UTF8String]) + ".json";
+  if (requestPath != claim.at.path + "/" + filename && requestPath != "/tmp/" + claim.at.path.substr(13) + "/" + filename) return false;
+  std::string raw; bool absent;
+  if (!readAt(claim.at.directory,filename,raw,absent) || absent) return false;
+  NSDictionary* request = json(raw); NSDictionary* selection = request[@"selection"];
+  return keys(request,@[@"format",@"request",@"profile",@"profileInstance",@"selection"]) && [request[@"format"] isEqual:@1] &&
+    [request[@"request"] isEqual:attempt[@"request"]] && [request[@"profile"] isEqual:attempt[@"profile"]] &&
+    [request[@"profileInstance"] isEqual:attempt[@"profileInstance"]] && keys(selection,@[@"build",@"directory",@"guard",@"explicit"]) &&
+    CFGetTypeID((__bridge CFTypeRef)selection[@"explicit"]) == CFBooleanGetTypeID() &&
+    [selection[@"build"] isEqual:attempt[@"build"]] && [selection[@"directory"] isEqual:attempt[@"buildRoot"]] &&
+    [selection[@"guard"] isEqual:attempt[@"buildGuard"]] && unchanged(claim.at);
+}
+inline bool bundleGuard(const std::string& bundle, std::string& buildRoot, std::string& guard) {
+  if (!arbol_boundary::canonical(bundle) || bundle.size() < 18 || bundle.substr(bundle.size()-17) != "/ArbolBrowser.app") return false;
+  buildRoot = bundle.substr(0,bundle.size()-17);
+  NSString* root = [NSString stringWithUTF8String:buildRoot.c_str()];
+  NSString* component = root.stringByDeletingLastPathComponent;
+  if (!pattern(root.lastPathComponent,@"^[1-9a-f][0-9a-f]{0,15}$") || ![component.lastPathComponent isEqual:@"arbol-browser"]) return false;
+  guard = [[component stringByAppendingPathComponent:[@".uses/" stringByAppendingString:root.lastPathComponent]] UTF8String];
+  for (const std::string& path : {buildRoot,std::string(component.UTF8String),guard.substr(0,guard.rfind('/'))}) {
+    struct stat st{};
+    if (!arbol_boundary::canonical(path) || lstat(path.c_str(),&st) || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode&07777)!=0700) return false;
+  }
+  return arbol_boundary::privateAncestors(guard);
+}
+inline bool openBuild(const std::string& bundle, arbol_boundary::Lock& lock) {
+  std::string root,path; if (!bundleGuard(bundle,root,path)) return false;
+  int fd = open(path.c_str(),O_RDWR|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC); if (fd < 0) return false;
+  struct stat st{}; bool valid = !fstat(fd,&st) && privateFile(st) && !flock(fd,LOCK_SH|LOCK_NB);
+  lock = {fd,path,(uint64_t)st.st_dev,st.st_ino,st.st_uid,0600,LOCK_SH};
+  if (!valid || !arbol_boundary::lockIdentity(lock)) { close(fd); lock.fd=-1; return false; }
+  return true;
 }
 } // namespace arbol_attempt

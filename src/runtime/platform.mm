@@ -29,7 +29,7 @@ struct UniqueInfo {
 static_assert(sizeof(UniqueInfo) == 56);
 struct ProcessInfo { proc_bsdinfo bsd; UniqueInfo unique; };
 static constexpr int kBsdWithUniqueId = 18;
-struct HeldLock { int fd; std::string path; dev_t dev; ino_t ino; int mode; };
+struct HeldLock { int fd; std::string path; dev_t dev; ino_t ino; int mode; bool retained = false; };
 static std::set<HeldLock*> liveLocks;
 
 static napi_value fail(napi_env env) {
@@ -61,6 +61,7 @@ static bool argument(napi_env env, napi_callback_info info, napi_value* value) {
 }
 static void finalize(napi_env, void* data, void*) {
   auto* lock = static_cast<HeldLock*>(data);
+  if (lock->retained) return; // exact fixed-exec original lasts until OS exit
   liveLocks.erase(lock);
   if (lock->fd >= 0) close(lock->fd);
   delete lock;
@@ -114,6 +115,7 @@ static napi_value assertLock(napi_env env, napi_callback_info info) {
 }
 static napi_value releaseLock(napi_env env, napi_callback_info info) {
   auto* lock = held(env, info); if (!lock) return fail(env);
+  if (lock->retained) return fail(env); // no main-process early Build release
   if (lock->fd >= 0) {
     int fd = lock->fd; lock->fd = -1;
     // close releases flock; never unlink the shared lock inode, or retry close.
@@ -289,6 +291,62 @@ static napi_value writeLaunchAttempt(napi_env env, napi_callback_info info) {
   } @catch (NSException*) { return fail(env); } }
 }
 
+static bool adoptionAttempted=false;
+static napi_value adoptHostBuild(napi_env env,napi_callback_info info) {
+  napi_value args[3]; size_t n=3; std::string requestPath,guard,bundle;
+  if(adoptionAttempted) return fail(env); adoptionAttempted=true;
+  if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok || n!=3 || !string(env,args[0],requestPath) ||
+      !string(env,args[1],guard) || !string(env,args[2],bundle)) return fail(env);
+  @autoreleasepool { @try {
+    std::string root,expected; if(!arbol_attempt::bundleGuard(bundle,root,expected)||expected!=guard) return fail(env);
+    const char* inherited=getenv("ARBOL_BROWSER_BUILD_CAPSULE");
+    if(!inherited || !*inherited || strspn(inherited,"0123456789")!=strlen(inherited) || strlen(inherited)>9) return fail(env);
+    int capsule=atoi(inherited); unsetenv("ARBOL_BROWSER_BUILD_CAPSULE");
+    struct stat st{},after{};
+    if(capsule<3 || fstat(capsule,&st) || !S_ISREG(st.st_mode) || st.st_uid!=geteuid() || st.st_nlink ||
+       (st.st_mode&07777)!=0600 || st.st_size<1 || st.st_size>(off_t)arbol_attempt::limit ||
+       (fcntl(capsule,F_GETFL)&O_ACCMODE)!=O_RDONLY || (fcntl(capsule,F_GETFD)&FD_CLOEXEC)) return fail(env);
+    std::string raw((size_t)st.st_size+1,'\0'); size_t offset=0;
+    while(offset<raw.size()) { ssize_t bytes=pread(capsule,raw.data()+offset,raw.size()-offset,offset);
+      if(bytes>0) offset+=(size_t)bytes; else if(bytes<0&&errno==EINTR) continue; else if(!bytes) break; else return fail(env); }
+    if(offset!=(size_t)st.st_size || fstat(capsule,&after) || after.st_dev!=st.st_dev || after.st_ino!=st.st_ino ||
+       after.st_nlink || after.st_size!=st.st_size || after.st_mtimespec.tv_sec!=st.st_mtimespec.tv_sec ||
+       after.st_mtimespec.tv_nsec!=st.st_mtimespec.tv_nsec || after.st_ctimespec.tv_sec!=st.st_ctimespec.tv_sec ||
+       after.st_ctimespec.tv_nsec!=st.st_ctimespec.tv_nsec) return fail(env);
+    raw.resize(offset); NSDictionary* transport=arbol_attempt::json(raw); uint64_t descriptor;
+    if(!arbol_attempt::keys(transport,@[@"format",@"kind",@"requestPath",@"claimDigest",@"bootstrap",@"guard",@"descriptor"]) ||
+       ![transport[@"format"] isEqual:@1] || ![transport[@"kind"] isEqual:@"host-build"] ||
+       ![transport[@"requestPath"] isEqual:[NSString stringWithUTF8String:requestPath.c_str()]] ||
+       !arbol_attempt::uintNumber(transport[@"descriptor"],descriptor) || descriptor<3 || descriptor>INT_MAX || descriptor==(uint64_t)capsule) return fail(env);
+    int fd=(int)descriptor; struct stat guardStat{};
+    if(fstat(fd,&guardStat) || (fcntl(fd,F_GETFL)&O_ACCMODE)!=O_RDWR || (fcntl(fd,F_GETFD)&FD_CLOEXEC)) return fail(env);
+    arbol_boundary::Lock original{fd,guard,(uint64_t)guardStat.st_dev,guardStat.st_ino,guardStat.st_uid,0600,LOCK_SH};
+    if(!arbol_boundary::lockIdentity(original) || ![arbol_boundary::capsuleLock(original) isEqual:transport[@"guard"]] ||
+       flock(fd,LOCK_SH|LOCK_NB) || !arbol_boundary::lockIdentity(original)) return fail(env);
+    arbol_attempt::Claim claim; std::string prior; NSDictionary* attempt=nil;
+    if(!claim.acquire(requestPath,arbol_boundary::clockMs()+2000)||!claim.read(prior,attempt)||
+       !arbol_attempt::launchRequest(claim,requestPath,attempt)||![arbol_attempt::digest(prior) isEqual:transport[@"claimDigest"]] ||
+       ![attempt[@"bootstrap"] isEqual:transport[@"bootstrap"]]||![attempt[@"buildRoot"] isEqual:[NSString stringWithUTF8String:root.c_str()]] ||
+       ![attempt[@"buildGuard"] isEqual:[NSString stringWithUTF8String:guard.c_str()]] ||
+       ![attempt[@"phase"] isEqual:@"claimed"] || ![attempt[@"stage"] isEqual:@"untransferred"] || attempt[@"engine"]!=NSNull.null) return fail(env);
+    NSDictionary* self=arbol_attempt::processRecord(getpid()); NSDictionary* outer=attempt[@"bootstrap"];
+    if(!self || ![outer[@"executable"] isEqual:[NSString stringWithUTF8String:(bundle+"/Contents/MacOS/arbol-browser-native").c_str()]] ||
+       ![self[@"executable"] isEqual:[NSString stringWithUTF8String:(bundle+"/Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron").c_str()]] ||
+       [outer[@"pidVersion"] isEqual:self[@"pidVersion"]] || !arbol_boundary::signature(bundle,false) ||
+       !arbol_boundary::signature([self[@"executable"] UTF8String],true)) return fail(env);
+    for(NSString* key in @[@"pid",@"uid",@"startId",@"group",@"session",@"parentStartId",@"parentPidVersion"])
+      if(![outer[key] isEqual:self[key]]) return fail(env);
+    if([self[@"group"] intValue]!=getpid() || getppid()!=1) return fail(env);
+    NSMutableDictionary* next=[attempt mutableCopy]; next[@"engine"]=self;
+    if(!arbol_attempt::transition(attempt,next,arbol_attempt::Role::engine)||
+       !arbol_attempt::replace(claim.at,prior,false,arbol_attempt::bytes(next)) || !arbol_boundary::lockIdentity(original) ||
+       fcntl(fd,F_SETFD,FD_CLOEXEC) || close(capsule)) return fail(env);
+    auto* lock=new HeldLock{fd,guard,guardStat.st_dev,guardStat.st_ino,LOCK_SH,true};
+    liveLocks.insert(lock); napi_value out;
+    if(napi_create_external(env,lock,finalize,nullptr,&out)!=napi_ok) return fail(env); return out;
+  } @catch(NSException*) { return fail(env); } }
+}
+
 // Process-lifetime native custody is intentionally not garbage-collected. Once
 // created it has no unlock/disarm export; retained originals survive JS failure.
 struct Custody { arbol_boundary::Context context; int capsule=-1; bool bound = false; };
@@ -375,6 +433,7 @@ static napi_value terminateProfileNow(napi_env env,napi_callback_info info) {
 }
 static napi_value init(napi_env env, napi_value exports) {
   napi_property_descriptor properties[] = {
+    {"adoptHostBuild",nullptr,adoptHostBuild,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"continuousTime",nullptr,continuousTime,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"processProvenance",nullptr,processProvenance,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"readLaunchAttempt",nullptr,readLaunchAttempt,nullptr,nullptr,nullptr,napi_default,nullptr},

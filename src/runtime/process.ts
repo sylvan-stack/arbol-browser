@@ -114,3 +114,28 @@ export async function cancelLaunchAttempt(profile: ProfileSnapshot, platform: Pl
     const next: LaunchAttempt = frozen({ ...current, phase: 'cancelled' }); transaction.replace(next); return next;
   });
 }
+
+/** Independent post-exec binding, after native one-use Build adoption. The
+ * returned snapshot grants no data/session access; custody and the serialized
+ * mutation boundary must still be established by the pre-ready assembly. */
+export async function claimedHostAttempt(profile: ProfileSnapshot, host: VerifiedHost, platform: PlatformPort,
+  request: string, deadline: number): Promise<LaunchAttempt> {
+  assertPlatform(platform); assertVerifiedHost(host, deadline); await assertProfile(profile);
+  return withLaunchAttempt(profile, platform, deadline, transaction => {
+    const current = transaction.current, self = platform.processProvenance(process.pid), layout = host.identity.layout;
+    if (!current || current.request !== request || current.profileInstance !== profile.record.instance ||
+        current.phase !== 'claimed' || current.stage !== 'untransferred' || current.expires <= platform.continuousTime() ||
+        current.build !== layout.build || current.buildRoot !== layout.buildRoot ||
+        current.buildGuard !== join(layout.buildRoot, '../.uses', layout.build) ||
+        current.sourceDigest !== host.identity.sourceDigest || current.productDigest !== host.identity.productDigest ||
+        current.candidateDigest !== host.signed.snapshotDigest ||
+        current.profile !== join(host.policy.stateRoot, 'profiles', profile.record.id) ||
+        !self || !current.engine || (['pid', 'uid', 'startId', 'pidVersion', 'group', 'session',
+          'parentStartId', 'parentPidVersion', 'executable'] as const).some(key => self[key] !== current.engine![key]) ||
+        current.engine.executable !== layout.engine || current.starter.executable !== layout.engine ||
+        current.bootstrap?.executable !== join(layout.bundle, 'Contents/MacOS/arbol-browser-native') ||
+        current.bootstrap.pid !== self.pid || current.bootstrap.startId !== self.startId ||
+        current.bootstrap.pidVersion === self.pidVersion) throw unavailable('browser');
+    return current;
+  });
+}
