@@ -881,10 +881,11 @@ static bool priorMarkerMatches(Custody* c,const std::string& raw,const struct st
   if(![path hasPrefix:[prefix stringByAppendingString:@"/"]]||
      ![@[@"activation.json",@"terminal.json"] containsObject:path.lastPathComponent]||!arbol_boundary::canonical(path.fileSystemRepresentation)) return false;
   int fd=open(path.stringByDeletingLastPathComponent.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC); if(fd<0) return false;
-  std::string bytes; bool missing;
-  bool ok=arbol_attempt::readAt(fd,path.lastPathComponent.UTF8String,bytes,missing)&&!missing&&[arbol_attempt::digest(bytes) isEqual:prior[@"digest"]];
+  std::string bytes; struct stat receiptIdentity{};
+  bool ok=arbol_exit::readNativeFile(fd,path.lastPathComponent.UTF8String,bytes,receiptIdentity,arbol_exit::exitReceiptLimit)&&
+    [arbol_attempt::digest(bytes) isEqual:prior[@"digest"]];
   if(close(fd)) ok=false;
-  NSDictionary* receipt=arbol_attempt::json(bytes),*marker=receipt[@"marker"];
+  NSDictionary* receipt=arbol_exit::parseExitReceipt(bytes),*marker=receipt[@"marker"];
   ok=ok&&[receipt[@"format"] isEqual:@1]&&[receipt[@"profileInstance"] isEqual:attempt[@"profileInstance"]]&&
     [receipt[@"profilePathHash"] isEqual:attempt[@"profilePathHash"]]&&[receipt[@"profileDirectory"] isEqual:capability[@"profileDirectory"]];
   if(absent) return ok&&marker==(id)NSNull.null;

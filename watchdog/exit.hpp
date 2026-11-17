@@ -12,6 +12,35 @@
 #include <dirent.h>
 namespace arbol_exit {
 using arbol_boundary::Identity;
+// Purpose-specific private exit evidence only. Launch/cancel/capsule/marker
+// formats retain their independent16KiB bounds in arbol_attempt. A journal
+// contains the whole bounded capability PLUS ordinary/storage evidence.
+constexpr size_t exitReceiptLimit=262144;
+inline std::string encodeExitReceiptValue(NSDictionary* value) {
+  @try {
+    if(![value isKindOfClass:NSDictionary.class]||![NSJSONSerialization isValidJSONObject:value]) return {};
+    NSError* error=nil;
+    NSData* data=[NSJSONSerialization dataWithJSONObject:value options:NSJSONWritingSortedKeys error:&error];
+    if(error||!data||!data.length||data.length>=exitReceiptLimit||![[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]) return {};
+    return std::string((const char*)data.bytes,data.length)+"\n";
+  } @catch(NSException*) { return {}; }
+}
+inline NSDictionary* parseExitReceipt(const std::string& raw) {
+  @try {
+    if(raw.empty()||raw.size()>exitReceiptLimit||raw.find('\0')!=std::string::npos) return nil;
+    NSData* data=[NSData dataWithBytes:raw.data() length:raw.size()];
+    if(![[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]) return nil;
+    NSError* error=nil; id value=[NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
+    // Canonical complete writer bytes exclude partial prefixes, duplicate-key
+    // substitutions, trailing material or lossy/non-stable round trips.
+    return !error&&[value isKindOfClass:NSDictionary.class]&&encodeExitReceiptValue(value)==raw?value:nil;
+  } @catch(NSException*) { return nil; }
+}
+inline std::string exitReceiptBytes(NSDictionary* value) {
+  std::string raw=encodeExitReceiptValue(value); if(raw.empty()) return {};
+  NSDictionary* complete=parseExitReceipt(raw);
+  return complete&&[complete isEqual:value]?raw:std::string{};
+}
 class ExitWatch {
   int queue_=-1; Identity original_{}; bool attempted_=false, enrolled_=false, uncertain_=false, seen_=false;
   int status_=-1; double observed_=0;
@@ -595,7 +624,7 @@ struct NativeFile {
   ~NativeFile() { if(fd>=0) close(fd); }
   bool finish() { if(fd<0) return true; int original=fd; fd=-1; return !close(original); }
 };
-inline bool readNativeFile(int directory,const std::string& name,std::string& raw,struct stat& identity,size_t limit=262144) {
+inline bool readNativeFile(int directory,const std::string& name,std::string& raw,struct stat& identity,size_t limit=exitReceiptLimit) {
   NativeFile file; file.fd=openat(directory,name.c_str(),O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC); if(file.fd<0) return false;
   struct stat first{},named{},last{},after{}; raw.clear();
   bool ok=!fstat(file.fd,&first)&&!fstatat(directory,name.c_str(),&named,AT_SYMLINK_NOFOLLOW)&&
@@ -610,7 +639,7 @@ inline bool readNativeFile(int directory,const std::string& name,std::string& ra
   if(!file.finish()) ok=false; if(ok) identity=last; return ok;
 }
 inline bool writeNativeFile(int directory,const std::string& temporary,const std::string& raw,double deadline,NativeFile& file) {
-  if(raw.empty()||raw.size()>262144||arbol_boundary::clockMs()>=deadline) return false;
+  if(raw.empty()||raw.size()>exitReceiptLimit||arbol_boundary::clockMs()>=deadline) return false;
   file.fd=openat(directory,temporary.c_str(),O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC,0600);
   if(file.fd<0||fchmod(file.fd,0600)) return false;
   size_t at=0;
@@ -1064,11 +1093,14 @@ public:
     if(result<0||storageJob_->completed>=ordinaryDeadline_||!metadata()||
        ![boundMarker(c) isEqual:ordinaryProof_[@"marker"]]||![family_->frontierTuple() isEqual:ordinaryProof_[@"family"]]||
        !ordinaryCurrent(c,ordinaryDeadline_)) { state_->poison(storageLoss); return -1; }
-    if(!storageProof_) storageProof_=@{@"format":@1,@"kind":@"native-emitted-storage-sync",@"ordinaryProofDigest":arbol_attempt::digest(arbol_attempt::bytes(ordinaryProof_)),
+    std::string ordinaryRaw=exitReceiptBytes(ordinaryProof_);
+    if(ordinaryRaw.empty()) { state_->poison(storageLoss); return -1; }
+    if(!storageProof_) storageProof_=@{@"format":@1,@"kind":@"native-emitted-storage-sync",@"ordinaryProofDigest":arbol_attempt::digest(ordinaryRaw),
       @"device":@((uint64_t)state_->marker.device),@"directories":value_[@"directories"],@"files":@(storageJob_->files),@"directoryCount":@(storageJob_->directories),
       @"metadataDigest":[NSString stringWithUTF8String:storageJob_->digest.c_str()],@"startedUs":@((uint64_t)(storageJob_->started*1000)),
       @"completedUs":@((uint64_t)(storageJob_->completed*1000)),@"deadlineUs":@((uint64_t)(ordinaryDeadline_*1000)),
       @"fileOperation":@"fsync+F_FULLFSYNC",@"directoryOperation":@"fsync",@"scope":@"opaque emitted data/userData; no stronger backend transaction claim"};
+    if(exitReceiptBytes(storageProof_).empty()) { state_->poison(storageLoss); return -1; }
     return 1;
   }
   NSDictionary* storageProof() const { return storageProof_; }
@@ -1089,7 +1121,8 @@ public:
     Identity last; if(arbol_boundary::observe(getpid(),last)!=1||!arbol_boundary::same(last,c.primary)) return false;
     NSDictionary* journal=@{@"format":@1,@"kind":@"post-exit-journal",@"capability":value_,@"capabilityDigest":arbol_attempt::digest(raw_),
       @"ordinary":ordinaryProof_,@"storage":storageProof_,@"lastHolder":arbol_boundary::capsuleIdentity(last,c.session)};
-    std::string journalRaw=arbol_attempt::bytes(journal); struct stat journalIdentity{};
+    std::string journalRaw=exitReceiptBytes(journal); struct stat journalIdentity{};
+    if(journalRaw.empty()) return false;
     if(!publishNativeReceipt(receipts.fd,"proof.json",journalRaw,deadline,journalIdentity)||
        !ordinaryCurrent(c,deadline)||![boundMarker(c) isEqual:ordinaryProof_[@"marker"]]) return false;
     // The journal and emitted-storage acknowledgements precede ANY clean-bit
@@ -1105,7 +1138,7 @@ public:
        !publishedNativeFile(root.fd,"engine.json",cleanRaw,cleanFile,cleanIdentity,deadline)||!cleanFile.finish()) return false;
     NSDictionary* cleanMarker=@{@"identity":fileIdentity(cleanIdentity),@"digest":arbol_attempt::digest(cleanRaw),@"value":clean};
     std::string actualClean,actualJournal; struct stat checkedClean{},checkedJournal{};
-    if(!ordinaryCurrent(c,deadline)||!readNativeFile(root.fd,"engine.json",actualClean,checkedClean)||actualClean!=cleanRaw||
+    if(!ordinaryCurrent(c,deadline)||!readNativeFile(root.fd,"engine.json",actualClean,checkedClean,arbol_attempt::limit)||actualClean!=cleanRaw||
        !arbol_attempt::sameFile(cleanIdentity,checkedClean)||!readNativeFile(receipts.fd,"proof.json",actualJournal,checkedJournal)||
        actualJournal!=journalRaw||!arbol_attempt::sameFile(journalIdentity,checkedJournal)||
        ![family_->frontierTuple() isEqual:ordinaryProof_[@"family"]]) return false;
@@ -1116,7 +1149,8 @@ public:
       @"journal":@{@"path":[receiptPath stringByAppendingPathComponent:@"proof.json"],@"identity":fileIdentity(journalIdentity),@"digest":arbol_attempt::digest(journalRaw)},
       @"main":value_[@"main"],@"primary":arbol_boundary::capsuleIdentity(c.primary),@"custody":arbol_boundary::capsuleIdentity(c.custody),
       @"lastHolder":arbol_boundary::capsuleIdentity(last,c.session),@"deadlineUs":@((uint64_t)(deadline*1000))};
-    std::string activationRaw=arbol_attempt::bytes(activation); struct stat activationIdentity{};
+    std::string activationRaw=exitReceiptBytes(activation); struct stat activationIdentity{};
+    if(activationRaw.empty()) return false;
     if(!ordinaryCurrent(c,deadline)||!publishNativeReceipt(receipts.fd,"activation.json",activationRaw,deadline,activationIdentity)||
        !ordinaryCurrent(c,deadline)||!arbol_attempt::unchanged(claim.at)) return false;
     // This existing native terminal reference is written ONLY after actual
