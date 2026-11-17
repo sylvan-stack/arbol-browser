@@ -73,6 +73,7 @@ inline bool retainNativeImage() {
 enum class KernelState : int { transient=-3,pending=-1,uncertain=-2,live=0,exiting=1,absent=2 };
 struct KernelAnswer {
   std::atomic<KernelState> state{KernelState::pending}; double completed=0;
+  int returned=0,error=0;
   Info observed{};
 };
 class KernelQueries {
@@ -99,7 +100,7 @@ class KernelQueries {
         else if(same(actual,job.original)&&(!job.exactGroup||actual.group==job.original.group))
           result=(info.bsd.pbi_flags&PROC_FLAG_INEXIT)?KernelState::exiting:KernelState::live;
       }
-      job.answer->observed=info; job.answer->completed=clockMs();
+      job.answer->observed=info; job.answer->returned=n; job.answer->error=failure; job.answer->completed=clockMs();
       job.answer->state.store(result,std::memory_order_release);
       { std::lock_guard<std::mutex> held(mutex_); --running_; }
     }
@@ -131,22 +132,35 @@ public:
     } catch(...) { return {}; }
   }
 };
+struct KernelAbsence {
+  Identity original{},replacement{}; uint64_t observedUs=0; unsigned kind=0;
+};
 class OriginalExit {
-  std::shared_ptr<KernelAnswer> answer_;
+  std::shared_ptr<KernelAnswer> answer_; KernelAbsence proof_{};
 public:
   bool absent(const Identity& original) {
     if(original.pid<=1||!original.start||original.version<=0) return false;
     Identity now; int live=observe(original.pid,now);
-    if(live==1) return now.start!=original.start; // actual PID reuse requires reaping
+    if(live==1) {
+      if(now.start==original.start) return false;
+      proof_={original,now,(uint64_t)(clockMs()*1000),2}; return true;
+    }
     if(live<0) return false;
     if(answer_) {
       KernelState result=answer_->state.load(std::memory_order_acquire);
-      if(result==KernelState::absent) return true;
+      if(result==KernelState::absent) {
+        const auto& info=answer_->observed; Identity replacement{}; unsigned kind=1;
+        if(answer_->returned==sizeof(Info)&&info.unique.start!=original.start) {
+          replacement={original.pid,info.unique.start,info.unique.version,info.bsd.pbi_uid,info.bsd.pbi_pgid}; kind=2;
+        }
+        proof_={original,replacement,(uint64_t)(answer_->completed*1000),kind}; return true;
+      }
       if((result==KernelState::live||result==KernelState::exiting||result==KernelState::transient)&&clockMs()>=answer_->completed+10) answer_.reset();
     }
     if(!answer_) { auto* pool=KernelQueries::get(); if(pool) answer_=pool->submit(original,false); }
-    return answer_&&answer_->state.load(std::memory_order_acquire)==KernelState::absent;
+    return false;
   }
+  const KernelAbsence& proof() const { return proof_; }
 };
 inline bool canonical(const std::string& path) { char resolved[PATH_MAX]; return !path.empty() && path[0] == '/' && realpath(path.c_str(), resolved) && path == resolved; }
 inline bool executable(const Identity& id, std::string& path) {
@@ -215,6 +229,10 @@ public:
   virtual ~FamilyCapture()=default;
   virtual bool capture(const FamilyObservation& original)=0;
   virtual void refuse()=0;
+  virtual bool snapshot(std::vector<FamilyObservation>& values)=0;
+  virtual bool retire(const KernelAbsence& proof)=0;
+  virtual bool complete()=0;
+  virtual bool seal()=0;
 };
 struct Context {
   Identity main, primary, custody; bool authenticated=false, cleanupOnly=false, primaryOutside=false,familyUncertain=false; std::string bundle, digest; int session = 0; Lock owner, build;
@@ -225,7 +243,9 @@ struct Context {
   bool originalGone(const Identity& id) {
     if(!id.pid) return true;
     if(exits.size()>=4096&&!exits.count(key(id))) { uncertainFamily(); return false; }
-    return exits[key(id)].absent(id);
+    auto& observation=exits[key(id)];
+    if(!observation.absent(id)) return false;
+    return !family||same(id,main)||same(id,primary)||same(id,custody)||family->retire(observation.proof());
   }
   std::string engine() const { return bundle + "/Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron"; }
   std::string helper() const { return bundle + "/Contents/Resources/browser/native/watchdog"; }
@@ -332,6 +352,15 @@ struct Context {
     int bytes=proc_listpids(PROC_UID_ONLY,main.uid,pids.data(),(int)(cap*sizeof(pid_t)));
     if(bytes<0||bytes%sizeof(pid_t)||(size_t)bytes>=cap*sizeof(pid_t)) return false;
     bool valid=!familyUncertain;
+    if(family) {
+      std::vector<FamilyObservation> shared;
+      if(!family->snapshot(shared)) return false;
+      for(const auto& value:shared) {
+        auto old=seen.find(key(value.original));
+        if(old!=seen.end()&&!same(old->second,value.original)) { uncertainFamily(); return false; }
+        seen.emplace(key(value.original),value.original);
+      }
+    }
     for(int i=0;i<bytes/(int)sizeof(pid_t);++i) {
       int pid=pids[i]; if(pid<=0) continue;
       Identity id; Info info{}; int state=observe(pid,id,&info);
@@ -394,13 +423,17 @@ struct Context {
     }
     // Every captured original survives orphaning, group escape and PID reuse.
     // A pending/uncertain zombie-aware query keeps it in the target set.
-    for(const auto& entry:seen) if(!originalGone(entry.second)) targets.push_back(entry.second);
+    for(auto it=seen.begin();it!=seen.end();) {
+      if(!originalGone(it->second)) { targets.push_back(it->second); ++it; }
+      else if(!same(it->second,main)) { exits.erase(it->first); it=seen.erase(it); }
+      else ++it;
+    }
     if(!originalGone(main)&&std::none_of(targets.begin(),targets.end(),[&](const Identity& id){return same(id,main);}))
       targets.push_back(main);
     return valid;
   }
   bool engineGone(bool executingMain = false) {
-    std::vector<Identity> targets; if(!census(targets)||familyUncertain) return false;
+    std::vector<Identity> targets; if(!census(targets)||familyUncertain||(family&&!family->complete())) return false;
     return std::none_of(targets.begin(),targets.end(),[&](const Identity& id){return !executingMain||!same(id,main);})&&
       (executingMain?(getpid()==main.pid&&current(main)==1):originalGone(main));
   }

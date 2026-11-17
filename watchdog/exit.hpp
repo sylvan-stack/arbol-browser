@@ -117,6 +117,7 @@ struct IdentitySlot {
 // not a generic read-only census in progress.
 struct FamilySlot {
   std::atomic<uint64_t> publication{0},start{0},parentStart{0},capturedUs{0};
+  std::atomic<uint64_t> captureAck{0},resolver{0},absenceAck{0};
   std::atomic<uint32_t> pid{0},version{0},uid{0},group{0},parentVersion{0},session{0},image{0};
   bool read(arbol_boundary::FamilyObservation& out,uint64_t& serial) const {
     uint64_t before=publication.load(std::memory_order_acquire);
@@ -130,18 +131,58 @@ struct FamilySlot {
     uint64_t empty=publication.load(std::memory_order_acquire);
     if((empty&3)||!serial||serial>(UINT64_MAX>>2)||
        !publication.compare_exchange_strong(empty,(serial<<2)|1,std::memory_order_acq_rel)) return false;
+    captureAck.store(0); resolver.store(0); absenceAck.store(0);
     pid.store(value.original.pid); start.store(value.original.start); version.store(value.original.version);
     uid.store(value.original.uid); group.store(value.original.group); parentStart.store(value.parentStart);
     parentVersion.store(value.parentVersion); capturedUs.store(value.capturedUs); session.store(value.session); image.store(value.image);
     publication.store((serial<<2)|2,std::memory_order_release); return true;
   }
 };
+struct LedgerStamp {
+  uint64_t device=0,inode=0,size=0; uint32_t uid=0,mode=0;
+  int64_t modified=0,changed=0; uint64_t modifiedNs=0,changedNs=0;
+  static LedgerStamp from(const struct stat& st) {
+    return {(uint64_t)st.st_dev,st.st_ino,(uint64_t)st.st_size,st.st_uid,(uint32_t)(st.st_mode&07777),
+      st.st_mtimespec.tv_sec,st.st_ctimespec.tv_sec,(uint64_t)st.st_mtimespec.tv_nsec,(uint64_t)st.st_ctimespec.tv_nsec};
+  }
+  bool is(const struct stat& st) const {
+    return S_ISREG(st.st_mode)&&st.st_nlink==1&&device==(uint64_t)st.st_dev&&inode==st.st_ino&&size==(uint64_t)st.st_size&&
+      uid==st.st_uid&&mode==(uint32_t)(st.st_mode&07777)&&modified==st.st_mtimespec.tv_sec&&changed==st.st_ctimespec.tv_sec&&
+      modifiedNs==(uint64_t)st.st_mtimespec.tv_nsec&&changedNs==(uint64_t)st.st_ctimespec.tv_nsec;
+  }
+};
+struct LedgerFront {
+  LedgerStamp file{}; uint64_t count=0,tailOffset=0,tailLength=0; std::string chain;
+};
+struct FamilyFrontier {
+  std::atomic<uint64_t> publication{0},device{0},inode{0},size{0},uid{0},mode{0},modified{0},changed{0},modifiedNs{0},changedNs{0};
+  std::atomic<uint64_t> count{0},tailOffset{0},tailLength{0},hash[4]{};
+  bool read(LedgerFront& out) const {
+    uint64_t first=publication.load(std::memory_order_acquire); if(!first||(first&1)) return false;
+    out.file={device.load(),inode.load(),size.load(),(uint32_t)uid.load(),(uint32_t)mode.load(),
+      (int64_t)modified.load(),(int64_t)changed.load(),modifiedNs.load(),changedNs.load()};
+    out.count=count.load(); out.tailOffset=tailOffset.load(); out.tailLength=tailLength.load(); out.chain.clear();
+    char word[17]; for(unsigned i=0;i<4;++i) { snprintf(word,sizeof(word),"%016llx",(unsigned long long)hash[i].load()); out.chain+=word; }
+    return publication.load(std::memory_order_acquire)==first;
+  }
+  bool publish(const LedgerFront& value) {
+    if(value.chain.size()!=64) return false;
+    uint64_t old=publication.load(std::memory_order_acquire); if((old&1)||old>UINT64_MAX-2) return false;
+    publication.store(old+1,std::memory_order_release);
+    device.store(value.file.device); inode.store(value.file.inode); size.store(value.file.size); uid.store(value.file.uid); mode.store(value.file.mode);
+    modified.store(value.file.modified); changed.store(value.file.changed); modifiedNs.store(value.file.modifiedNs); changedNs.store(value.file.changedNs);
+    count.store(value.count); tailOffset.store(value.tailOffset); tailLength.store(value.tailLength);
+    for(unsigned i=0;i<4;++i) hash[i].store(strtoull(value.chain.substr(i*16,16).c_str(),nullptr,16));
+    publication.store(old+2,std::memory_order_release); return true;
+  }
+};
 struct FamilyRoleState {
   std::atomic<uint64_t> nextCapture{0};
+  FamilyFrontier frontier;
   std::atomic<uint32_t> appendInFlight{0},failed{0},sealed{0};
   FamilySlot active[4096]; // simultaneous unresolved originals, not lifetime count
 };
-struct FamilyState { std::atomic<uint32_t> uncertain{0}; FamilyRoleState roles[3]; };
+struct FamilyState { std::atomic<uint32_t> uncertain{0}; std::atomic<uint64_t> activity{0}; FamilyRoleState roles[3]; };
 struct LedgerHeader {
   char magic[8]={'A','B','R','2','9','F','1','\0'}; uint32_t format=1,role=0;
   char capabilityDigest[65]{},nonce[65]{}; uint8_t reserved[6]{};
@@ -219,26 +260,209 @@ inline bool privateDirectoryAt(int parent,const char* name,struct stat& out,bool
   if(close(fd)) valid=false; return valid;
 }
 class RetainedFamily final:public arbol_boundary::FamilyCapture {
+  struct Job { unsigned origin,index; uint64_t serial; arbol_boundary::FamilyObservation value; arbol_boundary::KernelAbsence proof; bool absence; };
   SharedState* state_; unsigned role_; Identity main_; int session_;
+  int readers_[3],writer_; NSDictionary* capability_; std::string capabilityDigest_;
+  std::mutex mutex_; std::condition_variable available_; std::deque<Job> queue_; bool worker_=false,failed_=false;
+  bool compatible(const arbol_boundary::FamilyObservation& value) const {
+    return value.original.pid>1&&value.original.start&&value.original.version>0&&value.original.uid==main_.uid&&
+      value.original.group==main_.group&&value.parentStart==main_.start&&value.parentVersion==main_.version&&
+      value.session==(uint32_t)session_&&value.image>=1&&value.image<=4;
+  }
+  bool self() const {
+    const auto& slot=role_==0?state_->main:role_==1?state_->primary:state_->custody;
+    Identity now; if(slot.state.load(std::memory_order_acquire)!=2||arbol_boundary::observe(getpid(),now)!=1||!slot.is(now)||getsid(0)!=session_) return false;
+    return now.group==main_.group||(role_==1&&now.group==(uint32_t)getpid());
+  }
+  bool physical(unsigned role,const LedgerFront& front) const {
+    if(role>2||readers_[role]<0) return false;
+    struct stat fd{},named{}; char path[PATH_MAX]{};
+    NSString* expected=capability_[@"family"][role][@"path"];
+    return expected&&arbol_boundary::canonical(expected.fileSystemRepresentation)&&!fstat(readers_[role],&fd)&&
+      !lstat(expected.fileSystemRepresentation,&named)&&front.file.is(fd)&&front.file.is(named)&&
+      !fcntl(readers_[role],F_GETPATH,path)&&std::string(path)==expected.fileSystemRepresentation;
+  }
+  NSDictionary* identity(const arbol_boundary::FamilyObservation& value) const {
+    NSMutableDictionary* out=[arbol_boundary::capsuleIdentity(value.original) mutableCopy];
+    out[@"parentStartId"]=[NSString stringWithUTF8String:std::to_string(value.parentStart).c_str()];
+    out[@"parentPidVersion"]=@(value.parentVersion); out[@"session"]=@(value.session); out[@"image"]=@(value.image); out[@"capturedUs"]=@(value.capturedUs); return out;
+  }
+  bool append(std::vector<Job>& jobs) {
+    @autoreleasepool { @try {
+      if(!self()) return false;
+      LedgerFront before; if(!state_->family.roles[role_].frontier.read(before)||!physical(role_,before)) return false;
+      struct stat writing{}; if(fstat(writer_,&writing)||!before.file.is(writing)||(fcntl(writer_,F_GETFL)&O_ACCMODE)!=O_WRONLY) return false;
+      LedgerFront next=before; std::string bytes; std::vector<Job> committed;
+      for(const auto& job:jobs) {
+        if(next.count==UINT64_MAX||!compatible(job.value)) return false;
+        auto& slot=state_->family.roles[job.origin].active[job.index];
+        arbol_boundary::FamilyObservation current; uint64_t serial;
+        uint64_t publication=slot.publication.load(std::memory_order_acquire);
+        // Reuse is allowed only after the old generation's durable absence.
+        // An old queued observation may therefore be harmlessly superseded;
+        // never charge or acknowledge the replacement original.
+        if((publication>>2)>job.serial||((publication>>2)==job.serial&&!(publication&3))) continue;
+        if(!slot.read(current,serial)||serial!=job.serial||!arbol_boundary::same(current.original,job.value.original)) return false;
+        if(job.absence&&slot.resolver.load(std::memory_order_acquire)!=((job.serial<<2)|(role_+1))) return false;
+        NSMutableDictionary* record=[@{@"format":@1,@"kind":job.absence?@"absence":@"capture",@"writerRole":@(role_),@"sequence":@(++next.count),
+          @"originRole":@(job.origin),@"capture":@(job.serial),@"original":identity(job.value),@"previous":[NSString stringWithUTF8String:next.chain.c_str()]} mutableCopy];
+        if(job.absence) {
+          if(!arbol_boundary::same(job.proof.original,job.value.original)||!job.proof.observedUs||(job.proof.kind!=1&&job.proof.kind!=2)) return false;
+          record[@"proof"]=@{@"kind":job.proof.kind==1?@"complete-kernel-absence":@"unique-start-reuse",@"observedUs":@(job.proof.observedUs),
+            @"replacement":job.proof.kind==2?arbol_boundary::capsuleIdentity(job.proof.replacement):(id)NSNull.null};
+        }
+        std::string core=arbol_attempt::bytes(record); if(core.empty()) return false;
+        next.chain=[arbol_attempt::digest(core) UTF8String]; record[@"digest"]=[NSString stringWithUTF8String:next.chain.c_str()];
+        std::string raw=arbol_attempt::bytes(record); if(raw.empty()||bytes.size()+raw.size()>1048576) return false;
+        next.tailOffset=before.file.size+bytes.size(); next.tailLength=raw.size(); bytes+=raw; committed.push_back(job);
+      }
+      if(committed.empty()) return true;
+      // No unexpected edit or append may be hidden behind our next increment.
+      if(!physical(role_,before)) return false;
+      size_t at=0;
+      while(at<bytes.size()) { ssize_t n=pwrite(writer_,bytes.data()+at,bytes.size()-at,before.file.size+at); if(n>0) at+=n; else if(n<0&&errno==EINTR) continue; else return false; }
+      if(fsync(writer_)||fcntl(writer_,F_FULLFSYNC)||fstat(writer_,&writing)||writing.st_size!=(off_t)(before.file.size+bytes.size())||
+         writing.st_dev!=(dev_t)before.file.device||writing.st_ino!=before.file.inode||!arbol_attempt::privateFile(writing)) return false;
+      next.file=LedgerStamp::from(writing); if(!physical(role_,next)||!state_->family.roles[role_].frontier.publish(next)) return false;
+      for(const auto& job:committed) {
+        auto& slot=state_->family.roles[job.origin].active[job.index];
+        auto& acknowledgement=job.absence?slot.absenceAck:slot.captureAck;
+        uint64_t value=acknowledgement.load(std::memory_order_acquire);
+        while(value<job.serial&&slot.publication.load(std::memory_order_acquire)==((job.serial<<2)|2)) {
+          if(acknowledgement.compare_exchange_weak(value,job.serial,std::memory_order_acq_rel)) break;
+        }
+      }
+      state_->family.activity.fetch_add(1,std::memory_order_acq_rel);
+      return true;
+    } @catch(NSException*) { return false; } }
+  }
+  void fail() { state_->family.roles[role_].failed.store(1,std::memory_order_release); refuse(); }
+  void run() {
+    for(;;) {
+      std::vector<Job> jobs;
+      {
+        std::unique_lock<std::mutex> held(mutex_); available_.wait(held,[&] { return failed_||!queue_.empty(); });
+        if(failed_) return;
+        while(!queue_.empty()&&jobs.size()<64) { jobs.push_back(std::move(queue_.front())); queue_.pop_front(); }
+      }
+      bool ok=false; try { ok=append(jobs); } catch(...) {}
+      if(!ok) { { std::lock_guard<std::mutex> held(mutex_); failed_=true; } fail(); return; }
+      { std::lock_guard<std::mutex> held(mutex_); if(queue_.empty()) state_->family.roles[role_].appendInFlight.store(0,std::memory_order_release); }
+    }
+  }
+  bool enqueue(Job job) {
+    std::lock_guard<std::mutex> held(mutex_);
+    if(failed_||state_->family.roles[role_].sealed.load(std::memory_order_acquire)||queue_.size()>=16384) { fail(); return false; }
+    state_->family.roles[role_].appendInFlight.store(1,std::memory_order_release);
+    try {
+      queue_.push_back(std::move(job));
+      if(!worker_) {
+        if(!arbol_boundary::retainNativeImage()) { failed_=true; fail(); return false; }
+        std::thread([this] { run(); }).detach(); worker_=true;
+      }
+      available_.notify_one(); return true;
+    } catch(...) { failed_=true; fail(); return false; }
+  }
 public:
-  RetainedFamily(SharedState* state,unsigned role,const Identity& main,int session):state_(state),role_(role),main_(main),session_(session) {}
+  RetainedFamily(SharedState* state,unsigned role,const Identity& main,int session,const int* readers,int writer,NSDictionary* capability,const std::string& digest):
+    state_(state),role_(role),main_(main),session_(session),writer_(writer),capability_(capability),capabilityDigest_(digest) {
+    for(unsigned i=0;i<3;++i) readers_[i]=readers[i];
+  }
   void refuse() override { state_->family.uncertain.store(1,std::memory_order_release); state_->poison(identityLoss); }
   bool capture(const arbol_boundary::FamilyObservation& value) override {
-    if(role_>2||value.original.pid<=1||!value.original.start||value.original.version<=0||value.original.uid!=main_.uid||
-       value.original.group!=main_.group||value.parentStart!=main_.start||value.parentVersion!=main_.version||
-       value.session!=(uint32_t)session_||value.image<1||value.image>4) { refuse(); return false; }
+    if(role_>2||!compatible(value)||!self()) { refuse(); return false; }
     auto& role=state_->family.roles[role_];
     for(auto& slot:role.active) {
       arbol_boundary::FamilyObservation old; uint64_t serial;
       if(slot.read(old,serial)&&arbol_boundary::same(old.original,value.original))
-        return old.original.group==value.original.group&&old.parentStart==value.parentStart&&old.parentVersion==value.parentVersion&&
-          old.session==value.session&&old.image==value.image;
+        return old.original.group==value.original.group&&old.parentStart==value.parentStart&&old.parentVersion==value.parentVersion&&old.session==value.session&&old.image==value.image;
     }
-    for(auto& slot:role.active) if(!(slot.publication.load(std::memory_order_acquire)&3)) {
+    for(unsigned i=0;i<4096;++i) if(!(role.active[i].publication.load(std::memory_order_acquire)&3)) {
       uint64_t serial=role.nextCapture.fetch_add(1,std::memory_order_acq_rel)+1;
-      if(slot.publish(value,serial)) return true;
+      state_->family.activity.fetch_add(1,std::memory_order_acq_rel);
+      if(role.active[i].publish(value,serial)) return enqueue({role_,i,serial,value,{},false});
     }
     refuse(); return false;
+  }
+  bool snapshot(std::vector<arbol_boundary::FamilyObservation>& values) override {
+    values.clear(); if(state_->family.uncertain.load(std::memory_order_acquire)) return false;
+    for(unsigned r=0;r<3;++r) {
+      if(state_->family.roles[r].failed.load(std::memory_order_acquire)) return false;
+      for(auto& slot:state_->family.roles[r].active) {
+        arbol_boundary::FamilyObservation value; uint64_t serial;
+        if(slot.read(value,serial)) {
+          if(!compatible(value)) { refuse(); return false; }
+          // A completed durable absence increment is immutable history. It can
+          // leave the active union without replaying that lifetime stream.
+          if(slot.absenceAck.load(std::memory_order_acquire)==serial) {
+            uint64_t expected=(serial<<2)|2;
+            if(slot.publication.compare_exchange_strong(expected,serial<<2,std::memory_order_acq_rel)) state_->family.activity.fetch_add(1,std::memory_order_acq_rel);
+          } else values.push_back(value);
+        }
+      }
+    }
+    return true;
+  }
+  bool retire(const arbol_boundary::KernelAbsence& proof) override {
+    if(!proof.kind||!proof.observedUs) return false;
+    bool done=true;
+    for(unsigned r=0;r<3;++r) for(unsigned i=0;i<4096;++i) {
+      auto& slot=state_->family.roles[r].active[i]; arbol_boundary::FamilyObservation value; uint64_t serial;
+      if(!slot.read(value,serial)||!arbol_boundary::same(value.original,proof.original)) continue;
+      uint64_t publication=(serial<<2)|2;
+      if(slot.absenceAck.load(std::memory_order_acquire)==serial) continue;
+      done=false;
+      if(slot.captureAck.load(std::memory_order_acquire)!=serial) continue;
+      uint64_t current=slot.resolver.load(std::memory_order_acquire);
+      if(current&&(current>>2)<serial) {
+        // A delayed old claimant can race legitimate acknowledged reuse. Only
+        // its exact stale tag is cleared; a current replacement claim is safe.
+        if(slot.publication.load(std::memory_order_acquire)==publication)
+          slot.resolver.compare_exchange_strong(current,0,std::memory_order_acq_rel);
+        continue;
+      }
+      if(current&&(current>>2)>serial) continue; // our snapshot is superseded
+      uint64_t empty=0,claim=(serial<<2)|(role_+1);
+      if(slot.publication.load(std::memory_order_acquire)!=publication) continue;
+      if(slot.resolver.compare_exchange_strong(empty,claim,std::memory_order_acq_rel)) {
+        if(slot.publication.load(std::memory_order_acquire)!=publication) {
+          slot.resolver.compare_exchange_strong(claim,0,std::memory_order_acq_rel); continue;
+        }
+        if(!enqueue({r,i,serial,value,proof,true})) return false;
+      }
+    }
+    return done;
+  }
+  bool complete() override {
+    uint64_t activity=state_->family.activity.load(std::memory_order_acquire);
+    if(state_->family.uncertain.load(std::memory_order_acquire)) return false;
+    for(unsigned r=0;r<3;++r) {
+      const auto& role=state_->family.roles[r]; LedgerFront frontier;
+      if(role.failed.load(std::memory_order_acquire)||role.appendInFlight.load(std::memory_order_acquire)||!role.frontier.read(frontier)||!physical(r,frontier)) return false;
+      for(const auto& slot:role.active) {
+        uint64_t publication=slot.publication.load(std::memory_order_acquire);
+        if((publication&3)==1||((publication&3)==2&&slot.absenceAck.load(std::memory_order_acquire)!=(publication>>2))||
+           slot.publication.load(std::memory_order_acquire)!=publication) return false;
+      }
+    }
+    return state_->family.activity.load(std::memory_order_acquire)==activity;
+  }
+  bool seal() override {
+    if(!complete()) return false;
+    std::lock_guard<std::mutex> held(mutex_);
+    if(!queue_.empty()||state_->family.roles[role_].appendInFlight.load(std::memory_order_acquire)) return false;
+    state_->family.roles[role_].sealed.store(1,std::memory_order_release); return true;
+  }
+  NSDictionary* frontierTuple() const {
+    NSMutableArray* values=[NSMutableArray new];
+    for(unsigned r=0;r<3;++r) {
+      LedgerFront f; if(!state_->family.roles[r].frontier.read(f)||!physical(r,f)) return nil;
+      [values addObject:@{@"role":@(r),@"path":capability_[@"family"][r][@"path"],@"device":@(f.file.device),@"inode":@(f.file.inode),
+        @"uid":@(f.file.uid),@"mode":@(f.file.mode),@"size":@(f.file.size),@"modified":@(f.file.modified),@"modifiedNs":@(f.file.modifiedNs),
+        @"changed":@(f.file.changed),@"changedNs":@(f.file.changedNs),@"count":@(f.count),@"tailOffset":@(f.tailOffset),@"tailLength":@(f.tailLength),
+        @"chain":[NSString stringWithUTF8String:f.chain.c_str()],@"nonce":capability_[@"family"][r][@"nonce"]}];
+    }
+    return @{@"format":@1,@"capabilityDigest":[NSString stringWithUTF8String:capabilityDigest_.c_str()],@"streams":values};
   }
 };
 class HostCapability {
@@ -296,7 +520,7 @@ class HostCapability {
       memcpy(header.nonce,[value_[@"family"][i][@"nonce"] UTF8String],65);
       size_t at=0; const char* bytes=(const char*)&header;
       while(at<sizeof(header)) { ssize_t n=pwrite(writes_[i],bytes+at,sizeof(header)-at,at); if(n>0) at+=n; else if(n<0&&errno==EINTR) continue; else return false; }
-      if(fsync(writes_[i])||!ledgerDescriptor(reads_[i],i,false)||!ledgerDescriptor(writes_[i],i,true)) return false;
+      if(fsync(writes_[i])||fcntl(writes_[i],F_FULLFSYNC)||!ledgerDescriptor(reads_[i],i,false)||!ledgerDescriptor(writes_[i],i,true)) return false;
     }
     return true;
   }
@@ -314,7 +538,7 @@ class HostCapability {
   }
   bool attachFamily(arbol_boundary::Context& c) {
     if(family_||role_>2) return false;
-    family_=new RetainedFamily(state_,role_,c.main,c.session); c.family=family_; return true;
+    family_=new RetainedFamily(state_,role_,c.main,c.session,reads_,writes_[role_],value_,[arbol_attempt::digest(raw_) UTF8String]); c.family=family_; return true;
   }
 public:
   HostCapability()=default; HostCapability(const HostCapability&)=delete; HostCapability& operator=(const HostCapability&)=delete;
@@ -341,6 +565,7 @@ public:
     if(!ok) { state_->family.uncertain.store(1,std::memory_order_release); state_->poison(identityLoss); }
     return ok;
   }
+  RetainedFamily* family() const { return family_; }
   bool exclusiveWriter() const {
     for(unsigned i=0;i<3;++i) if(i!=role_&&writes_[i]>=0) return false;
     return ledgerDescriptor(writes_[role_],role_,true);
@@ -428,6 +653,12 @@ public:
     void* mapping=mmap(nullptr,sizeof(SharedState),PROT_READ|PROT_WRITE,MAP_SHARED,stateFd_,0); if(mapping==MAP_FAILED) return false;
     state_=new(mapping) SharedState; memcpy(state_->capabilityDigest,[arbol_attempt::digest(raw_) UTF8String],65);
     if(!state_->main.bind(c.main,deadline)) return false; state_->enrolled.fetch_or(1,std::memory_order_release);
+    for(unsigned i=0;i<3;++i) {
+      struct stat st{}; LedgerHeader header{};
+      if(fstat(reads_[i],&st)||pread(reads_[i],&header,sizeof(header),0)!=sizeof(header)) return false;
+      LedgerFront front{LedgerStamp::from(st),0,0,0,[arbol_attempt::digest(std::string((const char*)&header,sizeof(header))) UTF8String]};
+      if(!state_->family.roles[i].frontier.publish(front)) return false;
+    }
     if(!attachFamily(c)) return false;
     valid_=arbol_boundary::clockMs()<deadline && metadata() && arbol_boundary::lockIdentity(c.owner)&&arbol_boundary::lockIdentity(c.build);
     return valid_;

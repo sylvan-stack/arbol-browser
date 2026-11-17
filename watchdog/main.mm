@@ -152,8 +152,22 @@ struct Deadline {
       } else poison(cap,arbol_exit::protocolLoss);
     }
     reap(peer);
-    if(!c.engineGone()||!lockIdentity(c.owner)||!lockIdentity(c.build)) {
+    if(!lockIdentity(c.owner)||!lockIdentity(c.build)) {
       poison(cap,arbol_exit::identityLoss|arbol_exit::forced); c.enforce(); usleep(10000); continue;
+    }
+    if(!c.engineGone()) {
+      // Another original can finish a genuinely enrolled capture/absence
+      // increment just as this holder starts its T/K round. Pending durable
+      // evidence is not immediate identity failure, nor a deadline renewal.
+      double bound=std::min(expires,mainLimit);
+      if(cap) {
+        uint64_t fatal=cap->shared()->fatalCutoffUs.load(std::memory_order_acquire);
+        if(fatal) bound=std::min(bound,(double)fatal/1000);
+      }
+      if(!cap||cap->shared()->family.uncertain.load(std::memory_order_acquire)||clockMs()>=bound) {
+        poison(cap,arbol_exit::identityLoss|arbol_exit::forced); c.enforce();
+      }
+      usleep(1000); continue;
     }
     int state=current(peer);
     if(state<0) poison(cap,arbol_exit::identityLoss);
