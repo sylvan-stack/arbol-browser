@@ -329,7 +329,10 @@ export function loadPlatform(): PlatformPort {
           throw unavailable('browser');
       };
       try {
-        preparing(); actualApp = (await import('electron')).app;
+        preparing();
+        const address = 'electron';
+        const actual = await import(address) as typeof import('electron');
+        actualApp = actual.app;
         if (!actualApp || typeof actualApp.isReady !== 'function') throw unavailable('browser');
         isReady = actualApp.isReady; preparing();
         preparing(); await custody.host.assertTrusted(deadline); preparing();
