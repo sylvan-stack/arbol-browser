@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import type { Contract } from '../contracts/generated.js';
 import { BrowserFailure, invalidInput, unavailable } from '../contracts/errors.js';
 import { assertPageRetirement, assertPageSurface, assertWindowHost, type PageSurface, type WindowHost } from './windows.js';
+import { agentURL, AgentNavigationPolicy } from '../automation/navigation.js';
 
 export type TabState = Readonly<Contract<'browser.ShellTab'>>;
 export interface TabTarget { readonly id: string; readonly page: PageSurface }
@@ -142,23 +143,40 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
     // logical target's newer page and acquire its authority or popup budget.
     const current = () => tabs.get(target.id) === target && target.page === page && !closing.has(target) &&
       !windowClosures.has(page.window) && !page.retirement();
+    const policy = new AgentNavigationPolicy();
+    const agent = () => lifecycle.state(target).controller.kind === 'agent';
     page.view.webContents.setWindowOpenHandler(details => {
       if (current()) void popup(target, page, details.url).catch(() => {});
       return { action: 'deny' };
     });
     page.view.webContents.on('will-navigate', event => {
-      try { if (!current()) throw refused('control_changed'); userURL(event.url); lifecycle.assertAdmission(); }
+      try { if (!current()) throw refused('control_changed');
+        if (agent()) policy.start(event.url, page.view.webContents.getURL()); else userURL(event.url);
+        lifecycle.assertAdmission(); }
       catch { event.preventDefault(); }
     });
-    page.view.webContents.on('will-redirect', (event, address) => {
-      try { if (!current()) throw refused('control_changed'); userURL(address); lifecycle.assertAdmission(); }
+    page.view.webContents.on('will-frame-navigate', event => {
+      try { if (!current()) throw refused('control_changed');
+        if (event.isMainFrame && agent()) agentURL(event.url, page.view.webContents.getURL());
+        lifecycle.assertAdmission(); }
+      catch { event.preventDefault(); }
+    });
+    page.view.webContents.on('did-start-navigation', event => {
+      if (!current() || !event.isMainFrame) return;
+      try { if (agent()) policy.start(event.url, page.view.webContents.getURL()); }
+      catch { /* Cancellable barriers own refusal; document authority fences an issued load. */ }
+    });
+    page.view.webContents.on('will-redirect', (event, address, _inPlace, main) => {
+      try { if (!current()) throw refused('control_changed');
+        if (main && agent()) policy.redirect(address); else userURL(address);
+        lifecycle.assertAdmission(); }
       catch { event.preventDefault(); }
     });
     page.view.webContents.on('will-prevent-unload', event => event.preventDefault());
   }
   async function open(window: WindowHost, url: string, creator?: Contract<'browser.ClientIdentity'>,
     inherited?: TabState, inheritedBudget?: PopupBudget, background = false, scope?: AgentOpenScope, opener?: TabTarget): Promise<TabTarget> {
-    lifecycle.assertAdmission(); assertWindowHost(window); url = userURL(url);
+    lifecycle.assertAdmission(); assertWindowHost(window); url = creator ? agentURL(url) : userURL(url);
     if (windowClosures.has(window)) throw refused('control_refused', 'This browser window is closing.');
     if (tabs.size >= 64) throw refused('control_refused', 'Close an existing tab before opening another.');
     if (creator && !lifecycle.connected(creator.id)) throw refused('control_refused');
@@ -221,7 +239,8 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
   }
   async function popup(opener: TabTarget, page: PageSurface, url: string) {
     if (opener.page !== page || page.retirement()) throw refused('control_changed');
-    const before = state(opener); userURL(url);
+    const before = state(opener);
+    if (before.controller.kind === 'agent') agentURL(url, page.view.webContents.getURL()); else userURL(url);
     if (before.handoff !== 'idle') throw refused('control_refused');
     // Popup creation does not silently change the shell's selected tab.
     if (before.controller.kind === 'user') return open(opener.page.window, url, undefined, undefined, undefined, true);
