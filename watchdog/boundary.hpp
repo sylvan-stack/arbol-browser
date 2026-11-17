@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -238,6 +239,8 @@ struct Context {
   Identity main, primary, custody; bool authenticated=false, cleanupOnly=false, primaryOutside=false,familyUncertain=false; std::string bundle, digest; int session = 0; Lock owner, build;
   std::map<OriginalKey,Identity> seen;
   std::map<OriginalKey,OriginalExit> exits;
+  double lastFullCensus=0; bool fullCensusValid=false,originalGroupRetired=false,groupPending=false;
+  std::map<int,std::shared_ptr<KernelAnswer>> groupGaps;
   FamilyCapture* family=nullptr; // actual native capability owns its lifetime
   void uncertainFamily() { familyUncertain=true; if(family) family->refuse(); }
   bool originalGone(const Identity& id) {
@@ -340,17 +343,9 @@ struct Context {
     }
     if(count>1) return false; if(count==1) custody=found; return true;
   }
-  bool census(std::vector<Identity>& targets) {
+  bool census(std::vector<Identity>& targets,bool forceFull=false) {
     targets.clear();
     if(!authenticated||!foundation()) return false;
-    // Chromium 156.0.8078.100 ChildProcessLauncherHelper constructs default
-    // LaunchOptions; the macOS launcher does not request a new group/session.
-    // Eligible children are direct original-browser children, including GPU,
-    // renderer and utility images. No Node utility/crash reporter/third-party
-    // executable is authorized. Unknown images/descendants never widen this set.
-    constexpr size_t cap=16385; std::vector<pid_t> pids(cap);
-    int bytes=proc_listpids(PROC_UID_ONLY,main.uid,pids.data(),(int)(cap*sizeof(pid_t)));
-    if(bytes<0||bytes%sizeof(pid_t)||(size_t)bytes>=cap*sizeof(pid_t)) return false;
     bool valid=!familyUncertain;
     if(family) {
       std::vector<FamilyObservation> shared;
@@ -361,81 +356,135 @@ struct Context {
         seen.emplace(key(value.original),value.original);
       }
     }
-    for(int i=0;i<bytes/(int)sizeof(pid_t);++i) {
-      int pid=pids[i]; if(pid<=0) continue;
+    // Exact original-parent keys, never parent-version-only ancestry. This
+    // active index is rebuilt once per pass, not searched per UID process.
+    std::set<std::pair<uint64_t,int32_t>> parents;
+    parents.emplace(main.start,main.version);
+    for(const auto& entry:seen) parents.emplace(entry.second.start,entry.second.version);
+    Identity leader; int leaderState=observe(main.pid,leader);
+    if(leaderState<0) return false;
+    if(!originalGroupRetired&&leaderState==1&&leader.start!=main.start&&leader.group==main.group) {
+      // Darwin cannot allocate the old leader PID while that original process
+      // group exists. A new same-number group is not ours. First reconcile ALL
+      // retained originals (including other holders and durable shared union).
+      bool retainedSelf=getpid()==primary.pid&&primaryMonitor()&&primaryOutside;
+      bool gone=originalGone(main)&&(retainedSelf||originalGone(primary))&&originalGone(custody);
+      for(const auto& entry:seen) if(!originalGone(entry.second)) gone=false;
+      if(!gone||(family&&!family->complete())) return false;
+      originalGroupRetired=true;
+    }
+    groupPending=false; std::set<int> currentGaps;
+    auto inspect=[&](int pid,bool groupMember) {
+      if(pid<=0) return;
       Identity id; Info info{}; int state=observe(pid,id,&info);
-      // Reconcile every known original separately, including a live-list gap.
-      if(!state) continue;
-      if(state<0) { valid=false; continue; }
-      bool direct=info.unique.parent==main.start&&info.unique.originalParentVersion==main.version;
-      bool descendant=direct;
-      for(const auto& entry:seen)
-        if(info.unique.parent==entry.second.start&&info.unique.originalParentVersion==entry.second.version) descendant=true;
-      bool captured=seen.count(key(id));
-      if(id.group!=main.group&&!descendant&&!captured&&pid!=main.pid&&pid!=primary.pid&&pid!=custody.pid) continue;
-      if(same(id,primary)) { if(!primaryMonitor()) valid=false; continue; }
-      if(same(id,custody)) { if(!monitor(custody,true)) valid=false; continue; }
-      if(id.uid!=main.uid) { valid=false; continue; }
-      std::string path; bool image=executable(id,path);
-      bool original=captured&&same(seen.at(key(id)),id);
-      bool eligible=same(id,main)?image&&path==engine():(direct||original)&&image&&enginePath(path);
-      if(!eligible) {
-        // A known original may be in irreversible exit without an image. Keep
-        // its original provenance and require complete kernel absence below.
-        if(!captured||!(info.bsd.pbi_flags&PROC_FLAG_INEXIT)||!same(seen.at(key(id)),id)) { uncertainFamily(); valid=false; }
-      } else {
-        if(!captured) {
-          if(seen.size()>=4096||!signature(path,true)) { valid=false; continue; }
-          if(family&&!same(id,main)) {
-            FamilyObservation observation{id,info.unique.parent,(uint64_t)(clockMs()*1000),info.unique.originalParentVersion,(uint32_t)getsid(id.pid),engineRole(path)};
-            if(!family->capture(observation)) { uncertainFamily(); valid=false; continue; }
-          }
-          seen.emplace(key(id),id); // first authoritative capture is retained before local use
-        } else if(!same(seen.at(key(id)),id)) { uncertainFamily(); valid=false; }
-      }
-      if(id.group!=main.group||(!(info.bsd.pbi_flags&PROC_FLAG_INEXIT)&&getsid(id.pid)!=session)||
-         (!same(id,main)&&!direct&&!original)) {
-        // Retain authenticated originals for exact cleanup, but escape/drift
-        // permanently refuses readiness/ordinary finalization.
-        uncertainFamily(); valid=false;
-      }
-    }
-    // A second kernel group list includes allproc AND zombproc on the pinned
-    // kernel path. A listed live-view ESRCH is not silently skipped; wait until
-    // it is gone from the actual group list, or retain/refuse at the old cutoff.
-    bytes=proc_listpids(PROC_PGRP_ONLY,main.group,pids.data(),(int)(cap*sizeof(pid_t)));
-    if(bytes<0||bytes%sizeof(pid_t)||(size_t)bytes>=cap*sizeof(pid_t)) return false;
-    for(int i=0;i<bytes/(int)sizeof(pid_t);++i) {
-      if(pids[i]<=0) continue;
-      Identity id; int state=observe(pids[i],id);
       if(!state) {
-        // A captured original in the kernel exit gap remains pending, not a
-        // fabricated identity failure. The immutable history below includes
-        // it until the separate exiting/zombie-aware query proves absence.
-        bool known=pids[i]==main.pid||pids[i]==primary.pid||pids[i]==custody.pid;
-        for(const auto& entry:seen) if(entry.second.pid==pids[i]) known=true;
-        if(!known) { uncertainFamily(); valid=false; }
-        continue;
+        if(groupMember) {
+          Identity known{};
+          if(pid==main.pid) known=main;
+          else if(pid==primary.pid) known=primary;
+          else if(pid==custody.pid) known=custody;
+          for(const auto& entry:seen) if(entry.second.pid==pid) known=entry.second;
+          if(!known.pid) { uncertainFamily(); valid=false; }
+          else {
+            // Numeric equality does not prove this group-list occupant is the
+            // old original. Keep it unresolved until the actual group no
+            // longer lists it; inspect a full kernel identity in the meantime.
+            groupPending=true; currentGaps.insert(pid);
+            auto& answer=groupGaps[pid];
+            if(!answer) { auto* pool=KernelQueries::get(); if(pool) answer=pool->submit(known,false); }
+            if(answer) {
+              KernelState result=answer->state.load(std::memory_order_acquire);
+              if(result!=KernelState::pending) {
+                const auto& full=answer->observed;
+                if(answer->returned==sizeof(Info)&&full.bsd.pbi_pid==(uint32_t)pid&&full.unique.start&&full.unique.version>0) {
+                  Identity actual{pid,full.unique.start,full.unique.version,full.bsd.pbi_uid,full.bsd.pbi_pgid};
+                  if((actual.start!=known.start&&actual.group==main.group)||
+                     (actual.start==known.start&&!same(actual,known))) { uncertainFamily(); valid=false; }
+                } else if(result==KernelState::uncertain) { uncertainFamily(); valid=false; }
+                if(clockMs()>=answer->completed+10) answer.reset();
+              }
+            }
+          }
+        }
+        return; // known originals remain in the full kernel reconciliation
       }
-      if(state<0) { valid=false; continue; }
-      if(same(id,primary)||same(id,custody)) continue;
-      if(!seen.count(key(id))||!same(seen.at(key(id)),id)) valid=false;
+      if(state<0) { valid=false; return; }
+      bool direct=info.unique.parent==main.start&&info.unique.originalParentVersion==main.version;
+      bool descendant=parents.count({info.unique.parent,info.unique.originalParentVersion});
+      auto old=seen.find(key(id)); bool captured=old!=seen.end();
+      // Numeric equality with a former main/monitor is no identity evidence.
+      // Unrelated reuse outside the original group never enrolls or poisons it.
+      if((originalGroupRetired||id.group!=main.group)&&!descendant&&!captured&&
+         !same(id,main)&&!same(id,primary)&&!same(id,custody)) return;
+      if(same(id,primary)) { if(!primaryMonitor()) valid=false; return; }
+      if(same(id,custody)) { if(!monitor(custody,true)) valid=false; return; }
+      if(id.uid!=main.uid) { uncertainFamily(); valid=false; return; }
+      bool original=captured&&same(old->second,id);
+      std::string path; bool image=executable(id,path);
+      if(!image&&original) {
+        Identity after; Info latest{}; int again=observe(pid,after,&latest);
+        // Preserve the accepted ABR-46 race tree. Neither live-list ESRCH nor
+        // unique-start reuse alone is complete original-kernel disappearance.
+        if(!again||(again==1&&after.start!=id.start&&after.group!=main.group)) return;
+        // A genuinely observed exiting original can lack a task/image; retain
+        // its immutable capture until its separate full kernel query completes.
+        if(again==1&&same(after,id)&&after.group==main.group&&(latest.bsd.pbi_flags&PROC_FLAG_INEXIT)) return;
+        uncertainFamily(); valid=false; return;
+      }
+      bool eligible=same(id,main)?image&&path==engine():(direct||original)&&image&&enginePath(path);
+      if(!eligible) { uncertainFamily(); valid=false; return; }
+      if(id.group!=main.group||getsid(id.pid)!=session||(!same(id,main)&&!direct&&!original)) {
+        // A helper may disappear after successful image lookup too. Keep only
+        // the same narrow proven natural-disappearance/reuse explanation.
+        Identity after; int again=observe(pid,after);
+        if(original&&(!again||(again==1&&after.start!=id.start&&after.group!=main.group))) return;
+        uncertainFamily(); valid=false; return;
+      }
+      if(!captured) {
+        if(seen.size()>=4096||!signature(path,true)) { uncertainFamily(); valid=false; return; }
+        if(family&&!same(id,main)) {
+          FamilyObservation observation{id,info.unique.parent,(uint64_t)(clockMs()*1000),info.unique.originalParentVersion,(uint32_t)session,engineRole(path)};
+          if(!family->capture(observation)) { uncertainFamily(); valid=false; return; }
+        }
+        seen.emplace(key(id),id);
+        parents.emplace(id.start,id.version);
+      } else if(!original) { uncertainFamily(); valid=false; }
+    };
+    constexpr size_t cap=16385; std::vector<pid_t> pids(cap);
+    double began=clockMs();
+    // Fixed <=50ms schedule while live; group checks below run every cycle.
+    // This clock only controls read cadence and never renews a native deadline.
+    if(forceFull||!lastFullCensus||began>=lastFullCensus+40) {
+      lastFullCensus=began; fullCensusValid=false;
+      int bytes=proc_listpids(PROC_UID_ONLY,main.uid,pids.data(),(int)(cap*sizeof(pid_t)));
+      if(bytes<0||bytes%sizeof(pid_t)||(size_t)bytes>=cap*sizeof(pid_t)) return false;
+      for(int i=0;i<bytes/(int)sizeof(pid_t);++i) inspect(pids[i],false);
+      fullCensusValid=valid;
     }
-    // Every captured original survives orphaning, group escape and PID reuse.
-    // A pending/uncertain zombie-aware query keeps it in the target set.
+    if(!originalGroupRetired) {
+      int bytes=proc_listpids(PROC_PGRP_ONLY,main.group,pids.data(),(int)(cap*sizeof(pid_t)));
+      if(bytes<0||bytes%sizeof(pid_t)||(size_t)bytes>=cap*sizeof(pid_t)) return false;
+      for(int i=0;i<bytes/(int)sizeof(pid_t);++i) inspect(pids[i],true);
+    }
+    for(auto it=groupGaps.begin();it!=groupGaps.end();) {
+      if(!currentGaps.count(it->first)) it=groupGaps.erase(it); else ++it;
+    }
     for(auto it=seen.begin();it!=seen.end();) {
       if(!originalGone(it->second)) { targets.push_back(it->second); ++it; }
       else if(!same(it->second,main)) { exits.erase(it->first); it=seen.erase(it); }
       else ++it;
     }
-    if(!originalGone(main)&&std::none_of(targets.begin(),targets.end(),[&](const Identity& id){return same(id,main);}))
-      targets.push_back(main);
-    return valid;
+    if(!originalGone(main)&&std::none_of(targets.begin(),targets.end(),[&](const Identity& id){return same(id,main);})) targets.push_back(main);
+    return valid&&fullCensusValid;
   }
   bool engineGone(bool executingMain = false) {
-    std::vector<Identity> targets; if(!census(targets)||familyUncertain||(family&&!family->complete())) return false;
-    return std::none_of(targets.begin(),targets.end(),[&](const Identity& id){return !executingMain||!same(id,main);})&&
-      (executingMain?(getpid()==main.pid&&current(main)==1):originalGone(main));
+    std::vector<Identity> targets;
+    auto empty=[&] { return std::none_of(targets.begin(),targets.end(),[&](const Identity& id){return !executingMain||!same(id,main);}); };
+    if(!census(targets)||groupPending||familyUncertain||!empty()) return false;
+    // Final eligibility always performs a newly completed full UID pass after
+    // the candidate quiescence, plus current actual group and durable union.
+    if(!census(targets,true)||groupPending||familyUncertain||!empty()||(family&&!family->complete())) return false;
+    return executingMain?(getpid()==main.pid&&current(main)==1):originalGone(main);
   }
   bool signalEngine(const Identity& original) {
     Identity actual; std::string path;
