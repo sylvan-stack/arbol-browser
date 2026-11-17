@@ -11,6 +11,7 @@ import { refused, userURL, type TabTarget } from './tabs.js';
 
 export interface PhysicalFrame {
   readonly handle: WebFrameMain;
+  readonly parent: WebFrameMain | null;
   readonly process: number;
   readonly osProcess: number;
   readonly routing: number;
@@ -77,7 +78,7 @@ function navigationFailed(): BrowserFailure {
     remedy: 'Read the current page state before another explicit navigation or recovery.' });
 }
 function sameFrame(a: PhysicalFrame, b: PhysicalFrame): boolean {
-  return a.handle === b.handle && a.process === b.process && a.osProcess === b.osProcess && a.routing === b.routing &&
+  return a.handle === b.handle && a.parent === b.parent && a.process === b.process && a.osProcess === b.osProcess && a.routing === b.routing &&
     a.token === b.token && a.node === b.node;
 }
 function fragmentChange(before: string, after: string): boolean {
@@ -91,11 +92,11 @@ export function physicalFrames(page: PageSurface): readonly PhysicalFrame[] {
   const contents = page.view.webContents;
   if (page.retirement() || !contents || contents.isDestroyed() || contents.isCrashed()) throw staleSnapshot();
   const main = contents.mainFrame, frames = main.framesInSubtree;
-  if (!frames.length || !frames.includes(main)) throw staleSnapshot();
+  if (!frames.length || frames.length > 256 || !frames.includes(main)) throw staleSnapshot();
   return Object.freeze(frames.map(handle => {
     if (handle.isDestroyed() || handle.detached || webContents.fromFrame(handle) !== contents ||
         (handle !== main && handle.top !== main)) throw staleSnapshot();
-    const value = Object.freeze({ handle, process: handle.processId, osProcess: handle.osProcessId,
+    const value = Object.freeze({ handle, parent: handle.parent, process: handle.processId, osProcess: handle.osProcessId,
       routing: handle.routingId, token: handle.frameToken, node: handle.frameTreeNodeId });
     if (value.process < 0 || value.osProcess <= 0 || value.routing < 0 || !value.token || value.node < 0 ||
         webFrameMain.fromFrameToken(value.process, value.token) !== handle) throw staleSnapshot();

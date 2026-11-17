@@ -1,4 +1,5 @@
 import type { Debugger, WebContents } from 'electron';
+import { createHash, randomBytes } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { assertNativeFailureBoundary, type NativeFailureBoundary } from '../runtime/bootstrap.js';
 import { unavailable } from '../contracts/errors.js';
@@ -19,6 +20,9 @@ export interface InspectionFrame {
   readonly frameId: string;
   readonly session: string | undefined;
   readonly physical: PhysicalFrame | undefined;
+  readonly loaderId: string;
+  readonly parent: InspectionFrame | undefined;
+  readonly ownerBackend: number | undefined;
 }
 export interface InspectionObservation {
   readonly epoch: number;
@@ -92,16 +96,38 @@ function actionEvent(method: string, raw: unknown): ActionEvent | undefined {
   }
   return Object.freeze({ kind: 'lost' });
 }
-interface ChildSession { targetId: string; parent: string | undefined }
+interface DefaultContext { readonly id: number; readonly unique: string; readonly frame: string }
+interface DebuggerOwner { events: number; readonly limit: number; bad: boolean; readonly done: Promise<void>; finish(): void }
+interface ChildSession {
+  readonly targetId: string; readonly parent: string | undefined;
+  readonly contexts: Map<string, DefaultContext>; detached: boolean; prepared?: Promise<void>; debuggerOwner?: DebuggerOwner;
+}
+interface FrameRoute { readonly id: string; readonly loader: string; readonly parent: string | undefined }
+interface FrameGraph {
+  readonly epoch: number; readonly signature: string; readonly frames: ReadonlyMap<string, FrameRoute>;
+  readonly sessions: ReadonlyMap<string | undefined, ChildSession>;
+  readonly local: ReadonlyMap<string | undefined, ReadonlyMap<string, FrameRoute>>;
+}
+interface FrameSeal { readonly channel: Channel; readonly graph: FrameGraph; readonly context: DefaultContext | undefined }
+interface FrameChallenge {
+  readonly hash: string; matches: number; failed: boolean;
+  readonly observed: Promise<void>; notify(): void;
+  match?: { readonly session: string | undefined; readonly context: DefaultContext };
+}
 interface Channel {
   readonly page: PageSurface;
   readonly contents: WebContents;
   readonly debugger: Debugger;
   readonly identity: object;
   active: boolean;
+  poisoned?: boolean;
+  detached: boolean;
+  graphEpoch: number;
+  readonly root: ChildSession;
+  proof?: Promise<void>;
+  challenge?: FrameChallenge;
   interception: 'unknown' | 'enabled' | 'disabled';
   interceptionInFlight?: object;
-  inspection?: Promise<void>;
   epoch: number;
   unknownActivity: boolean;
   sessions: Map<string, ChildSession>;
@@ -144,10 +170,11 @@ export class PageReadiness implements DocumentPreparation {
     if (page.retirement()) throw staleSnapshot();
     const contents = page.view.webContents, debugger_ = contents.debugger;
     if (contents.isDestroyed() || debugger_.isAttached()) throw unavailable('browser');
-    const channel: Channel = { page, contents, debugger: debugger_, identity: Object.freeze({}), active: true, interception: 'unknown', epoch: 0, unknownActivity: false, sessions: new Map(), observers: new Set(), resources: new Set(), animations: new Set(), actionObservers: new Set() };
+    const channel: Channel = { page, contents, debugger: debugger_, identity: Object.freeze({}), active: true, detached: false, graphEpoch: 0, root: { targetId: '', parent: undefined, contexts: new Map(), detached: false }, interception: 'unknown', epoch: 0, unknownActivity: false, sessions: new Map(), observers: new Set(), resources: new Set(), animations: new Set(), actionObservers: new Set() };
     this.channels.set(page, channel);
     debugger_.on('message', (_event, method, params, sessionId) => {
       if (!channel.active || this.channels.get(page) !== channel) return;
+      this.frameEvent(channel, sessionId || undefined, method, params);
       if (channel.actionObservers.size || (channel.actionWorld && ['Runtime.executionContextCreated',
         'Runtime.executionContextDestroyed', 'Runtime.executionContextsCleared'].includes(method))) {
         const projected = actionEvent(method, params);
@@ -162,15 +189,6 @@ export class PageReadiness implements DocumentPreparation {
       }
       if (!/^(Target|Page|DOM|Animation|Network|Runtime)\./.test(method)) return;
       if (++channel.epoch >= Number.MAX_SAFE_INTEGER) return this.boundary.fatal.fail('native_boundary_unavailable');
-      if (method === 'Target.attachedToTarget') {
-        const child = params as { sessionId?: string; targetInfo?: { type?: string; targetId?: string } };
-        if (child.sessionId && child.targetInfo?.type === 'iframe' && child.targetInfo.targetId && channel.sessions.size < 256)
-          channel.sessions.set(child.sessionId, { targetId: child.targetInfo.targetId, parent: sessionId || undefined });
-        else channel.unknownActivity = true;
-      } else if (method === 'Target.detachedFromTarget') {
-        const child = params as { sessionId?: string };
-        if (child.sessionId) channel.sessions.delete(child.sessionId); else channel.unknownActivity = true;
-      }
       // Events are invalidations, never proof that pixels/geometry settled.
       if (sessionId && !channel.sessions.has(sessionId)) channel.unknownActivity = true;
       const data = params as { requestId?: string; id?: string; animation?: { id?: string } };
@@ -186,6 +204,9 @@ export class PageReadiness implements DocumentPreparation {
       for (const notify of channel.observers) notify();
     });
     debugger_.on('detach', () => {
+      channel.detached = true; channel.root.detached = true;
+      for (const state of channel.sessions.values()) state.detached = true;
+      if (channel.challenge) channel.challenge.failed = true;
       if (!channel.active) return;
       channel.active = false;
       if (channel.actionWorld) delete channel.actionWorld.context;
@@ -198,7 +219,7 @@ export class PageReadiness implements DocumentPreparation {
   }
   private assertChannel(channel: Channel): void {
     this.native();
-    if (!channel.active || this.channels.get(channel.page) !== channel || channel.page.retirement() ||
+    if (!channel.active || channel.poisoned || this.channels.get(channel.page) !== channel || channel.page.retirement() ||
         channel.contents.isDestroyed() || !channel.debugger.isAttached()) throw staleSnapshot();
     const binding = channel.page.binding();
     if (binding.id !== channel.page.identity.id || binding.nonce !== channel.page.identity.nonce ||
@@ -210,6 +231,7 @@ export class PageReadiness implements DocumentPreparation {
   /** Host-only callers retain original page/job guards. Result data does not
    * carry authority and is checked again after the actual channel response. */
   async command(page: PageSurface, assertCurrent: () => void, method: string, params?: object, session?: string): Promise<unknown> {
+    if (method.startsWith('Debugger.') || method === 'Runtime.disable') throw staleSnapshot();
     const channel = this.owned(page);
     const check = () => { this.synchronous(assertCurrent); this.assertChannel(channel); };
     check(); if (session !== undefined && !channel.sessions.has(session)) throw staleSnapshot();
@@ -231,61 +253,302 @@ export class PageReadiness implements DocumentPreparation {
       return result;
     } finally { if (channel.interceptionInFlight === token) delete channel.interceptionInFlight; }
   }
-  private readonly inspectionFrames = new WeakSet<InspectionFrame>();
-  /** The debugger is attached to this literal WebContents. Its root is the
-   * original owned main frame; CDP child IDs are never Electron frame tokens.
-   * Until a child has a physical correlation it is unavailable, even if its
-   * URL/name, process or sampled image happens to match. */
+  private readonly inspectionFrames = new WeakMap<InspectionFrame, FrameSeal>();
+  private state(channel: Channel, session: string | undefined): ChildSession {
+    const state = session === undefined ? channel.root : channel.sessions.get(session);
+    if (!state || state.detached) throw staleSnapshot(); return state;
+  }
+  /** Only fixed scalar engine fields survive this listener. In particular no
+   * URL, source, stack, script text or arbitrary event object is retained. */
+  private frameEvent(channel: Channel, session: string | undefined, method: string, raw: unknown): void {
+    const data = raw as any;
+    const scalar = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.length <= 256;
+    const changed = () => {
+      if (++channel.graphEpoch >= Number.MAX_SAFE_INTEGER) return this.boundary.fatal.fail('native_boundary_unavailable');
+    };
+    if (method === 'Target.attachedToTarget') {
+      changed();
+      if (!scalar(data?.sessionId) || !scalar(data?.targetInfo?.targetId) || data.targetInfo.type !== 'iframe' ||
+          channel.sessions.has(data.sessionId) || channel.sessions.size >= 255 || (session && !channel.sessions.has(session))) {
+        channel.unknownActivity = true; if (channel.challenge) channel.challenge.failed = true; return;
+      }
+      channel.sessions.set(data.sessionId, { targetId: data.targetInfo.targetId, parent: session,
+        contexts: new Map(), detached: false }); return;
+    }
+    if (method === 'Target.detachedFromTarget') {
+      changed(); const state = channel.sessions.get(data?.sessionId);
+      if (!state || state.parent !== session) { channel.unknownActivity = true; return; }
+      state.detached = true; channel.sessions.delete(data.sessionId); return;
+    }
+    if (['Page.frameAttached', 'Page.frameDetached', 'Page.frameNavigated', 'Page.navigatedWithinDocument'].includes(method)) changed();
+    const state = session === undefined ? channel.root : channel.sessions.get(session);
+    if (!state) { if (channel.challenge) channel.challenge.failed = true; return; }
+    if (method === 'Runtime.executionContextsCleared') { state.contexts.clear(); changed(); }
+    if (method === 'Runtime.executionContextDestroyed') {
+      for (const [frame, context] of state.contexts) if (context.id === data?.executionContextId || context.unique === data?.executionContextUniqueId) {
+        state.contexts.delete(frame); changed();
+      }
+    }
+    if (method === 'Runtime.executionContextCreated' && data?.context?.auxData?.isDefault === true) {
+      const c = data.context, frame = c.auxData.frameId;
+      if (!scalar(frame) || !scalar(c.uniqueId) || !Number.isSafeInteger(c.id) || c.id <= 0) {
+        state.contexts.clear(); channel.unknownActivity = true; changed(); return;
+      }
+      const old = state.contexts.get(frame);
+      if (old?.id !== c.id || old?.unique !== c.uniqueId) {
+        let count = channel.root.contexts.size;
+        for (const child of channel.sessions.values()) count += child.contexts.size;
+        if (!old && count >= 256) { channel.unknownActivity = true; return; }
+        state.contexts.set(frame, Object.freeze({ id: c.id, unique: c.uniqueId, frame })); changed();
+      }
+    }
+    const owner = state.debuggerOwner;
+    if (!owner) return;
+    if (method === 'Debugger.paused') owner.bad = true;
+    if (method !== 'Debugger.scriptParsed') return;
+    // enable enumerates existing live scripts even with a zero source cache.
+    if (++owner.events > owner.limit) { owner.bad = true; channel.challenge?.notify(); return; }
+    const pending = channel.challenge;
+    if (!pending || data?.hash !== pending.hash) return;
+    if (++pending.matches !== 1) { pending.failed = true; pending.notify(); return; }
+    const aux = data.executionContextAuxData;
+    const context = scalar(aux?.frameId) ? state.contexts.get(aux.frameId) : undefined;
+    if (!context || aux?.isDefault !== true || context.id !== data.executionContextId || owner.bad) { pending.failed = true; pending.notify(); return; }
+    pending.match = Object.freeze({ session, context }); pending.notify();
+  }
+  private async prepareInspection(channel: Channel, session: string | undefined, guard: () => void): Promise<void> {
+    const state = this.state(channel, session);
+    if (!state.prepared) {
+      const setup = (async () => {
+        for (const method of ['Page.enable', 'DOM.enable', 'Runtime.enable', 'Animation.enable', 'Network.enable'])
+          emptyAck(await this.command(channel.page, guard, method, undefined, session));
+        emptyAck(await this.command(channel.page, guard, 'Target.setAutoAttach',
+          { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }, session));
+        emptyAck(await this.command(channel.page, guard, 'Page.setLifecycleEventsEnabled', { enabled: true }, session));
+      })();
+      state.prepared = setup;
+      void setup.catch(() => { if (state.prepared === setup) delete state.prepared; });
+    }
+    await state.prepared; guard();
+    if (this.state(channel, session) !== state) throw staleSnapshot();
+  }
+  private sessionGraph(channel: Channel): Map<string | undefined, ChildSession> {
+    const sessions = new Map<string | undefined, ChildSession>([[undefined, channel.root]]);
+    for (const [id, state] of channel.sessions) {
+      if (state.detached || (state.parent !== undefined && !channel.sessions.has(state.parent))) throw staleSnapshot();
+      const seen = new Set<string>([id]); let parent = state.parent;
+      while (parent !== undefined) {
+        if (seen.has(parent) || seen.size > 256) throw staleSnapshot(); seen.add(parent);
+        parent = channel.sessions.get(parent)!.parent;
+      }
+      sessions.set(id, state);
+    }
+    return sessions;
+  }
+  private sameSessions(channel: Channel, sessions: ReadonlyMap<string | undefined, ChildSession>): void {
+    const live = this.sessionGraph(channel);
+    if (live.size !== sessions.size || [...sessions].some(([id, state]) => live.get(id) !== state)) throw staleSnapshot();
+  }
+  private async frameGraph(channel: Channel, guard: () => void): Promise<FrameGraph> {
+    guard(); const epoch = channel.graphEpoch, sessions = this.sessionGraph(channel);
+    const frames = new Map<string, FrameRoute>(), local = new Map<string | undefined, Map<string, FrameRoute>>();
+    let work = 0;
+    for (const [session] of sessions) {
+      const value = await this.command(channel.page, guard, 'Page.getFrameTree', undefined, session) as { frameTree?: unknown };
+      const nodes = new Map<string, FrameRoute>(); local.set(session, nodes);
+      const visit = (raw: any, parent: string | undefined, depth: number) => {
+        if (++work > 65536 || depth > 32 || nodes.size >= 256) throw staleSnapshot();
+        const f = raw?.frame;
+        const scalar = (x: unknown): x is string => typeof x === 'string' && x.length > 0 && x.length <= 256;
+        if (!scalar(f?.id) || !scalar(f.loaderId) || (f.parentId !== undefined && !scalar(f.parentId)) || nodes.has(f.id)) throw staleSnapshot();
+        const lineage = parent ?? f.parentId;
+        if (parent !== undefined && f.parentId !== undefined && f.parentId !== parent) throw staleSnapshot();
+        const known = frames.get(f.id);
+        if (known && (known.loader !== f.loaderId || (lineage !== undefined && known.parent !== lineage))) throw staleSnapshot();
+        const frame: FrameRoute = known ?? Object.freeze({ id: f.id, loader: f.loaderId, parent: lineage });
+        nodes.set(f.id, frame); frames.set(f.id, frame);
+        if (frames.size > 256 || (raw.childFrames !== undefined && (!Array.isArray(raw.childFrames) || raw.childFrames.length > 256))) throw staleSnapshot();
+        for (const child of raw.childFrames ?? []) visit(child, f.id, depth + 1);
+      };
+      visit(value.frameTree, undefined, 1);
+    }
+    guard(); this.sameSessions(channel, sessions); if (channel.graphEpoch !== epoch) throw staleSnapshot();
+    const roots = [...local.get(undefined)!.values()].filter(frame => frame.parent === undefined);
+    if (roots.length !== 1 || [...frames.values()].some(frame => frame.parent !== undefined && !frames.has(frame.parent))) throw staleSnapshot();
+    const signature = JSON.stringify([...local].map(([id, nodes]) => [id, sessions.get(id)!.targetId, sessions.get(id)!.parent,
+      [...nodes.values()].map(f => [f.id, f.loader, f.parent])]));
+    return { epoch, sessions, local, frames, signature };
+  }
+  /** This guard is deliberately independent of the expired logical read. It
+   * permits only disable on the literal original channel and original target
+   * attachment; it confers no authority for document work or retargeting. */
+  private originalDebugger(channel: Channel, session: string | undefined, state: ChildSession): 'live' | 'detached' {
+    this.native();
+    if (channel.contents.isDestroyed() || channel.detached || state.detached) return 'detached';
+    if (this.channels.get(channel.page) !== channel || channel.contents.debugger !== channel.debugger || !channel.debugger.isAttached() ||
+        (session === undefined ? channel.root !== state : channel.sessions.get(session) !== state)) throw staleSnapshot();
+    return 'live';
+  }
+  private async disableDebugger(channel: Channel, session: string | undefined, state: ChildSession, owner: DebuggerOwner): Promise<void> {
+    let clean = false;
+    try {
+      if (this.originalDebugger(channel, session, state) === 'detached') clean = true;
+      else {
+        await this.deadline(performance.now() + 2000, () => {
+          if (state.debuggerOwner !== owner) throw staleSnapshot();
+          this.originalDebugger(channel, session, state);
+        }, async check => {
+          check();
+          // No Runtime.disable: the original passive action world is retained.
+          const value = await channel.debugger.sendCommand('Debugger.disable', undefined, session);
+          check(); emptyAck(value); clean = true;
+        });
+      }
+    } catch {
+      try { clean = this.originalDebugger(channel, session, state) === 'detached'; } catch { /* unresolved original */ }
+    }
+    if (clean) { if (state.debuggerOwner === owner) delete state.debuggerOwner; owner.finish(); return; }
+    owner.bad = true; channel.poisoned = true;
+    this.documents.channelLost(channel.page, channel.identity);
+    // This is the canonical idempotent original-surface retirement, never a
+    // lookup through a target that may now designate a replacement page.
+    void channel.page.retire().catch(() => this.boundary.fatal.fail('native_retirement_unavailable'));
+    // Retain the owner forever unless this exact attachment really detaches.
+    throw staleSnapshot();
+  }
+  /** The physical main frame is bound by the original WebContents debugger.
+   * Each child is correlated by its own original RFH executing only this nonce
+   * literal in the default main world, and by V8's UTF-16LE source hash. */
   async inspection(receipt: HostDocument, assertCurrent: () => void): Promise<readonly InspectionFrame[]> {
-    const channel = this.owned(receipt.page);
+    const channel = this.owned(receipt.page), deadline = performance.now() + 5000;
     const guard = () => { this.synchronous(assertCurrent); this.documents.target(receipt); this.assertChannel(channel);
       if (receipt.channel !== channel.identity) throw staleSnapshot(); };
     guard();
-    if (!channel.inspection) {
-      const setup = (async () => {
-      for (const method of ['Page.enable', 'DOM.enable', 'Animation.enable', 'Network.enable'])
-        emptyAck(await this.command(receipt.page, guard, method));
-      emptyAck(await this.command(receipt.page, guard, 'Target.setAutoAttach',
-        { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }));
-      emptyAck(await this.command(receipt.page, guard, 'Page.setLifecycleEventsEnabled', { enabled: true }));
-      })();
-      channel.inspection = setup;
-      // Only this failed attempt is cleared. Current callers still share the
-      // same in-flight work and each caller keeps its own exact receipt guard.
-      void setup.catch(() => { if (channel.inspection === setup) delete channel.inspection; });
+    while (channel.proof) await this.deadline(deadline, guard, async () => { await channel.proof; });
+    guard();
+    let finish = () => {};
+    const token = new Promise<void>(resolve => { finish = resolve; }); channel.proof = token;
+    const activated: [string | undefined, ChildSession, DebuggerOwner][] = [];
+    try {
+      return await this.deadline(deadline, guard, async check => {
+        await this.prepareInspection(channel, undefined, check);
+        // Auto-attach is recursive only after each actual flattened child has
+        // itself enabled it. Bound all rounds and keep object identity.
+        const prepared = new Set<ChildSession>([channel.root]);
+        for (let round = 0; round < 256; round++) {
+          const next = [...this.sessionGraph(channel)].find(([, state]) => !prepared.has(state));
+          if (!next) break;
+          await this.prepareInspection(channel, next[0], check); prepared.add(next[1]);
+        }
+        // Preserve the released root's actual frontend DOM invalidation until
+        // the reviewed bounded replacement exists. DOM.enable alone does not
+        // bind nodes: pinned Blink can omit attribute/insertion notifications
+        // for unbound nodes, so equal sampled classifications cannot fence ABA.
+        // This is the retained root mirror, not child-content qualification.
+        await this.command(receipt.page, check, 'DOM.getDocument', { depth: -1, pierce: true });
+        const graph = await this.frameGraph(channel, check);
+        const root = [...graph.local.get(undefined)!.values()].find(f => f.parent === undefined)!;
+        const routes = new Map<PhysicalFrame, { route: FrameRoute; session: string | undefined; context: DefaultContext | undefined }>();
+        routes.set(receipt.frame, { route: root, session: undefined, context: undefined });
+        if (receipt.frames.length > 1) {
+          for (const [session, state] of graph.sessions) {
+            check();
+            if (state.debuggerOwner) throw staleSnapshot();
+            let done = () => {};
+            const owner: DebuggerOwner = { events: 0, limit: Math.min(4096, Math.floor(16384 / graph.sessions.size)), bad: false, done: new Promise<void>(resolve => { done = resolve; }), finish: () => done() };
+            state.debuggerOwner = owner; activated.push([session, state, owner]);
+            // The observer is installed above before enable can enumerate live
+            // scripts. A genuine skip receipt closes the debugger-statement gap.
+            check(); emptyAck(await channel.debugger.sendCommand('Debugger.setSkipAllPauses', { skip: true }, session)); check();
+            emptyAck(await channel.debugger.sendCommand('Debugger.setBreakpointsActive', { active: false }, session)); check();
+            const enabled = await channel.debugger.sendCommand('Debugger.enable', { maxScriptsCacheSize: 0 }, session); check();
+            if (!enabled || typeof enabled !== 'object' || typeof (enabled as { debuggerId?: unknown }).debuggerId !== 'string' || owner.bad) throw staleSnapshot();
+          }
+          const used = new Set<string>([root.id]);
+          for (const physical of receipt.frames) if (physical !== receipt.frame) {
+            check();
+            if (channel.graphEpoch !== graph.epoch || activated.some(([, , owner]) => owner.bad)) throw staleSnapshot();
+            const source = `void 0/*arbol-frame-${randomBytes(16).toString('hex')}*/`;
+            let notify = () => {};
+            const pending: FrameChallenge = { hash: createHash('sha256').update(Buffer.from(source, 'utf16le')).digest('hex'), matches: 0, failed: false,
+              observed: new Promise<void>(resolve => { notify = resolve; }), notify: () => notify() };
+            channel.challenge = pending;
+            try {
+              const result: unknown = await physical.handle.executeJavaScript(source, false); check();
+              // RFH execution replies and CDP script notifications use distinct
+              // channels. Require both genuine receipts without ordering them.
+              if (!pending.match && !pending.failed) await this.deadline(Math.min(deadline, performance.now() + 250), check,
+                async () => { await pending.observed; });
+              check();
+              const match = pending.match;
+              if (result !== undefined || pending.failed || pending.matches !== 1 || !match || used.has(match.context.frame)) continue;
+              const state = this.state(channel, match.session), route = graph.local.get(match.session)?.get(match.context.frame);
+              if (!route || state.contexts.get(route.id) !== match.context) continue;
+              routes.set(physical, { route, session: match.session, context: match.context }); used.add(route.id);
+            } catch (error) { check(); /* This physical child remains unavailable. */ }
+            finally { if (channel.challenge === pending) delete channel.challenge; }
+          }
+        }
+        check(); if (activated.some(([, , owner]) => owner.bad)) throw staleSnapshot();
+        const after = await this.frameGraph(channel, check);
+        if (after.signature !== graph.signature || after.epoch !== graph.epoch) throw staleSnapshot();
+        const frames: InspectionFrame[] = [], byPhysical = new Map<PhysicalFrame['handle'], InspectionFrame>();
+        const pending = [...receipt.frames];
+        for (let round = 0; pending.length && round < 256; round++) {
+          const index = pending.findIndex(physical => physical.parent === null || byPhysical.has(physical.parent));
+          if (index < 0) break;
+          const physical = pending.splice(index, 1)[0]!, binding = routes.get(physical);
+          const parent = physical.parent === null ? undefined : byPhysical.get(physical.parent);
+          if (!binding || (physical !== receipt.frame && (!parent?.physical || binding.route.parent !== parent.frameId))) continue;
+          const state = this.state(channel, binding.session);
+          if (binding.context && state.contexts.get(binding.route.id) !== binding.context) throw staleSnapshot();
+          let ownerBackend: number | undefined;
+          if (parent) {
+            // DOM ownership is queried on the actual parent's route. Flattened
+            // target parentage is checked separately by the original graph.
+            const value = await this.command(receipt.page, check, 'DOM.getFrameOwner', { frameId: binding.route.id }, parent.session) as { backendNodeId?: number };
+            if (!Number.isSafeInteger(value.backendNodeId) || value.backendNodeId! <= 0) continue;
+            ownerBackend = value.backendNodeId;
+          }
+          const frame: InspectionFrame = Object.freeze({ receipt, physical, frameId: binding.route.id, loaderId: binding.route.loader,
+            session: binding.session, parent, ownerBackend });
+          this.inspectionFrames.set(frame, { channel, graph, context: binding.context }); frames.push(frame); byPhysical.set(physical.handle, frame);
+        }
+        if (frames[0]?.physical !== receipt.frame) throw staleSnapshot();
+        for (const physical of receipt.frames) if (!byPhysical.has(physical.handle)) {
+          const parent = physical.parent === null ? undefined : byPhysical.get(physical.parent);
+          frames.push(Object.freeze({ receipt, physical: undefined, frameId: '', loaderId: '', session: undefined, parent, ownerBackend: undefined }));
+        }
+        check(); const final = await this.frameGraph(channel, check);
+        if (final.signature !== graph.signature || final.epoch !== graph.epoch) throw staleSnapshot();
+        for (const frame of frames) if (frame.physical) this.assertInspection(frame, check);
+        return Object.freeze(frames);
+      });
+    } finally {
+      delete channel.challenge;
+      // Cleanup owns the actual attachment after read timeout, Take, navigation
+      // or cancellation. Neither its lock nor its disable follows target.page.
+      const cleaned = await Promise.allSettled(activated.map(([session, state, owner]) => this.disableDebugger(channel, session, state, owner)));
+      if (channel.proof === token) delete channel.proof; finish();
+      if (cleaned.some(result => result.status === 'rejected')) throw staleSnapshot();
     }
-    await channel.inspection; guard();
-    // Re-populate after navigation too; a prior document's mirror is no proof.
-    // Data remains private; classification uses its own fresh DOMSnapshot.
-    await this.command(receipt.page, guard, 'DOM.getDocument', { depth: -1, pierce: true });
-    const result = await this.command(receipt.page, guard, 'Page.getFrameTree') as {
-      frameTree?: { frame?: { id?: string }; childFrames?: unknown[] } };
-    guard(); const root = result.frameTree?.frame?.id;
-    if (!root || receipt.page.view.webContents.mainFrame !== receipt.frame.handle || receipt.frame.handle.parent !== null) throw staleSnapshot();
-    const frames: InspectionFrame[] = [];
-    const add = (frameId: string, session: string | undefined, physical: PhysicalFrame | undefined) => {
-      const frame = Object.freeze({ receipt, frameId, session, physical }); this.inspectionFrames.add(frame); frames.push(frame);
-    };
-    add(root, undefined, receipt.frame);
-    // Keep the flattened routing map distinct from physical authority. Unknown
-    // same-process children are represented by the physical census below too.
-    for (const [session, child] of channel.sessions) {
-      // Target ids are not frame ids either. Query that flattened session's
-      // own tree; the result is routing metadata, never physical authority.
-      const tree = await this.command(receipt.page, guard, 'Page.getFrameTree', undefined, session) as {
-        frameTree?: { frame?: { id?: string } } };
-      guard(); if (channel.sessions.get(session) !== child) throw staleSnapshot();
-      add(tree.frameTree?.frame?.id ?? '', session, undefined);
-    }
-    for (const physical of receipt.frames) if (physical !== receipt.frame) add('', undefined, undefined);
-    return Object.freeze(frames);
   }
   assertInspection(frame: InspectionFrame, assertCurrent: () => void): void {
     this.synchronous(assertCurrent); this.documents.target(frame.receipt);
-    const channel = this.owned(frame.receipt.page);
-    if (!this.inspectionFrames.has(frame) || frame.receipt.channel !== channel.identity || !frame.physical ||
-        !frame.receipt.frames.includes(frame.physical) || frame.physical !== frame.receipt.frame || frame.session !== undefined)
-      throw staleSnapshot();
+    const seal = this.inspectionFrames.get(frame), channel = this.owned(frame.receipt.page);
+    if (!seal || seal.channel !== channel || frame.receipt.channel !== channel.identity || !frame.physical ||
+        !frame.receipt.frames.includes(frame.physical) || channel.graphEpoch !== seal.graph.epoch) throw staleSnapshot();
+    this.sameSessions(channel, seal.graph.sessions);
+    const state = this.state(channel, frame.session);
+    if (seal.context && state.contexts.get(frame.frameId) !== seal.context) throw staleSnapshot();
+    if (frame.parent && (frame.physical.parent !== frame.parent.physical?.handle || frame.ownerBackend === undefined)) throw staleSnapshot();
+  }
+  async verifyInspection(frames: readonly InspectionFrame[], guard: () => void): Promise<void> {
+    const frame = frames.find(value => value.physical); if (!frame) throw staleSnapshot();
+    this.assertInspection(frame, guard); const seal = this.inspectionFrames.get(frame)!;
+    const graph = await this.frameGraph(seal.channel, () => this.assertInspection(frame, guard));
+    if (graph.signature !== seal.graph.signature) throw staleSnapshot();
+    for (const value of frames) if (value.physical) this.assertInspection(value, guard);
   }
   async inspect(frame: InspectionFrame, assertCurrent: () => void, method: InspectionMethod, params?: object): Promise<unknown> {
     const guard = () => this.assertInspection(frame, assertCurrent);
@@ -306,6 +569,7 @@ export class PageReadiness implements DocumentPreparation {
    * No implicit attach, generic event route or guessed child identity exists. */
   observeActions(frame: InspectionFrame, guard: () => void, signal: AbortSignal, receive: (event: ActionEvent) => void): () => void {
     this.assertInspection(frame, guard); const channel = this.owned(frame.receipt.page);
+    if (frame.physical !== frame.receipt.frame || frame.session !== undefined) throw staleSnapshot();
     if (signal.aborted || channel.actionObservers.size >= 8 || channel.identity !== frame.receipt.channel) throw staleSnapshot();
     let active = true;
     const remove = () => { if (!active) return; active = false; channel.actionObservers.delete(observer); signal.removeEventListener('abort', remove); };
