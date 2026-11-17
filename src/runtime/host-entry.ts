@@ -174,11 +174,19 @@ async function assembleAfterReady(prepared: HostPreparation, sessions: ProfileSe
     state.transport = transport; current();
     const shutdown = sessionModule.productionSessionShutdown(sessions, prepared.custody);
     const native = bootstrap.createNativeLifetime(boundary, prepared, request.selection, () => shutdown.quit());
-    const runtime = lifecycle.createHostLifecycle(prepared, sessions, transport, control.ownership.control, native, deadline);
+    const runtime = lifecycle.createHostLifecycle(prepared, sessions, transport, control.ownership.control, native, deadline, platform);
     state.runtime = runtime; control.ownership.bindRuntime(runtime);
+    app.on('before-quit', event => {
+      if (shutdown.isQuitting()) return;
+      event.preventDefault(); void runtime.close().catch(() => {});
+    });
+    app.on('window-all-closed', () => runtime.lastWindowClosed());
     await shell.registration.load(); current(); shell.registration.assertLoaded();
     await runtime.ready(); current();
-  } catch { state.closed = true; return boundary.fatal.fail('native_boundary_unavailable'); }
+  } catch {
+    if (state.runtime?.phase === 'closing') return; // actual bounded native shutdown already owns abandonment
+    state.closed = true; return boundary.fatal.fail('native_boundary_unavailable');
+  }
 }
 let entryAttempted = false;
 /** The thin packaged entry explicitly awaits ONLY this authenticated pre-ready

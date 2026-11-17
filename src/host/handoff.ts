@@ -656,6 +656,15 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
       if (context.attachment && contexts.get(context.attachment.id) !== context) throw unavailable('browser');
     },
     authorize,
+    closeManagement(context, request, write) {
+      authorize(context, request);
+      const ack = delivery.prepareClose(context, request, operations.info().profile);
+      const closing = runtime!.beginManagementClose(context, request);
+      // Native admission, complete ordinary fence and guarded ACK consumption
+      // are one synchronous call chain. Actual shutdown also runs on write loss.
+      try { write(ack.bytes, () => ack.commit(closing.opportunity), closing.finished); }
+      finally { closing.finished(); }
+    },
     async execute(context, request, deadline, signal) {
       authorize(context, request);
       const active = requests.get(context); if (!active) throw unavailable('browser'); active.set(request.id, request);
@@ -664,7 +673,7 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
         if (request.method !== 'tool') {
           // Actual management producer is the owned registry/lifecycle, never a
           // fabricated provider acknowledgement or agent-accessible close.
-          if (request.method === 'close') { await runtime!.close(); throw unavailable('browser'); }
+          if (request.method === 'close') throw unavailable('browser');
           const host = windowForOpen();
           if (request.params.url !== undefined || tabs().all().length === 0)
             await tabs().openUser(host, userURL(request.params.url ?? 'about:blank'));

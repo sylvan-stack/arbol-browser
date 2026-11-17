@@ -240,7 +240,11 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
           try {
             const authorityURL = new URL('./authorities.js', import.meta.url).href;
             const authorities = await import(authorityURL) as typeof import('./authorities.js');
-            const originalHost = own ? host : await authorities.verifyPackagedHost(selected,
+            const sameHost = host.identity.layout.build === admitted.build && host.identity.layout.buildRoot === admitted.buildRoot &&
+              join(host.identity.layout.buildRoot, '../.uses', host.identity.layout.build) === admitted.buildGuard &&
+              host.signed.snapshotDigest === admitted.candidateDigest && host.identity.sourceDigest === admitted.sourceDigest &&
+              host.identity.productDigest === admitted.productDigest;
+            const originalHost = sameHost ? host : await authorities.verifyPackagedHost(selected,
               join(admitted.buildRoot, 'ArbolBrowser.app/Contents/Resources/browser'), deadline);
             if (originalHost.signed.snapshotDigest !== admitted.candidateDigest || originalHost.identity.sourceDigest !== admitted.sourceDigest ||
                 originalHost.identity.productDigest !== admitted.productDigest || originalHost.policy.stateRoot !== profile.paths.state)
@@ -266,4 +270,19 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
       await cancelLaunchAttempt(profile, platform, request, expected.nonce, deadline);
     },
   });
+}
+
+/** Close joins an existing exact admitted host only; never reserves or starts. */
+export async function assertProductionCloseReady(profile: ProfileSnapshot, record: RuntimeRecord,
+  selection: import('./selection.js').BuildSelection, platform: PlatformPort,
+  exits: ProductionExitAuthority, deadline: number): Promise<void> {
+  const lease = await acquireBuildLease(selection, platform);
+  try {
+    const address = new URL('./authorities.js', import.meta.url).href;
+    const authority = await import(address) as typeof import('./authorities.js');
+    const host = await authority.verifyPackagedHost(selection,
+      join(selection.directory, 'ArbolBrowser.app/Contents/Resources/browser'), deadline);
+    await createLaunchTransactions(host, platform, exits).admitted(profile, record, deadline);
+    await lease.assert(); assertTime(deadline);
+  } finally { lease.release(); }
 }

@@ -21,6 +21,7 @@ import type { EngineExitEvidence } from '../profiles/compatibility.js';
 export interface ProductionExitAuthority extends ExitAuthority, HostPreviousExit, EngineExitEvidence {
   /** Only this poll treats protection contention/in-flight closure as pending.
    * It never certifies closure or invokes an external signal on uncertainty. */
+  assertClosedUnderOwner(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease, deadline: number): Promise<void>;
   tryClosed(profile: ProfileSnapshot, original: RuntimeRecord, deadline: number): Promise<boolean>;
   /** Retires only the independently verified exact closed reservation, retaining
    * its native closed-claim history outside profile and transient socket roots. */
@@ -34,6 +35,9 @@ export interface ProductionExitAuthority extends ExitAuthority, HostPreviousExit
   withdraw(profile: ProfileSnapshot, owner: OwnerLease, deadline: number): Promise<void>;
 }
 const authorities = new WeakSet<object>();
+export function isProductionExitAuthority(value: unknown): value is ProductionExitAuthority {
+  return typeof value === 'object' && value !== null && authorities.has(value);
+}
 export function assertProductionExitAuthority(value: ProductionExitAuthority): void {
   if (!authorities.has(value)) throw unavailable('profile');
 }
@@ -161,6 +165,9 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
       const deadline = now() + 10000;
       await withOwner(profile, undefined, deadline, held => inspect(profile, original, held, 'full', deadline));
     },
+    async assertClosedUnderOwner(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease, deadline: number) {
+      await inspect(profile, original, owner, 'full', deadline);
+    },
     async tryClosed(profile: ProfileSnapshot, original: RuntimeRecord, deadline: number) {
       assertTime(deadline);
       const owner = await ownerLock(profile, platform, false, deadline); if (!owner) return false;
@@ -187,6 +194,9 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
       await inspect(profile, undefined, owner, 'reserve', deadline, build, pending);
     },
     async withdraw(profile: ProfileSnapshot, owner: OwnerLease, deadline: number) {
+      const current = await withLaunchAttempt(profile, platform, deadline, transaction => transaction.current);
+      if (!current || current.phase === 'closed') return;
+      if (current.stage !== 'untransferred' || !['pending', 'claimed', 'cancelled'].includes(current.phase)) throw unavailable('profile');
       await inspect(profile, undefined, owner, 'withdraw', deadline);
     },
     async retire(profile: ProfileSnapshot, owner: OwnerLease, deadline: number) {

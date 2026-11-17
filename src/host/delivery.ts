@@ -2,7 +2,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import type { Contract, ContractTypes } from '../contracts/generated.js';
 import { BrowserFailure, unavailable, type BrowserError } from '../contracts/errors.js';
 import { validator, bundles } from '../contracts/schema.js';
-import type { ConnectionContext, Request } from '../runtime/transport.js';
+import { assertManagementCloseOpportunity, type ManagementCloseOpportunity, type ConnectionContext, type Request } from '../runtime/transport.js';
 import { TabAuthority, type AuthorityStamp, type CompletedTransition, type Invalidation } from './authority.js';
 import { assertTabRegistry, type TabRegistry } from './tabs.js';
 import { projectAgentTabs } from './projections.js';
@@ -69,6 +69,26 @@ export class DeliveryAuthority {
     for (const bytes of this.failures.get(context)?.values() ?? []) bytes.fill(0);
     this.pending.delete(context); this.failures.delete(context); this.outcomes.delete(context); this.malformed.delete(context);
     this.classifiedFailures.delete(context);
+  }
+  /** Fixed content-free acknowledgment only. The normal delivery gate is
+   * sealed before commit; this closure retains exactly one native-admitted
+   * management request, never a general bypass for page or tool delivery. */
+  prepareClose(context: ConnectionContext, request: Extract<Request, { method: 'close' }>, profile: string): Readonly<{
+    bytes: Buffer; commit(opportunity: ManagementCloseOpportunity): void;
+  }> {
+    this.assertContext(context);
+    if (context.endpoint !== 'management' || context.attachment) throw unavailable('browser');
+    const value = { profile, closed: false, dataRemoved: false };
+    if (!validator('wire.CloseResult')(value)) throw unavailable('browser');
+    const bytes = responseBytes(request.id, true, value), original = Buffer.from(bytes);
+    let used = false;
+    return Object.freeze({ bytes, commit: opportunity => {
+      if (used) throw unavailable('browser'); used = true;
+      assertManagementCloseOpportunity(opportunity, context, request);
+      this.authority.assertHealthy();
+      if (context.signal.aborted || !this.pending.has(context) || bytes.length !== original.length ||
+          !timingSafeEqual(bytes, original)) throw unavailable('browser');
+    } });
   }
   noteOutcome(context: ConnectionContext, request: Request, outcome: KnownOutcome): void {
     this.assertContext(context);

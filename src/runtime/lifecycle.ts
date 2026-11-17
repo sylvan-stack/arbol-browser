@@ -3,9 +3,11 @@ import type { Contract } from '../contracts/generated.js';
 import { unavailable, BrowserFailure } from '../contracts/errors.js';
 import { preflightPageAdmission } from './bootstrap.js';
 import { isHostCustody } from './custody.js';
-import type { PlatformPort, GroupProcess } from './platform.js';
+import { isProductionExitAuthority, type ProductionExitAuthority } from './exit.js';
+import { assertProductionCloseReady } from './process.js';
+import { assertPlatform, type PlatformPort, type GroupProcess } from './platform.js';
 import type { BuildSelection } from './selection.js';
-import { openProtectedReady, connectRuntime, type RuntimeClient, type Endpoint, type TransportServer, type ConnectionContext } from './transport.js';
+import { requestManagementClose, reserveManagementClose, openProtectedReady, connectRuntime, type Request, type ManagementCloseOpportunity, type RuntimeClient, type Endpoint, type TransportServer, type ConnectionContext } from './transport.js';
 import { runtimeLocation, readRuntime, originalAlive, now, startupDeadline, neverOpenedExit,
   token, assertTime, type RuntimeRecord, type PreviousExit } from './instance.js';
 import { assertProfile, type ProfileSnapshot } from '../profiles/records.js';
@@ -15,7 +17,7 @@ import { ownerLock } from '../profiles/locking.js';
 import type { ProfileRuntimePort } from '../profiles/manage.js';
 import type { ProcessPort, Stdio } from './ports.js';
 import type { HostPreparation } from './host-entry.js';
-import type { ProfileSessions } from '../profiles/session.js';
+import { productionSessionShutdown, type ProfileSessions } from '../profiles/session.js';
 
 /** Expiry is refusal only, never evidence that native work was cancelled. */
 async function within<T>(deadline: number, operation: () => Promise<T>): Promise<T> {
@@ -102,8 +104,76 @@ async function verifiedGone(profile: ProfileSnapshot, original: RuntimeRecord, p
   if (now() >= deadline) throw profileUnavailable();
   return !originalAlive(original, platform) && platform.groupCensus(original.pid).length === 0;
 }
+interface CommandClose {
+  readonly native: import('./platform.js').CloseBudget; readonly deadline: number; readonly grace: number;
+}
+function receiveClose(platform: PlatformPort): CommandClose {
+  const sampled = now(), native = platform.captureCloseBudget(), clock = platform.continuousTime();
+  return Object.freeze({ native, deadline: sampled + Math.max(0, native.overall - clock),
+    grace: sampled + Math.max(0, native.grace - clock) });
+}
+async function closeProductionProfile(profile: ProfileSnapshot, selection: BuildSelection, platform: PlatformPort,
+  exits: ProductionExitAuthority, command: CommandClose): Promise<Contract<'wire.CloseResult'>> {
+  const { deadline, grace } = command;
+  const location = await within(deadline, () => runtimeLocation(profile));
+  let original = location ? await within(deadline, () => readRuntime(location)) : undefined;
+  if (!original) {
+    // Withdraw while the genuine external Owner excludes data access. A late
+    // already-attached original must still produce authentic no-use evidence
+    // and disappear; cancellation itself is never a successful close.
+    while (now() < deadline) {
+      const owner = await acquireWithin(deadline, () => ownerLock(profile, platform, false, deadline), value => value?.release());
+      if (owner) try {
+        await exits.withdraw(profile, owner, deadline);
+        await exits.assertClosedUnderOwner(profile, undefined, owner, deadline);
+        await owner.assert(); await assertNoSockets(profile); await assertProfile(profile);
+        if (location && await readRuntime(location)) throw profileUnavailable();
+        assertTime(deadline); return { profile: profile.record.id, closed: false, dataRemoved: false };
+      } catch { assertTime(deadline); }
+      finally { owner.release(); }
+      await setTimeout(Math.min(10, Math.max(1, deadline - now())));
+    }
+    throw profileUnavailable();
+  }
+  if (selection.explicit && original.build !== selection.build && originalAlive(original, platform)) throw profileUnavailable();
+  while (original.phase === 'starting' && originalAlive(original, platform) && now() < grace) {
+    await setTimeout(Math.min(10, Math.max(1, grace - now())));
+    const observed = location ? await within(grace, () => readRuntime(location)) : undefined;
+    if (!originalAlive(original, platform)) break;
+    if (!observed || (['instance', 'nonce', 'pid', 'processStartId', 'profile', 'profileInstance', 'profilePathHash', 'build',
+        'agentSocket', 'managementSocket'] as const).some(key => observed[key] !== original![key])) throw profileUnavailable();
+    original = observed;
+  }
+  if (await exits.tryClosed(profile, original, deadline)) return { profile: profile.record.id, closed: false, dataRemoved: false };
+  let requested = false;
+  if (originalAlive(original, platform) && original.phase === 'ready' && location && now() < grace) {
+    await within(grace, () => assertProductionCloseReady(profile, original, selection, platform, exits, grace));
+    const client = await acquireWithin(grace,
+      () => connectRuntime(location, original, 'management', selection, platform, grace, 'Explicit close'), value => value.close());
+    try {
+      const observed = await requestManagementClose(client, command.native, grace);
+      if (observed.kind === 'refused') throw observed.error;
+      if (observed.kind === 'malformed') throw unavailable('browser');
+      if (observed.kind === 'lost' && (!observed.stamped || !observed.written)) throw unavailable('browser');
+      requested = true; // ordinary ACK or separately classified genuine loss only
+    } finally { client.close(); }
+  }
+  // In-flight native custody, including main-already-dead, is pending until the
+  // independent exact complete family/marker inspection passes. No PID signals.
+  while (now() < deadline) {
+    if (await exits.tryClosed(profile, original, deadline))
+      return { profile: profile.record.id, closed: requested, dataRemoved: false };
+    await setTimeout(Math.min(10, Math.max(1, deadline - now())));
+  }
+  throw profileUnavailable();
+}
 export async function closeProfile(profile: ProfileSnapshot, selection: BuildSelection, platform: PlatformPort,
   exits: ExitAuthority | undefined, deadline = now() + 8000): Promise<Contract<'wire.CloseResult'>> {
+  if (isProductionExitAuthority(exits)) {
+    const command = receiveClose(platform);
+    try { return await closeProductionProfile(profile, selection, platform, exits, command); }
+    finally { await platform.retireCloseBudget(command.native); }
+  }
   const graceful = deadline - 3000;
   const location = await within(deadline, () => runtimeLocation(profile));
   const original = location ? await within(deadline, () => readRuntime(location)) : undefined;
@@ -180,16 +250,22 @@ export function createProcessService(options: { selection: BuildSelection; platf
       } finally { attached.client.close(); }
     },
     async close(id) {
-      const deadline = now() + 8000;
-      const platform = options.platform();
-      let profile: ProfileSnapshot;
-      try { profile = await within(deadline, () => selectProfile(id, platform, { state })); }
-      catch (error) {
-        if (id === 'default' && error instanceof BrowserFailure && error.detail.code === 'profile_not_found')
-          return { profile: id, closed: false, dataRemoved: false };
-        throw error;
-      }
-      return closeProfile(profile, options.selection, platform, options.exits, deadline);
+      const platform = options.platform(), production = isProductionExitAuthority(options.exits);
+      // Capture the original native +5/+8 budget before the first await,
+      // including profile selection. Receiver work cannot renew that budget.
+      const command = production ? receiveClose(platform) : undefined, deadline = command?.deadline ?? now() + 8000;
+      try {
+        let profile: ProfileSnapshot;
+        try { profile = await within(deadline, () => selectProfile(id, platform, { state })); }
+        catch (error) {
+          if (id === 'default' && error instanceof BrowserFailure && error.detail.code === 'profile_not_found')
+            return { profile: id, closed: false, dataRemoved: false };
+          throw error;
+        }
+        if (command && isProductionExitAuthority(options.exits))
+          return await closeProductionProfile(profile, options.selection, platform, options.exits, command);
+        return await closeProfile(profile, options.selection, platform, options.exits, deadline);
+      } finally { if (command) await platform.retireCloseBudget(command.native); }
     },
     async mcp(id, io) {
       const integration = options.integration;
@@ -235,6 +311,9 @@ export interface HostLifecycle {
   assertAdmission(): void;
   disconnect(context: ConnectionContext): void;
   close(): Promise<void>;
+  beginManagementClose(context: ConnectionContext, request: Extract<Request, { method: 'close' }>): Readonly<{
+    opportunity: ManagementCloseOpportunity; finished(): void;
+  }>;
   lastWindowClosed(): void;
 }
 const hostLifecycles = new WeakSet<object>();
@@ -266,10 +345,11 @@ export interface HostNativeLifetime {
 }
 /** One authoritative host; no automatic restart and no saved action/lease state. */
 export function createHostLifecycle(prepared: HostPreparation, sessions: ProfileSessions, transport: TransportServer,
-  control: HostControlPort, native: HostNativeLifetime, productionDeadline?: number): HostLifecycle {
+  control: HostControlPort, native: HostNativeLifetime, productionDeadline?: number, productionPlatform?: PlatformPort): HostLifecycle {
   const production = isHostCustody(prepared.custody);
   if (production && (productionDeadline === undefined || !Number.isFinite(productionDeadline) || now() >= productionDeadline))
     return prepared.custody.terminate();
+  if (production) { if (!productionPlatform) return prepared.custody.terminate(); assertPlatform(productionPlatform); }
   if (!production && productionDeadline !== undefined) throw unavailable('browser');
   let phase: 'starting' | 'ready' | 'closing' | 'fatal' = 'starting';
   let admitted = false;
@@ -290,25 +370,38 @@ export function createHostLifecycle(prepared: HostPreparation, sessions: Profile
       try { synchronous(() => control.closeAdmission()); } finally { synchronous(() => transport.closeAdmission()); }
     }
   }
-  const shutdown = () => {
+  const witness = production ? productionSessionShutdown(sessions, prepared.custody) : undefined;
+  const shutdown = (opportunity?: ManagementCloseOpportunity, acknowledgement?: Promise<void>) => {
     if (closing) return closing;
     if (phase === 'fatal') return Promise.reject(unavailable('browser'));
+    let deadline = now() + 8000, grace = deadline - 3000;
+    if (production) {
+      try {
+        if (opportunity) { deadline = opportunity.deadline; grace = opportunity.grace; }
+        else {
+          const sampled = now(), nativeNow = productionPlatform!.continuousTime(), admitted = prepared.custody.localClose();
+          deadline = sampled + Math.max(0, admitted.overall - nativeNow);
+          grace = sampled + Math.max(0, admitted.grace - nativeNow);
+        }
+      } catch (error) { fatal(); return Promise.reject(error); }
+    }
     let resolve!: () => void, reject!: (error: unknown) => void;
     const result = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
     closing = result; // before close/revoke/window callbacks may reenter
     phase = 'closing';
     // Close admission synchronously before the first await or queue operation.
     try { closeAdmission(); } catch (error) { try { fatal(); } finally { reject(error); } return result; }
-    const deadline = now() + 8000;
     void (async () => {
-      const timer = globalThis.setTimeout(() => { try { fatal(); } catch { /* native already armed */ } }, 5000);
+      const timer = globalThis.setTimeout(() => { try { fatal(); } catch { /* native already armed */ } }, Math.max(1, grace - now()));
       try {
         // A genuine still-starting abandonment never publishes ready. Both
         // paths retain the same actual custody and arm native lifetime once.
+        if (acknowledgement) await acknowledgement;
         await arm();
         if (readyPublication) await readyPublication;
         await prepared.instance.phase('closing');
-        await Promise.all([control.retireAll(deadline - 3000), ...pending]);
+        await Promise.all([control.retireAll(grace), ...pending]);
+        witness?.pagesRetired();
         await sessions.flushStorage(); // necessary; explicitly insufficient to mark clean
         await prepared.instance.owner.assert(); await prepared.buildGuard.assert();
         await transport.close();
@@ -377,7 +470,17 @@ export function createHostLifecycle(prepared: HostPreparation, sessions: Profile
       pending.add(cleanup);
       void cleanup.catch(() => fatal()).finally(() => { clearTimeout(timer); pending.delete(cleanup); }).catch(() => {});
     },
-    close: shutdown,
+    close: () => shutdown(),
+    beginManagementClose(context: ConnectionContext, request: Extract<Request, { method: 'close' }>) {
+      if (!production || phase !== 'ready' || !admitted || closing) throw unavailable('browser');
+      const opportunity = reserveManagementClose(context, request, socket => prepared.custody.consumeClose(request.id, socket));
+      let finish!: () => void, finished = false;
+      const acknowledgement = new Promise<void>(resolve => { finish = resolve; });
+      // shutdown fences synchronously. Its first await is this exact writer's
+      // barrier; no ordinary dispatch can intervene before the one ACK attempt.
+      void shutdown(opportunity, acknowledgement).catch(() => {});
+      return Object.freeze({ opportunity, finished() { if (!finished) { finished = true; finish(); } } });
+    },
     lastWindowClosed() { if (control.windowCount() === 0) void shutdown().catch(() => {}); },
   });
   hostLifecycles.add(lifecycle); return lifecycle;

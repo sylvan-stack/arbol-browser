@@ -38,6 +38,8 @@ export interface ProtectedDispatchPort extends Omit<DispatchPort, 'commit'> {
   commitResponse(context: ConnectionContext, request: Request, success: boolean, bytes: Uint8Array): void;
   redactedFailure(context: ConnectionContext, request: Request, error: unknown): BrowserError;
   forget(context: ConnectionContext, request: Request): void;
+  closeManagement?(context: ConnectionContext, request: Extract<Request, { method: 'close' }>,
+    write: (bytes: Uint8Array, commit: () => void, finished: () => void) => void): void;
 }
 export function capacityFailure(): BrowserFailure {
   return new BrowserFailure({ code: 'control_refused', message: 'Browser capacity is exhausted.',
@@ -59,7 +61,7 @@ function peer(socket: Socket, platform: PlatformPort): ProcessIdentity {
   return identity;
 }
 /** No decoded or aggregate buffer may grow past one bounded frame. */
-function frames(socket: Socket, maximum: number, receive: (value: unknown) => void, fail: () => void): void {
+function frames(socket: Socket, maximum: number, receive: (value: unknown) => void, fail: (reason?: 'malformed' | 'lost') => void): void {
   let pending: Buffer = Buffer.alloc(0);
   socket.on('data', (chunk: Buffer) => {
     try {
@@ -76,9 +78,10 @@ function frames(socket: Socket, maximum: number, receive: (value: unknown) => vo
         receive(frame); if (socket.destroyed) return;
         start = newline + 1;
       }
-    } catch { fail(); }
+    } catch { fail('malformed'); }
   });
-  socket.once('end', fail); socket.once('error', fail); socket.once('close', () => { pending = Buffer.alloc(0); fail(); });
+  socket.once('end', () => fail(pending.length ? 'malformed' : 'lost'));
+  socket.once('error', () => fail('lost')); socket.once('close', () => { pending = Buffer.alloc(0); fail('lost'); });
 }
 function write(socket: Socket, value: unknown, maximum = 8 * 1024 * 1024): void {
   const bytes = Buffer.from(JSON.stringify(value) + '\n', 'utf8');
@@ -155,6 +158,24 @@ class Scheduler {
   }
 }
 export interface TransportServer { openAdmission(): void; closeAdmission(): void; close(): Promise<void> }
+export interface ManagementCloseOpportunity { readonly admission: import('./platform.js').CloseAdmission; readonly deadline: number; readonly grace: number }
+interface ManagementConnection {
+  socket: Socket; context: ConnectionContext; active: Map<string, Request>; stop(): void;
+  reserve(request: Request, consume: (socket: number) => import('./platform.js').CloseAdmission): ManagementCloseOpportunity;
+}
+const managementConnections = new WeakMap<ConnectionContext, ManagementConnection>();
+const closeOpportunities = new WeakMap<ManagementCloseOpportunity, { context: ConnectionContext; request: Request }>();
+export function reserveManagementClose(context: ConnectionContext, request: Request,
+  consume: (socket: number) => import('./platform.js').CloseAdmission): ManagementCloseOpportunity {
+  const actual = managementConnections.get(context);
+  if (!actual || context.endpoint !== 'management' || context.attachment || context.signal.aborted ||
+      request.method !== 'close' || actual.active.get(request.id) !== request) throw unavailable('browser');
+  return actual.reserve(request, consume);
+}
+export function assertManagementCloseOpportunity(value: ManagementCloseOpportunity, context: ConnectionContext, request: Request): void {
+  const actual = closeOpportunities.get(value);
+  if (!actual || actual.context !== context || actual.request !== request || now() >= value.grace) throw unavailable('browser');
+}
 interface ProtectedReadyServer {
   open(custody: import('./custody.js').HostCustody, record: RuntimeRecord, guard: () => void, control: () => void): void;
 }
@@ -183,7 +204,7 @@ export function listenProtectedTransport(location: RuntimeLocation, record: Runt
 async function listenServer(location: RuntimeLocation, record: RuntimeRecord, platform: PlatformPort,
   dispatch: DispatchPort | ProtectedDispatchPort, protectedPort?: ProtectedDispatchPort): Promise<TransportServer> {
   let admission = false, sealed = false, agents = 0, management = 0;
-  const connections = new Set<() => void>(), servers: Server[] = [], scheduler = new Scheduler();
+  const connections = new Set<() => void>(), retainedCloseStops = new Map<() => void, () => void>(), servers: Server[] = [], scheduler = new Scheduler();
   let fatalLatched = false;
   const fatal = () => {
     sealed = true; admission = false;
@@ -195,11 +216,14 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
     let context: ConnectionContext | undefined, dead = false, handshaking = true;
     let identity: ProcessIdentity;
     const connection = new AbortController();
-    const active = new Map<string, AbortController>(), seen = new Set<string>();
+    const active = new Map<string, AbortController>(), requestTimers = new Map<string, NodeJS.Timeout>(), actualRequests = new Map<string, Request>(), seen = new Set<string>();
+    let closeOpportunity: ManagementCloseOpportunity | undefined, closeWritten = false;
+    let closeDrain: NodeJS.Timeout | undefined;
     let helloTimer: NodeJS.Timeout, heartbeat: NodeJS.Timeout;
     let pingId: string | undefined, lastPong = now();
     const stop = () => {
-      if (dead) return; dead = true; connections.delete(stop);
+      if (dead) return; dead = true; connections.delete(stop); retainedCloseStops.delete(stop); clearTimeout(closeDrain);
+      if (context) managementConnections.delete(context);
       clearTimeout(helloTimer); clearInterval(heartbeat);
       try {
       if (protectedPort) {
@@ -257,6 +281,30 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
           const attachment = endpoint === 'agent' ? Object.freeze({ id: token('att'), label: sanitizedLabel(p.label) }) : undefined;
           context = Object.freeze({ endpoint, peer: identity, signal: connection.signal, ...(attachment ? { attachment } : {}) });
           if (endpoint === 'agent') ++agents; else ++management;
+          if (protectedPort && endpoint === 'management') {
+            const captured = context;
+            managementConnections.set(captured, { socket, context: captured, active: actualRequests, stop,
+              reserve(request, consume) {
+                if (dead || sealed || !admission || closeOpportunity || captured.signal.aborted ||
+                    actualRequests.get(request.id) !== request) throw unavailable('browser');
+                checkPeer();
+                // Actual native admission first, then retain this exact socket
+                // before synchronous sealing can abort ordinary connections.
+                const actualFd = fd(socket), sampled = now(), nativeNow = platform.continuousTime();
+                const nativeAdmission = consume(actualFd);
+                closeOpportunity = Object.freeze({ admission: nativeAdmission,
+                  deadline: sampled + Math.max(0, nativeAdmission.overall - nativeNow),
+                  grace: sampled + Math.max(0, nativeAdmission.grace - nativeNow) });
+                closeOpportunities.set(closeOpportunity, { context: captured, request });
+                retainedCloseStops.set(stop, () => {
+                  for (const [id, controller] of active) if (id !== request.id) {
+                    controller.abort(); clearTimeout(requestTimers.get(id)); requestTimers.delete(id);
+                  }
+                }); clearInterval(heartbeat);
+                return closeOpportunity;
+              },
+            });
+          }
           if (protectedPort) {
             const enrolled: unknown = protectedPort.enroll(context);
             if (enrolled !== undefined) { fatal(); throw unavailable('browser'); }
@@ -276,6 +324,7 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
           }, 2000);
           return;
         }
+        if (sealed || !admission) throw unavailable('browser');
         checkPeer();
         if (validator('wire.Response')(value)) {
           if (!pingId || value.id !== pingId || !value.ok || Object.keys(value.result).length) throw unavailable('browser');
@@ -303,7 +352,33 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
         const deadline = now() + duration(request), controller = new AbortController(), captured = context;
         const abort = () => controller.abort();
         connection.signal.addEventListener('abort', abort, { once: true });
-        active.set(request.id, controller);
+        active.set(request.id, controller); actualRequests.set(request.id, request);
+      if (request.method === 'close' && protectedPort?.closeManagement) {
+        try {
+          protectedPort.authorize(captured, request);
+          protectedPort.closeManagement(captured, request, (bytes, commit, finished) => {
+            try {
+              if (!closeOpportunity || closeWritten || dead || socket.destroyed) throw unavailable('browser');
+              assertManagementCloseOpportunity(closeOpportunity, captured, request); checkPeer();
+              if (bytes.byteLength > 16384) throw unavailable('browser');
+              commit(); closeWritten = true;
+              // Guarded exact small frame, then bounded end/drain. Never destroy
+              // a successfully accepted ordinary ACK before its write can flush.
+              socket.write(bytes, error => { if (error) stop(); }); socket.end();
+              closeDrain = setTimeout(stop, Math.max(1, closeOpportunity.deadline - now())); closeDrain.unref();
+            } catch { stop(); }
+            finally { finished(); }
+          });
+        } catch (error) {
+          if (!dead && !sealed) { try { failure(captured, request, error, deadline); } catch { stop(); } }
+          else stop();
+        } finally {
+          active.delete(request.id); actualRequests.delete(request.id);
+          connection.signal.removeEventListener('abort', abort);
+          try { protectedPort.forget(captured, request); } catch { fatal(); }
+        }
+        return;
+      }
         // A timeout closes transport/admission and delegates actual drain/retire;
         // it never emits a synthetic successful cancellation or action outcome.
         const timer = setTimeout(() => {
@@ -311,6 +386,7 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
           try { const returned: unknown = dispatch.cancel(captured, request.id); if (protectedPort && returned !== undefined) fatal(); } catch { fatal(); }
           controller.abort(); stop();
         }, Math.max(1, deadline - now()));
+        requestTimers.set(request.id, timer);
         void (async () => {
           let committed = false;
           try {
@@ -318,6 +394,7 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
             if (protectedPort && authorized !== undefined) { fatal(); throw unavailable('browser'); }
             const result = await (protectedPort ? dispatch.execute(captured, request, deadline, controller.signal)
               : scheduler.run(request, controller.signal, () => dispatch.execute(captured, request, deadline, controller.signal)));
+            if (controller.signal.aborted) return;
             if (protectedPort && now() >= deadline) { stop(); return; }
             if (dead || controller.signal.aborted || now() >= deadline) return;
             if (!resultValidator(request)(result)) {
@@ -341,6 +418,7 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
               write(socket, { wire: 1, id: request.id, ok: true, result });
             }
           } catch (error) {
+            if (controller.signal.aborted) return;
             // A write after final commitment may have reached the OS. Do not
             // manufacture another result; disconnect means uncertain delivery.
             if (protectedPort && committed) { stop(); return; }
@@ -350,7 +428,7 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
               catch { stop(); }
             }
           } finally {
-            clearTimeout(timer); active.delete(request.id); connection.signal.removeEventListener('abort', abort);
+            clearTimeout(timer); requestTimers.delete(request.id); active.delete(request.id); actualRequests.delete(request.id); connection.signal.removeEventListener('abort', abort);
             if (protectedPort) { try {
               const returned: unknown = protectedPort.forget(captured, request); if (returned !== undefined) { fatal(); stop(); }
             } catch { fatal(); stop(); } }
@@ -379,9 +457,9 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
   }
   const result: TransportServer = Object.freeze({
     openAdmission() { if (sealed || protectedPort) throw unavailable('browser'); admission = true; },
-    closeAdmission() { sealed = true; admission = false; for (const stop of [...connections]) stop(); },
+    closeAdmission() { sealed = true; admission = false; for (const stop of [...connections]) { const fence = retainedCloseStops.get(stop); if (fence) fence(); else stop(); } },
     async close() {
-      sealed = true; admission = false; for (const stop of [...connections]) stop();
+      sealed = true; admission = false; for (const stop of [...connections]) { const fence = retainedCloseStops.get(stop); if (fence) fence(); else stop(); }
       await Promise.all(servers.map(server => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))));
     },
   });
@@ -413,6 +491,20 @@ export interface RuntimeClient {
   cancel(requestId: string, deadline?: number): Promise<Contract<'wire.CancelResult'>>;
   close(): void;
 }
+export type ManagementCloseObservation =
+  | Readonly<{ kind: 'ack' }>
+  | Readonly<{ kind: 'refused'; error: unknown }>
+  | Readonly<{ kind: 'malformed' }>
+  | Readonly<{ kind: 'lost'; stamped: boolean; written: boolean }>;
+const actualCloseClients = new WeakMap<RuntimeClient,
+  (budget: import('./platform.js').CloseBudget, deadline: number) => Promise<ManagementCloseObservation>>();
+/** Private actual client/socket boundary. The native one-use stamp binds this
+ * exact connected peer and request before the sole Close frame is written. */
+export function requestManagementClose(client: RuntimeClient, budget: import('./platform.js').CloseBudget,
+  deadline: number): Promise<ManagementCloseObservation> {
+  const actual = actualCloseClients.get(client); if (!actual) throw unavailable('browser');
+  actualCloseClients.delete(client); return actual(budget, deadline);
+}
 /** One connection attempt only. Never reconnects or replays on loss. */
 export async function connectRuntime(location: RuntimeLocation, record: RuntimeRecord, endpoint: Endpoint,
   selection: BuildSelection, platform: PlatformPort, deadline: number, label = 'Browser client'): Promise<RuntimeClient> {
@@ -422,14 +514,16 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
   await assertSocket(location, path);
   const socket = createConnection(path), helloId = token('req'), seen = new Set<string>([helloId]);
   const lost = new AbortController();
+  let stopReason: 'lost' | 'malformed' | 'refused' = 'lost';
+  let closeRequest: string | undefined, closeWritten = false, explicitCloseRefusal: BrowserFailure | undefined;
   let dead = false, hello: Contract<'wire.HelloResult'>['result'] | undefined;
   const pending = new Map<string, { check(value: unknown): boolean; resolve(value: unknown): void; reject(error: unknown): void; timer: NodeJS.Timeout }>();
   let heartbeat: NodeJS.Timeout, lastPong = now(), pingId: string | undefined;
   let resolveHello: (value: RuntimeClient) => void, rejectHello: (error: unknown) => void;
   const ready = new Promise<RuntimeClient>((resolve, reject) => { resolveHello = resolve; rejectHello = reject; });
   const timer = setTimeout(() => stop(), Math.max(1, Math.min(deadline, now() + 5000) - now()));
-  function stop() {
-    if (dead) return; dead = true; clearTimeout(timer); clearInterval(heartbeat); socket.destroy();
+  function stop(reason: 'lost' | 'malformed' | 'refused' = 'lost') {
+    if (dead) return; stopReason = reason; dead = true; clearTimeout(timer); clearInterval(heartbeat); socket.destroy();
     lost.abort();
     rejectHello(unavailable('browser'));
     for (const entry of pending.values()) { clearTimeout(entry.timer); entry.reject(unavailable('browser')); }
@@ -448,6 +542,17 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
   });
   frames(socket, 8 * 1024 * 1024, value => {
     try {
+      if (closeRequest && pending.has(closeRequest)) {
+        if (!validator('wire.Response')(value) && !validator('wire.Ping')(value)) { stop('malformed'); return; }
+        if (validator('wire.Response')(value) && value.id === closeRequest) {
+          const entry = pending.get(closeRequest)!;
+          if (!value.ok) {
+            pending.delete(closeRequest); clearTimeout(entry.timer); explicitCloseRefusal = new BrowserFailure(value.error); entry.reject(explicitCloseRefusal); return;
+          }
+          if (!entry.check(value.result)) { stop('malformed'); return; }
+          if (!originalAlive(record, platform)) { stop('lost'); return; }
+        }
+      }
       verify();
       if (!hello) {
         if (!validator('wire.HelloResult')(value) || value.id !== helloId) throw unavailable('browser');
@@ -468,12 +573,12 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
             return Promise.reject(unavailable('browser'));
           seen.add(request.id);
           return new Promise((resolve, reject) => {
-            const timeout = setTimeout(stop, Math.max(1, limit - now()));
+            const timeout = setTimeout(() => stop('lost'), Math.max(1, limit - now()));
             pending.set(request.id, { check, resolve, reject, timer: timeout });
-            try { verify(); write(socket, request, 1024 * 1024); } catch { stop(); }
+            try { verify(); write(socket, request, 1024 * 1024); if (request.id === closeRequest) closeWritten = true; } catch { stop('refused'); }
           });
         };
-        resolveHello(Object.freeze({ hello, signal: lost.signal, close: stop,
+        const client: RuntimeClient = Object.freeze({ hello, signal: lost.signal, close: () => stop(),
           call(request: Request, limit = now() + duration(request)): Promise<unknown> {
             if (!(endpoint === 'agent' ? validator('wire.ToolRequest')(request) : validator('wire.ManagementRequest')(request)))
               return Promise.reject(unavailable('browser'));
@@ -484,7 +589,24 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
             return send({ wire: 1, id: token('req'), method: 'cancel', params: { request: requestId } }, limit,
               value => validator('wire.CancelResult')(value) && value.request === requestId) as Promise<Contract<'wire.CancelResult'>>;
           },
-        })); return;
+        });
+        if (endpoint === 'management') actualCloseClients.set(client, async (budget, limit) => {
+          if (dead || closeRequest || pending.size || now() >= limit) return { kind: 'refused', error: unavailable('browser') };
+          const request: Extract<Request, { method: 'close' }> = { wire: 1, id: token('req'), method: 'close', params: {} };
+          closeRequest = request.id; let stamped = false;
+          try {
+            verify(); await platform.stampCloseRequest(budget, location.leaf, record, request.id, fd(socket)); stamped = true;
+            if (dead || now() >= limit) return { kind: 'lost', stamped, written: false };
+            await send(request, limit, value => validator('wire.CloseResult')(value) &&
+              value.profile === record.profile && value.closed === false && value.dataRemoved === false); return { kind: 'ack' };
+          } catch (error) {
+            if (explicitCloseRefusal) return { kind: 'refused', error: explicitCloseRefusal };
+            if (!stamped || !dead || stopReason === 'refused') return { kind: 'refused', error };
+            if (stopReason === 'malformed') return { kind: 'malformed' };
+            return { kind: 'lost', stamped, written: closeWritten };
+          }
+        });
+        resolveHello(client); return;
       }
       if (validator('wire.Ping')(value)) {
         if (seen.has(value.id) || seen.size >= 65536) throw unavailable('browser');
@@ -500,7 +622,7 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
       if (value.ok && !entry.check(value.result)) throw unavailable('browser');
       pending.delete(value.id); clearTimeout(entry.timer);
       if (value.ok) entry.resolve(value.result); else entry.reject(new BrowserFailure(value.error));
-    } catch { stop(); }
-  }, stop);
+    } catch { stop('malformed'); }
+  }, reason => stop(reason ?? 'lost'));
   return ready;
 }
