@@ -14,54 +14,128 @@ enum class Outcome { pending, refused, accepted, timedOut };
 struct Reply {
   std::mutex mutex;
   Outcome outcome = Outcome::pending;
-  bool callbackStarted = false;
-  int pid = 0;
+  bool callback = false;
+  int callbackPid = 0;
   bool error = false, app = false;
-  unsigned branch = 0, phase = 0;
 };
 
-// This authenticates only the fixed exec's PID hint. The caller still requires
-// its independent attempts.launched proof and all normal readiness/owner gates.
-bool reexecuted(NSString* application, const std::string& requestPath,
-    NSDictionary* pending, const std::string& requestRaw, int pid,
-    double deadline, unsigned& phase) {
-  arbol_attempt::Claim claim; std::string raw; NSDictionary* current = nil;
+enum class Observation { refused, waiting, proved };
+struct Baseline {
+  int requestFd = -1;
+  struct stat directory{}, lock{}, request{};
+  ~Baseline() { if (requestFd >= 0) close(requestFd); }
+};
+bool stable(const arbol_attempt::Claim& claim, const Baseline& baseline,
+    const std::string& name) {
+  struct stat request{}, held{};
+  return claim.at.identity.st_dev == baseline.directory.st_dev &&
+    claim.at.identity.st_ino == baseline.directory.st_ino &&
+    arbol_attempt::sameFile(claim.at.lockIdentity,baseline.lock) &&
+    baseline.requestFd >= 0 && !fstat(baseline.requestFd,&held) &&
+    arbol_attempt::sameFile(held,baseline.request) &&
+    !fstatat(claim.at.directory,name.c_str(),&request,AT_SYMLINK_NOFOLLOW) &&
+    arbol_attempt::sameFile(request,baseline.request) && arbol_attempt::unchanged(claim.at);
+}
+
+bool lineage(const arbol_boundary::Identity& id, const arbol_boundary::Info& info,
+    int session, NSDictionary* original) {
+  return id.pid == [original[@"pid"] intValue] && id.uid == [original[@"uid"] unsignedIntValue] &&
+    std::to_string(id.start) == [original[@"startId"] UTF8String] &&
+    id.group == [original[@"group"] unsignedIntValue] && session == [original[@"session"] intValue] &&
+    std::to_string(info.unique.parent) == [original[@"parentStartId"] UTF8String] &&
+    info.unique.originalParentVersion == [original[@"parentPidVersion"] intValue] &&
+    !(info.bsd.pbi_flags & PROC_FLAG_INEXIT);
+}
+
+// An audit-token image query can straddle the one fixed exec. Only a verified
+// unchanged original birth/lineage on BOTH sides permits another observation.
+// A later complete coherent sample, never that inconclusive query, proves PID.
+Observation sample(NSString* application, NSDictionary* original,
+    NSDictionary* __strong& live, unsigned& branch) {
+  int pid = [original[@"pid"] intValue];
+  arbol_boundary::Identity first, last; arbol_boundary::Info before{}, after{};
+  if (arbol_boundary::observe(pid,first,&before) != 1 ||
+      !lineage(first,before,getsid(pid),original)) return Observation::refused;
+  std::string image;
+  bool found = arbol_boundary::executable(first,image);
+  if (arbol_boundary::observe(pid,last,&after) != 1 ||
+      !lineage(last,after,getsid(pid),original)) return Observation::refused;
+  int version = [original[@"pidVersion"] intValue];
+  NSString* outer = [application stringByAppendingPathComponent:@"Contents/MacOS/arbol-browser-native"];
+  NSString* engine = [application stringByAppendingPathComponent:@"Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron"];
+  if (found && image != outer.fileSystemRepresentation && image != engine.fileSystemRepresentation)
+    return Observation::refused;
+  if (first.version != last.version)
+    return first.version == version && last.version != version ? Observation::waiting : Observation::refused;
+  if (!found) return Observation::refused;
+  branch = first.version == version ? 1 : 2;
+  NSString* expected = branch == 1 ? outer : engine;
+  if (image != expected.fileSystemRepresentation || !arbol_boundary::canonical(expected.fileSystemRepresentation))
+    return Observation::refused;
+  live = @{@"pid":@(last.pid),@"uid":@(last.uid),@"startId":original[@"startId"],
+    @"pidVersion":@(last.version),@"group":@(last.group),@"session":original[@"session"],
+    @"parentStartId":original[@"parentStartId"],@"parentPidVersion":original[@"parentPidVersion"],@"executable":expected};
+  return Observation::proved;
+}
+
+// Read-only classification under a temporary short Claim. The main loop owns
+// it only until this observation/reply ends, never across a polling wait.
+Observation inspect(arbol_attempt::Claim& claim, NSString* application, const std::string& requestPath,
+    NSDictionary* pending, const std::string& requestRaw, const Baseline& baseline,
+    double deadline, int& pid, unsigned& branch, unsigned& phase) {
+  std::string raw; NSDictionary* current = nil;
+  const std::string name = requestPath.substr(requestPath.rfind('/')+1);
   if (!claim.acquire(requestPath,std::min(deadline,arbol_boundary::clockMs()+2000)) ||
-      !claim.read(raw,current)) return false;
-  phase = 2;
+      !claim.read(raw,current) || !stable(claim,baseline,name)) return Observation::refused;
+  phase = 1;
   std::string liveRequest; bool absent;
   if (!arbol_attempt::immutable(pending,current) ||
-      ![@[@"claimed",@"ready"] containsObject:current[@"phase"]] ||
       current[@"terminal"] != NSNull.null || [current[@"expires"] doubleValue] <= arbol_boundary::clockMs() ||
       !arbol_attempt::currentProcess(pending[@"starter"]) ||
       !arbol_attempt::launchRequest(claim,requestPath,current) ||
-      !arbol_attempt::readAt(claim.at.directory,requestPath.substr(requestPath.rfind('/')+1),liveRequest,absent) ||
-      absent || liveRequest != requestRaw) return false;
-  phase = 3;
+      !arbol_attempt::readAt(claim.at.directory,name,liveRequest,absent) ||
+      absent || liveRequest != requestRaw || !stable(claim,baseline,name) ||
+      arbol_boundary::clockMs() >= deadline) return Observation::refused;
+  phase = 2;
+  if ([current[@"phase"] isEqual:@"pending"]) return Observation::waiting;
+  if (![@[@"claimed",@"ready"] containsObject:current[@"phase"]]) return Observation::refused;
   NSDictionary* original = current[@"bootstrap"];
-  if (!arbol_attempt::process(original) || [original[@"pid"] intValue] != pid ||
-      [original[@"group"] intValue] != pid ||
+  if (!arbol_attempt::process(original) || [original[@"group"] intValue] != [original[@"pid"] intValue] ||
       ![original[@"executable"] isEqual:[application stringByAppendingPathComponent:@"Contents/MacOS/arbol-browser-native"]] ||
-      !arbol_boundary::canonical([original[@"executable"] fileSystemRepresentation])) return false;
-  NSString* engine = [application stringByAppendingPathComponent:@"Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron"];
-  NSDictionary* live = arbol_attempt::processRecord(pid);
-  if (!arbol_attempt::process(live) || ![live[@"executable"] isEqual:engine] ||
-      !arbol_boundary::canonical(engine.fileSystemRepresentation) ||
-      [live[@"pidVersion"] isEqual:original[@"pidVersion"]]) return false;
-  for (NSString* key in @[@"pid",@"uid",@"startId",@"group",@"session",@"parentStartId",@"parentPidVersion"])
-    if (![live[key] isEqual:original[key]]) return false;
-  if (current[@"engine"] != NSNull.null && ![current[@"engine"] isEqual:live]) return false;
+      !arbol_boundary::canonical([original[@"executable"] fileSystemRepresentation])) return Observation::refused;
+  phase = 3;
+  NSDictionary* live = nil;
+  Observation result = sample(application,original,live,branch);
+  if (result != Observation::proved) return result;
+  if (current[@"engine"] != NSNull.null && ![current[@"engine"] isEqual:live]) return Observation::refused;
   phase = 4;
   std::string after, afterRequest; NSDictionary* reread = nil;
-  // Keep the same short Claim lock through the fresh kernel and exact file
-  // rechecks. No transition, admission or new authority is published here.
-  if (!arbol_attempt::currentProcess(live) || !claim.read(after,reread) || after != raw ||
+  if (!claim.read(after,reread) || after != raw ||
       !arbol_attempt::launchRequest(claim,requestPath,reread) ||
-      !arbol_attempt::readAt(claim.at.directory,requestPath.substr(requestPath.rfind('/')+1),afterRequest,absent) ||
-      absent || afterRequest != requestRaw || !arbol_attempt::unchanged(claim.at) ||
-      arbol_boundary::clockMs() >= deadline) return false;
+      !arbol_attempt::readAt(claim.at.directory,name,afterRequest,absent) ||
+      absent || afterRequest != requestRaw || !stable(claim,baseline,name) ||
+      !arbol_attempt::currentProcess(pending[@"starter"]) || arbol_boundary::clockMs() >= deadline)
+    return Observation::refused;
+  NSDictionary* fresh = nil;
+  result = sample(application,original,fresh,branch);
+  if (result != Observation::proved) return result;
+  if (![fresh isEqual:live]) {
+    // Two coherent samples on opposite sides of the same fixed exec are also
+    // inconclusive for this reply. Reclassify with the Claim released.
+    return [live[@"pidVersion"] isEqual:original[@"pidVersion"]] &&
+      ![fresh[@"pidVersion"] isEqual:original[@"pidVersion"]] && current[@"engine"] == NSNull.null ?
+      Observation::waiting : Observation::refused;
+  }
+  if (arbol_boundary::clockMs() >= deadline) return Observation::refused;
+  pid = [fresh[@"pid"] intValue];
   phase = 5;
-  return true;
+  return Observation::proved;
+}
+
+void diagnostic(const Reply& reply, unsigned branch, unsigned phase) {
+  os_log_with_type(OS_LOG_DEFAULT,OS_LOG_TYPE_DEFAULT,
+    "host-launch reply callback=%{public}d error=%{public}d app=%{public}d branch=%{public}u phase=%{public}u outcome=%{public}u",
+    reply.callback,reply.error,reply.app,branch,phase,(unsigned)reply.outcome);
 }
 }
 
@@ -72,7 +146,7 @@ int main(int argc, const char* argv[]) {
     NSString* request = [NSString stringWithUTF8String:argv[2]];
     if (!application.isAbsolutePath || !request.isAbsolutePath) return 4;
     double deadline=arbol_boundary::clockMs()+28000;
-    NSDictionary* pending = nil; std::string requestRaw;
+    NSDictionary* pending = nil; std::string requestRaw; Baseline baseline;
     { arbol_attempt::Claim claim; std::string raw; NSDictionary* attempt=nil;
       if(!claim.acquire(argv[2],std::min(deadline,arbol_boundary::clockMs()+2000)) || !claim.read(raw,attempt) ||
          !arbol_attempt::launchRequest(claim,argv[2],attempt) || ![attempt[@"phase"] isEqual:@"pending"] ||
@@ -81,10 +155,14 @@ int main(int argc, const char* argv[]) {
          !arbol_boundary::canonical(application.fileSystemRepresentation)) return 4;
       bool absent; std::string checkedRequest;
       const std::string name = request.lastPathComponent.UTF8String;
-      if (!arbol_attempt::readAt(claim.at.directory,name,requestRaw,absent) || absent ||
+      baseline.requestFd = openat(claim.at.directory,name.c_str(),O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
+      baseline.directory = claim.at.identity; baseline.lock = claim.at.lockIdentity;
+      if (baseline.requestFd < 0 || fstat(baseline.requestFd,&baseline.request) ||
+          !arbol_attempt::privateFile(baseline.request) ||
+          !arbol_attempt::readAt(claim.at.directory,name,requestRaw,absent) || absent ||
           !arbol_attempt::launchRequest(claim,argv[2],attempt) ||
           !arbol_attempt::readAt(claim.at.directory,name,checkedRequest,absent) || absent ||
-          checkedRequest != requestRaw || !arbol_attempt::unchanged(claim.at)) return 4;
+          checkedRequest != requestRaw || !stable(claim,baseline,name)) return 4;
       pending = [attempt copy];
       deadline=std::min(deadline,[attempt[@"expires"] doubleValue]);
     }
@@ -99,62 +177,54 @@ int main(int argc, const char* argv[]) {
     configuration.environment = @{};
     const std::string requestPath = argv[2];
     const auto reply = std::make_shared<Reply>();
-    [[NSWorkspace sharedWorkspace] openApplicationAtURL:[NSURL fileURLWithPath:application]
+    try { @try {
+      [[NSWorkspace sharedWorkspace] openApplicationAtURL:[NSURL fileURLWithPath:application]
       configuration:configuration completionHandler:^(NSRunningApplication* app, NSError* error) {
-        bool open;
-        { std::lock_guard<std::mutex> held(reply->mutex);
-          if (reply->callbackStarted) return;
-          reply->callbackStarted = true;
-          open = reply->outcome == Outcome::pending;
-        }
-        bool accepted = false; int pid = 0; unsigned branch = 0, phase = 0;
+        std::lock_guard<std::mutex> held(reply->mutex);
+        if (reply->callback || reply->outcome != Outcome::pending) return;
+        reply->callback = true; reply->error = error != nil; reply->app = app != nil;
+        // Optional metadata can veto a contrary positive PID, never authorize
+        // this launch. Preserve the first observation under reply serialization.
         try { @try {
-          if (open && !error && app && app.processIdentifier > 1 && arbol_boundary::clockMs()<deadline) {
-            pid = app.processIdentifier;
-            NSString* reported = app.bundleURL.path;
-            NSString* nested = [application stringByAppendingPathComponent:@"Contents/Resources/browser/runtime/Electron.app"];
-            if ([[reported stringByResolvingSymlinksInPath] isEqual:application]) {
-              branch = 1; accepted = true;
-            } else if ([reported isEqual:nested] && arbol_boundary::canonical(nested.fileSystemRepresentation)) {
-              branch = 2; phase = 1;
-              accepted = reexecuted(application,requestPath,pending,requestRaw,pid,deadline,phase);
-            }
-          }
-        } @catch (NSException*) { accepted = false; } } catch (...) { accepted = false; }
-        { std::lock_guard<std::mutex> held(reply->mutex);
-          if (reply->outcome == Outcome::pending) {
-            reply->error = error != nil; reply->app = app != nil;
-            reply->branch = branch; reply->phase = phase;
-            if (arbol_boundary::clockMs() >= deadline) reply->outcome = Outcome::timedOut;
-            else {
-              reply->outcome = accepted ? Outcome::accepted : Outcome::refused;
-              if (accepted) reply->pid = pid;
-            }
-          }
-        }
+          if (app) reply->callbackPid = app.processIdentifier;
+        } @catch (NSException*) { reply->callbackPid = 0; } } catch (...) { reply->callbackPid = 0; }
       }];
+    } @catch (NSException*) { std::lock_guard<std::mutex> held(reply->mutex); reply->error = true; }
+    } catch (...) { std::lock_guard<std::mutex> held(reply->mutex); reply->error = true; }
+    unsigned branch = 0, phase = 0;
     while (arbol_boundary::clockMs() < deadline) {
       { std::lock_guard<std::mutex> held(reply->mutex);
-        if (reply->outcome != Outcome::pending) break;
+        if (reply->error) { reply->outcome = Outcome::refused; break; }
       }
+      {
+        arbol_attempt::Claim claim; int pid = 0;
+        Observation result = Observation::refused;
+        try { @try {
+          result = inspect(claim,application,requestPath,pending,requestRaw,baseline,deadline,pid,branch,phase);
+        } @catch (NSException*) {} } catch (...) {}
+        std::lock_guard<std::mutex> held(reply->mutex);
+        if (reply->error || result == Observation::refused ||
+            (result == Observation::proved && reply->callbackPid > 0 && reply->callbackPid != pid)) {
+          reply->outcome = Outcome::refused; break;
+        }
+        if (result == Observation::proved) {
+          reply->outcome = Outcome::accepted;
+          if (arbol_boundary::clockMs() >= deadline) reply->outcome = Outcome::timedOut;
+          diagnostic(*reply,branch,phase);
+          if (reply->outcome != Outcome::accepted || pid <= 1 || arbol_boundary::clockMs() >= deadline) return 4;
+          // Claim and callback serialization remain held through the sole
+          // reply. No cancellation or settled callback error can race output.
+          std::printf("%d\n",pid); std::fflush(stdout);
+          return 0;
+        }
+      }
+      // The temporary Claim is closed before AppKit or the outer can run.
       [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.025]];
     }
-    Outcome outcome; int pid; bool callback, error, app; unsigned branch, phase;
     { std::lock_guard<std::mutex> held(reply->mutex);
-      if (arbol_boundary::clockMs() >= deadline && reply->outcome == Outcome::pending)
-        reply->outcome = Outcome::timedOut;
-      outcome = reply->outcome; pid = reply->pid; callback = reply->callbackStarted;
-      error = reply->error; app = reply->app; branch = reply->branch; phase = reply->phase;
+      if (reply->outcome == Outcome::pending) reply->outcome = Outcome::timedOut;
+      diagnostic(*reply,branch,phase);
     }
-    // One bounded local system diagnostic, before main can exit normally.
-    // Only allowlisted fixed booleans/enums are observable: no PID, paths,
-    // request/profile bytes, result tokens or raw errors. Never wait for a late
-    // callback to finish its validation or diagnostic after the cutoff.
-    os_log_with_type(OS_LOG_DEFAULT,OS_LOG_TYPE_DEFAULT,
-      "host-launch reply callback=%{public}d error=%{public}d app=%{public}d branch=%{public}u phase=%{public}u outcome=%{public}u",
-      callback,error,app,branch,phase,(unsigned)outcome);
-    if (outcome != Outcome::accepted || pid <= 1 || arbol_boundary::clockMs() >= deadline) return 4;
-    std::printf("%d\n",pid); std::fflush(stdout);
-    return 0;
+    return 4;
   }
 }
