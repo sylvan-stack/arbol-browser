@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <cerrno>
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <dirent.h>
@@ -37,8 +38,14 @@ static constexpr int kBsdWithUniqueId = 18;
 struct HeldLock { int fd; std::string path; dev_t dev; ino_t ino; int mode; bool retained = false; };
 static std::set<HeldLock*> liveLocks;
 
-static napi_value fail(napi_env env) {
-  napi_throw_error(env, "platform_unavailable", "Private OS support unavailable."); return nullptr;
+// Process-local diagnostic only; no callback, allocation or I/O at refusal.
+static std::atomic<unsigned> firstRefusalLine{0};
+static std::atomic<bool> refusalLineEmitted{false};
+static_assert(std::atomic<unsigned>::is_always_lock_free && std::atomic<bool>::is_always_lock_free);
+static napi_value fail(napi_env env, unsigned line = __builtin_LINE()) {
+  int saved=errno; unsigned empty=0;
+  (void)firstRefusalLine.compare_exchange_strong(empty,line,std::memory_order_relaxed);
+  napi_throw_error(env, "platform_unavailable", "Private OS support unavailable."); errno=saved; return nullptr;
 }
 static napi_value text(napi_env env, const std::string& value) {
   napi_value out; if (napi_create_string_utf8(env, value.c_str(), value.size(), &out) != napi_ok) return fail(env);
@@ -614,6 +621,20 @@ static bool custodyAttempted = false;
 static Custody* custodyArgument(napi_env env, napi_value value) {
   void* data = nullptr; if (napi_get_value_external(env,value,&data) != napi_ok) return nullptr;
   auto* c = static_cast<Custody*>(data); return nativeCustodies.count(c) ? c : nullptr;
+}
+// Observe only after the original irreversible fatal on the same genuine host.
+static void observeNativeRefusal(Custody* c) noexcept {
+  int saved=errno;
+  @autoreleasepool { @try { try {
+    unsigned line=firstRefusalLine.load(std::memory_order_relaxed);
+    if(line&&c&&nativeCustodies.count(c)&&c->continuousBuild&&c->hostRequired&&c->finalization.present()&&
+       c->finalization.shared()->fatal.load(std::memory_order_acquire)&&
+       getpid()==c->context.main.pid&&arbol_boundary::current(c->context.main)==1&&
+       arbol_boundary::lockIdentity(c->context.owner)&&arbol_boundary::lockIdentity(c->context.build)&&
+       !refusalLineEmitted.exchange(true,std::memory_order_relaxed))
+      os_log_with_type(OS_LOG_DEFAULT,OS_LOG_TYPE_DEFAULT,"arbol-browser native-refusal %{public}u",line);
+  } catch(...) {} } @catch(NSException*) {} }
+  errno=saved;
 }
 // Fixed local milestones only. Neither an observation failure nor a valid
 // handle can acquire admission, a Claim, or change retained native state.
@@ -1281,7 +1302,7 @@ static napi_value assertHostClipboard(napi_env env,napi_callback_info info) {
 static napi_value latchWatchdogFatal(napi_env env,napi_callback_info info) {
   napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg);
   if(!c||getpid()!=c->context.main.pid||arbol_boundary::current(c->context.main)!=1) return fail(env);
-  if(c->finalization.present()) c->finalization.shared()->declareFatal();
+  if(c->finalization.present()) { c->finalization.shared()->declareFatal(); observeNativeRefusal(c); }
   napi_value out; napi_get_undefined(env,&out); return out;
 }
 
@@ -1366,7 +1387,7 @@ static napi_value publishHostReady(napi_env env,napi_callback_info info) {
   if(c->continuousBuild&&adoptedNoUse&&adoptedNoUse->matches(c->context.bundle,c->context.digest,c->context.build)&&
      adoptedNoUse->mayFinalize()&&!c->spawned&&!c->markerAttempted&&!c->sessionAttempted) adoptedNoUse->terminate();
   // Irreversible attribution precedes discovery, retirement or any signal.
-  if(c->finalization.present()) c->finalization.shared()->poison(arbol_exit::protocolLoss|arbol_exit::forced);
+  if(c->finalization.present()) { c->finalization.shared()->poison(arbol_exit::protocolLoss|arbol_exit::forced); observeNativeRefusal(c); }
   if(c->mutation) { c->mutation->relinquish(); c->mutation=nullptr; }
   if(c->sessionUse) c->sessionUse->relinquish();
   for(;;) {
