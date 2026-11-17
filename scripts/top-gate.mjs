@@ -121,11 +121,28 @@ if (!embedded && !controlWorker) {
         cwd: repository, env: { HOME: home, PATH: '/usr/bin:/bin', ELECTRON_RUN_AS_NODE: '1', LANG: 'en_US.UTF-8' },
         stdio: 'inherit', timeout: 480000,
       });
-    const control = await readJson(join(controlOutput, 'result.json'));
-    assert.deepEqual(control.selection, controlSelection.map(([id]) => id));
-    assert.deepEqual(control.harness, Object.fromEntries(sourceFiles(controlSelection, controlSupport).map(path => [path, gate.harness[path]])));
-    gate.control = { record: join(controlOutput, 'result.json'), passed: control.passed,
+    gate.control = { record: join(controlOutput, 'result.json'), passed: false,
       status: controlRun.status, signal: controlRun.signal, error: controlRun.error ? String(controlRun.error) : undefined };
+    await save();
+    let control;
+    try {
+      control = await readJson(gate.control.record);
+      assert.equal(control.buildRoot, buildRoot); assert.equal(control.candidate, candidate);
+      assert.deepEqual(control.selection, controlSelection.map(([id]) => id));
+      assert.deepEqual(control.harness, Object.fromEntries(sourceFiles(controlSelection, controlSupport).map(path => [path, gate.harness[path]])));
+      assert.deepEqual(control.cases.map(row => row.id), controlSelection.map(([id]) => id), 'Missing/partial Control results');
+      for (const [id, body] of controlSelection) {
+        const row = control.cases.find(row => row.id === id);
+        assert.equal(row.body, body); assert.equal(row.bodyDigest, gate.harness[body]);
+        assert.ok(['passed', 'failed'].includes(row.status));
+      }
+      gate.control.passed = control.passed === true && controlRun.status === 0 && controlRun.signal === null &&
+        control.cases.every(row => row.status === 'passed');
+    } catch (error) {
+      gate.control.receiptError = String(error.stack ?? error);
+      control = { passed: false, cases: controlSelection.map(([id, body]) => ({ id, body, bodyDigest: gate.harness[body],
+        status: 'unavailable', error: 'Required Control receipt missing, partial or invalid; inspect child status and original output' })) };
+    }
     await save();
     const result = spawnSync(join(candidate, 'runtime/Electron.app/Contents/MacOS/Electron'),
       [fileURLToPath(import.meta.url), '--candidate', buildRoot, '--out', foundationOutput, '--embedded'], {
