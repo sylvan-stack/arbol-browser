@@ -108,29 +108,172 @@ export interface CandidateTrust {
  * Node clients may verify two different retained Builds. Only the host's one
  * verifyNativeCandidate result is eligible for addon/watchdog installation. */
 export type SignedBundle = CandidateTrust;
+interface PhysicalEntry {
+  readonly stamp: string;
+  readonly kind: 'file' | 'directory' | 'symlink';
+  readonly children?: readonly string[];
+  readonly link?: string;
+  readonly target?: string;
+}
+interface FrozenSnapshot {
+  readonly encoded: string;
+  readonly physical: Readonly<Record<string, PhysicalEntry>>;
+  poisoned: boolean;
+}
+const signedSnapshots = new WeakMap<SignedBundle, FrozenSnapshot>();
+export interface SignedSnapshotComparison { readonly deadline: number }
+const comparisons = new WeakMap<SignedSnapshotComparison, { signed: SignedBundle; snapshot: FrozenSnapshot; used: boolean; expiry: ReturnType<typeof setTimeout> }>();
+function physicalStamp(stat: import('node:fs').BigIntStats): string {
+  return stable([stat.dev, stat.ino, stat.mode, stat.uid, stat.gid, stat.nlink, stat.size, stat.mtimeNs, stat.ctimeNs, stat.birthtimeNs].map(String));
+}
+// Capture the actual unpatched implementation once, in this canonical module.
+// These callbacks perform filesystem work off the browser heartbeat thread.
+const originalAsyncFS = createRequire(import.meta.url)(process.type === 'browser' ? 'original-fs' : 'node:fs') as typeof import('node:fs');
+const asynchronousFS = Object.freeze({ lstat: originalAsyncFS.lstat, fstat: originalAsyncFS.fstat, open: originalAsyncFS.open,
+  close: originalAsyncFS.close, read: originalAsyncFS.read, readdir: originalAsyncFS.readdir, readlink: originalAsyncFS.readlink, realpath: originalAsyncFS.realpath });
+function asyncLstat(path: string): Promise<import('node:fs').BigIntStats> {
+  return new Promise((resolve, reject) => asynchronousFS.lstat(path, { bigint: true }, (error, stat) => error ? reject(error) : resolve(stat)));
+}
+function asyncStat(fd: number): Promise<import('node:fs').BigIntStats> {
+  return new Promise((resolve, reject) => asynchronousFS.fstat(fd, { bigint: true }, (error, stat) => error ? reject(error) : resolve(stat)));
+}
+function asyncRealpath(path: string): Promise<string> {
+  return new Promise((resolve, reject) => asynchronousFS.realpath(path, (error, value) => error ? reject(error) : resolve(value)));
+}
+function asyncNames(path: string): Promise<string[]> {
+  return new Promise((resolve, reject) => asynchronousFS.readdir(path, (error, value) => error ? reject(error) : resolve(value.sort())));
+}
+function asyncLink(path: string): Promise<string> {
+  return new Promise((resolve, reject) => asynchronousFS.readlink(path, (error, value) => error ? reject(error) : resolve(value)));
+}
+function asyncOpen(path: string): Promise<number> {
+  return new Promise((resolve, reject) => asynchronousFS.open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    (error, fd) => error ? reject(error) : resolve(fd)));
+}
+function asyncClose(fd: number): Promise<void> {
+  return new Promise((resolve, reject) => asynchronousFS.close(fd, error => error ? reject(error) : resolve()));
+}
+function asyncRead(fd: number, buffer: Buffer, length: number, position: number): Promise<number> {
+  return new Promise((resolve, reject) => asynchronousFS.read(fd, buffer, 0, length, position,
+    (error, count) => error ? reject(error) : resolve(count)));
+}
+/** Recompare every original byte and physical entry. Nothing here signs,
+ * loads an addon, spawns a verifier or learns a replacement snapshot. */
+async function compareCompleteSnapshot(signed: SignedBundle, snapshot: FrozenSnapshot, deadline: number): Promise<void> {
+  const root = signed.bundle, entries: Record<string, string> = {}, keys = Object.keys(snapshot.physical).sort();
+  if (keys.length > 4097) refuse();
+  const check = async (key: string, topology: boolean): Promise<import('node:fs').BigIntStats> => {
+    budget(deadline); if (snapshot.poisoned) refuse();
+    const expected = snapshot.physical[key]; if (!expected) refuse();
+    const path = key ? join(root, key) : root, stat = await asyncLstat(path);
+    budget(deadline);
+    if (physicalStamp(stat) !== expected.stamp ||
+        (expected.kind === 'directory' ? !stat.isDirectory() : expected.kind === 'file' ? !stat.isFile() : !stat.isSymbolicLink())) refuse();
+    if (expected.kind === 'symlink') {
+      const link = await asyncLink(path), target = await asyncRealpath(path); budget(deadline);
+      if (link !== expected.link || target !== expected.target || !target.startsWith(root + sep) ||
+          !resolve(dirname(path), link).startsWith(root + sep) || await asyncLink(path) !== link) refuse();
+    } else {
+      if (await asyncRealpath(path) !== path) refuse();
+      if (topology && expected.kind === 'directory' && stable(await asyncNames(path)) !== stable(expected.children)) refuse();
+    }
+    budget(deadline); return stat;
+  };
+  for (const key of keys) {
+    const expected = snapshot.physical[key]!, path = key ? join(root, key) : root;
+    const named = await check(key, true);
+    if (!key) continue;
+    if (expected.kind === 'directory') entries[key] = `directory:${named.mode & 0o7777n}`;
+    else if (expected.kind === 'symlink') entries[key] = `symlink:${expected.link}`;
+    else {
+      let fd: number | undefined;
+      try {
+        fd = await asyncOpen(path); budget(deadline);
+        const first = await asyncStat(fd);
+        if (!first.isFile() || first.nlink !== 1n || physicalStamp(first) !== expected.stamp || first.size < 0n || first.size > BigInt(Number.MAX_SAFE_INTEGER)) refuse();
+        const size = Number(first.size);
+        const hash = createHash('sha256'), buffer = Buffer.alloc(65536); let position = 0;
+        while (position < size) {
+          budget(deadline); const count = await asyncRead(fd, buffer, Math.min(buffer.length, size - position), position);
+          budget(deadline); if (count < 1) refuse(); hash.update(buffer.subarray(0, count)); position += count;
+        }
+        if (await asyncRead(fd, buffer, 1, position) !== 0 || physicalStamp(await asyncStat(fd)) !== expected.stamp) refuse();
+        await check(key, false); budget(deadline);
+        entries[key] = `file:${first.mode & 0o7777n}:${hash.digest('hex')}`;
+      } finally { if (fd !== undefined) await asyncClose(fd); }
+    }
+    await check(key, true);
+  }
+  if (stable(entries) !== snapshot.encoded) refuse();
+  // Full final physical/topology sweep after hashing, not a partial prefix or
+  // an early metadata sample accepted after a slow file operation.
+  for (const key of keys) await check(key, true);
+  budget(deadline); if (snapshot.poisoned) refuse();
+}
+export async function compareSignedSnapshot(signed: SignedBundle, deadline: number): Promise<SignedSnapshotComparison> {
+  const snapshot = signedSnapshots.get(signed);
+  if (!snapshot || snapshot.poisoned || (signed === trustedCandidate && poisonedTrust)) refuse();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    budget(deadline);
+    await Promise.race([compareCompleteSnapshot(signed, snapshot, deadline), new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error('native_snapshot_timeout')), Math.max(1, deadline - performance.now()));
+    })]);
+    budget(deadline); if (snapshot.poisoned) refuse();
+    const receipt: SignedSnapshotComparison = Object.freeze({ deadline });
+    const expiry = setTimeout(() => {
+      const actual = comparisons.get(receipt);
+      if (actual && !actual.used) { snapshot.poisoned = true; if (signed === trustedCandidate) poisonedTrust = true; }
+    }, Math.max(1, deadline - performance.now())); expiry.unref();
+    comparisons.set(receipt, { signed, snapshot, used: false, expiry }); return receipt;
+  } catch {
+    snapshot.poisoned = true; if (signed === trustedCandidate) poisonedTrust = true; return refuse();
+  } finally { if (timer) clearTimeout(timer); }
+}
+/** One synchronous consumer, original local object and absolute deadline only.
+ * Custody/purpose/operation binding is supplied by the actual host integration. */
+export function consumeSignedSnapshot(receipt: SignedSnapshotComparison, signed: SignedBundle, deadline: number): void {
+  const actual = comparisons.get(receipt), snapshot = signedSnapshots.get(signed);
+  try {
+    if (!actual || actual.used || actual.signed !== signed || actual.snapshot !== snapshot || !snapshot || snapshot.poisoned ||
+        receipt.deadline !== deadline || (signed === trustedCandidate && poisonedTrust)) refuse();
+    actual.used = true; clearTimeout(actual.expiry); budget(deadline);
+  } catch {
+    if (actual) actual.snapshot.poisoned = true;
+    if (snapshot) snapshot.poisoned = true;
+    if (signed === trustedCandidate) poisonedTrust = true;
+    return refuse();
+  }
+}
+
 let attemptedTrust = false, poisonedTrust = false;
 let trustedCandidate: CandidateTrust | undefined;
 /** Complete physical signed bundle, including the outer seal and directories.
  * No subprocess, expected-byte learning, or symlink traversal on later checks. */
-function completeSnapshot(root: string, deadline = Infinity): string {
+function completeSnapshot(root: string, deadline = Infinity, physical?: Record<string, PhysicalEntry>): string {
   const entries: Record<string, string> = {};
   function walk(directory: string): void {
     budget(deadline);
-    if (realpathSync(directory) !== directory) return refuse();
-    for (const name of readdirSync(directory).sort()) {
+    const original = lstatSync(directory), originalStamp = physicalStamp(lstatSync(directory, { bigint: true })), names = readdirSync(directory).sort();
+    if (realpathSync(directory) !== directory || !original.isDirectory()) return refuse();
+    if (physical) physical[relative(root, directory)] = Object.freeze({ stamp: originalStamp, kind: 'directory', children: Object.freeze(names) });
+    for (const name of names) {
       budget(deadline);
-      const path = join(directory, name), key = relative(root, path), before = lstatSync(path);
+      const path = join(directory, name), key = relative(root, path), before = lstatSync(path), beforeStamp = physicalStamp(lstatSync(path, { bigint: true }));
       if (before.isSymbolicLink()) {
         const link = readlinkSync(path), target = realpathSync(path);
         if (!target.startsWith(root + sep) || !resolve(dirname(path), link).startsWith(root + sep) || readlinkSync(path) !== link) refuse();
         entries[key] = `symlink:${link}`;
+        if (physical) physical[key] = Object.freeze({ stamp: beforeStamp, kind: 'symlink', link, target });
       } else if (before.isDirectory()) { entries[key] = `directory:${before.mode & 0o7777}`; walk(path); }
       else if (before.isFile()) {
         entries[key] = `file:${before.mode & 0o7777}:${physicalFile(path, before, deadline).digest}`;
+        if (physical) physical[key] = Object.freeze({ stamp: beforeStamp, kind: 'file' });
       } else refuse();
       const after = lstatSync(path);
-      if (after.dev !== before.dev || after.ino !== before.ino || after.mode !== before.mode || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs || Object.keys(entries).length > 4096) refuse();
+      if (after.dev !== before.dev || after.ino !== before.ino || after.mode !== before.mode || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs || physicalStamp(lstatSync(path, { bigint: true })) !== beforeStamp || Object.keys(entries).length > 4096) refuse();
     }
+    if (physicalStamp(lstatSync(directory, { bigint: true })) !== originalStamp || stable(readdirSync(directory).sort()) !== stable(names)) refuse();
   }
   walk(root); budget(deadline); return stable(entries);
 }
@@ -172,24 +315,28 @@ export function verifySignedBundle(bundle: string, deadline = Infinity): SignedB
     if (stable(inventory) !== stable(value.files)) refuse();
     return value;
   };
-  const before = completeSnapshot(root, deadline);
+  const physical: Record<string, PhysicalEntry> = {}, afterPhysical: Record<string, PhysicalEntry> = {};
+  const before = completeSnapshot(root, deadline, physical);
   const initial = check(), encoded = stable(initial);
-  const after = completeSnapshot(root, deadline);
-  if (before !== after) refuse();
+  const after = completeSnapshot(root, deadline, afterPhysical);
+  if (before !== after || stable(physical) !== stable(afterPhysical)) refuse();
   // Snapshot validation cannot be bypassed by mutation through a caller-held object.
   function frozen<T>(value: T): T { if (value && typeof value === 'object') { for (const entry of Object.values(value)) frozen(entry); Object.freeze(value); } return value; }
   const manifest = frozen(initial);
-  let poisoned = false;
-  return Object.freeze({ bundle: root, manifest,
+  const snapshot: FrozenSnapshot = { encoded: before, physical: Object.freeze(physical), poisoned: false };
+  const result: SignedBundle = Object.freeze({ bundle: root, manifest,
     snapshotDigest: createHash('sha256').update(before).digest('hex'),
     assertIdentity(limit = Infinity) {
       try {
         budget(limit);
-        if (poisoned || realpathSync(root) !== root || completeSnapshot(root, limit) !== before ||
+        const currentPhysical: Record<string, PhysicalEntry> = {};
+        if (snapshot.poisoned || realpathSync(root) !== root || completeSnapshot(root, limit, currentPhysical) !== before ||
+            stable(currentPhysical) !== stable(snapshot.physical) ||
             stable(boundedJson(join(root, 'Contents/Resources/native-compatibility.json'), limit)) !== encoded) refuse();
         budget(limit);
-      } catch { poisoned = true; return refuse(); }
+      } catch { snapshot.poisoned = true; return refuse(); }
     } });
+  signedSnapshots.set(result, snapshot); return result;
 }
 export function verifyNativeCandidate(bundle: string, deadline = Infinity): CandidateTrust {
   if (poisonedTrust) refuse();
