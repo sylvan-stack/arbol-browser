@@ -24,6 +24,8 @@ export interface InspectionObservation {
   readonly epoch: number;
   readonly sessions: number;
   readonly unknownActivity: boolean;
+  readonly resources: number;
+  readonly animations: number;
 }
 interface ChildSession { targetId: string; parent: string | undefined }
 interface Channel {
@@ -39,6 +41,9 @@ interface Channel {
   unknownActivity: boolean;
   sessions: Map<string, ChildSession>;
   observers: Set<() => void>;
+  resources: Set<string>;
+  animations: Set<string>;
+  surface?: object;
 }
 function emptyAck(value: unknown): void {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length) throw staleSnapshot();
@@ -61,7 +66,7 @@ export class PageReadiness implements DocumentPreparation {
     if (page.retirement()) throw staleSnapshot();
     const contents = page.view.webContents, debugger_ = contents.debugger;
     if (contents.isDestroyed() || debugger_.isAttached()) throw unavailable('browser');
-    const channel: Channel = { page, contents, debugger: debugger_, identity: Object.freeze({}), active: true, interception: 'unknown', epoch: 0, unknownActivity: false, sessions: new Map(), observers: new Set() };
+    const channel: Channel = { page, contents, debugger: debugger_, identity: Object.freeze({}), active: true, interception: 'unknown', epoch: 0, unknownActivity: false, sessions: new Map(), observers: new Set(), resources: new Set(), animations: new Set() };
     this.channels.set(page, channel);
     debugger_.on('message', (_event, method, params, sessionId) => {
       if (!channel.active || this.channels.get(page) !== channel) return;
@@ -78,6 +83,16 @@ export class PageReadiness implements DocumentPreparation {
       }
       // Events are invalidations, never proof that pixels/geometry settled.
       if (sessionId && !channel.sessions.has(sessionId)) channel.unknownActivity = true;
+      const data = params as { requestId?: string; id?: string; animation?: { id?: string } };
+      if (method === 'Network.requestWillBeSent' && data.requestId) channel.resources.add(data.requestId);
+      if (['Network.loadingFinished', 'Network.loadingFailed'].includes(method) && data.requestId) channel.resources.delete(data.requestId);
+      if (/^Network\.(webSocket|webTransport|eventSource)/.test(method)) channel.unknownActivity = true;
+      if (method === 'Animation.animationCreated' && data.id) channel.animations.add(data.id);
+      if (method === 'Animation.animationStarted' && data.animation?.id) channel.animations.add(data.animation.id);
+      if (method === 'Animation.animationCanceled' && data.id) channel.animations.delete(data.id);
+      if (channel.resources.size > 4096 || channel.animations.size > 4096) {
+        channel.resources.clear(); channel.animations.clear(); channel.unknownActivity = true;
+      }
       for (const notify of channel.observers) notify();
     });
     debugger_.on('detach', () => {
@@ -140,6 +155,7 @@ export class PageReadiness implements DocumentPreparation {
         emptyAck(await this.command(receipt.page, guard, method));
       emptyAck(await this.command(receipt.page, guard, 'Target.setAutoAttach',
         { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }));
+      emptyAck(await this.command(receipt.page, guard, 'Page.setLifecycleEventsEnabled', { enabled: true }));
       })();
       channel.inspection = setup;
       // Only this failed attempt is cleared. Current callers still share the
@@ -147,6 +163,9 @@ export class PageReadiness implements DocumentPreparation {
       void setup.catch(() => { if (channel.inspection === setup) delete channel.inspection; });
     }
     await channel.inspection; guard();
+    // Re-populate after navigation too; a prior document's mirror is no proof.
+    // Data remains private; classification uses its own fresh DOMSnapshot.
+    await this.command(receipt.page, guard, 'DOM.getDocument', { depth: -1, pierce: true });
     const result = await this.command(receipt.page, guard, 'Page.getFrameTree') as {
       frameTree?: { frame?: { id?: string }; childFrames?: unknown[] } };
     guard(); const root = result.frameTree?.frame?.id;
@@ -183,12 +202,44 @@ export class PageReadiness implements DocumentPreparation {
   observation(receipt: HostDocument): InspectionObservation {
     this.documents.target(receipt); const channel = this.owned(receipt.page);
     if (channel.identity !== receipt.channel) throw staleSnapshot();
-    return Object.freeze({ epoch: channel.epoch, sessions: channel.sessions.size, unknownActivity: channel.unknownActivity });
+    return Object.freeze({ epoch: channel.epoch, sessions: channel.sessions.size, unknownActivity: channel.unknownActivity,
+      resources: channel.resources.size, animations: channel.animations.size });
   }
   observeInspection(receipt: HostDocument, notify: () => void): () => void {
     this.documents.target(receipt); const channel = this.owned(receipt.page);
     if (channel.identity !== receipt.channel) throw staleSnapshot();
     channel.observers.add(notify); return () => { channel.observers.delete(notify); };
+  }
+  /** A real compositor observation, scoped to the original page. This is an
+   * invalidation epoch only: it is not a layout-coupled screenshot token. */
+  watchSurface(receipt: HostDocument, guard: () => void): {
+    sample(): Readonly<{ epoch: number; width: number; height: number }>;
+    close(): void;
+  } {
+    const channel = this.owned(receipt.page); this.synchronous(guard); this.documents.target(receipt);
+    if (channel.surface || channel.identity !== receipt.channel) throw staleSnapshot();
+    const token = Object.freeze({}); channel.surface = token;
+    let epoch = 0, width = 0, height = 0, valid = true;
+    try {
+      channel.contents.beginFrameSubscription(true, image => {
+        if (channel.surface !== token || !channel.active) return;
+        try {
+          this.documents.target(receipt); this.assertChannel(channel);
+          const size = image.getSize();
+          if (image.isEmpty() || size.width <= 0 || size.height <= 0 || ++epoch >= Number.MAX_SAFE_INTEGER) valid = false;
+          width = size.width; height = size.height;
+        } catch { valid = false; }
+      });
+    } catch (error) { if (channel.surface === token) delete channel.surface; throw error; }
+    return Object.freeze({ sample: () => {
+      this.synchronous(guard); this.documents.target(receipt); this.assertChannel(channel);
+      if (!valid || channel.surface !== token || epoch < 1) throw staleSnapshot();
+      return Object.freeze({ epoch, width, height });
+    }, close: () => {
+      if (channel.surface !== token) return;
+      delete channel.surface; valid = false;
+      if (!channel.contents.isDestroyed()) channel.contents.endFrameSubscription();
+    } });
   }
   private async deadline<T>(deadline: number, assertCurrent: () => void, work: (check: () => void) => Promise<T>): Promise<T> {
     let active = true, timer: ReturnType<typeof setTimeout> | undefined;

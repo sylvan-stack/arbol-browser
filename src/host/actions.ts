@@ -40,6 +40,13 @@ interface Task {
   command: number; terminal: boolean;
   sequences: Set<Sequence>; issued: Set<Promise<void>>; safe: Promise<void>; safeResolve(): void;
   start(): void; reject(error: unknown): void; cleanup(): void;
+  captureHeld?: boolean;
+}
+export interface CaptureReservation {
+  readonly original: DocumentReceipt;
+  assertOriginal(): void;
+  /** Only after original lifecycle, animation and responsiveness verification. */
+  restored(): void;
 }
 interface Slot { active?: Task; waiting: Task[] }
 interface Preparation {
@@ -63,6 +70,8 @@ export class ActionQueue implements HandoffOperations {
   private readonly tasks = new Set<Task>();
   private readonly interrupted = new WeakMap<TabTarget, Task | undefined>();
   private readonly preparations = new Set<Preparation>();
+  private readonly executions = new WeakMap<ActionExecution, Task>();
+  private readonly captures = new Map<TabTarget, Task>();
   private reads = 0;
   private screenshots = 0;
   constructor(readonly authority: TabAuthority,
@@ -80,7 +89,7 @@ export class ActionQueue implements HandoffOperations {
     if (task.mutation) this.authority.requireSnapshot(task.snapshot!, task.stamp);
   }
   private safe(task: Task): void {
-    if (task.retired || (task.workDone && task.issued.size === 0 && task.sequences.size === 0 && (!task.dispatched || !task.mutation || task.settled))) {
+    if (task.retired || (task.workDone && !task.captureHeld && task.issued.size === 0 && task.sequences.size === 0 && (!task.dispatched || !task.mutation || task.settled))) {
       task.safeResolve(); this.tasks.delete(task);
     }
   }
@@ -90,6 +99,7 @@ export class ActionQueue implements HandoffOperations {
     if ([...this.tasks].some(task => task.stamp.attachment === stamp.attachment && task.request === options.request))
       throw refused('control_refused');
     if (options.mutation) {
+      if (this.captures.has(stamp.target)) throw refused('control_refused');
       if (!options.snapshot) throw refused('control_refused'); this.authority.requireSnapshot(options.snapshot, stamp);
     } else if (this.reads >= 4 || (options.screenshot && this.screenshots >= 1)) throw refused('control_refused');
     if (options.signal.aborted || performance.now() >= options.deadline) throw refused('control_refused');
@@ -147,6 +157,7 @@ export class ActionQueue implements HandoffOperations {
         this.safe(task);
       },
     });
+    this.executions.set(execution, task);
     issuedExecutions.set(execution, authority => {
       if (authority !== this.authority || !task.navigation || !task.started || task.terminal || task.retired ||
           task.workDone || task.issued.size !== 1 || task.controller.signal.aborted || performance.now() >= task.deadline)
@@ -192,6 +203,28 @@ export class ActionQueue implements HandoffOperations {
     if (task.mutation) { if (slot!.active) slot!.waiting.push(task); else { slot!.active = task; task.start(); } }
     else task.start();
     return result;
+  }
+  /** Capture uses this queue, not a second lock which input could bypass. The
+   * reservation precedes every engine-state change and includes orphaned issued
+   * work and waiting mutations on the literal original tab. */
+  reserveCapture(execution: ActionExecution): CaptureReservation {
+    const task = this.executions.get(execution), target = execution.stamp.target;
+    if (!task || !this.tasks.has(task) || !task.started || task.workDone || task.mutation || !task.screenshot ||
+        this.captures.has(target) || this.slots.has(target) ||
+        [...this.tasks].some(other => other !== task && other.stamp.target === target &&
+          (other.mutation || other.issued.size > 0 || other.sequences.size > 0)) ||
+        [...this.preparations].some(other => other.target === target)) throw refused('control_refused');
+    this.check(task); const original = task.stamp.document;
+    task.captureHeld = true; this.captures.set(target, task);
+    const assertOriginal = () => {
+      this.authority.assertHealthy();
+      if (task.retired || this.captures.get(target) !== task || target.page !== original.page) throw this.failure(task);
+      this.authority.documents.assertCurrent(target, original);
+    };
+    return Object.freeze({ original, assertOriginal,
+      restored: () => {
+        assertOriginal(); task.captureHeld = false; this.captures.delete(target); this.safe(task);
+      } });
   }
   private cancelTask(task: Task, code: ErrorCode): void {
     const error = this.failure(task, code);
@@ -252,7 +285,7 @@ export class ActionQueue implements HandoffOperations {
     this.invalidate({ target });
   }
   unsafe(target: TabTarget): boolean {
-    return [...this.preparations].some(value => value.target === target && !value.retired) ||
+    return this.captures.has(target) || [...this.preparations].some(value => value.target === target && !value.retired) ||
       [...this.tasks].some(task => task.stamp.target === target && !task.retired &&
       (task.issued.size !== 0 || task.sequences.size !== 0 || (task.dispatched && task.mutation && !task.settled) || (task.started && !task.workDone)));
   }
@@ -266,6 +299,7 @@ export class ActionQueue implements HandoffOperations {
     return task?.action ? { action: task.action, status: task.settled ? 'completed' : task.dispatched ? 'outcome_unknown' : 'not_dispatched' } : undefined;
   }
   retired(target: TabTarget): void {
+    this.captures.delete(target);
     for (const task of [...this.tasks]) if (task.stamp.target === target) { task.retired = true; this.cancelTask(task, 'control_changed'); }
     this.slots.delete(target); this.interrupted.delete(target);
     for (const preparation of [...this.preparations]) if (preparation.target === target) {
