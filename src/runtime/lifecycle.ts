@@ -267,6 +267,7 @@ export function createProcessService(options: { selection: BuildSelection; platf
       const integration = options.integration;
       if (!integration) return preflightPageAdmission();
       const deadline = Math.min(startupDeadline(), options.openCutoff ?? Infinity), contentionDeadline = Math.min(deadline, now() + 10000);
+      if (!Number.isFinite(deadline)) throw unavailable('browser');
       noteOpenCommand(options.observation, 'open-dispatch-admission-trust');
       await within(deadline, () => integration.assertAdmissionAvailable(deadline));
       noteOpenCommand(options.observation, 'open-profile-selection');
