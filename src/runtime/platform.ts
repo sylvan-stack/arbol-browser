@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { isAbsolute } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
 import { unavailable } from '../contracts/errors.js';
+import { assertActualSessionFactory, consumeActualSessionSeal, type ActualSessionFactory, type ActualSessionSeal } from '../profiles/session.js';
 
 export interface FileIdentity { readonly device: string; readonly inode: string; readonly uid: number }
 export interface ProcessIdentity { readonly pid: number; readonly uid: number; readonly startId: string }
@@ -20,6 +21,16 @@ export interface HeldLock {
  * transferable authority. The private native handle stays in this port. */
 export interface CloseBudget { readonly received: number; readonly grace: number; readonly overall: number }
 export interface CloseAdmission extends CloseBudget { readonly kind: 'management' | 'local-window' }
+export interface WebsiteSessionReceipt {
+  pagesRetired(): void;
+  domRequested(): void;
+  cookieAcknowledged(): void;
+  quitIntended(): void;
+}
+export interface SessionUsePermit {
+  accept(seal: ActualSessionSeal): WebsiteSessionReceipt;
+  abort(): never;
+}
 export interface WatchdogCustody {
   readonly descriptors: readonly [number, number];
   readonly startupDescriptor: number;
@@ -29,6 +40,7 @@ export interface WatchdogCustody {
   prepareHost(input: HostFinalizationInput): void;
   consumeClose(requestId: string, socketFd: number): CloseAdmission;
   localClose(): CloseAdmission;
+  beginSessionUse(factory: ActualSessionFactory): SessionUsePermit;
   assertHost(): void;
   beginMarkerMutation(bytes: string): import('../profiles/compatibility.js').EngineMutation;
   assertMarker(): void;
@@ -85,6 +97,13 @@ export interface PlatformPort {
   peerIdentity(socketFd: number): ProcessIdentity;
 }
 interface NativeSupport {
+  beginHostSessionUse(handle: object): object;
+  acceptHostSessionUse(handle: object, facts: string): object;
+  abortHostSessionUse(handle: object): never;
+  recordPagesRetired(handle: object): void;
+  recordDOMRequested(handle: object): void;
+  recordCookieAcknowledged(handle: object): void;
+  recordQuitIntended(handle: object): void;
   captureCloseBudget(): CloseBudget & { handle: object };
   beginCloseStamp(handle: object, runtimeLeaf: string, runtime: string, requestId: string, socketFd: number): void;
   pollCloseStamp(handle: object): number;
@@ -136,7 +155,7 @@ export function loadPlatform(): PlatformPort {
   let native: NativeSupport;
   try {
     native = createRequire(import.meta.url)(fileURLToPath(new URL('../../native/platform.node', import.meta.url)));
-    for (const name of ['captureCloseBudget', 'beginCloseStamp', 'pollCloseStamp', 'cancelCloseStamp', 'beginCloseRetirement', 'pollCloseRetirement', 'consumeCloseRequest', 'armLocalClose', 'beginHostMarkerMutation', 'acceptHostMarkerMutation', 'assertHostMarker', 'abortHostMarkerMutation', 'latchWatchdogFatal', 'prepareHostFinalization', 'spawnWatchdog', 'assertHostFinalization', 'adoptHostBuild', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
+    for (const name of ['beginHostSessionUse', 'acceptHostSessionUse', 'abortHostSessionUse', 'recordPagesRetired', 'recordDOMRequested', 'recordCookieAcknowledged', 'recordQuitIntended', 'captureCloseBudget', 'beginCloseStamp', 'pollCloseStamp', 'cancelCloseStamp', 'beginCloseRetirement', 'pollCloseRetirement', 'consumeCloseRequest', 'armLocalClose', 'beginHostMarkerMutation', 'acceptHostMarkerMutation', 'assertHostMarker', 'abortHostMarkerMutation', 'latchWatchdogFatal', 'prepareHostFinalization', 'spawnWatchdog', 'assertHostFinalization', 'adoptHostBuild', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
       if (typeof native[name] !== 'function') throw new Error('Missing process support');
   } catch { throw unavailable('profile'); }
   const call = <T>(operation: () => T): T => {
@@ -191,6 +210,25 @@ export function loadPlatform(): PlatformPort {
         },
         consumeClose: (requestId: string, socketFd: number) => closeAdmission(call(() => native.consumeCloseRequest(handle, requestId, socketFd))),
         localClose: () => closeAdmission(call(() => native.armLocalClose(handle))),
+        beginSessionUse(factory: ActualSessionFactory): SessionUsePermit {
+          assertActualSessionFactory(factory);
+          const permit = call(() => native.beginHostSessionUse(handle)); let used = false;
+          return Object.freeze({
+            accept(seal: ActualSessionSeal): WebsiteSessionReceipt {
+              if (used) throw unavailable('browser'); used = true;
+              const encoded = JSON.stringify(consumeActualSessionSeal(factory, seal));
+              if (!encoded || Buffer.byteLength(encoded) > 16384) throw unavailable('browser');
+              const sealed = call(() => native.acceptHostSessionUse(permit, encoded));
+              return Object.freeze({
+                pagesRetired: () => call(() => native.recordPagesRetired(sealed)),
+                domRequested: () => call(() => native.recordDOMRequested(sealed)),
+                cookieAcknowledged: () => call(() => native.recordCookieAcknowledged(sealed)),
+                quitIntended: () => call(() => native.recordQuitIntended(sealed)),
+              });
+            },
+            abort(): never { native.abortHostSessionUse(permit); throw unavailable('browser'); },
+          });
+        },
         assertHost: () => call(() => native.assertHostFinalization(handle)),
         assertMarker: () => call(() => native.assertHostMarker(handle)),
         beginMarkerMutation(bytes: string) {

@@ -11,6 +11,7 @@ import { assertTime, type InstanceOwner } from './instance.js';
 import { claimedHostAttempt } from './process.js';
 import type { NativeBoundaryPreparation } from './bootstrap.js';
 import type { NativeWatchdog } from '../native/watchdog.js';
+import { assertActualSessionFactory, type ActualSessionFactory, type ActualSessionSeal } from '../profiles/session.js';
 
 export interface HostCustody {
   readonly host: VerifiedHost;
@@ -24,6 +25,10 @@ export interface HostCustody {
    * the original native holder authenticates and consumes the private carrier. */
   consumeClose(requestId: string, socketFd: number): import('./platform.js').CloseAdmission;
   localClose(): import('./platform.js').CloseAdmission;
+  beginSessionUse(factory: ActualSessionFactory): Readonly<{
+    accept(seal: ActualSessionSeal): import('./platform.js').WebsiteSessionReceipt;
+    abort(): never;
+  }>;
   beginMarkerMutation(marker: Readonly<import('../profiles/compatibility.js').EngineMarker>): Promise<import('../profiles/compatibility.js').EngineMutation>;
   assertMarker(): void;
   terminate(): never;
@@ -90,6 +95,20 @@ export async function prepareHostCustody(host: VerifiedHost, instance: InstanceO
     assertRetained() { assertHostCustody(receipt); },
     consumeClose(requestId: string, socketFd: number) { assertHostCustody(receipt); return native.consumeClose(requestId, socketFd); },
     localClose() { assertHostCustody(receipt); return native.localClose(); },
+    beginSessionUse(factory: ActualSessionFactory) {
+      assertHostCustody(receipt); assertActualSessionFactory(factory);
+      const permit = native.beginSessionUse(factory); let used = false;
+      return Object.freeze({
+        accept(seal: ActualSessionSeal) {
+          if (used) return permit.abort(); used = true;
+          // The same native short claim is still held. Do not call the generic
+          // assertRetained/controls path and recursively acquire that claim.
+          try { return permit.accept(seal); }
+          catch { return permit.abort(); }
+        },
+        abort(): never { return permit.abort(); },
+      });
+    },
     assertMarker() { assertHostCustody(receipt); native.assertMarker(); },
     async beginMarkerMutation(marker: Readonly<import('../profiles/compatibility.js').EngineMarker>) {
       assertHostCustody(receipt); await instance.owner.assert(); await build.assert();

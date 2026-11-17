@@ -544,12 +544,15 @@ struct RetainedPipe {
   // descriptions last until actual main-process death, not Node teardown.
 };
 struct MarkerPermit;
+struct SessionUseNative;
+struct WebsiteSessionNative;
 struct Custody {
   arbol_boundary::Context context; int capsule=-1; bool bound=false,continuousBuild=false,hostRequired=false,spawned=false;
   arbol_exit::HostCapability finalization;
   int reader=-1,writer=-1; bool endpointsPublished=false;
   RetainedPipe retainedReader,retainedWriter;
   MarkerPermit* mutation=nullptr; bool markerAttempted=false;
+  SessionUseNative* sessionUse=nullptr; WebsiteSessionNative* websiteSession=nullptr; bool sessionAttempted=false;
   std::string policyDigest,compatibilityDigest;
 };
 static std::set<Custody*> nativeCustodies;
@@ -971,6 +974,109 @@ static napi_value assertHostMarker(napi_env env,napi_callback_info info) {
     napi_value out; napi_get_undefined(env,&out); return out;
   } @catch(NSException*) { return fail(env); } }
 }
+[[noreturn]] static void terminateCustody(Custody* c);
+struct SessionUseNative {
+  Custody* custody=nullptr; arbol_attempt::Claim claim; std::string raw; NSDictionary* attempt=nil,*marker=nil;
+  bool active=false,accepted=false;
+  bool relinquish() {
+    bool ok=true; active=false; if(claim.fd>=0) { int held=claim.fd; claim.fd=-1; if(close(held)) ok=false; }
+    if(custody&&custody->sessionUse==this) custody->sessionUse=nullptr;
+    return ok;
+  }
+  bool current() {
+    if(!active||!custody||!custody->finalization.ready(custody->context)||custody->mutation) return false;
+    std::string actual; NSDictionary* value=nil;
+    return claim.read(actual,value)&&actual==raw&&[value isEqual:attempt]&&[value[@"phase"] isEqual:@"claimed"]&&
+      [value[@"stage"] isEqual:@"admitted"]&&[value[@"expires"] doubleValue]>arbol_boundary::clockMs()&&
+      [custody->finalization.boundMarker(custody->context) isEqual:marker];
+  }
+};
+struct WebsiteSessionNative { Custody* custody=nullptr; NSDictionary* marker=nil,*facts=nil; };
+static std::set<SessionUseNative*> sessionUses;
+static std::set<WebsiteSessionNative*> websiteSessions;
+static SessionUseNative* sessionUseArgument(napi_env env,napi_value value) {
+  void* raw=nullptr; if(napi_get_value_external(env,value,&raw)!=napi_ok) return nullptr;
+  auto* permit=static_cast<SessionUseNative*>(raw); return sessionUses.count(permit)?permit:nullptr;
+}
+static WebsiteSessionNative* websiteSessionArgument(napi_env env,napi_value value) {
+  void* raw=nullptr; if(napi_get_value_external(env,value,&raw)!=napi_ok) return nullptr;
+  auto* receipt=static_cast<WebsiteSessionNative*>(raw); return websiteSessions.count(receipt)?receipt:nullptr;
+}
+static napi_value beginHostSessionUse(napi_env env,napi_callback_info info) {
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg);
+  if(!c||!c->hostRequired||!c->bound||c->sessionAttempted||c->mutation||getpid()!=c->context.main.pid||
+     !c->finalization.ready(c->context)||c->finalization.shared()->markerBound.load(std::memory_order_acquire)!=1||
+     c->finalization.shared()->admitted.load(std::memory_order_acquire)) return fail(env);
+  c->sessionAttempted=true;
+  @autoreleasepool { @try {
+    auto* permit=new SessionUseNative; permit->custody=c; sessionUses.insert(permit); c->sessionUse=permit;
+    if(!c->finalization.currentAttempt(c->context,permit->claim,permit->raw,permit->attempt,arbol_boundary::clockMs()+250)||
+       ![permit->attempt[@"phase"] isEqual:@"claimed"]||![permit->attempt[@"stage"] isEqual:@"marker-bound"]||
+       [permit->attempt[@"expires"] doubleValue]<=arbol_boundary::clockMs()||
+       !(permit->marker=c->finalization.boundMarker(c->context))) return fail(env);
+    NSMutableDictionary* admitted=[permit->attempt mutableCopy]; admitted[@"stage"]=@"admitted";
+    std::string next=arbol_attempt::bytes(admitted);
+    if(!arbol_attempt::transition(permit->attempt,admitted,arbol_attempt::Role::engine)||
+       !arbol_attempt::replace(permit->claim.at,permit->raw,false,next)) return fail(env);
+    // This is actual resource-admission linearization, before fromPath. Ready
+    // remains separate. The same Claim stays held through real Session sealing.
+    permit->attempt=admitted; permit->raw=next; permit->active=true;
+    if(!permit->current()) return fail(env);
+    napi_value out; if(napi_create_external(env,permit,nullptr,nullptr,&out)!=napi_ok) return fail(env); return out;
+  } @catch(NSException*) { return fail(env); } }
+}
+static napi_value acceptHostSessionUse(napi_env env,napi_callback_info info) {
+  napi_value args[2]; size_t n=2; std::string raw;
+  if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok||n!=2||!boundedText(env,args[1],raw)) return fail(env);
+  auto* permit=sessionUseArgument(env,args[0]); if(!permit||!permit->current()||permit->accepted) return fail(env); auto* c=permit->custody;
+  @autoreleasepool { @try {
+    NSDictionary* facts=arbol_attempt::json(raw); NSString* expected=[permit->attempt[@"profile"] stringByAppendingPathComponent:@"data"];
+    if(c->websiteSession||!arbol_attempt::keys(facts,@[@"format",@"websitePath",@"shellPartition",@"shellStoragePath"])||
+       ![facts[@"format"] isEqual:@1]||![facts[@"websitePath"] isEqual:expected]||
+       !arbol_boundary::canonical(expected.fileSystemRepresentation)||facts[@"shellStoragePath"]!=(id)NSNull.null||
+       !arbol_attempt::pattern(facts[@"shellPartition"],@"^shell-[0-9a-f]{32}$")||!permit->current()) return fail(env);
+    auto* receipt=new WebsiteSessionNative; receipt->custody=c; receipt->marker=permit->marker; receipt->facts=facts;
+    websiteSessions.insert(receipt); c->websiteSession=receipt; permit->accepted=true;
+    c->finalization.shared()->admitted.store(1,std::memory_order_release);
+    if(!permit->relinquish()) return fail(env);
+    napi_value out; if(napi_create_external(env,receipt,nullptr,nullptr,&out)!=napi_ok) return fail(env); return out;
+  } @catch(NSException*) { return fail(env); } }
+}
+static napi_value abortHostSessionUse(napi_env env,napi_callback_info info) {
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* permit=sessionUseArgument(env,arg);
+  if(!permit||!permit->custody) return fail(env); auto* c=permit->custody;
+  if(c->finalization.present()) c->finalization.shared()->poison(arbol_exit::admissionLoss|arbol_exit::forced);
+  permit->relinquish(); terminateCustody(c);
+}
+static napi_value recordSessionShutdown(napi_env env,napi_callback_info info,unsigned step) {
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* receipt=websiteSessionArgument(env,arg);
+  if(!receipt||!receipt->custody||step<1||step>4) return fail(env); auto* c=receipt->custody;
+  if(c->websiteSession!=receipt||!c->hostRequired||!c->bound||getpid()!=c->context.main.pid||c->sessionUse||!c->finalization.ready(c->context)) return fail(env);
+  @autoreleasepool { @try {
+    auto* state=c->finalization.shared(); uint64_t grace=state->closeGraceUs.load(std::memory_order_acquire),now=continuousUs();
+    if(!grace||!now||now>=grace||state->admitted.load(std::memory_order_acquire)!=1||
+       ![c->finalization.boundMarker(c->context) isEqual:receipt->marker]) return fail(env);
+    arbol_attempt::Claim claim; std::string raw; NSDictionary* attempt=nil;
+    if(!c->finalization.currentAttempt(c->context,claim,raw,attempt,std::min((double)grace/1000,arbol_boundary::clockMs()+100))||
+       ![attempt[@"phase"] isEqual:@"closing"]||![attempt[@"stage"] isEqual:@"admitted"]||
+       ![c->finalization.boundMarker(c->context) isEqual:receipt->marker]) return fail(env);
+    now=continuousUs(); if(!now||now>=grace||state->fatal.load(std::memory_order_acquire)) return fail(env);
+    std::atomic<uint32_t>* flags[4]={&state->retiredPages,&state->domRequested,&state->cookieAcknowledged,&state->quitRequested};
+    uint32_t old=state->shutdownOrder.load(std::memory_order_acquire);
+    if(old>=step) {
+      if(flags[step-1]->load(std::memory_order_acquire)!=1||!state->shutdownTimes[step-1].load(std::memory_order_acquire)) return fail(env);
+    } else {
+      if(old+1!=step) return fail(env);
+      state->shutdownTimes[step-1].store(now,std::memory_order_release); flags[step-1]->store(1,std::memory_order_release);
+      state->shutdownOrder.store(step,std::memory_order_release);
+    }
+    napi_value out; napi_get_undefined(env,&out); return out;
+  } @catch(NSException*) { return fail(env); } }
+}
+static napi_value recordPagesRetired(napi_env env,napi_callback_info info) { return recordSessionShutdown(env,info,1); }
+static napi_value recordDOMRequested(napi_env env,napi_callback_info info) { return recordSessionShutdown(env,info,2); }
+static napi_value recordCookieAcknowledged(napi_env env,napi_callback_info info) { return recordSessionShutdown(env,info,3); }
+static napi_value recordQuitIntended(napi_env env,napi_callback_info info) { return recordSessionShutdown(env,info,4); }
 static napi_value abortHostMarkerMutation(napi_env env,napi_callback_info info);
 [[noreturn]] static void terminateCustody(Custody* c);
 static napi_value watchdogAssert(napi_env env,napi_callback_info info) {
@@ -984,7 +1090,7 @@ static napi_value watchdogAssert(napi_env env,napi_callback_info info) {
   if(c->hostRequired) {
     auto* state=c->finalization.shared(); uint64_t reasons=state->fatal.load(std::memory_order_acquire),cutoff=state->fatalCutoffUs.load(std::memory_order_acquire);
     if((reasons&~arbol_exit::admissionLoss)||(reasons&&(!cutoff||arbol_boundary::clockMs()*1000>=cutoff))||
-       !c->finalization.held(c->context)||!(c->mutation?c->mutation->current():c->finalization.controls(c->context,arbol_boundary::clockMs()+100))) return fail(env);
+       !c->finalization.held(c->context)||!(c->mutation?c->mutation->current():c->sessionUse?c->sessionUse->current():c->finalization.controls(c->context,arbol_boundary::clockMs()+100))) return fail(env);
   }
   napi_value out; napi_get_undefined(env,&out); return out;
 }
@@ -1007,6 +1113,7 @@ static napi_value latchWatchdogFatal(napi_env env,napi_callback_info info) {
   // Irreversible attribution precedes discovery, retirement or any signal.
   if(c->finalization.present()) c->finalization.shared()->poison(arbol_exit::protocolLoss|arbol_exit::forced);
   if(c->mutation) { c->mutation->relinquish(); c->mutation=nullptr; }
+  if(c->sessionUse) c->sessionUse->relinquish();
   for(;;) {
     (void)c->context.discoverCustody();
     c->context.enforce(true);
@@ -1036,6 +1143,13 @@ static napi_value abortHostMarkerMutation(napi_env env,napi_callback_info info) 
 }
 static napi_value init(napi_env env, napi_value exports) {
   napi_property_descriptor properties[] = {
+    {"beginHostSessionUse",nullptr,beginHostSessionUse,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"acceptHostSessionUse",nullptr,acceptHostSessionUse,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"abortHostSessionUse",nullptr,abortHostSessionUse,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"recordPagesRetired",nullptr,recordPagesRetired,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"recordDOMRequested",nullptr,recordDOMRequested,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"recordCookieAcknowledged",nullptr,recordCookieAcknowledged,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"recordQuitIntended",nullptr,recordQuitIntended,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"captureCloseBudget",nullptr,captureCloseBudget,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"beginCloseStamp",nullptr,beginCloseStamp,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"pollCloseStamp",nullptr,pollCloseStamp,nullptr,nullptr,nullptr,napi_default,nullptr},
