@@ -37,6 +37,24 @@ bool stable(const arbol_attempt::Claim& claim, const Baseline& baseline,
     arbol_attempt::sameFile(request,baseline.request) && arbol_attempt::unchanged(claim.at);
 }
 
+bool readRequest(const arbol_attempt::Claim& claim, const Baseline& baseline,
+    const std::string& name, double deadline, std::string& bytes) {
+  bytes.clear();
+  if (baseline.request.st_size <= 0 || baseline.request.st_size > (off_t)arbol_attempt::limit ||
+      !stable(claim,baseline,name)) return false;
+  char buffer[4096];
+  while (bytes.size() <= (size_t)baseline.request.st_size) {
+    if (arbol_boundary::clockMs() >= deadline) return false;
+    ssize_t n = pread(baseline.requestFd,buffer,
+      std::min(sizeof(buffer),(size_t)baseline.request.st_size+1-bytes.size()),(off_t)bytes.size());
+    if (n > 0) bytes.append(buffer,(size_t)n);
+    else if (!n) break;
+    else if (errno != EINTR) return false;
+  }
+  return bytes.size() == (size_t)baseline.request.st_size && stable(claim,baseline,name) &&
+    arbol_boundary::clockMs() < deadline;
+}
+
 bool lineage(const arbol_boundary::Identity& id, const arbol_boundary::Info& info,
     int session, NSDictionary* original) {
   return id.pid == [original[@"pid"] intValue] && id.uid == [original[@"uid"] unsignedIntValue] &&
@@ -88,13 +106,13 @@ Observation inspect(arbol_attempt::Claim& claim, NSString* application, const st
   if (!claim.acquire(requestPath,std::min(deadline,arbol_boundary::clockMs()+2000)) ||
       !claim.read(raw,current) || !stable(claim,baseline,name)) return Observation::refused;
   phase = 1;
-  std::string liveRequest; bool absent;
+  std::string liveRequest;
   if (!arbol_attempt::immutable(pending,current) ||
       current[@"terminal"] != NSNull.null || [current[@"expires"] doubleValue] <= arbol_boundary::clockMs() ||
       !arbol_attempt::currentProcess(pending[@"starter"]) ||
       !arbol_attempt::launchRequest(claim,requestPath,current) ||
-      !arbol_attempt::readAt(claim.at.directory,name,liveRequest,absent) ||
-      absent || liveRequest != requestRaw || !stable(claim,baseline,name) ||
+      !readRequest(claim,baseline,name,deadline,liveRequest) ||
+      liveRequest != requestRaw || !stable(claim,baseline,name) ||
       arbol_boundary::clockMs() >= deadline) return Observation::refused;
   phase = 2;
   if ([current[@"phase"] isEqual:@"pending"]) return Observation::waiting;
@@ -112,8 +130,8 @@ Observation inspect(arbol_attempt::Claim& claim, NSString* application, const st
   std::string after, afterRequest; NSDictionary* reread = nil;
   if (!claim.read(after,reread) || after != raw ||
       !arbol_attempt::launchRequest(claim,requestPath,reread) ||
-      !arbol_attempt::readAt(claim.at.directory,name,afterRequest,absent) ||
-      absent || afterRequest != requestRaw || !stable(claim,baseline,name) ||
+      !readRequest(claim,baseline,name,deadline,afterRequest) ||
+      afterRequest != requestRaw || !stable(claim,baseline,name) ||
       !arbol_attempt::currentProcess(pending[@"starter"]) || arbol_boundary::clockMs() >= deadline)
     return Observation::refused;
   NSDictionary* fresh = nil;
@@ -153,15 +171,15 @@ int main(int argc, const char* argv[]) {
          !arbol_attempt::currentProcess(attempt[@"starter"]) ||
          ![application isEqual:[attempt[@"buildRoot"] stringByAppendingPathComponent:@"ArbolBrowser.app"]] ||
          !arbol_boundary::canonical(application.fileSystemRepresentation)) return 4;
-      bool absent; std::string checkedRequest;
+      std::string checkedRequest;
       const std::string name = request.lastPathComponent.UTF8String;
       baseline.requestFd = openat(claim.at.directory,name.c_str(),O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
       baseline.directory = claim.at.identity; baseline.lock = claim.at.lockIdentity;
       if (baseline.requestFd < 0 || fstat(baseline.requestFd,&baseline.request) ||
           !arbol_attempt::privateFile(baseline.request) ||
-          !arbol_attempt::readAt(claim.at.directory,name,requestRaw,absent) || absent ||
+          !readRequest(claim,baseline,name,deadline,requestRaw) ||
           !arbol_attempt::launchRequest(claim,argv[2],attempt) ||
-          !arbol_attempt::readAt(claim.at.directory,name,checkedRequest,absent) || absent ||
+          !readRequest(claim,baseline,name,deadline,checkedRequest) ||
           checkedRequest != requestRaw || !stable(claim,baseline,name)) return 4;
       pending = [attempt copy];
       deadline=std::min(deadline,[attempt[@"expires"] doubleValue]);
@@ -180,14 +198,20 @@ int main(int argc, const char* argv[]) {
     try { @try {
       [[NSWorkspace sharedWorkspace] openApplicationAtURL:[NSURL fileURLWithPath:application]
       configuration:configuration completionHandler:^(NSRunningApplication* app, NSError* error) {
-        std::lock_guard<std::mutex> held(reply->mutex);
-        if (reply->callback || reply->outcome != Outcome::pending) return;
-        reply->callback = true; reply->error = error != nil; reply->app = app != nil;
+        { std::lock_guard<std::mutex> held(reply->mutex);
+          if (reply->callback || reply->outcome != Outcome::pending) return;
+          reply->callback = true; reply->error = error != nil; reply->app = app != nil;
+        }
+        if (error) return;
         // Optional metadata can veto a contrary positive PID, never authorize
-        // this launch. Preserve the first observation under reply serialization.
+        // this launch. Its getter cannot hold main past the original cutoff.
+        int callbackPid = 0;
         try { @try {
-          if (app) reply->callbackPid = app.processIdentifier;
-        } @catch (NSException*) { reply->callbackPid = 0; } } catch (...) { reply->callbackPid = 0; }
+          if (app) callbackPid = app.processIdentifier;
+        } @catch (NSException*) {} } catch (...) {}
+        { std::lock_guard<std::mutex> held(reply->mutex);
+          if (reply->outcome == Outcome::pending) reply->callbackPid = callbackPid;
+        }
       }];
     } @catch (NSException*) { std::lock_guard<std::mutex> held(reply->mutex); reply->error = true; }
     } catch (...) { std::lock_guard<std::mutex> held(reply->mutex); reply->error = true; }
