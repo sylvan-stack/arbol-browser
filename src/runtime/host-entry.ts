@@ -11,7 +11,7 @@ import { consumeSelection, type BuildSelection } from './selection.js';
 import { validator } from '../contracts/schema.js';
 import { unavailable } from '../contracts/errors.js';
 import { adoptHostBuildLease, captureHostBuild, terminateCapturedHostBuild, type CapturedHostBuild, type BuildLease } from './build-lease.js';
-import { assertTrustedHost, assertHostEngineAuthority, type VerifiedHost } from './authorities.js';
+import { assertVerifiedHostMetadata, assertHostEngineAuthority, type VerifiedHost } from './authorities.js';
 import { claimedHostAttempt } from './process.js';
 import { noteHostStartup, prepareHostCustody, abortUnadmittedHost, type HostCustody } from './custody.js';
 import type { NativeBoundaryPreparation } from './bootstrap.js';
@@ -65,7 +65,7 @@ export async function prepareOwnedHost(actualApp: ProfileApp, request: HostReque
   const bootstrap = await import(bootstrapURL) as typeof import('./bootstrap.js');
   bootstrap.assertNativeBoundaryPreparation(native);
   const platform = native.platform;
-  await assertTrustedHost(host, deadline);
+  assertVerifiedHostMetadata(host, deadline);
   if (native.trust.bundle !== host.signed.bundle || native.trust.snapshotDigest !== host.signed.snapshotDigest ||
       request.selection.build !== host.identity.layout.build || request.selection.directory !== host.identity.layout.buildRoot)
     throw unavailable('browser');
@@ -80,7 +80,6 @@ export async function prepareOwnedHost(actualApp: ProfileApp, request: HostReque
   };
   let instance: InstanceOwner | null = null, custody: HostCustody | undefined;
   try {
-    await assertAdmission();
     instance = await acquireInstance(request.profile, platform, request.selection.build, previousExit, deadline,
       { assertAdmission, failed: owner => abortUnadmittedHost(owner, buildGuard, platform) });
     // The losing original still owns the genuine inherited Build, and must
@@ -119,7 +118,7 @@ export async function prepareHost(actualApp: ProfileApp, owned: OwnedHost, autho
   if (actualApp.isReady()) return custody.terminate();
   try {
     noteHostStartup(custody, 'owned-lease-policy');
-    await instance.owner.assert(); await buildGuard.assert(); custody.assertRetained();
+    await instance.owner.assert(); custody.assertRetained();
     if (authority.build !== instance.record.build) return custody.terminate();
     const engine = await prepareEngine(instance.owner, authority, stage => noteHostStartup(custody, stage));
     custody.assertRetained(); custody.assertMarker();
