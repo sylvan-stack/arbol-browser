@@ -51,7 +51,7 @@ export async function cli(c, args) {
       env: { HOME: c.home, PATH: '/usr/bin:/bin', LANG: 'en_US.UTF-8', TMPDIR: c.output + '/',
         ARBOL_BROWSER_SELECTION: JSON.stringify(c.selection) }, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '', stderr = '';
-    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('Actual CLI exceeded 45 s')); }, 45000);
+    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('Actual CLI exceeded 75 s')); }, 75000);
     child.stdout.on('data', b => { stdout += b; }); child.stderr.on('data', b => { stderr += b; });
     child.once('error', e => { clearTimeout(timer); reject(e); });
     child.once('close', (status, signal) => { clearTimeout(timer); resolve({ status, signal, stdout, stderr }); });

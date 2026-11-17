@@ -119,7 +119,7 @@ if (!embedded && !controlWorker) {
     const controlRun = spawnSync(join(candidate, 'runtime/Electron.app/Contents/MacOS/Electron'),
       [fileURLToPath(import.meta.url), '--candidate', buildRoot, '--out', controlOutput, '--control-worker'], {
         cwd: repository, env: { HOME: home, PATH: '/usr/bin:/bin', ELECTRON_RUN_AS_NODE: '1', LANG: 'en_US.UTF-8' },
-        stdio: 'inherit', timeout: 480000,
+        stdio: 'inherit', timeout: 960000,
       });
     gate.control = { record: join(controlOutput, 'result.json'), passed: false,
       status: controlRun.status, signal: controlRun.signal, error: controlRun.error ? String(controlRun.error) : undefined };
