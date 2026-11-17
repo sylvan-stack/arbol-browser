@@ -20,6 +20,10 @@ export interface HostCustody {
    * already-prepared native descriptions and one-use private capability. */
   arm(prepared: NativeBoundaryPreparation, deadline: number): Promise<NativeWatchdog>;
   assertRetained(): void;
+  /** Only actual protected management dispatch supplies this socket/request;
+   * the original native holder authenticates and consumes the private carrier. */
+  consumeClose(requestId: string, socketFd: number): import('./platform.js').CloseAdmission;
+  localClose(): import('./platform.js').CloseAdmission;
   beginMarkerMutation(marker: Readonly<import('../profiles/compatibility.js').EngineMarker>): Promise<import('../profiles/compatibility.js').EngineMutation>;
   assertMarker(): void;
   terminate(): never;
@@ -84,6 +88,8 @@ export async function prepareHostCustody(host: VerifiedHost, instance: InstanceO
       } catch { return native.terminate(); }
     },
     assertRetained() { assertHostCustody(receipt); },
+    consumeClose(requestId: string, socketFd: number) { assertHostCustody(receipt); return native.consumeClose(requestId, socketFd); },
+    localClose() { assertHostCustody(receipt); return native.localClose(); },
     assertMarker() { assertHostCustody(receipt); native.assertMarker(); },
     async beginMarkerMutation(marker: Readonly<import('../profiles/compatibility.js').EngineMarker>) {
       assertHostCustody(receipt); await instance.owner.assert(); await build.assert();

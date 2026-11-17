@@ -1,6 +1,7 @@
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { isAbsolute } from 'node:path';
+import { setTimeout } from 'node:timers/promises';
 import { unavailable } from '../contracts/errors.js';
 
 export interface FileIdentity { readonly device: string; readonly inode: string; readonly uid: number }
@@ -15,6 +16,10 @@ export interface HeldLock {
   /** Caller retains this object through flush and complete helper shutdown. Never unlinks. */
   release(): void;
 }
+/** Genuine one-command native receipt; numeric fields are observations, never
+ * transferable authority. The private native handle stays in this port. */
+export interface CloseBudget { readonly received: number; readonly grace: number; readonly overall: number }
+export interface CloseAdmission extends CloseBudget { readonly kind: 'management' | 'local-window' }
 export interface WatchdogCustody {
   readonly descriptors: readonly [number, number];
   readonly startupDescriptor: number;
@@ -22,6 +27,8 @@ export interface WatchdogCustody {
    * These numbers are genuine pipe endpoints, never a shared-state writer. */
   spawn(): Readonly<{ pid: number; reader: number; writer: number }>;
   prepareHost(input: HostFinalizationInput): void;
+  consumeClose(requestId: string, socketFd: number): CloseAdmission;
+  localClose(): CloseAdmission;
   assertHost(): void;
   beginMarkerMutation(bytes: string): import('../profiles/compatibility.js').EngineMutation;
   assertMarker(): void;
@@ -51,6 +58,9 @@ export interface PlatformPort {
   adoptHostBuild(requestPath: string, guard: string, bundle: string): HeldLock;
   /** Kernel continuous time shared by native outer, host and both monitors. */
   continuousTime(): number;
+  captureCloseBudget(): CloseBudget;
+  stampCloseRequest(budget: CloseBudget, runtimeLeaf: string, runtime: import('./instance.js').RuntimeRecord, requestId: string, socketFd: number): Promise<void>;
+  retireCloseBudget(budget: CloseBudget): Promise<void>;
   processProvenance(pid: number): ProcessProvenance | null;
   /** Private fixed claim.json transaction, only under the genuine claim.lock.
    * No caller-supplied destination or engine/profile payload read is exposed. */
@@ -75,6 +85,14 @@ export interface PlatformPort {
   peerIdentity(socketFd: number): ProcessIdentity;
 }
 interface NativeSupport {
+  captureCloseBudget(): CloseBudget & { handle: object };
+  beginCloseStamp(handle: object, runtimeLeaf: string, runtime: string, requestId: string, socketFd: number): void;
+  pollCloseStamp(handle: object): number;
+  cancelCloseStamp(handle: object): void;
+  beginCloseRetirement(handle: object): void;
+  pollCloseRetirement(handle: object): number;
+  consumeCloseRequest(handle: object, requestId: string, socketFd: number): CloseAdmission;
+  armLocalClose(handle: object): CloseAdmission;
   beginHostMarkerMutation(handle: object, bytes: string): object;
   acceptHostMarkerMutation(handle: object): void;
   assertHostMarker(handle: object): void;
@@ -118,13 +136,26 @@ export function loadPlatform(): PlatformPort {
   let native: NativeSupport;
   try {
     native = createRequire(import.meta.url)(fileURLToPath(new URL('../../native/platform.node', import.meta.url)));
-    for (const name of ['beginHostMarkerMutation', 'acceptHostMarkerMutation', 'assertHostMarker', 'abortHostMarkerMutation', 'latchWatchdogFatal', 'prepareHostFinalization', 'spawnWatchdog', 'assertHostFinalization', 'adoptHostBuild', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
+    for (const name of ['captureCloseBudget', 'beginCloseStamp', 'pollCloseStamp', 'cancelCloseStamp', 'beginCloseRetirement', 'pollCloseRetirement', 'consumeCloseRequest', 'armLocalClose', 'beginHostMarkerMutation', 'acceptHostMarkerMutation', 'assertHostMarker', 'abortHostMarkerMutation', 'latchWatchdogFatal', 'prepareHostFinalization', 'spawnWatchdog', 'assertHostFinalization', 'adoptHostBuild', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
       if (typeof native[name] !== 'function') throw new Error('Missing process support');
   } catch { throw unavailable('profile'); }
   const call = <T>(operation: () => T): T => {
     try { return operation(); } catch { throw unavailable('profile'); }
   };
   const locks = new WeakMap<HeldLock, object>();
+  const budgets = new WeakMap<CloseBudget, object>();
+  const consumedBudgets = new WeakMap<CloseBudget, object>();
+  const clockBudget = (value: CloseBudget): CloseBudget => {
+    if (!value || ![value.received, value.grace, value.overall].every(n => Number.isFinite(n) && n > 0) ||
+        Math.abs(value.grace - value.received - 5000) > 0.001 || Math.abs(value.overall - value.received - 8000) > 0.001)
+      throw unavailable('browser');
+    return Object.freeze({ received: value.received, grace: value.grace, overall: value.overall });
+  };
+  const closeAdmission = (value: CloseAdmission): CloseAdmission => {
+    const budget = clockBudget(value);
+    if (value.kind !== 'management' && value.kind !== 'local-window') throw unavailable('browser');
+    return Object.freeze({ ...budget, kind: value.kind });
+  };
   const wrapLock = (handle: object, retained = false): HeldLock => {
     let released = false;
     const lease: HeldLock = Object.freeze({
@@ -158,6 +189,8 @@ export function loadPlatform(): PlatformPort {
           if (!encoded || Buffer.byteLength(encoded) > 16384) throw unavailable('browser');
           call(() => native.prepareHostFinalization(handle, encoded, input.signedPolicy.policyDigest, input.signedPolicy.compatibilityDigest));
         },
+        consumeClose: (requestId: string, socketFd: number) => closeAdmission(call(() => native.consumeCloseRequest(handle, requestId, socketFd))),
+        localClose: () => closeAdmission(call(() => native.armLocalClose(handle))),
         assertHost: () => call(() => native.assertHostFinalization(handle)),
         assertMarker: () => call(() => native.assertHostMarker(handle)),
         beginMarkerMutation(bytes: string) {
@@ -191,6 +224,42 @@ export function loadPlatform(): PlatformPort {
       const value = call(() => native.continuousTime());
       if (!Number.isFinite(value) || value < 0 || value > Number.MAX_SAFE_INTEGER) throw unavailable('profile');
       return value;
+    },
+    captureCloseBudget(): CloseBudget {
+      const value = call(() => native.captureCloseBudget()), receipt = clockBudget(value);
+      if (!value.handle || typeof value.handle !== 'object') throw unavailable('browser');
+      budgets.set(receipt, value.handle); return receipt;
+    },
+    async stampCloseRequest(budget: CloseBudget, runtimeLeaf: string, runtime: import('./instance.js').RuntimeRecord, requestId: string, socketFd: number): Promise<void> {
+      const handle = budgets.get(budget); if (!handle) throw unavailable('browser'); budgets.delete(budget); consumedBudgets.set(budget, handle);
+      if (!isAbsolute(runtimeLeaf) || runtimeLeaf.includes('\0') || !/^req_[A-Za-z0-9_-]{22}$/.test(requestId) ||
+          !Number.isInteger(socketFd) || socketFd < 0) throw unavailable('browser');
+      const encoded = JSON.stringify(runtime);
+      if (!encoded || Buffer.byteLength(encoded) > 16384) throw unavailable('browser');
+      let complete = false;
+      try {
+        call(() => native.beginCloseStamp(handle, runtimeLeaf, encoded, requestId, socketFd));
+        for (;;) {
+          const current = call(() => native.continuousTime());
+          if (current >= budget.grace) throw unavailable('browser');
+          const state = call(() => native.pollCloseStamp(handle));
+          if (state === 1) { complete = true; return; }
+          if (state !== 0) throw unavailable('browser');
+          await setTimeout(Math.min(10, Math.max(1, budget.grace - current)));
+        }
+      } finally { if (!complete) call(() => native.cancelCloseStamp(handle)); }
+    },
+    async retireCloseBudget(budget: CloseBudget): Promise<void> {
+      const handle = consumedBudgets.get(budget) ?? budgets.get(budget);
+      if (!handle) throw unavailable('browser');
+      budgets.delete(budget); consumedBudgets.delete(budget);
+      call(() => native.beginCloseRetirement(handle));
+      for (;;) {
+        const current = call(() => native.continuousTime()), state = call(() => native.pollCloseRetirement(handle));
+        if (state === 1) return;
+        if (state !== 0 || current >= budget.overall) throw unavailable('browser');
+        await setTimeout(Math.min(10, Math.max(1, budget.overall - current)));
+      }
     },
     processProvenance(pid: number): ProcessProvenance | null {
       const value = call(() => native.processProvenance(pid));

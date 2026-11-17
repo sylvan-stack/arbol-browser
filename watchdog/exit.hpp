@@ -230,6 +230,15 @@ struct SharedState {
     // the genuine acknowledged cut which won before this fatal publication.
     fatal.fetch_or(reason,std::memory_order_acq_rel);
   }
+  static void minimum(std::atomic<uint64_t>& field,uint64_t value) {
+    uint64_t old=field.load(std::memory_order_acquire);
+    while((!old||value<old)&&!field.compare_exchange_weak(old,value,std::memory_order_acq_rel)) {}
+  }
+  void installClose(uint64_t received,uint64_t grace,uint64_t overall) {
+    // All offsets are fixed. Independent MIN publications can only shorten an
+    // already admitted budget. Grace is published last for first admission.
+    minimum(closeReceivedUs,received); minimum(closeOverallUs,overall); minimum(closeGraceUs,grace);
+  }
   void declareFatal() {
     uint64_t cutoff=(uint64_t)((arbol_boundary::clockMs()+1000)*1000),old=fatalCutoffUs.load(std::memory_order_acquire);
     while((!old||cutoff<old)&&!fatalCutoffUs.compare_exchange_weak(old,cutoff,std::memory_order_acq_rel)) {}

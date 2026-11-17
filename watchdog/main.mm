@@ -116,7 +116,11 @@ struct Deadline {
   bool initialSent=false,kSent=false,kCommitted=false,pendingFamily=false;
   auto proofBound=[&] {
     double bound=cap&&!cap->hasOrdinaryQuiescence()?std::min(expires,mainLimit):expires;
-    if(cap) { uint64_t fatal=cap->shared()->fatalCutoffUs.load(std::memory_order_acquire); if(fatal) bound=std::min(bound,(double)fatal/1000); }
+    if(cap) {
+      uint64_t fatal=cap->shared()->fatalCutoffUs.load(std::memory_order_acquire),grace=cap->shared()->closeGraceUs.load(std::memory_order_acquire);
+      if(fatal) bound=std::min(bound,(double)fatal/1000);
+      if(grace&&!cap->hasOrdinaryQuiescence()) bound=std::min(bound,(double)grace/1000);
+    }
     return bound;
   };
   auto currentQuiescence=[&] {
@@ -344,6 +348,12 @@ struct Deadline {
       }
     }
     observedExit();
+    if(cap) {
+      uint64_t grace=cap->shared()->closeGraceUs.load(std::memory_order_acquire);
+      if(grace&&clockMs()*1000>=grace&&!cap->hasOrdinaryQuiescence()) {
+        poison(cap,arbol_exit::forced); deadline.lost(clockMs());
+      }
+    }
     if(!terminal) {
       if(primary&&!pending.empty()&&now-pending.front().sent>=1000) deadline.lost(now);
       (void)deadline.expired(now);

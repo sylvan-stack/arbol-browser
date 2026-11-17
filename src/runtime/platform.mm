@@ -232,6 +232,178 @@ static bool boundedText(napi_env env, napi_value value, std::string& out) {
   if (napi_get_value_string_utf8(env,value,out.data(),out.size(),&written) != napi_ok || written != length) return false;
   out.resize(length); return out.find('\0') == std::string::npos;
 }
+// Command receipt has no caller-selected clock/issuer. A single detached
+// native I/O job can block without keeping the CLI event loop alive past its
+// original cutoff; actual module/input/socket lifetime remains native-owned.
+struct CloseBudgetNative {
+  NSDictionary* issuer=nil; NSString* boot=nil; uint64_t received=0,grace=0,overall=0;
+  bool used=false; std::atomic<bool> cancelled{false}; std::atomic<int> state{0};
+  std::thread* worker=nullptr; std::thread* retirement=nullptr; std::atomic<int> retired{0};
+  bool created=false,attributable=false; std::string leaf,filename; NSDictionary* attempt=nil;
+  struct stat createdFile{},directory{},lock{};
+};
+// The worker captures its actual still-open created description immediately
+// before close, including a partial failed write. Never infer a replaced inode.
+struct CloseCreatedCapture {
+  CloseBudgetNative* budget; arbol_exit::NativeFile* file;
+  ~CloseCreatedCapture() {
+    if(file->fd<0) return;
+    struct stat actual{};
+    if(fstat(file->fd,&actual)||!arbol_attempt::privateFile(actual)||actual.st_dev!=budget->createdFile.st_dev||actual.st_ino!=budget->createdFile.st_ino)
+      budget->attributable=false;
+    else { budget->createdFile=actual; budget->attributable=true; }
+  }
+};
+static std::set<CloseBudgetNative*> closeBudgets;
+static bool closeBudgetCaptured=false;
+static CloseBudgetNative* closeBudgetArgument(napi_env env,napi_value value) {
+  void* raw=nullptr; if(napi_get_value_external(env,value,&raw)!=napi_ok) return nullptr;
+  auto* budget=static_cast<CloseBudgetNative*>(raw); return closeBudgets.count(budget)?budget:nullptr;
+}
+static uint64_t continuousUs() {
+  double value=arbol_boundary::clockMs()*1000;
+  return std::isfinite(value)&&value>0&&value<9007199246740991.0?(uint64_t)value:0;
+}
+static NSDictionary* kernelPeer(int fd) {
+  int type=0; uid_t uid; gid_t gid; pid_t pid; audit_token_t token{};
+  socklen_t n=sizeof(type); sockaddr_un address{}; socklen_t length=sizeof(address);
+  if(fd<0||getsockopt(fd,SOL_SOCKET,SO_TYPE,&type,&n)||n!=sizeof(type)||type!=SOCK_STREAM||
+     getpeername(fd,(sockaddr*)&address,&length)||address.sun_family!=AF_UNIX||getpeereid(fd,&uid,&gid)||uid!=geteuid()) return nil;
+  n=sizeof(pid); if(getsockopt(fd,SOL_LOCAL,LOCAL_PEERPID,&pid,&n)||n!=sizeof(pid)||pid<=1) return nil;
+  n=sizeof(token);
+  if(getsockopt(fd,SOL_LOCAL,LOCAL_PEERTOKEN,&token,&n)||n!=sizeof(token)||audit_token_to_pid(token)!=pid||audit_token_to_euid(token)!=uid) return nil;
+  NSDictionary* actual=arbol_attempt::processRecord(pid);
+  return actual&&[actual[@"uid"] unsignedIntValue]==uid&&[actual[@"pidVersion"] intValue]==audit_token_to_pidversion(token)&&
+    arbol_attempt::currentProcess(actual)?actual:nil;
+}
+static bool managementSocketPath(int fd,bool remote,NSString* expected) {
+  if(!arbol_attempt::path(expected)) return false;
+  sockaddr_un address{}; socklen_t length=sizeof(address);
+  int result=remote?getpeername(fd,(sockaddr*)&address,&length):getsockname(fd,(sockaddr*)&address,&length);
+  size_t offset=offsetof(sockaddr_un,sun_path);
+  if(result||address.sun_family!=AF_UNIX||length<=offset||length>sizeof(address)||address.sun_len!=length) return false;
+  size_t available=length-offset,n=strnlen(address.sun_path,available); const char* path=expected.fileSystemRepresentation;
+  // Pinned libuv supplies zero-padded sockaddr_un. Darwin also supports a
+  // length-delimited non-NUL pathname; never read past the returned length.
+  if(!path||!n||n>=sizeof(address.sun_path)||strlen(path)!=n||memcmp(address.sun_path,path,n)) return false;
+  for(size_t i=n;i<available;++i) if(address.sun_path[i]) return false;
+  return true;
+}
+static bool budgetValue(napi_env env,napi_value value,uint64_t received,uint64_t grace,uint64_t overall,const char* kind=nullptr) {
+  for(const auto& entry:std::vector<std::pair<const char*,uint64_t>>{{"received",received},{"grace",grace},{"overall",overall}}) {
+    napi_value field; if(napi_create_double(env,(double)entry.second/1000,&field)!=napi_ok||!property(env,value,entry.first,field)) return false;
+  }
+  return !kind||property(env,value,"kind",text(env,kind));
+}
+static napi_value captureCloseBudget(napi_env env,napi_callback_info) {
+  uint64_t received=continuousUs(); if(closeBudgetCaptured||!received) return fail(env); closeBudgetCaptured=true;
+  @autoreleasepool { @try {
+    auto* budget=new CloseBudgetNative; budget->received=received; budget->grace=received+5000000; budget->overall=received+8000000;
+    budget->issuer=arbol_attempt::processRecord(getpid()); budget->boot=arbol_exit::bootSession();
+    if(!budget->issuer||!budget->boot||!arbol_attempt::currentProcess(budget->issuer,true)) { delete budget; return fail(env); }
+    closeBudgets.insert(budget); napi_value out,handle;
+    if(napi_create_object(env,&out)!=napi_ok||napi_create_external(env,budget,nullptr,nullptr,&handle)!=napi_ok||
+       !property(env,out,"handle",handle)||!budgetValue(env,out,budget->received,budget->grace,budget->overall)) return fail(env);
+    return out;
+  } @catch(NSException*) { return fail(env); } }
+}
+static bool closeStamp(CloseBudgetNative* budget,const std::string& leaf,const std::string& runtimeRaw,const std::string& requestId,int socket) {
+  if(budget->cancelled.load(std::memory_order_acquire)||continuousUs()>=budget->grace||
+     ![budget->boot isEqual:arbol_exit::bootSession()]||!arbol_attempt::currentProcess(budget->issuer,true)) return false;
+  std::string filename="close-"+requestId+".json";
+  arbol_attempt::Claim claim; std::string currentRaw; NSDictionary* current=nil;
+  if(!claim.acquire(leaf+"/"+filename,std::min((double)budget->grace/1000,arbol_boundary::clockMs()+250))||!claim.read(currentRaw,current)||
+     ![@[@"ready",@"closing"] containsObject:current[@"phase"]]||![current[@"stage"] isEqual:@"admitted"]||
+     ![current[@"runtime"] isEqual:arbol_attempt::json(runtimeRaw)]||!arbol_attempt::currentProcess(current[@"engine"])) return false;
+  NSDictionary* peer=kernelPeer(socket);
+  if(!peer||![peer isEqual:current[@"engine"]]||![current[@"runtime"][@"phase"] isEqual:@"ready"]||
+     !managementSocketPath(socket,true,current[@"runtime"][@"managementSocket"])) return false;
+  arbol_exit::NativeFile file;
+  file.fd=openat(claim.at.directory,filename.c_str(),O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC,0600);
+  struct stat first{},published{};
+  if(file.fd<0||fchmod(file.fd,0600)||fstat(file.fd,&first)||!arbol_attempt::privateFile(first)) return false;
+  budget->created=true; budget->attributable=true; budget->createdFile=first; budget->leaf=claim.at.path; budget->filename=filename;
+  budget->directory=claim.at.identity; budget->lock=claim.at.lockIdentity; budget->attempt=current;
+  CloseCreatedCapture capture{budget,&file};
+  NSDictionary* value=@{@"format":@1,@"kind":@"management-close-budget",@"bootSession":budget->boot,
+    @"requestId":[NSString stringWithUTF8String:requestId.c_str()],@"issuer":budget->issuer,@"attempt":current,
+    @"receivedUs":@(budget->received),@"graceUs":@(budget->grace),@"overallUs":@(budget->overall),@"file":arbol_exit::fileIdentity(first)};
+  std::string raw=arbol_attempt::bytes(value); if(raw.empty()) return false; size_t at=0;
+  while(at<raw.size()) {
+    if(budget->cancelled.load(std::memory_order_acquire)||continuousUs()>=budget->grace) return false;
+    ssize_t n=write(file.fd,raw.data()+at,raw.size()-at); if(n>0) at+=n; else if(n<0&&errno==EINTR) continue; else return false;
+  }
+  bool valid=!fsync(file.fd)&&!fcntl(file.fd,F_FULLFSYNC)&&
+    arbol_exit::publishedNativeFile(claim.at.directory,filename,raw,file,published,(double)budget->grace/1000)&&
+    [arbol_exit::fileIdentity(published) isEqual:value[@"file"]]&&arbol_attempt::unchanged(claim.at)&&
+    [kernelPeer(socket) isEqual:peer]&&managementSocketPath(socket,true,current[@"runtime"][@"managementSocket"])&&arbol_attempt::currentProcess(budget->issuer,true)&&
+    !budget->cancelled.load(std::memory_order_acquire)&&continuousUs()<budget->grace;
+  if(valid) budget->createdFile=published;
+  return valid&&file.finish();
+}
+static napi_value beginCloseStamp(napi_env env,napi_callback_info info) {
+  napi_value args[5]; size_t n=5; std::string leaf,runtime,request; int socket;
+  if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok||n!=5) return fail(env);
+  auto* budget=closeBudgetArgument(env,args[0]); if(!budget||budget->used) return fail(env); budget->used=true;
+  if(!boundedText(env,args[1],leaf)||!boundedText(env,args[2],runtime)||!boundedText(env,args[3],request)||
+     !integer(env,args[4],&socket)||socket<0||!arbol_attempt::pattern([NSString stringWithUTF8String:request.c_str()],@"^req_[A-Za-z0-9_-]{22}$")||
+     !arbol_boundary::retainNativeImage()) return fail(env);
+  int retained=fcntl(socket,F_DUPFD_CLOEXEC,64); if(retained<0) return fail(env);
+  try {
+    budget->worker=new std::thread([budget,leaf,runtime,request,retained] {
+      bool ok=false; @autoreleasepool { @try { try { ok=closeStamp(budget,leaf,runtime,request,retained); } catch(...) {} } @catch(NSException*) {} }
+      if(close(retained)) ok=false;
+      budget->state.store(ok?1:-1,std::memory_order_release);
+    });
+    try { budget->worker->detach(); } catch(...) {} // actual handle/module stay retained
+  } catch(...) { close(retained); budget->state.store(-1,std::memory_order_release); return fail(env); }
+  napi_value out; napi_get_undefined(env,&out); return out;
+}
+static napi_value pollCloseStamp(napi_env env,napi_callback_info info) {
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* budget=closeBudgetArgument(env,arg); if(!budget||!budget->used) return fail(env);
+  int state=budget->state.load(std::memory_order_acquire); napi_value out;
+  if(napi_create_int32(env,state,&out)!=napi_ok) return fail(env); return out;
+}
+static napi_value cancelCloseStamp(napi_env env,napi_callback_info info) {
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* budget=closeBudgetArgument(env,arg); if(!budget) return fail(env);
+  budget->cancelled.store(true,std::memory_order_release); napi_value out; napi_get_undefined(env,&out); return out;
+}
+static bool retireCreatedClose(CloseBudgetNative* budget) {
+  if(!budget->created) return true;
+  if(!budget->attributable||continuousUs()>=budget->overall) return false;
+  arbol_attempt::Claim claim; std::string raw; NSDictionary* current=nil;
+  if(!claim.acquire(budget->leaf+"/"+budget->filename,(double)budget->overall/1000)||
+     claim.at.identity.st_dev!=budget->directory.st_dev||claim.at.identity.st_ino!=budget->directory.st_ino||
+     claim.at.lockIdentity.st_dev!=budget->lock.st_dev||claim.at.lockIdentity.st_ino!=budget->lock.st_ino) return false;
+  struct stat named{}; errno=0;
+  if(fstatat(claim.at.directory,budget->filename.c_str(),&named,AT_SYMLINK_NOFOLLOW)) return errno==ENOENT&&arbol_attempt::unchanged(claim.at);
+  if(!claim.read(raw,current)||!arbol_attempt::immutable(budget->attempt,current)||
+     ![budget->attempt[@"engine"] isEqual:current[@"engine"]]||![budget->attempt[@"bootstrap"] isEqual:current[@"bootstrap"]]||
+     !arbol_attempt::privateFile(named)||!arbol_attempt::sameFile(budget->createdFile,named)||!arbol_attempt::unchanged(claim.at)) return false;
+  return !unlinkat(claim.at.directory,budget->filename.c_str(),0)&&!fsync(claim.at.directory)&&
+    arbol_attempt::unchanged(claim.at)&&continuousUs()<budget->overall;
+}
+static napi_value beginCloseRetirement(napi_env env,napi_callback_info info) {
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* budget=closeBudgetArgument(env,arg); if(!budget) return fail(env);
+  budget->cancelled.store(true,std::memory_order_release);
+  if(!budget->retirement) {
+    if(!arbol_boundary::retainNativeImage()) return fail(env);
+    try {
+      budget->retirement=new std::thread([budget] {
+        while(budget->worker&&budget->state.load(std::memory_order_acquire)==0&&continuousUs()<budget->overall) usleep(1000);
+        bool complete=!budget->worker||budget->state.load(std::memory_order_acquire)!=0,ok=false;
+        @autoreleasepool { @try { try { ok=complete&&retireCreatedClose(budget); } catch(...) {} } @catch(NSException*) {} }
+        budget->retired.store(ok?1:-1,std::memory_order_release);
+      });
+      try { budget->retirement->detach(); } catch(...) {}
+    } catch(...) { budget->retired.store(-1,std::memory_order_release); return fail(env); }
+  }
+  napi_value out; napi_get_undefined(env,&out); return out;
+}
+static napi_value pollCloseRetirement(napi_env env,napi_callback_info info) {
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* budget=closeBudgetArgument(env,arg); if(!budget) return fail(env);
+  napi_value out; if(napi_create_int32(env,budget->retired.load(std::memory_order_acquire),&out)!=napi_ok) return fail(env); return out;
+}
 static HeldLock* claimLock(napi_env env, napi_value value) {
   void* data = nullptr; struct stat st{};
   if (napi_get_value_external(env,value,&data) != napi_ok) return nullptr;
@@ -440,6 +612,73 @@ static napi_value prepareHostFinalization(napi_env env,napi_callback_info info) 
        !c->finalization.metadata()) return fail(env);
     c->policyDigest=actualPolicy; c->compatibilityDigest=actualCompatibility;
     napi_value out; napi_get_undefined(env,&out); return out;
+  } @catch(NSException*) { return fail(env); } }
+}
+static bool retireCloseFile(const arbol_attempt::Claim& claim,const std::string& name,const struct stat& original) {
+  struct stat actual{};
+  return arbol_attempt::unchanged(claim.at)&&!fstatat(claim.at.directory,name.c_str(),&actual,AT_SYMLINK_NOFOLLOW)&&
+    arbol_attempt::privateFile(actual)&&arbol_attempt::sameFile(original,actual)&&!unlinkat(claim.at.directory,name.c_str(),0)&&
+    !fsync(claim.at.directory)&&arbol_attempt::unchanged(claim.at);
+}
+static bool beginClosing(Custody* custody,arbol_attempt::Claim& claim,const std::string& raw,NSDictionary* current,
+  uint64_t received,uint64_t grace,uint64_t overall) {
+  auto* state=custody->finalization.shared();
+  uint64_t now=continuousUs(),earlier=state->closeGraceUs.load(std::memory_order_acquire);
+  if(!now||now>=grace||(earlier&&now>=earlier)||!custody->finalization.ready(custody->context)) return false;
+  state->installClose(received,grace,overall);
+  if([current[@"phase"] isEqual:@"closing"]) return true;
+  NSMutableDictionary* next=[current mutableCopy],*runtime=[current[@"runtime"] mutableCopy];
+  next[@"phase"]=@"closing"; runtime[@"phase"]=@"closing"; next[@"runtime"]=runtime;
+  return arbol_attempt::transition(current,next,arbol_attempt::Role::engine)&&arbol_attempt::replace(claim.at,raw,false,arbol_attempt::bytes(next));
+}
+static napi_value consumeCloseRequest(napi_env env,napi_callback_info info) {
+  napi_value args[3]; size_t n=3; std::string request; int socket;
+  if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok||n!=3||!boundedText(env,args[1],request)||!integer(env,args[2],&socket)||
+     !arbol_attempt::pattern([NSString stringWithUTF8String:request.c_str()],@"^req_[A-Za-z0-9_-]{22}$")) return fail(env);
+  auto* c=custodyArgument(env,args[0]);
+  if(!c||!c->hostRequired||!c->bound||getpid()!=c->context.main.pid||!c->finalization.ready(c->context)) return fail(env);
+  @autoreleasepool { @try {
+    NSDictionary* peer=kernelPeer(socket); if(!peer) return fail(env);
+    arbol_attempt::Claim claim; std::string currentRaw,raw; NSDictionary* current=nil; struct stat file{};
+    if(!c->finalization.currentAttempt(c->context,claim,currentRaw,current,arbol_boundary::clockMs()+250)||
+       ![@[@"ready",@"closing"] containsObject:current[@"phase"]]||![current[@"stage"] isEqual:@"admitted"]||
+       !managementSocketPath(socket,false,current[@"runtime"][@"managementSocket"])) return fail(env);
+    std::string filename="close-"+request+".json";
+    if(!arbol_exit::readNativeFile(claim.at.directory,filename,raw,file,arbol_attempt::limit)) return fail(env);
+    NSDictionary* value=arbol_attempt::json(raw),*attempt=value[@"attempt"]; uint64_t received,grace,overall;
+    if(!arbol_attempt::keys(value,@[@"format",@"kind",@"bootSession",@"requestId",@"issuer",@"attempt",@"receivedUs",@"graceUs",@"overallUs",@"file"])||
+       ![value[@"format"] isEqual:@1]||![value[@"kind"] isEqual:@"management-close-budget"]||
+       ![value[@"bootSession"] isEqual:c->finalization.value()[@"bootSession"]]||![value[@"requestId"] isEqual:[NSString stringWithUTF8String:request.c_str()]]||
+       ![value[@"file"] isEqual:arbol_exit::fileIdentity(file)]||![value[@"issuer"] isEqual:peer]||!arbol_attempt::record(attempt)||
+       !arbol_attempt::immutable(attempt,current)||![attempt[@"engine"] isEqual:current[@"engine"]]||![attempt[@"bootstrap"] isEqual:current[@"bootstrap"]]||
+       !arbol_attempt::sameRuntimeBinding(attempt[@"runtime"],current[@"runtime"])||
+       !arbol_attempt::uintNumber(value[@"receivedUs"],received)||!arbol_attempt::uintNumber(value[@"graceUs"],grace)||
+       !arbol_attempt::uintNumber(value[@"overallUs"],overall)||!received||grace!=received+5000000||overall!=received+8000000||
+       received>continuousUs()||![kernelPeer(socket) isEqual:peer]) return fail(env);
+    if(continuousUs()>=grace) { (void)retireCloseFile(claim,filename,file); return fail(env); }
+    if(!beginClosing(c,claim,currentRaw,current,received,grace,overall)||![kernelPeer(socket) isEqual:peer]||
+       !managementSocketPath(socket,false,current[@"runtime"][@"managementSocket"])||!retireCloseFile(claim,filename,file)) { c->finalization.shared()->poison(arbol_exit::admissionLoss|arbol_exit::forced); return fail(env); }
+    if(continuousUs()>=c->finalization.shared()->closeGraceUs.load(std::memory_order_acquire)) return fail(env);
+    napi_value out; if(napi_create_object(env,&out)!=napi_ok||!budgetValue(env,out,
+      c->finalization.shared()->closeReceivedUs.load(std::memory_order_acquire),c->finalization.shared()->closeGraceUs.load(std::memory_order_acquire),
+      c->finalization.shared()->closeOverallUs.load(std::memory_order_acquire),"management")) return fail(env);
+    return out;
+  } @catch(NSException*) { if(c->finalization.present()) c->finalization.shared()->poison(arbol_exit::admissionLoss|arbol_exit::forced); return fail(env); } }
+}
+static napi_value armLocalClose(napi_env env,napi_callback_info info) {
+  uint64_t received=continuousUs(); napi_value arg;
+  if(!received||!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg);
+  if(!c||!c->hostRequired||!c->bound||getpid()!=c->context.main.pid||!c->finalization.ready(c->context)) return fail(env);
+  @autoreleasepool { @try {
+    arbol_attempt::Claim claim; std::string raw; NSDictionary* current=nil;
+    if(!c->finalization.currentAttempt(c->context,claim,raw,current,std::min((double)(received+5000000)/1000,arbol_boundary::clockMs()+250))||
+       ![@[@"claimed",@"ready",@"closing"] containsObject:current[@"phase"]]||![current[@"stage"] isEqual:@"admitted"]||
+       !beginClosing(c,claim,raw,current,received,received+5000000,received+8000000)) return fail(env);
+    if(continuousUs()>=c->finalization.shared()->closeGraceUs.load(std::memory_order_acquire)) return fail(env);
+    napi_value out; if(napi_create_object(env,&out)!=napi_ok||!budgetValue(env,out,
+      c->finalization.shared()->closeReceivedUs.load(std::memory_order_acquire),c->finalization.shared()->closeGraceUs.load(std::memory_order_acquire),
+      c->finalization.shared()->closeOverallUs.load(std::memory_order_acquire),"local-window")) return fail(env);
+    return out;
   } @catch(NSException*) { return fail(env); } }
 }
 static bool nativePipe(int (&ends)[2]) {
@@ -733,8 +972,13 @@ static napi_value assertHostMarker(napi_env env,napi_callback_info info) {
   } @catch(NSException*) { return fail(env); } }
 }
 static napi_value abortHostMarkerMutation(napi_env env,napi_callback_info info);
+[[noreturn]] static void terminateCustody(Custody* c);
 static napi_value watchdogAssert(napi_env env,napi_callback_info info) {
   napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg);
+  if(c&&c->hostRequired&&c->bound&&c->finalization.present()&&getpid()==c->context.main.pid&&arbol_boundary::current(c->context.main)==1) {
+    uint64_t grace=c->finalization.shared()->closeGraceUs.load(std::memory_order_acquire);
+    if(grace&&continuousUs()>=grace) terminateCustody(c);
+  }
   if(!c || !c->bound || arbol_boundary::current(c->context.main)!=1 || arbol_boundary::current(c->context.primary)!=1 || arbol_boundary::current(c->context.custody)!=1 || !arbol_boundary::lockIdentity(c->context.owner) || !arbol_boundary::lockIdentity(c->context.build)) return fail(env);
   if(!c->retainedReader.valid()||!c->retainedWriter.valid()) return fail(env);
   if(c->hostRequired) {
@@ -792,6 +1036,14 @@ static napi_value abortHostMarkerMutation(napi_env env,napi_callback_info info) 
 }
 static napi_value init(napi_env env, napi_value exports) {
   napi_property_descriptor properties[] = {
+    {"captureCloseBudget",nullptr,captureCloseBudget,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"beginCloseStamp",nullptr,beginCloseStamp,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"pollCloseStamp",nullptr,pollCloseStamp,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"cancelCloseStamp",nullptr,cancelCloseStamp,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"beginCloseRetirement",nullptr,beginCloseRetirement,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"pollCloseRetirement",nullptr,pollCloseRetirement,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"consumeCloseRequest",nullptr,consumeCloseRequest,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"armLocalClose",nullptr,armLocalClose,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"beginHostMarkerMutation",nullptr,beginHostMarkerMutation,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"acceptHostMarkerMutation",nullptr,acceptHostMarkerMutation,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"assertHostMarker",nullptr,assertHostMarker,nullptr,nullptr,nullptr,napi_default,nullptr},
