@@ -10,7 +10,7 @@ import { validator } from '../contracts/schema.js';
 // Trust covers physical signed bytes, including ASAR archives, on every check.
 // Browser verification uses the mandatory unpatched Electron builtin. The Node
 // CLI has an unpatched filesystem already and never imports Electron code.
-const { constants, lstatSync, openSync, fstatSync, readFileSync, readSync, closeSync, readdirSync, readlinkSync, realpathSync } =
+const { constants, lstatSync, openSync, fstatSync, readSync, closeSync, readdirSync, readlinkSync, realpathSync } =
   createRequire(import.meta.url)(process.type === 'browser' ? 'original-fs' : 'node:fs') as typeof import('node:fs');
 
 export const publisher = Object.freeze({ team: '7V372XL59S', bundleIdentifier: 'com.sylvan-stack.arbol-browser.native-candidate',
@@ -21,7 +21,7 @@ export type Compatibility = Contract<'native.BuildCompatibility'>;
 export function refuse(): never { throw new Error('native_candidate_unavailable'); }
 export function boundedJson(path: string, deadline = Infinity): unknown {
   budget(deadline);
-  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const stat = fstatSync(fd), named = lstatSync(path);
     if (!stat.isFile() || !named.isFile() || stat.dev !== named.dev || stat.ino !== named.ino ||
@@ -48,6 +48,37 @@ export function stable(value: unknown): string {
 function budget(deadline: number): number {
   if (deadline !== Infinity && (!Number.isFinite(deadline) || performance.now() >= deadline)) refuse();
   return deadline === Infinity ? 5000 : Math.max(1, Math.min(5000, Math.floor(deadline - performance.now())));
+}
+/** Hash and inspect one verified description, with exactly one overflow byte.
+ * Nonblocking no-follow open must precede fstat so a substituted FIFO cannot
+ * wait for a writer. Physical symlinks are handled separately by the caller. */
+function physicalFile(path: string, named: import('node:fs').Stats, deadline: number): { digest: string; magic: string } {
+  budget(deadline);
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const first = fstatSync(fd);
+    if (!first.isFile() || !named.isFile() || first.dev !== named.dev || first.ino !== named.ino ||
+        first.nlink !== 1 || named.nlink !== 1 || first.mode !== named.mode || first.uid !== named.uid ||
+        !Number.isSafeInteger(first.size) || first.size < 0 || realpathSync(path) !== path) refuse();
+    const hash = createHash('sha256'), buffer = Buffer.alloc(65536), header = Buffer.alloc(4);
+    let offset = 0;
+    while (offset < first.size) {
+      budget(deadline);
+      const n = readSync(fd, buffer, 0, Math.min(buffer.length, first.size - offset), null);
+      if (n < 1) refuse();
+      if (offset < 4) buffer.copy(header, offset, 0, Math.min(n, 4 - offset));
+      hash.update(buffer.subarray(0, n)); offset += n;
+    }
+    if (readSync(fd, buffer, 0, 1, null) !== 0) refuse();
+    const last = fstatSync(fd), after = lstatSync(path); budget(deadline);
+    if (!after.isFile() || first.dev !== last.dev || first.ino !== last.ino || first.size !== last.size ||
+        first.mode !== last.mode || first.uid !== last.uid || last.nlink !== 1 ||
+        first.mtimeMs !== last.mtimeMs || first.ctimeMs !== last.ctimeMs ||
+        after.dev !== last.dev || after.ino !== last.ino || after.size !== last.size || after.nlink !== 1 ||
+        after.mode !== last.mode || after.uid !== last.uid || after.mtimeMs !== last.mtimeMs || after.ctimeMs !== last.ctimeMs ||
+        realpathSync(path) !== path) refuse();
+    return { digest: hash.digest('hex'), magic: header.subarray(0, Math.min(first.size, 4)).toString('hex') };
+  } finally { closeSync(fd); }
 }
 function signature(path: string, outer = false, jit = false, deadline = Infinity): void {
   const requirement = publisher.requirement + (outer ? ` and identifier "${publisher.bundleIdentifier}"` : '');
@@ -95,13 +126,7 @@ function completeSnapshot(root: string, deadline = Infinity): string {
         entries[key] = `symlink:${link}`;
       } else if (before.isDirectory()) { entries[key] = `directory:${before.mode & 0o7777}`; walk(path); }
       else if (before.isFile()) {
-        const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-        try {
-          const first = fstatSync(fd), bytes = readFileSync(fd), last = fstatSync(fd);
-          if (first.dev !== before.dev || first.ino !== before.ino || last.ino !== first.ino || last.dev !== first.dev ||
-              first.size !== bytes.length || first.size !== last.size || first.mtimeMs !== last.mtimeMs || first.ctimeMs !== last.ctimeMs) refuse();
-          entries[key] = `file:${first.mode & 0o7777}:${createHash('sha256').update(bytes).digest('hex')}`;
-        } finally { closeSync(fd); }
+        entries[key] = `file:${before.mode & 0o7777}:${physicalFile(path, before, deadline).digest}`;
       } else refuse();
       const after = lstatSync(path);
       if (after.dev !== before.dev || after.ino !== before.ino || after.mode !== before.mode || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs || Object.keys(entries).length > 4096) refuse();
@@ -136,13 +161,9 @@ export function verifySignedBundle(bundle: string, deadline = Infinity): SignedB
           inventory[key] = createHash('sha256').update(`symlink\0${link}`).digest('hex');
         } else if (stat.isDirectory()) walk(path);
         else if (stat.isFile()) {
-          inventory[key] = createHash('sha256').update(readFileSync(path)).digest('hex');
-          const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-          try {
-            const magic = readFileSync(fd).subarray(0, 4).toString('hex');
-            if (['cffaedfe', 'cefaedfe', 'feedfacf', 'cafebabe', 'bebafeca'].includes(magic))
-              signature(path, false, key.startsWith('Contents/Resources/browser/runtime/Electron.app/') && key.includes('/Contents/MacOS/'), deadline);
-          } finally { closeSync(fd); }
+          const physical = physicalFile(path, stat, deadline); inventory[key] = physical.digest;
+          if (['cffaedfe', 'cefaedfe', 'feedfacf', 'cafebabe', 'bebafeca'].includes(physical.magic))
+            signature(path, false, key.startsWith('Contents/Resources/browser/runtime/Electron.app/') && key.includes('/Contents/MacOS/'), deadline);
         } else refuse();
         if (Object.keys(inventory).length > 4096) refuse();
       }

@@ -29,7 +29,7 @@ const digest = (value: unknown): value is string => typeof value === 'string' &&
 export async function physicalJson(path: string, limit = 1048576, deadline = Infinity): Promise<PhysicalJson> {
   const check = () => { if (deadline !== Infinity) assertBudget(deadline); }; check();
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1048576 || await realpath(path) !== path) throw unavailable('browser');
-  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     check();
     const before = await file.stat({ bigint: true }), named = await lstat(path, { bigint: true });
@@ -137,7 +137,9 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
   const identity = await readPackagedIdentity(selection, payload, policy.stateRoot, deadline);
   const compatibility = await physicalJson(join(layout.bundle, 'Contents/Resources/native-compatibility.json'), 1048576, deadline);
   const manifest = signed.manifest;
-  if (policy.purpose === 'blocked' || policy.build !== selection.build || policy.buildRoot !== layout.buildRoot ||
+  // ABR-29 supplies no independent production release authority. A candidate's
+  // own signed qualification strings cannot authorize the owner's data.
+  if (policy.purpose !== 'isolated-qualification' || policy.build !== selection.build || policy.buildRoot !== layout.buildRoot ||
       policy.sourceDigest !== identity.sourceDigest || policy.productDigest !== identity.productDigest ||
       policy.metadataDigest !== identity.metadataDigest || policy.compatibilityDigest !== compatibility.digest ||
       manifest.writerKey !== policy.readerKey ||
@@ -145,17 +147,12 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
       manifests.stable(manifest.readableDataEpochs) !== manifests.stable(policy.readableDataEpochs)) throw unavailable('browser');
   const ownerState = ownerStateDirectory();
   if (below(policy.stateRoot, layout.buildRoot)) throw unavailable('browser');
-  if (policy.purpose === 'isolated-qualification') {
-    if (below(policy.stateRoot, ownerState) || below(ownerState, policy.stateRoot) ||
+  if (below(policy.stateRoot, ownerState) || below(ownerState, policy.stateRoot) ||
         manifest.qualification !== `host-isolated:1:${policy.productDigest}` ||
         policy.readerKey !== `host-isolated:1:${policy.productDigest}`) throw unavailable('browser');
     // Explicit disposable roots are prepared by the separately authorized
     // qualifier; no environment or request may relocate them or create a bypass.
-    assertBudget(deadline); await directory(policy.stateRoot); assertBudget(deadline);
-  } else if (policy.stateRoot !== ownerState ||
-      manifest.qualification !== `host-production:1:${policy.productDigest}:${policy.qualificationDigest}` ||
-      policy.readableReaderKeys.some(key => key.includes('unqualified') || key.startsWith('host-isolated:')))
-    throw unavailable('browser');
+  assertBudget(deadline); await directory(policy.stateRoot); assertBudget(deadline);
   const result: VerifiedHost = Object.freeze({ identity, policy, signed,
     async assertTrusted(limit: number) {
       if (!verifiedHosts.has(result)) throw unavailable('browser');
