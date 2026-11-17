@@ -159,13 +159,31 @@ export function assertVerifiedHost(value: VerifiedHost, deadline: number): void 
 function assertBudget(deadline: number): void {
   if (!Number.isFinite(deadline) || performance.now() >= deadline) throw unavailable('browser');
 }
+export type HostVerificationStage = 'signed-bundle' | 'signed-policy-metadata-compatibility' |
+  'isolated-roots' | 'build-guard' | 'initial-verified-host';
+export type HostVerificationObservation = Readonly<object>;
+const verificationStages = new WeakMap<HostVerificationObservation, HostVerificationStage>();
+/** A command-local observation only. It is never a VerifiedHost or callback,
+ * and no supplied object can change the verifier's authority or failure. */
+export function createHostVerificationObservation(): HostVerificationObservation {
+  const observation = Object.freeze({});
+  verificationStages.set(observation, 'signed-bundle');
+  return observation;
+}
+export function readHostVerificationStage(observation: HostVerificationObservation): HostVerificationStage | undefined {
+  return verificationStages.get(observation);
+}
+function noteHostVerification(observation: HostVerificationObservation | undefined, stage: HostVerificationStage): void {
+  if (observation && verificationStages.has(observation)) verificationStages.set(observation, stage);
+}
 /** The trusted signing recipe issues a purpose-bound policy. Qualification uses
  * the real product providers on one isolated registered Build and private state;
  * it changes no Native check and cannot open the owner's production profiles.
  * The full source digest includes later testing-only source; productDigest pins
  * the separately reviewed actual product/compiler/sign inputs, never Git HEAD. */
 export async function verifyPackagedHost(selection: BuildSelection, payload: string, deadline: number,
-  bootstrapSigned?: SignedBundle): Promise<VerifiedHost> {
+  bootstrapSigned?: SignedBundle, observation?: HostVerificationObservation): Promise<VerifiedHost> {
+  noteHostVerification(observation, 'signed-bundle');
   assertBudget(deadline);
   const layout = selectedLayout(selection, payload);
   const manifestURL = new URL('../native/manifest.js', import.meta.url).href;
@@ -180,6 +198,7 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
     } else signed = manifests.verifySignedBundle(layout.bundle, deadline);
   } catch { throw unavailable('browser'); }
   assertBudget(deadline);
+  noteHostVerification(observation, 'signed-policy-metadata-compatibility');
   const policyFile = join(layout.bundle, 'Contents/Resources/host-policy.json');
   const rawPolicy = await physicalJson(policyFile, 1048576, deadline), policy = readPolicy(rawPolicy.value);
   const identity = await readPackagedIdentity(selection, payload, policy.stateRoot, deadline);
@@ -198,7 +217,9 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
         policy.readerKey !== `host-isolated:1:${policy.productDigest}`) throw unavailable('browser');
     // Explicit disposable roots are prepared by the separately authorized
     // qualifier; no environment or request may relocate them or create a bypass.
+  noteHostVerification(observation, 'isolated-roots');
   await assertIsolation(layout, policy.stateRoot, deadline);
+  noteHostVerification(observation, 'build-guard');
   const usesIdentity = await directory(dirname(selection.guard)); assertBudget(deadline);
   const guard = await lstat(selection.guard, { bigint: true });
   const guardIdentity = Object.freeze({ device: String(guard.dev), inode: String(guard.ino), uid: Number(guard.uid) });
@@ -239,6 +260,7 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
         throw error;
       }
     } });
+  noteHostVerification(observation, 'initial-verified-host');
   assertBudget(deadline); verifiedHosts.add(result); await result.assertTrusted(deadline); return result;
 }
 

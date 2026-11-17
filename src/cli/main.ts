@@ -10,11 +10,31 @@ import type { Contract } from '../contracts/generated.js';
 import type { CommandPorts, Stdio, PackageMetadata } from '../runtime/ports.js';
 import { consumePackagedSelection, type BuildSelection } from '../runtime/selection.js';
 
+const coldStages = ['package-metadata', 'selected-build', 'runtime-imports', 'signed-bundle',
+  'signed-policy-metadata-compatibility', 'isolated-roots', 'build-guard', 'initial-verified-host',
+  'pinned-runtime-tuple', 'repeated-host-trust', 'native-platform', 'production-adapters',
+  'command-dispatch', 'result-schema'] as const;
+type ColdStage = typeof coldStages[number];
+interface ColdObservation { stage: ColdStage }
+function noteCold(observation: ColdObservation | undefined, stage: ColdStage): void {
+  if (observation) observation.stage = stage;
+}
+function coldFailureSuffix(observation: ColdObservation | undefined, status: ExitCode): string {
+  // Compose only fixed supplemental text for the existing stderr write. No
+  // additional stream operation can introduce a new asynchronous failure.
+  try {
+    if (observation && (status === 4 || status === 70) && coldStages.includes(observation.stage))
+      return `arbol-browser: cold-stage ${observation.stage}\n`;
+  } catch { /* best effort only */ }
+  return '';
+}
+
 // All native/profile/runtime work is lazy. info remains metadata only.
 const defaultPorts = Object.freeze({}) as CommandPorts;
-async function productionPorts(selection: BuildSelection): Promise<CommandPorts> {
+async function productionPorts(selection: BuildSelection, observation?: ColdObservation): Promise<CommandPorts> {
+  noteCold(observation, 'runtime-imports');
   const [{ createProfileService }, { loadPlatform }, { createProcessService, createProfileRuntime },
-    { verifyPackagedHost }, { createProductionExitAuthority }, { createProductionProcessIntegration }] = await Promise.all([
+    authorities, { createProductionExitAuthority }, { createProductionProcessIntegration }] = await Promise.all([
     import('../profiles/manage.js'), import('../runtime/platform.js'), import('../runtime/lifecycle.js'),
     import('../runtime/authorities.js'), import('../runtime/exit.js'), import('../runtime/process.js'),
   ]);
@@ -23,15 +43,29 @@ async function productionPorts(selection: BuildSelection): Promise<CommandPorts>
   // Verify the real current outer/payload before loading its native support.
   // The fixed packaged entry must be running as the exact stock engine in
   // Node mode; no system Node, older Foundation or ad hoc helper substitution.
-  const host = await verifyPackagedHost(selection, payload, deadline);
+  noteCold(observation, 'signed-bundle');
+  const verification = observation ? authorities.createHostVerificationObservation() : undefined;
+  const host = await authorities.verifyPackagedHost(selection, payload, deadline, undefined, verification).catch(error => {
+    // Read only this genuine module's observation; no callback enters trust
+    // verification, and diagnostic readback cannot replace its actual error.
+    try {
+      if (observation && verification) noteCold(observation, authorities.readHostVerificationStage(verification) ?? 'signed-bundle');
+    } catch { /* preserve the original failure */ }
+    throw error;
+  });
+  noteCold(observation, 'pinned-runtime-tuple');
   const address = new URL('../native/manifest.js', import.meta.url).href;
   const { pinnedRuntime } = await import(address) as typeof import('../native/manifest.js');
   if (process.type === 'browser' || resolve(process.execPath) !== host.identity.layout.engine ||
       process.versions.electron !== pinnedRuntime.electron || process.versions.node !== pinnedRuntime.node ||
       process.versions.modules !== pinnedRuntime.modules || process.versions.napi !== pinnedRuntime.napi ||
       process.platform !== pinnedRuntime.platform || process.arch !== pinnedRuntime.arch) throw unavailable('browser');
+  noteCold(observation, 'repeated-host-trust');
   await host.assertTrusted(deadline);
-  const platform = loadPlatform(), exits = createProductionExitAuthority(platform, selection);
+  noteCold(observation, 'native-platform');
+  const platform = loadPlatform();
+  noteCold(observation, 'production-adapters');
+  const exits = createProductionExitAuthority(platform, selection);
   const integration = createProductionProcessIntegration(host, selection, platform, exits);
   const state = host.policy.stateRoot;
   return Object.freeze({
@@ -61,18 +95,23 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
   io: Stdio = process): Promise<ExitCode> {
   // On the MCP path stdout is reserved exclusively for the MCP transport, including failures.
   const mcp = args[0] === 'mcp';
+  let observation: ColdObservation | undefined;
   try {
     const command = parse(args);
+    if (ports === defaultPorts && (command.kind === 'open' || command.kind === 'profiles-create'))
+      observation = { stage: 'package-metadata' };
     if (ports === defaultPorts && command.kind === 'mcp') throw unavailable('browser');
     let activePorts = ports;
     if (ports === defaultPorts && command.kind !== 'info') {
       const metadata = await componentInfo();
+      noteCold(observation, 'selected-build');
       const selection = consumePackagedSelection(metadata.build, resolve(fileURLToPath(new URL('../../', import.meta.url))));
-      activePorts = await productionPorts(selection);
+      activePorts = await productionPorts(selection, observation);
     }
     if (command.kind === 'mcp') { await activePorts.process.mcp(command.profile, io); return 0; }
     let result: unknown;
     let check: (value: unknown) => boolean;
+    noteCold(observation, 'command-dispatch');
     switch (command.kind) {
       case 'info': result = await componentInfo(); check = validator('wire.ComponentInfo'); break;
       case 'open': result = await activePorts.process.open(command); check = validator('wire.OpenResult'); break;
@@ -85,6 +124,7 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
         result = await activePorts.profiles.remove(command.profile, io);
         check = validator('profile.ProfileRemoved'); break;
     }
+    noteCold(observation, 'result-schema');
     if (!check(result)) throw new Error('Invalid command result');
     io.stdout.write(`${JSON.stringify(result)}\n`);
     return 0;
@@ -93,12 +133,12 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
     if (!validator('browser.BrowserError')(failure.detail)) {
       const internal = publicFailure(undefined);
       if (!mcp) io.stdout.write(`${JSON.stringify({ error: internal.detail })}\n`);
-      io.stderr.write('arbol-browser: internal\n');
+      io.stderr.write(`arbol-browser: internal\n${coldFailureSuffix(observation, 70)}`);
       return 70;
     }
     if (!mcp) io.stdout.write(`${JSON.stringify({ error: failure.detail })}\n`);
     // No thrown messages, arguments, URLs, protocol bodies or stack traces.
-    io.stderr.write(`arbol-browser: ${failure.detail.code}\n`);
+    io.stderr.write(`arbol-browser: ${failure.detail.code}\n${coldFailureSuffix(observation, failure.exitCode)}`);
     return failure.exitCode;
   }
 }
