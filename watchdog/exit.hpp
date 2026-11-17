@@ -199,11 +199,19 @@ struct SharedState {
   char magic[8]={'A','B','R','2','9','S','1','\0'},capabilityDigest[65]{};
   uint64_t bytes=sizeof(SharedState); std::atomic<uint64_t> fatal{0};
   std::atomic<uint64_t> fatalCutoffUs{0};
+  // Installed only by the genuine13.4 Close/local-event budget consumer.
+  std::atomic<uint64_t> closeReceivedUs{0},closeGraceUs{0},closeOverallUs{0};
   IdentitySlot main,primary,custody;
   FamilyState family;
   std::atomic<uint32_t> enrolled{0},transfer{0},mutation{0},markerBound{0},admitted{0};
   std::atomic<uint32_t> cookieAcknowledged{0},domRequested{0},quitRequested{0},retiredPages{0};
   std::atomic<uint32_t> primaryConsent{0},custodyConsent{0};
+  std::atomic<uint64_t> primaryConsentUs{0},custodyConsentUs{0};
+  // Actual main-native publishers (13.5) advance this once through retired
+  // pages, same website DOM request, cookie callback, intended guarded quit.
+  // A void JS return or intent cannot set post-exit eligibility.
+  std::atomic<uint32_t> shutdownOrder{0};
+  std::atomic<uint64_t> shutdownTimes[4]{{0},{0},{0},{0}};
   std::atomic<uint32_t> ordinaryPostExitEligible{0};
   // Verified native mutation preparation publishes this before permission to
   // write. A later independent holder can authenticate an uncertain resulting
@@ -470,6 +478,8 @@ class HostCapability {
   int reads_[3]{-1,-1,-1},writes_[3]{-1,-1,-1}; unsigned role_=0;
   RetainedFamily* family_=nullptr;
   NSDictionary* value_=nil; std::string raw_; bool attempted_=false,valid_=false;
+  NSDictionary* ordinaryProof_=nil; double ordinaryDeadline_=0;
+  NSDictionary* quiescenceProof_=nil;
   bool ledgerDescriptor(int fd,unsigned index,bool writable,bool header=true) const {
     NSArray* streams=value_[@"family"];
     if(![streams isKindOfClass:NSArray.class]||streams.count!=3||index>2||fd<0) return false;
@@ -734,6 +744,102 @@ public:
       child.st_dev==root.st_dev&&[fileIdentity(child) isEqual:value_[@"receiptDirectory"][@"identity"]];
     if(close(fd)) valid=false; return valid;
   }
+  // Same actual descriptor supplies both bytes and the physical dirty marker
+  // identity. No reopened inode can be paired with previously closed bytes.
+  NSDictionary* boundMarker(arbol_boundary::Context& c) const {
+    if(!present()||state_->markerBound.load(std::memory_order_acquire)!=1||!metadata()||
+       !arbol_boundary::lockIdentity(c.owner)||!arbol_boundary::lockIdentity(c.build)) return nil;
+    NSString* path=value_[@"attempt"][@"profile"];
+    int root=open(path.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC); if(root<0) return nil;
+    struct stat parent{},namedParent{},first{},named{},last{},after{}; std::string raw;
+    bool ok=!fstat(root,&parent)&&!lstat(path.fileSystemRepresentation,&namedParent)&&S_ISDIR(parent.st_mode)&&
+      [fileIdentity(parent) isEqual:value_[@"profileDirectory"]]&&parent.st_dev==namedParent.st_dev&&parent.st_ino==namedParent.st_ino;
+    int fd=ok?openat(root,"engine.json",O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC):-1;
+    ok=ok&&fd>=0&&!fstat(fd,&first)&&!fstatat(root,"engine.json",&named,AT_SYMLINK_NOFOLLOW)&&
+      arbol_attempt::privateFile(first)&&arbol_attempt::sameFile(first,named)&&first.st_size>0&&first.st_size<16384;
+    char bytes[4096];
+    while(ok&&raw.size()<=(size_t)first.st_size) {
+      ssize_t n=read(fd,bytes,std::min(sizeof(bytes),(size_t)first.st_size+1-raw.size()));
+      if(n>0) raw.append(bytes,n); else if(!n) break; else if(errno!=EINTR) ok=false;
+    }
+    ok=ok&&raw.size()==(size_t)first.st_size&&!fstat(fd,&last)&&!fstatat(root,"engine.json",&after,AT_SYMLINK_NOFOLLOW)&&
+      arbol_attempt::sameFile(first,last)&&arbol_attempt::sameFile(last,after);
+    if(fd>=0&&close(fd)) ok=false;
+    struct stat end{},endName{};
+    ok=ok&&!fstat(root,&end)&&!lstat(path.fileSystemRepresentation,&endName)&&
+      [fileIdentity(end) isEqual:value_[@"profileDirectory"]]&&end.st_dev==endName.st_dev&&end.st_ino==endName.st_ino;
+    if(close(root)) ok=false;
+    const auto& bound=state_->marker;
+    NSDictionary* marker=arbol_attempt::json(raw); NSString* hash=arbol_attempt::digest(raw);
+    ok=ok&&marker&&last.st_dev==(dev_t)bound.device&&last.st_ino==bound.inode&&last.st_uid==bound.uid&&last.st_size==(off_t)bound.size&&
+      [hash isEqual:[NSString stringWithUTF8String:bound.digest]]&&[marker[@"cleanExit"] isEqual:@NO]&&
+      [marker[@"dataEpoch"] unsignedLongLongValue]==bound.dataEpoch&&
+      [marker[@"requiredReader"] isEqual:[NSString stringWithUTF8String:bound.reader]]&&
+      arbol_boundary::lockIdentity(c.owner)&&arbol_boundary::lockIdentity(c.build)&&metadata();
+    return ok?@{@"identity":fileIdentity(last),@"digest":hash,@"value":marker}:nil;
+  }
+  bool bindOrdinaryQuiescence(arbol_boundary::Context& c,const ExitWatch& watch,double mainLimit) {
+    if(quiescenceProof_||!present()||!watch.ordinaryBefore(mainLimit)||!arbol_boundary::same(watch.original(),c.main)||
+       state_->fatal.load(std::memory_order_acquire)||!c.engineGone()||!family_||!family_->complete()) return false;
+    NSDictionary* frontier=family_->frontierTuple(); double now=arbol_boundary::clockMs();
+    if(!frontier||now>=mainLimit||state_->fatal.load(std::memory_order_acquire)) return false;
+    quiescenceProof_=@{@"mainExitStatus":@(watch.status()),@"mainObservedUs":@((uint64_t)(watch.observedAt()*1000)),
+      @"quiescentUs":@((uint64_t)(now*1000)),@"liveLimitUs":@((uint64_t)(mainLimit*1000)),@"family":frontier};
+    return true;
+  }
+  bool hasOrdinaryQuiescence() const { return quiescenceProof_!=nil; }
+  bool ordinaryCurrent(arbol_boundary::Context& c,double deadline) const {
+    return present()&&role_==1&&getpid()==c.primary.pid&&arbol_boundary::clockMs()<deadline&&
+      state_->fatal.load(std::memory_order_acquire)==0&&state_->enrolled.load(std::memory_order_acquire)==7&&
+      state_->main.is(c.main)&&state_->primary.is(c.primary)&&state_->custody.is(c.custody)&&
+      state_->admitted.load(std::memory_order_acquire)==1&&state_->markerBound.load(std::memory_order_acquire)==1&&
+      c.primaryMonitor()&&c.primaryOutside&&arbol_boundary::lockIdentity(c.owner)&&arbol_boundary::lockIdentity(c.build)&&
+      c.engineGone()&&c.originalGone(c.custody)&&family_&&family_->complete()&&metadata()&&
+      state_->fatal.load(std::memory_order_acquire)==0&&arbol_boundary::clockMs()<deadline;
+  }
+  bool collectOrdinary(arbol_boundary::Context& c,const ExitWatch& mainWatch,const ExitWatch& peerWatch,
+    double mainLimit,double roundStart,double roundLimit) {
+    if(ordinaryProof_) return false;
+    // H/ACK proves timely original engine quiescence. Its frozen proof does
+    // not renew or truncate the separate one-second T/K round. Durability is
+    // bounded by the genuine already admitted overall Close/local-event budget.
+    double deadline=(double)state_->closeOverallUs.load(std::memory_order_acquire)/1000;
+    uint64_t grace=state_->closeGraceUs.load(std::memory_order_acquire);
+    if(!quiescenceProof_||!grace||![quiescenceProof_[@"liveLimitUs"] isEqual:@((uint64_t)(mainLimit*1000))]||
+       [quiescenceProof_[@"quiescentUs"] unsignedLongLongValue]>=grace||arbol_boundary::clockMs()>=roundLimit||
+       !ordinaryCurrent(c,deadline)||!arbol_boundary::same(mainWatch.original(),c.main)||
+       !arbol_boundary::same(peerWatch.original(),c.custody)||!mainWatch.ordinaryBefore(mainLimit)||!peerWatch.ordinaryBefore(roundLimit)||
+       state_->primaryConsent.load(std::memory_order_acquire)!=1||state_->custodyConsent.load(std::memory_order_acquire)!=1||
+       state_->shutdownOrder.load(std::memory_order_acquire)!=4||state_->retiredPages.load(std::memory_order_acquire)!=1||
+       state_->domRequested.load(std::memory_order_acquire)!=1||state_->cookieAcknowledged.load(std::memory_order_acquire)!=1||
+       state_->quitRequested.load(std::memory_order_acquire)!=1) return false;
+    uint64_t times[4]; for(unsigned i=0;i<4;++i) times[i]=state_->shutdownTimes[i].load(std::memory_order_acquire);
+    for(unsigned i=0;i<4;++i) if(!times[i]||(i&&times[i]<times[i-1])) return false;
+    uint64_t primaryConsent=state_->primaryConsentUs.load(std::memory_order_acquire),custodyConsent=state_->custodyConsentUs.load(std::memory_order_acquire);
+    if(times[3]>=(uint64_t)(mainWatch.observedAt()*1000)||primaryConsent<(uint64_t)(roundStart*1000)||
+       custodyConsent<(uint64_t)(roundStart*1000)||primaryConsent>=(uint64_t)(roundLimit*1000)||
+       custodyConsent>=(uint64_t)(peerWatch.observedAt()*1000)) return false;
+    arbol_attempt::Claim claim; std::string currentRaw; NSDictionary* current=nil;
+    if(!currentAttempt(c,claim,currentRaw,current,deadline)||![current[@"phase"] isEqual:@"closing"]||
+       ![current[@"stage"] isEqual:@"admitted"]) return false;
+    NSDictionary* marker=boundMarker(c),*frontier=family_->frontierTuple();
+    if(!marker||!frontier||![frontier isEqual:quiescenceProof_[@"family"]]||!ordinaryCurrent(c,deadline)) return false;
+    Identity self; if(arbol_boundary::observe(getpid(),self)!=1||!arbol_boundary::same(self,c.primary)) return false;
+    ordinaryProof_=@{@"format":@1,@"kind":@"ordinary-post-exit",@"capabilityDigest":arbol_attempt::digest(raw_),
+      @"bootSession":value_[@"bootSession"],@"attempt":current,@"runtime":value_[@"runtime"],
+      @"profileDirectory":value_[@"profileDirectory"],@"profileRecordDigest":value_[@"profileRecordDigest"],
+      @"main":value_[@"main"],@"primary":arbol_boundary::capsuleIdentity(c.primary),@"custody":arbol_boundary::capsuleIdentity(c.custody),
+      @"lastHolder":arbol_boundary::capsuleIdentity(self,c.session),@"marker":marker,@"family":frontier,@"quiescence":quiescenceProof_,
+      @"shutdown":@{@"pagesRetiredUs":@(times[0]),@"domRequestUs":@(times[1]),@"cookieCallbackUs":@(times[2]),@"quitIntentUs":@(times[3])},
+      @"mainExit":@{@"status":@(mainWatch.status()),@"observedUs":@((uint64_t)(mainWatch.observedAt()*1000)),@"limitUs":@((uint64_t)(mainLimit*1000))},
+      @"peerExit":@{@"status":@(peerWatch.status()),@"observedUs":@((uint64_t)(peerWatch.observedAt()*1000)),@"limitUs":@((uint64_t)(roundLimit*1000))},
+      @"consent":@{@"roundUs":@((uint64_t)(roundStart*1000)),@"primaryUs":@(primaryConsent),@"custodyUs":@(custodyConsent)},
+      @"deadlineUs":@((uint64_t)(deadline*1000)),@"collectedUs":@((uint64_t)(arbol_boundary::clockMs()*1000)),
+      @"storageScope":@"pinned Chromium ordinary shutdown; emitted storage requires independent native durable synchronization"};
+    ordinaryDeadline_=deadline; state_->ordinaryPostExitEligible.store(1,std::memory_order_release); return true;
+  }
+  NSDictionary* ordinaryProof() const { return ordinaryProof_; }
+  double ordinaryDeadline() const { return ordinaryDeadline_; }
   bool held(arbol_boundary::Context& c) const {
     return present()&&exclusiveWriter()&&state_->enrolled.load(std::memory_order_acquire)==7&&
       state_->main.is(c.main)&&state_->primary.is(c.primary)&&state_->custody.is(c.custody)&&

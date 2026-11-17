@@ -115,7 +115,7 @@ struct Deadline {
   pair.outgoing.clear();
   bool initialSent=false,kSent=false,kCommitted=false,pendingFamily=false;
   auto proofBound=[&] {
-    double bound=cap?std::min(expires,mainLimit):expires;
+    double bound=cap&&!cap->hasOrdinaryQuiescence()?std::min(expires,mainLimit):expires;
     if(cap) { uint64_t fatal=cap->shared()->fatalCutoffUs.load(std::memory_order_acquire); if(fatal) bound=std::min(bound,(double)fatal/1000); }
     return bound;
   };
@@ -150,7 +150,7 @@ struct Deadline {
         if(gotP) poison(cap,arbol_exit::protocolLoss); gotP=true;
       } else if(primary&&f.kind=='K') {
         if(!tCommitted||gotK) { poison(cap,arbol_exit::protocolLoss); continue; }
-        gotK=true; if(cap) cap->shared()->primaryConsent.store(1,std::memory_order_release);
+        gotK=true; if(cap) { cap->shared()->primaryConsentUs.store((uint64_t)(clockMs()*1000),std::memory_order_release); cap->shared()->primaryConsent.store(1,std::memory_order_release); }
       } else if(!primary&&f.kind=='T') {
         if(gotT) { poison(cap,arbol_exit::protocolLoss); continue; } gotT=true;
         // Keep this exact T and its original round cutoff while current
@@ -178,19 +178,20 @@ struct Deadline {
       pair.flush(expires); kCommitted=pair.outgoing.empty()&&!pair.failed;
     }
     if(!primary&&kCommitted&&clockMs()<expires&&currentQuiescence()&&current(c.custody)==1) {
-      if(cap) cap->shared()->custodyConsent.store(1,std::memory_order_release);
+      if(cap) { cap->shared()->custodyConsentUs.store((uint64_t)(clockMs()*1000),std::memory_order_release); cap->shared()->custodyConsent.store(1,std::memory_order_release); }
       _exit(0);
     }
     int state=current(peer);
     if(state<0) poison(cap,arbol_exit::identityLoss);
     if(!state) {
       if(!cap) _exit(0); // Native-only legacy has no finalization authority
-      if(watched&&!peerWatch.observed()&&clockMs()<expires) { usleep(1000); continue; }
+      if((!c.originalGone(peer)||(watched&&!peerWatch.observed()))&&clockMs()<expires) { usleep(1000); continue; }
       bool consent=primary&&gotK&&cap->shared()->primaryConsent.load(std::memory_order_acquire)==1&&
         cap->shared()->custodyConsent.load(std::memory_order_acquire)==1;
       bool ordinary=consent&&watched&&peerWatch.ordinaryBefore(expires)&&mainWatch&&mainWatch->ordinaryBefore(mainLimit)&&
-        cap->shared()->fatal.load(std::memory_order_acquire)==0;
-      if(ordinary) cap->shared()->ordinaryPostExitEligible.store(1,std::memory_order_release);
+        cap->shared()->fatal.load(std::memory_order_acquire)==0&&c.originalGone(peer)&&
+        cap->collectOrdinary(c,*mainWatch,peerWatch,mainLimit,requested,expires);
+      if(ordinary) { /* Native-only proof; synchronization/activation follows in13.2/13.3. */ }
       else poison(cap,arbol_exit::peerLoss);
       // No clean marker or flush receipt here. The later native independent
       // finalizer/dirty witness owns this last-holder exit boundary.
@@ -295,7 +296,10 @@ struct Deadline {
       // The census itself may have been delayed. Its first complete result
       // cannot be backdated from a late poll into the frozen live window.
       if(cap&&terminal&&clockMs()>=terminalExpires) { deadline.lost(clockMs()); poison(cap,arbol_exit::identityLoss); }
-      retirePair(c,pair,primary,cap,&watch,terminalExpires?terminalExpires:liveLimit(),first);
+      double mainLimit=terminalExpires?terminalExpires:liveLimit();
+      if(cap&&cap->shared()->fatal.load(std::memory_order_acquire)==0&&!cap->bindOrdinaryQuiescence(c,watch,mainLimit))
+        poison(cap,arbol_exit::identityLoss);
+      retirePair(c,pair,primary,cap,&watch,mainLimit,first);
     }
   };
   for(;;) {
