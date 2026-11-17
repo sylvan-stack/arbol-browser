@@ -18,7 +18,7 @@ function acknowledgement(value: unknown): void {
 }
 interface EventReceipt { readonly type: string; readonly token: string; readonly target: 'source' | 'other'; readonly serial: number; readonly key?: string }
 export interface IssuedInput { readonly token: string; readonly command: number }
-interface MonitorState { connected: boolean; pointer: boolean; captures: number; keys: number; bad: boolean }
+interface MonitorState { connected: boolean; pointer: boolean; captures: number; keys: number; composing: boolean; bad: boolean }
 export const physicalKeys = Object.freeze({
   Enter: ['Enter', 'Enter', 13], Tab: ['Tab', 'Tab', 9], Escape: ['Escape', 'Escape', 27],
   Backspace: ['Backspace', 'Backspace', 8], Delete: ['Delete', 'Delete', 46],
@@ -37,9 +37,10 @@ const installMonitor = `function(action,binding){
   'use strict'; const source=this, doc=source.ownerDocument||source;
   if(!source.isConnected||doc!==document)throw Error('target');
   const notify=globalThis[binding]; if(typeof notify!=='function')throw Error('binding');
-  let token='',serial=0,live=true,pointer=false,bad=false;const captures=new Set(),keys=new Set();
+  let token='',serial=0,live=true,pointer=false,composing=false,bad=false,expected;
+  const captures=new Set(),keys=new Set();
   const allowedKeys=['Enter','Tab','Escape','Backspace','Delete','ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End','PageUp','PageDown',' ','a','A','Shift','Meta'];
-  const types=['pointerdown','pointerup','pointercancel','gotpointercapture','lostpointercapture','mousedown','mouseup','click','keydown','keyup'];
+  const types=['pointerdown','pointerup','pointercancel','gotpointercapture','lostpointercapture','mousedown','mouseup','click','keydown','keyup','beforeinput','input','compositionstart','compositionend'];
   const receive=e=>{
     if(!live||!e.isTrusted)return;
     const original=e.composedPath()[0]===source;
@@ -50,6 +51,8 @@ const installMonitor = `function(action,binding){
     if(e.type==='gotpointercapture'){if(captures.size>=16)bad=true;else captures.add(e.pointerId);}
     if(e.type==='lostpointercapture')captures.delete(e.pointerId);
     if(e.type==='pointercancel')bad=true;
+    if(e.type==='compositionstart')composing=true;
+    if(e.type==='compositionend')composing=false;
     let key;
     if(e.type==='keydown'||e.type==='keyup'){
       if(!allowedKeys.includes(e.key)){bad=true;return;}key=e.key==='A'?'a':e.key;
@@ -61,10 +64,20 @@ const installMonitor = `function(action,binding){
   for(const type of types)doc.addEventListener(type,receive,true);
   return Object.freeze({
     arm(next){if(!live||typeof next!=='string'||next.length!==32||!source.isConnected)throw Error('arm');token=next;return true;},
-    state(){return {connected:source.isConnected&&source.ownerDocument===doc,pointer,captures:captures.size,keys:keys.size,bad};},
+    state(){return {connected:source.isConnected&&source.ownerDocument===doc,pointer,captures:captures.size,keys:keys.size,composing,bad};},
     focused(){return source.isConnected&&(source.getRootNode().activeElement===source||doc.activeElement===source);},
+    prepareText(text,mode){
+      if(!this.focused()||typeof text!=='string'||text.length>20000||!['replace','append'].includes(mode))return false;
+      const value=('value' in source)?source.value:source.textContent;
+      if(typeof value!=='string'||value.length>65536)return false;
+      expected=mode==='replace'?text:value+text;return true;
+    },
+    accepted(){
+      if(!this.focused()||typeof expected!=='string'||composing)return false;
+      return (('value' in source)?source.value:source.textContent)===expected;
+    },
     async frame(){await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));return this.state();},
-    close(){live=false;token='';for(const type of types)doc.removeEventListener(type,receive,true);captures.clear();keys.clear();return true;}
+    close(){live=false;token='';expected=undefined;for(const type of types)doc.removeEventListener(type,receive,true);captures.clear();keys.clear();return true;}
   });
 }`;
 const armMonitor = 'function(token){return this.arm(token);}';
@@ -123,7 +136,8 @@ export class TrustedObservation {
       let data: any; try { data = JSON.parse(event.payload); } catch { this.invalid = true; return; }
       if (data?.action !== this.target.execution.action || typeof data.token !== 'string' || !this.issued.has(data.token) ||
           !Number.isSafeInteger(data.serial) || data.serial !== this.serial + 1 || data.serial > 128 ||
-          !['pointerdown', 'pointerup', 'pointercancel', 'gotpointercapture', 'lostpointercapture', 'mousedown', 'mouseup', 'click', 'keydown', 'keyup'].includes(data.type) ||
+          !['pointerdown', 'pointerup', 'pointercancel', 'gotpointercapture', 'lostpointercapture', 'mousedown', 'mouseup', 'click', 'keydown', 'keyup',
+            'beforeinput', 'input', 'compositionstart', 'compositionend'].includes(data.type) ||
           !['source', 'other'].includes(data.target) || this.events.length >= 128) { this.invalid = true; return; }
       this.serial = data.serial;
       if (['keydown', 'keyup'].includes(data.type) && !Object.values(physicalKeys).some(key => key[0] === data.key)) { this.invalid = true; return; }
@@ -226,26 +240,47 @@ export class TrustedObservation {
       ...(type === 'keyDown' && key === 'Space' ? { text: ' ', unmodifiedText: ' ' } : {}),
       ...(type === 'keyDown' && key === 'A' && modifiers === 4 ? { commands: ['selectAll'] } : {}) });
   }
+  async prepareText(text: string, mode: 'replace' | 'append'): Promise<void> {
+    if (await this.call('function(text,mode){return this.prepareText(text,mode);}', [{ value: text }, { value: mode }]) !== true) throw staleSnapshot();
+  }
+  /** Fixed native editor command, not a DOM selection/value setter. */
+  appendSelection(): Promise<IssuedInput> {
+    return this.issue('Input.dispatchKeyEvent', { type: 'keyDown', key: 'End', code: 'End', windowsVirtualKeyCode: 35,
+      modifiers: 0, autoRepeat: false, isSystemKey: false, commands: ['moveToEndOfDocument'] });
+  }
+  insertText(text: string): Promise<IssuedInput> { return this.issue('Input.insertText', { text }); }
   private seen(type: string, issued: IssuedInput, target: EventReceipt['target'] = 'source'): boolean {
     return this.issued.get(issued.token) === issued.command && this.events.some(event => event.type === type && event.token === issued.token && event.target === target);
   }
   private async balanced(): Promise<void> {
     const state = await this.call(frameMonitor, [], true) as MonitorState;
     this.guard();
-    if (!state || !state.connected || state.pointer !== false || state.captures !== 0 || state.keys !== 0 || state.bad !== false || this.pending.size) throw staleSnapshot();
+    if (!state || !state.connected || state.pointer !== false || state.captures !== 0 || state.keys !== 0 || state.composing !== false ||
+        state.bad !== false || this.pending.size) throw staleSnapshot();
   }
-  async settleKeys(strokes: readonly KeyStroke[], allowTabTransfer: boolean): Promise<void> {
-    await this.balanced(); this.guard();
+  private checkStrokes(strokes: readonly KeyStroke[], allowTabTransfer: boolean): void {
+    this.guard();
     for (const stroke of strokes) {
       const name = physicalKeys[stroke.key][0];
       if (!this.events.some(event => event.type === 'keydown' && event.target === 'source' && event.token === stroke.down.token && event.key === name) ||
           !this.events.some(event => event.type === 'keyup' && (event.target === 'source' || allowTabTransfer) && event.token === stroke.up.token && event.key === name) ||
           this.issued.get(stroke.down.token) !== stroke.down.command || this.issued.get(stroke.up.token) !== stroke.up.command) throw staleSnapshot();
     }
+  }
+  async settleKeys(strokes: readonly KeyStroke[], allowTabTransfer: boolean): Promise<void> {
+    await this.balanced(); this.checkStrokes(strokes, allowTabTransfer);
     const last = strokes.at(-1)?.up.command, { execution } = this.target;
     if (!last || last !== execution.command) throw staleSnapshot();
     execution.settle({ action: execution.action!, operation: this.operation, original: execution.stamp.document,
       current: this.target.frame.receipt, delivered: true, quiescent: true, command: last });
+  }
+  async settleText(strokes: readonly KeyStroke[], insertion: IssuedInput): Promise<void> {
+    await this.balanced(); this.checkStrokes(strokes, false);
+    if (!this.seen('beforeinput', insertion) || !this.seen('input', insertion) ||
+        insertion.command !== this.target.execution.command || await this.call('function(){return this.accepted();}') !== true) throw staleSnapshot();
+    this.guard(); const { execution } = this.target;
+    execution.settle({ action: execution.action!, operation: this.operation, original: execution.stamp.document,
+      current: this.target.frame.receipt, delivered: true, quiescent: true, command: insertion.command });
   }
   async settleClick(press: IssuedInput, release: IssuedInput): Promise<void> {
     await this.balanced(); this.guard();
