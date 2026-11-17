@@ -88,19 +88,27 @@ export async function agent(c, profile, label) {
 export const tool = (client, name, args = {}) => client.call({ wire: 1, id: token('req'), method: 'tool', params: { name, arguments: args } });
 export async function closes(c, profile) { return success(await cli(c, ['close', '--profile', profile])); }
 export function processSnapshot() {
-  return execFileSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,command='], { encoding: 'utf8' });
+  return execFileSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,comm='], { encoding: 'utf8' });
 }
 export async function family(c, label) {
-  const ps = processSnapshot(); await writeFile(join(c.output, label + '-ps.txt'), ps, { mode: 0o600 });
-  return ps.split('\n').filter(line => line.includes(c.buildRoot));
+  // Inspect the OS census in memory. Persist only this exact package's rows,
+  // never unrelated owner process arguments or the Node-mode gate worker.
+  const rows = processSnapshot().split('\n').filter(line => line.includes(c.buildRoot + '/ArbolBrowser.app/') &&
+    Number(line.trim().split(/\s+/)[0]) !== process.pid);
+  await save(join(c.output, label + '-processes.json'), rows); return rows;
 }
 export async function finish(c) {
   for (const peer of c.peers) peer.close();
   // Always try the real bounded close, including after an assertion fails.
   // Failed close is retained and never converted into qualification success.
+  const cleanup = [];
   for (const profile of c.profiles) {
-    try { await cli(c, ['close', '--profile', profile]); } catch (error) { await save(join(c.output, 'cleanup-' + profile + '.json'), { error: String(error.stack ?? error) }); }
+    try { const result = await cli(c, ['close', '--profile', profile]); cleanup.push({ profile, result }); success(result); }
+    catch (error) { cleanup.push({ profile, error: String(error.stack ?? error) }); }
   }
+  await save(join(c.output, 'cleanup.json'), cleanup);
+  assert.ok(cleanup.every(row => !row.error), 'Real profile cleanup failed; inspect cleanup.json');
+  assert.deepEqual(await family(c, 'after-cleanup'), [], 'Owned package process survived actual cleanup');
   assert.deepEqual(await readFile(c.recordPath), c.originalRecord, 'Gate changed the original Building record');
   const st = await lstat(c.selection.guard); assert.deepEqual({ dev: st.dev, ino: st.ino }, c.guardIdentity);
 }
