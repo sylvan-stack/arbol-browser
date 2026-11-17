@@ -640,8 +640,27 @@ static void observeNativeRefusal(Custody* c) noexcept {
 // handle can acquire admission, a Claim, or change retained native state.
 static const char* const hostStartupStages[]={"arm-readback","native-install-snapshot","native-feature-addon-preflight",
   "engine-authority","owned-lease-policy","engine-owner-policy","marker-read","existing-marker-compatibility",
-  "fresh-marker-compatibility","verified-prior-exit","native-marker-permit"};
+  "fresh-marker-compatibility","verified-prior-exit","native-marker-permit",
+  "watchdog-spawn-loss","watchdog-readiness-loss","watchdog-pipe-error","watchdog-pipe-end","watchdog-ack-malformed","watchdog-ack-order","watchdog-ack-expiry","watchdog-custody-refusal","watchdog-termination","watchdog-transport-loss","native_integrity_unavailable","native_retirement_unavailable","native_watchdog_unavailable","native_boundary_unavailable"};
+// New failure labels alone may observe a genuine pre-bind fatal context.
+// Ordinary milestone guards below, including bound, remain unchanged.
+static constexpr int hostLossStart=11;
+static std::atomic<bool> hostLossEmitted{false};
+static void observeHostLoss(Custody* c,int stage) noexcept {
+  int saved=errno;
+  @autoreleasepool { @try { try {
+    if(stage>=hostLossStart&&stage<(int)(sizeof(hostStartupStages)/sizeof(hostStartupStages[0]))&&
+       c&&nativeCustodies.count(c)&&c->continuousBuild&&c->hostRequired&&c->finalization.present()&&
+       c->finalization.shared()->fatal.load(std::memory_order_acquire)&&
+       getpid()==c->context.main.pid&&arbol_boundary::current(c->context.main)==1&&
+       arbol_boundary::lockIdentity(c->context.owner)&&arbol_boundary::lockIdentity(c->context.build)&&
+       !hostLossEmitted.exchange(true,std::memory_order_relaxed))
+      os_log_with_type(OS_LOG_DEFAULT,OS_LOG_TYPE_DEFAULT,"arbol-browser retained-stage %{public}s",hostStartupStages[stage]);
+  } catch(...) {} } @catch(NSException*) {} }
+  errno=saved;
+}
 static void observeHostStartup(Custody* c,int stage) noexcept {
+  if(stage>=hostLossStart) { observeHostLoss(c,stage); return; }
   int saved=errno;
   @autoreleasepool { @try { try {
     if(c&&nativeCustodies.count(c)&&stage>=0&&stage<(int)(sizeof(hostStartupStages)/sizeof(hostStartupStages[0]))&&

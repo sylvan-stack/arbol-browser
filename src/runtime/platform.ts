@@ -49,6 +49,8 @@ export interface WatchdogCustody {
   assertMarker(): void;
   /** Native shared attribution precedes any JS/native cleanup; no raw flags. */
   latchFatal(): void;
+  /** Optional warning only, on this genuine receipt and existing native handle. */
+  noteLoss?(stage: HostLossStage): void;
   now(): number;
   capture(primaryPid: number): void;
   bind(): void;
@@ -95,9 +97,11 @@ export function assertSystemClipboardProtection(value: SystemClipboardProtection
   if (!actual || actual.custody !== custody) throw unavailable('browser');
   actual.check();
 }
+const hostLossStages = Object.freeze(['watchdog-spawn-loss', 'watchdog-readiness-loss', 'watchdog-pipe-error', 'watchdog-pipe-end', 'watchdog-ack-malformed', 'watchdog-ack-order', 'watchdog-ack-expiry', 'watchdog-custody-refusal', 'watchdog-termination', 'watchdog-transport-loss', 'native_integrity_unavailable', 'native_retirement_unavailable', 'native_watchdog_unavailable', 'native_boundary_unavailable'] as const);
+export type HostLossStage = typeof hostLossStages[number];
 const hostStartupStages = Object.freeze(['arm-readback', 'native-install-snapshot', 'native-feature-addon-preflight',
   'engine-authority', 'owned-lease-policy', 'engine-owner-policy', 'marker-read',
-  'existing-marker-compatibility', 'fresh-marker-compatibility', 'verified-prior-exit', 'native-marker-permit'] as const);
+  'existing-marker-compatibility', 'fresh-marker-compatibility', 'verified-prior-exit', 'native-marker-permit', ...hostLossStages] as const);
 export type HostStartupStage = typeof hostStartupStages[number];
 export interface PlatformPort {
   /** Warning-only finite local milestone on the genuine original native handle. */
@@ -307,6 +311,13 @@ export function loadPlatform(): PlatformPort {
           });
         },
         latchFatal: () => call(() => native.latchWatchdogFatal(handle)),
+        noteLoss(stage: HostLossStage): void {
+          try {
+            const index = hostStartupStages.indexOf(stage);
+            if (hostLossStages.includes(stage) && index >= 0 && typeof native.noteHostStartup === 'function')
+              native.noteHostStartup(handle, index);
+          } catch { /* Warning only: retain the original fatal/termination path. */ }
+        },
         now: () => call(() => native.continuousTime()),
         capture: (pid: number) => call(() => native.captureWatchdog(handle, pid)),
         bind: () => call(() => native.watchdogBind(handle)), assert: () => call(() => native.watchdogAssert(handle)),

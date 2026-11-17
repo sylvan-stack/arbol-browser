@@ -1,6 +1,6 @@
 /** Profile-wide irreversible authority and guarded native failure path. */
 import { unavailable } from '../contracts/errors.js';
-import { assertNativeWatchdog, type NativeWatchdog } from './watchdog.js';
+import { assertNativeWatchdog, type NativeWatchdog, type ProfileFatalCause } from './watchdog.js';
 import type { NativeCompatibility } from './preflight.js';
 export interface FatalEffects {
   closeAdmission(): void;
@@ -23,7 +23,7 @@ export function assertProfileFatal(value: ProfileFatal): void {
 export function createProfileFatal(watchdog: NativeWatchdog, effects: FatalEffects): ProfileFatal {
   assertNativeWatchdog(watchdog);
   if (!effects || ['closeAdmission', 'invalidate', 'hidePages'].some(name => typeof effects[name as keyof FatalEffects] !== 'function')) throw unavailable('browser');
-  let latched = false, cause: string | undefined, native: NativeCompatibility | undefined;
+  let latched = false, cause: ProfileFatalCause | undefined, native: NativeCompatibility | undefined;
   function closed() { return latched || watchdog.fatal; }
   function synchronous(operation: () => void) {
     const result: unknown = operation();
@@ -32,8 +32,8 @@ export function createProfileFatal(watchdog: NativeWatchdog, effects: FatalEffec
   function fail(reason: string): never {
     if (!latched) {
       // This bit governs admission/content guards before ANY callback/await.
-      latched = true; cause = diagnostics.has(reason) ? reason : 'native_boundary_unavailable';
-      watchdog.quarantine(); // stop H and request F before every risky operation
+      latched = true; cause = diagnostics.has(reason) ? reason as ProfileFatalCause : 'native_boundary_unavailable';
+      watchdog.quarantine(cause); // stop H and request F before every risky operation
       try {
         synchronous(() => effects.closeAdmission());
         synchronous(() => effects.invalidate());
