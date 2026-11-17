@@ -35,30 +35,55 @@ export async function terminateAdoptedBuild(lease: BuildLease, platform: Platfor
   return owner ? withOwnerLockForCustody(owner, platform, heldOwner => platform.terminateAdoptedHost(source.held, heldOwner)) :
     platform.terminateAdoptedHost(source.held);
 }
-/** Host-only continuous outer description. This is deliberately separate from
- * the Node starter's ordinary independently acquired shared guard below. The
- * native original cannot be released in a running main or by GC; the OS closes
- * it at actual process death, and armed custody owns its duplicated copies. */
+/** The native fixed-exec original is captured before profile request/policy
+ * reads. This private token grants neither Owner nor any engine permission. */
+export interface CapturedHostBuild { readonly role: 'native-original-build' }
+const capturedBuilds = new WeakMap<CapturedHostBuild, { platform: PlatformPort; held: HeldLock;
+  requestPath: string; bundle: string; selection: BuildSelection; binding: boolean }>();
+export function captureHostBuild(platform: PlatformPort, selection: BuildSelection, bundle: string,
+  requestPath: string): CapturedHostBuild {
+  assertPlatform(platform);
+  if (bundle !== join(selection.directory, 'ArbolBrowser.app') ||
+      selection.guard !== join(dirname(selection.directory), '.uses', selection.build)) throw profileUnavailable();
+  // Native authenticates actual inherited capsule/OFD, signed fixed image,
+  // original birth and current Claim. Expired/cancelled is terminal-only there.
+  const held = platform.adoptHostBuild(requestPath, selection.guard, bundle);
+  const token: CapturedHostBuild = Object.freeze({ role: 'native-original-build' });
+  capturedBuilds.set(token, { platform, held, requestPath, bundle, selection: Object.freeze({ ...selection }), binding: false });
+  return token;
+}
+export function terminateCapturedHostBuild(capture: CapturedHostBuild): never {
+  const value = capturedBuilds.get(capture); if (!value) throw profileUnavailable();
+  return value.platform.terminateAdoptedHost(value.held);
+}
+/** Bind only after full current request/profile/signed policy verification.
+ * No reopen, second native adoption, raw descriptor or caller-created lease. */
 export async function adoptHostBuildLease(host: VerifiedHost, platform: PlatformPort,
-  requestPath: string, deadline: number): Promise<BuildLease> {
-  assertPlatform(platform); assertVerifiedHost(host, deadline); await host.assertTrusted(deadline);
+  requestPath: string, deadline: number, capture?: CapturedHostBuild): Promise<BuildLease> {
+  assertPlatform(platform);
   const layout = host.identity.layout;
   const selection: BuildSelection = Object.freeze({ build: layout.build, directory: layout.buildRoot,
     guard: join(dirname(layout.buildRoot), '.uses', layout.build), explicit: true });
-  const held = platform.adoptHostBuild(requestPath, selection.guard, layout.bundle);
-  const lease: BuildLease = Object.freeze({ selection,
-    async assert() {
-      const current = held.assertIdentity(), expected = host.guardIdentity;
-      if (current.device !== expected.device || current.inode !== expected.inode || current.uid !== expected.uid) throw profileUnavailable();
-      // A later identity check gets an operation budget; it does not renew the
-      // independently fixed launch-attempt admission expiry.
-      await host.assertTrusted(performance.now() + 5000); held.assertIdentity();
-    },
-    release(): never { throw profileUnavailable(); },
-  });
-  buildDescriptions.set(lease, { platform, held });
-  try { await lease.assert(); return lease; }
-  catch { return platform.terminateAdoptedHost(held); }
+  const token = capture ?? captureHostBuild(platform, selection, layout.bundle, requestPath);
+  const original = capturedBuilds.get(token);
+  if (!original) throw profileUnavailable();
+  try {
+    if (original.binding || original.platform !== platform || original.requestPath !== requestPath ||
+        original.bundle !== layout.bundle || original.selection.build !== selection.build ||
+        original.selection.directory !== selection.directory || original.selection.guard !== selection.guard) return terminateCapturedHostBuild(token);
+    original.binding = true;
+    assertVerifiedHost(host, deadline); await host.assertTrusted(deadline);
+    const held = original.held;
+    const lease: BuildLease = Object.freeze({ selection,
+      async assert() {
+        const current = held.assertIdentity(), expected = host.guardIdentity;
+        if (current.device !== expected.device || current.inode !== expected.inode || current.uid !== expected.uid) throw profileUnavailable();
+        await host.assertTrusted(performance.now() + 5000); held.assertIdentity();
+      },
+      release(): never { throw profileUnavailable(); },
+    });
+    buildDescriptions.set(lease, { platform, held }); await lease.assert(); return lease;
+  } catch { return terminateCapturedHostBuild(token); }
 }
 /** Reacquire the launcher's exact stable .uses/<hex> shared kernel flock.
  * This is Build-use protection, never publisher/native/engine compatibility

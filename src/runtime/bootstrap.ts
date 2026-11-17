@@ -45,15 +45,20 @@ let boundaryAttempted = false;
  * ABR-29 must await preparation, then acquire real owner/Build handles using
  * this exact platform instance. Both bundled host and physical bootstrap resolve
  * to the same physical lib/native and lib/runtime graph; no second cache/brand. */
-export async function prepareNativeBoundary(bundle: string): Promise<NativeBoundaryPreparation> {
+export async function prepareNativeBoundary(bundle: string, deadline = performance.now() + 10000): Promise<NativeBoundaryPreparation> {
   if (boundaryAttempted || process.type !== 'browser') throw unavailable('browser');
   boundaryAttempted = true;
   const manifestUrl = new URL('../native/manifest.js', import.meta.url).href;
   const manifest = await import(manifestUrl) as typeof import('../native/manifest.js');
-  const trust = manifest.verifyNativeCandidate(bundle);
+  const trust = manifest.verifyNativeCandidate(bundle, deadline);
+  const actualRuntime = { electron: process.versions.electron, chromium: process.versions.chrome, node: process.versions.node,
+    napi: process.versions.napi, modules: process.versions.modules, platform: process.platform, arch: process.arch,
+    macOS: process.getSystemVersion?.() };
+  if (manifest.stable(actualRuntime) !== manifest.stable(manifest.pinnedRuntime) ||
+      Number(process.versions.napi) < 8 || performance.now() >= deadline) throw unavailable('browser');
   const platformUrl = new URL('../runtime/platform.js', import.meta.url).href;
   const platformModule = await import(platformUrl) as typeof import('./platform.js');
-  manifest.assertCandidateTrust(trust);
+  trust.assertIdentity(deadline);
   const platform = platformModule.loadPlatform();
   const watchdogUrl = new URL('../native/watchdog.js', import.meta.url).href;
   const watchdogModule = await import(watchdogUrl) as typeof import('../native/watchdog.js');

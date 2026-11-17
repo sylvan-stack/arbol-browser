@@ -1,7 +1,7 @@
-import { app, session } from 'electron';
+import { app } from 'electron';
 import { resolve, join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { preflightPageAdmission } from './bootstrap.js';
+import { performance } from 'node:perf_hooks';
 import { configureProfileSession, type SessionBinding, type ProfileSessions, type ProfileApp } from '../profiles/session.js';
 import { prepareEngine, type EngineAuthority, type EngineTransaction } from '../profiles/compatibility.js';
 import { acquireInstance, runtimeLocation, assertTime, type InstanceOwner, type PreviousExit, type RuntimeRecord } from './instance.js';
@@ -10,7 +10,7 @@ import { profilePaths } from '../profiles/paths.js';
 import { consumeSelection, type BuildSelection } from './selection.js';
 import { validator } from '../contracts/schema.js';
 import { unavailable } from '../contracts/errors.js';
-import { adoptHostBuildLease, type BuildLease } from './build-lease.js';
+import { adoptHostBuildLease, captureHostBuild, terminateCapturedHostBuild, type CapturedHostBuild, type BuildLease } from './build-lease.js';
 import { assertVerifiedHost, assertHostEngineAuthority, type VerifiedHost } from './authorities.js';
 import { claimedHostAttempt } from './process.js';
 import { prepareHostCustody, abortUnadmittedHost, type HostCustody } from './custody.js';
@@ -59,7 +59,7 @@ export function assertOwnedHost(host: OwnedHost): void {
 /** Genuine pre-ready ownership only: no compatibility read, dirty marker,
  * setPath, Session or shell access precedes retained Native acknowledgement. */
 export async function prepareOwnedHost(actualApp: ProfileApp, request: HostRequest, host: VerifiedHost,
-  native: NativeBoundaryPreparation, previousExit: HostPreviousExit, deadline: number): Promise<OwnedHost | null> {
+  native: NativeBoundaryPreparation, previousExit: HostPreviousExit, deadline: number, capture?: CapturedHostBuild): Promise<OwnedHost | null> {
   if (process.type !== 'browser' || actualApp.isReady()) throw unavailable('browser');
   const bootstrapURL = new URL('./bootstrap.js', import.meta.url).href;
   const bootstrap = await import(bootstrapURL) as typeof import('./bootstrap.js');
@@ -72,7 +72,7 @@ export async function prepareOwnedHost(actualApp: ProfileApp, request: HostReque
   const location = await runtimeLocation(request.profile);
   if (!location) throw unavailable('browser');
   // This adopts, rather than releases/reopens, the original outer description.
-  const buildGuard = await adoptHostBuildLease(host, platform, join(location.leaf, `launch-${request.request}.json`), deadline);
+  const buildGuard = await adoptHostBuildLease(host, platform, join(location.leaf, `launch-${request.request}.json`), deadline, capture);
   const assertAdmission = async () => {
     assertTime(deadline); if (actualApp.isReady()) throw unavailable('browser');
     await claimedHostAttempt(request.profile, host, platform, request.request, deadline);
@@ -122,7 +122,7 @@ export async function prepareHost(actualApp: ProfileApp, owned: OwnedHost, autho
     if (authority.build !== instance.record.build) return custody.terminate();
     const engine = await prepareEngine(instance.owner, authority);
     custody.assertRetained(); custody.assertMarker();
-    const binding = await configureProfileSession(actualApp, engine);
+    const binding = await configureProfileSession(actualApp, engine, custody);
     if (actualApp.isReady()) return custody.terminate();
     const prepared: HostPreparation = Object.freeze({ ...owned, engine, binding });
     ownedHosts.add(prepared); return prepared;
@@ -131,16 +131,99 @@ export async function prepareHost(actualApp: ProfileApp, owned: OwnedHost, autho
 export async function bindHostSessions(prepared: HostPreparation): Promise<ProfileSessions> {
   assertOwnedHost(prepared);
   await prepared.instance.owner.assert(); await prepared.buildGuard.assert();
-  return prepared.binding.bind(session);
+  return prepared.binding.bindActual();
 }
-/** The sealed native/control stages must call prepareHost with their verified
- * authority before ready, then bindHostSessions after ready. There is no
- * permissive candidate trust provider and no engine/page constructor here. */
-async function candidateEntry(): Promise<void> {
+interface ActualHostAssembly {
+  closed: boolean;
+  control?: import('../host/recovery.js').RendererControl;
+  shell?: import('./bootstrap.js').TrustedShellIntegration;
+  transport?: import('./transport.js').TransportServer;
+  runtime?: import('./lifecycle.js').HostLifecycle;
+}
+/** Filled by the next accepted shell/ready assembly leaf. Until then the
+ * actual retained native original closes rather than granting page access. */
+async function assembleAfterReady(prepared: HostPreparation, _sessions: ProfileSessions,
+  boundary: import('./bootstrap.js').NativeFailureBoundary, _request: HostRequest,
+  _state: ActualHostAssembly, _deadline: number): Promise<void> {
+  assertOwnedHost(prepared); return boundary.fatal.fail('native_boundary_unavailable');
+}
+let entryAttempted = false;
+/** The thin packaged entry explicitly awaits ONLY this authenticated pre-ready
+ * phase. It never waits for app.whenReady during ESM module evaluation. */
+export async function runHostEntry(): Promise<void> {
+  if (entryAttempted || process.type !== 'browser' || app.isReady()) throw unavailable('browser');
+  entryAttempted = true;
+  const localBudget = performance.now() + 30000;
+  let capture: CapturedHostBuild | undefined, owned: OwnedHost | null = null;
+  let boundary: import('./bootstrap.js').NativeFailureBoundary | undefined;
+  const state: ActualHostAssembly = { closed: false };
   try {
-    // Top-level await is retained in the packaged ESM entry. This blocks ready
-    // until all required pre-ready preparation settles (Electron ESM contract).
-    await preflightPageAdmission();
-  } catch { app.exit(4); }
+    // Only the fixed entry's physical layout and exact outer argument precede
+    // native capture. Never read the profile request or learn policy from it.
+    const payload = resolve(fileURLToPath(new URL('../../', import.meta.url)));
+    const bundle = dirname(dirname(dirname(payload))), buildRoot = dirname(bundle);
+    const args = process.argv.slice(2);
+    if (args.length !== 2 || args[0] !== '--arbol-host-request' || !args[1]) throw unavailable('browser');
+    const selection: BuildSelection = Object.freeze({ build: basename(buildRoot), directory: buildRoot,
+      guard: join(dirname(buildRoot), '.uses', basename(buildRoot)), explicit: true });
+    const selectionURL = new URL('./selection.js', import.meta.url).href;
+    const selections = await import(selectionURL) as typeof import('./selection.js');
+    selections.selectedLayout(selection, payload);
+    const bootstrapURL = new URL('./bootstrap.js', import.meta.url).href;
+    const bootstrap = await import(bootstrapURL) as typeof import('./bootstrap.js');
+    // This finite read-only budget is not new engine admission: Native owns
+    // the immutable original expiry and its expired/cancelled terminal branch.
+    const native = await bootstrap.prepareNativeBoundary(bundle, localBudget);
+    capture = captureHostBuild(native.platform, selection, bundle, args[1]);
+    const authoritiesURL = new URL('./authorities.js', import.meta.url).href;
+    const authorities = await import(authoritiesURL) as typeof import('./authorities.js');
+    const request = await consumeHostRequest(args, selection.build, buildRoot);
+    const host = await authorities.verifyPackagedHost(request.selection, payload, localBudget, native.trust);
+    const processURL = new URL('./process.js', import.meta.url).href;
+    const attempts = await import(processURL) as typeof import('./process.js');
+    const attempt = await attempts.withLaunchAttempt(request.profile, native.platform, localBudget, transaction => transaction.current);
+    if (!attempt || attempt.request !== request.request || attempt.phase !== 'claimed' || attempt.stage !== 'untransferred')
+      return terminateCapturedHostBuild(capture);
+    // Sample caller clock first: translating native remaining admission can
+    // shorten this original deadline, never extend it by the sampling gap.
+    const sampled = performance.now(), nativeNow = native.platform.continuousTime();
+    const deadline = Math.min(localBudget, sampled + attempt.expires - nativeNow); assertTime(deadline);
+    const exitURL = new URL('./exit.js', import.meta.url).href;
+    const exits = await import(exitURL) as typeof import('./exit.js');
+    const previous = exits.createProductionExitAuthority(native.platform, request.selection);
+    owned = await prepareOwnedHost(app, request, host, native, previous, deadline, capture);
+    if (!owned) return terminateCapturedHostBuild(capture);
+    const effects: import('../native/fatal.js').FatalEffects = Object.freeze({
+      closeAdmission() { state.closed = true; state.control?.ownership.control.closeAdmission(); state.transport?.closeAdmission(); },
+      invalidate() { state.control?.ownership.authority.closeAdmission(); },
+      hidePages() { const window = state.shell?.host.window; if (window && !window.isDestroyed()) window.hide(); },
+    });
+    boundary = await owned.installNative(effects, deadline);
+    const engine = authorities.createHostEngineAuthority(host, owned.custody, previous);
+    const prepared = await prepareHost(app, owned, engine);
+    prepared.custody.assertRetained(); assertTime(deadline);
+    if (app.isReady() || state.closed) return prepared.custody.terminate();
+    const installed = boundary;
+    // Register, do not await. Electron can now finish this ESM evaluation and
+    // reach readiness; the continuation owns all later errors and custody.
+    void app.whenReady().then(async () => {
+      try {
+        assertTime(deadline); prepared.custody.assertRetained();
+        if (!app.isReady() || state.closed) return prepared.custody.terminate();
+        const sessions = await bindHostSessions(prepared);
+        assertTime(deadline); prepared.custody.assertRetained();
+        if (state.closed) return prepared.custody.terminate();
+        await assembleAfterReady(prepared, sessions, installed, request, state, deadline);
+      } catch { state.closed = true; return installed.fatal.fail('native_boundary_unavailable'); }
+    }, () => installed.fatal.fail('native_boundary_unavailable'));
+  } catch (error) {
+    state.closed = true;
+    if (boundary) return boundary.fatal.fail('native_boundary_unavailable');
+    if (owned) return owned.custody.terminate();
+    if (capture) return terminateCapturedHostBuild(capture);
+    // No unknown original receives a terminal/clean witness or a JS unlock.
+    // The inherited guard is untouched; no profile resource was admitted.
+    throw error;
+  }
 }
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await candidateEntry();
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await runHostEntry();

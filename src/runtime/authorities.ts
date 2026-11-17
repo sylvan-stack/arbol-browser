@@ -161,13 +161,21 @@ function assertBudget(deadline: number): void {
  * it changes no Native check and cannot open the owner's production profiles.
  * The full source digest includes later testing-only source; productDigest pins
  * the separately reviewed actual product/compiler/sign inputs, never Git HEAD. */
-export async function verifyPackagedHost(selection: BuildSelection, payload: string, deadline: number): Promise<VerifiedHost> {
+export async function verifyPackagedHost(selection: BuildSelection, payload: string, deadline: number,
+  bootstrapSigned?: SignedBundle): Promise<VerifiedHost> {
   assertBudget(deadline);
   const layout = selectedLayout(selection, payload);
   const manifestURL = new URL('../native/manifest.js', import.meta.url).href;
   const manifests = await import(manifestURL) as typeof import('../native/manifest.js');
   let signed: SignedBundle;
-  try { signed = manifests.verifySignedBundle(layout.bundle, deadline); } catch { throw unavailable('browser'); }
+  try {
+    if (bootstrapSigned) {
+      // The canonical bootstrap alone owns this Native candidate brand. Reuse
+      // that exact original frozen object, with no second signer or snapshot.
+      signed = manifests.verifyNativeCandidate(layout.bundle, deadline);
+      if (signed !== bootstrapSigned) throw unavailable('browser');
+    } else signed = manifests.verifySignedBundle(layout.bundle, deadline);
+  } catch { throw unavailable('browser'); }
   assertBudget(deadline);
   const policyFile = join(layout.bundle, 'Contents/Resources/host-policy.json');
   const rawPolicy = await physicalJson(policyFile, 1048576, deadline), policy = readPolicy(rawPolicy.value);
