@@ -16,9 +16,19 @@ const opaque = () => randomBytes(16).toString('hex');
 function acknowledgement(value: unknown): void {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length) throw staleSnapshot();
 }
-interface EventReceipt { readonly type: string; readonly token: string; readonly target: 'source' | 'other'; readonly serial: number }
+interface EventReceipt { readonly type: string; readonly token: string; readonly target: 'source' | 'other'; readonly serial: number; readonly key?: string }
 export interface IssuedInput { readonly token: string; readonly command: number }
-interface MonitorState { connected: boolean; pointer: boolean; captures: number; bad: boolean }
+interface MonitorState { connected: boolean; pointer: boolean; captures: number; keys: number; bad: boolean }
+export const physicalKeys = Object.freeze({
+  Enter: ['Enter', 'Enter', 13], Tab: ['Tab', 'Tab', 9], Escape: ['Escape', 'Escape', 27],
+  Backspace: ['Backspace', 'Backspace', 8], Delete: ['Delete', 'Delete', 46],
+  ArrowLeft: ['ArrowLeft', 'ArrowLeft', 37], ArrowRight: ['ArrowRight', 'ArrowRight', 39],
+  ArrowUp: ['ArrowUp', 'ArrowUp', 38], ArrowDown: ['ArrowDown', 'ArrowDown', 40],
+  Home: ['Home', 'Home', 36], End: ['End', 'End', 35], PageUp: ['PageUp', 'PageUp', 33], PageDown: ['PageDown', 'PageDown', 34],
+  Space: [' ', 'Space', 32], A: ['a', 'KeyA', 65], Shift: ['Shift', 'ShiftLeft', 16], Meta: ['Meta', 'MetaLeft', 91],
+} as const);
+export type PhysicalKey = keyof typeof physicalKeys;
+export interface KeyStroke { readonly key: PhysicalKey; readonly down: IssuedInput; readonly up: IssuedInput }
 
 /** Fixed host program, never caller script. The reusable world starts inert;
  * this function arms bounded listeners on exactly one resolved original node.
@@ -27,26 +37,34 @@ const installMonitor = `function(action,binding){
   'use strict'; const source=this, doc=source.ownerDocument||source;
   if(!source.isConnected||doc!==document)throw Error('target');
   const notify=globalThis[binding]; if(typeof notify!=='function')throw Error('binding');
-  let token='',serial=0,live=true,pointer=false,bad=false;const captures=new Set();
-  const types=['pointerdown','pointerup','pointercancel','gotpointercapture','lostpointercapture','mousedown','mouseup','click'];
+  let token='',serial=0,live=true,pointer=false,bad=false;const captures=new Set(),keys=new Set();
+  const allowedKeys=['Enter','Tab','Escape','Backspace','Delete','ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End','PageUp','PageDown',' ','a','A','Shift','Meta'];
+  const types=['pointerdown','pointerup','pointercancel','gotpointercapture','lostpointercapture','mousedown','mouseup','click','keydown','keyup'];
   const receive=e=>{
     if(!live||!e.isTrusted)return;
     const original=e.composedPath()[0]===source;
-    if(!original&&!['pointerup','pointercancel','lostpointercapture','mouseup'].includes(e.type))return;
+    if(!original&&!['pointerup','pointercancel','lostpointercapture','mouseup','keyup'].includes(e.type))return;
     if(!token||++serial>128){bad=true;return;}
     if(e.type==='pointerdown')pointer=true;
     if(e.type==='pointerup'||e.type==='pointercancel')pointer=false;
     if(e.type==='gotpointercapture'){if(captures.size>=16)bad=true;else captures.add(e.pointerId);}
     if(e.type==='lostpointercapture')captures.delete(e.pointerId);
     if(e.type==='pointercancel')bad=true;
-    notify(JSON.stringify({action,token,serial,type:e.type,target:original?'source':'other'}));
+    let key;
+    if(e.type==='keydown'||e.type==='keyup'){
+      if(!allowedKeys.includes(e.key)){bad=true;return;}key=e.key==='A'?'a':e.key;
+      if(e.type==='keydown'){if(keys.has(e.code)||keys.size>=4)bad=true;keys.add(e.code);}
+      else{if(!keys.has(e.code))bad=true;keys.delete(e.code);}
+    }
+    notify(JSON.stringify({action,token,serial,type:e.type,target:original?'source':'other',...(key===undefined?{}:{key})}));
   };
   for(const type of types)doc.addEventListener(type,receive,true);
   return Object.freeze({
     arm(next){if(!live||typeof next!=='string'||next.length!==32||!source.isConnected)throw Error('arm');token=next;return true;},
-    state(){return {connected:source.isConnected&&source.ownerDocument===doc,pointer,captures:captures.size,bad};},
+    state(){return {connected:source.isConnected&&source.ownerDocument===doc,pointer,captures:captures.size,keys:keys.size,bad};},
+    focused(){return source.isConnected&&(source.getRootNode().activeElement===source||doc.activeElement===source);},
     async frame(){await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));return this.state();},
-    close(){live=false;token='';for(const type of types)doc.removeEventListener(type,receive,true);captures.clear();return true;}
+    close(){live=false;token='';for(const type of types)doc.removeEventListener(type,receive,true);captures.clear();keys.clear();return true;}
   });
 }`;
 const armMonitor = 'function(token){return this.arm(token);}';
@@ -64,6 +82,7 @@ export class TrustedObservation {
   private remove = () => {};
   private monitor?: string;
   private context?: Context;
+  private signature?: string;
   private invalid = false;
   private closed = false;
   private serial = 0;
@@ -104,10 +123,12 @@ export class TrustedObservation {
       let data: any; try { data = JSON.parse(event.payload); } catch { this.invalid = true; return; }
       if (data?.action !== this.target.execution.action || typeof data.token !== 'string' || !this.issued.has(data.token) ||
           !Number.isSafeInteger(data.serial) || data.serial !== this.serial + 1 || data.serial > 128 ||
-          !['pointerdown', 'pointerup', 'pointercancel', 'gotpointercapture', 'lostpointercapture', 'mousedown', 'mouseup', 'click'].includes(data.type) ||
+          !['pointerdown', 'pointerup', 'pointercancel', 'gotpointercapture', 'lostpointercapture', 'mousedown', 'mouseup', 'click', 'keydown', 'keyup'].includes(data.type) ||
           !['source', 'other'].includes(data.target) || this.events.length >= 128) { this.invalid = true; return; }
       this.serial = data.serial;
-      this.events.push(Object.freeze({ type: data.type, token: data.token, serial: data.serial, target: data.target }));
+      if (['keydown', 'keyup'].includes(data.type) && !Object.values(physicalKeys).some(key => key[0] === data.key)) { this.invalid = true; return; }
+      this.events.push(Object.freeze({ type: data.type, token: data.token, serial: data.serial, target: data.target,
+        ...(data.key !== undefined ? { key: data.key } : {}) }));
     } else if (event.kind === 'drag') {
       // Until the drag leaf installs its exact action path, unexpected HTML
       // continuation cannot be mistaken for a settled primary click.
@@ -145,6 +166,9 @@ export class TrustedObservation {
     initial(); const context = registration.context;
     if (!context || context.receipt !== target.frame.receipt || world.executionContextId !== context.id) throw staleSnapshot();
     this.context = context; this.guard();
+    const classified = await target.inspection.fields.classify(target.frame, this.guard); this.guard();
+    const field = classified.nodes.get(target.backend);
+    if (!field || field.sensitive || field.unavailable) throw staleSnapshot(); this.signature = field.signature;
     const resolved = await this.command('DOM.resolveNode', { backendNodeId: target.backend, executionContextId: context.id,
       objectGroup: this.group }) as { object?: { objectId?: string } };
     this.guard(); if (!resolved.object?.objectId) throw staleSnapshot();
@@ -165,7 +189,11 @@ export class TrustedObservation {
     this.guard(); if (result.exceptionDetails || !result.result) throw staleSnapshot(); return result.result.value;
   }
   private async issue(method: string, params: object): Promise<IssuedInput> {
-    this.guard(); const token = opaque();
+    this.guard();
+    const classified = await this.target.inspection.fields.classify(this.target.frame, this.guard); this.guard();
+    const field = classified.nodes.get(this.target.backend);
+    if (!field || field.sensitive || field.unavailable || field.signature !== this.signature) throw staleSnapshot();
+    const token = opaque();
     if (this.issued.size >= 32 || await this.call(armMonitor, [{ value: token }]) !== true) throw staleSnapshot();
     this.guard();
     let command = 0;
@@ -185,13 +213,39 @@ export class TrustedObservation {
     return this.issue('Input.dispatchMouseEvent', { type, x: point.x, y: point.y, button: 'left',
       buttons: type === 'mousePressed' ? 1 : 0, clickCount: 1, modifiers: 0, pointerType: 'mouse' });
   }
+  async focus(): Promise<void> {
+    await this.issue('DOM.focus', { backendNodeId: this.target.backend }); this.guard();
+    if (await this.call('function(){return this.focused();}') !== true) throw staleSnapshot();
+  }
+  key(key: PhysicalKey, type: 'keyDown' | 'keyUp', modifiers: 0 | 4 | 8): Promise<IssuedInput> {
+    if (!Object.hasOwn(physicalKeys, key) || ![0, 4, 8].includes(modifiers)) throw staleSnapshot();
+    const [name, code, virtual] = physicalKeys[key];
+    return this.issue('Input.dispatchKeyEvent', { type, modifiers, key: name, code, windowsVirtualKeyCode: virtual,
+      autoRepeat: false, isSystemKey: false, ...(key === 'Shift' || key === 'Meta' ? { location: 1 } : {}),
+      ...(type === 'keyDown' && key === 'Enter' ? { text: '\r', unmodifiedText: '\r' } : {}),
+      ...(type === 'keyDown' && key === 'Space' ? { text: ' ', unmodifiedText: ' ' } : {}),
+      ...(type === 'keyDown' && key === 'A' && modifiers === 4 ? { commands: ['selectAll'] } : {}) });
+  }
   private seen(type: string, issued: IssuedInput, target: EventReceipt['target'] = 'source'): boolean {
     return this.issued.get(issued.token) === issued.command && this.events.some(event => event.type === type && event.token === issued.token && event.target === target);
   }
   private async balanced(): Promise<void> {
     const state = await this.call(frameMonitor, [], true) as MonitorState;
     this.guard();
-    if (!state || !state.connected || state.pointer !== false || state.captures !== 0 || state.bad !== false || this.pending.size) throw staleSnapshot();
+    if (!state || !state.connected || state.pointer !== false || state.captures !== 0 || state.keys !== 0 || state.bad !== false || this.pending.size) throw staleSnapshot();
+  }
+  async settleKeys(strokes: readonly KeyStroke[], allowTabTransfer: boolean): Promise<void> {
+    await this.balanced(); this.guard();
+    for (const stroke of strokes) {
+      const name = physicalKeys[stroke.key][0];
+      if (!this.events.some(event => event.type === 'keydown' && event.target === 'source' && event.token === stroke.down.token && event.key === name) ||
+          !this.events.some(event => event.type === 'keyup' && (event.target === 'source' || allowTabTransfer) && event.token === stroke.up.token && event.key === name) ||
+          this.issued.get(stroke.down.token) !== stroke.down.command || this.issued.get(stroke.up.token) !== stroke.up.command) throw staleSnapshot();
+    }
+    const last = strokes.at(-1)?.up.command, { execution } = this.target;
+    if (!last || last !== execution.command) throw staleSnapshot();
+    execution.settle({ action: execution.action!, operation: this.operation, original: execution.stamp.document,
+      current: this.target.frame.receipt, delivered: true, quiescent: true, command: last });
   }
   async settleClick(press: IssuedInput, release: IssuedInput): Promise<void> {
     await this.balanced(); this.guard();
