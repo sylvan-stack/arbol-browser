@@ -623,7 +623,9 @@ static napi_value custodyDescriptors(napi_env env,napi_callback_info info) {
   napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg); if(!c) return fail(env);
   napi_value out; if(napi_create_array_with_length(env,3,&out)!=napi_ok || napi_set_element(env,out,0,number(env,c->context.owner.fd))!=napi_ok || napi_set_element(env,out,1,number(env,c->context.build.fd))!=napi_ok || napi_set_element(env,out,2,number(env,c->capsule))!=napi_ok) return fail(env); return out;
 }
-static NSDictionary* sealedObject(const std::string& path,std::string& digest);
+enum class SignedObjectPurpose { policy, compatibility };
+static NSDictionary* sealedObject(Custody* custody,SignedObjectPurpose purpose,const std::string& expected,
+  double deadline,std::string& digest);
 static napi_value prepareHostFinalization(napi_env env,napi_callback_info info) {
   napi_value args[4]; size_t n=4; std::string input,policyDigest,compatibilityDigest;
   if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok||n!=4||!boundedText(env,args[1],input)||
@@ -633,21 +635,23 @@ static napi_value prepareHostFinalization(napi_env env,napi_callback_info info) 
   auto* c=custodyArgument(env,args[0]); if(!c||c->hostRequired||c->spawned||!c->continuousBuild) return fail(env);
   c->hostRequired=true; // a failed host preparation cannot fall back to legacy
   @autoreleasepool { @try {
-    if(!c->finalization.prepare(c->context,input,arbol_boundary::clockMs()+1000)) return fail(env);
+    const double deadline=arbol_boundary::clockMs()+1000;
+    if(!c->finalization.prepare(c->context,input,deadline)) return fail(env);
     // Expected hashes arrive only through the canonical previously verified
     // HostCustody route. Capture both actual physical sealed files before any
     // enrollment; a consistent replacement pair cannot teach us new trust.
     std::string actualPolicy,actualCompatibility;
-    NSDictionary* policy=sealedObject(c->context.bundle+"/Contents/Resources/host-policy.json",actualPolicy);
-    NSDictionary* compatibility=sealedObject(c->context.bundle+"/Contents/Resources/native-compatibility.json",actualCompatibility);
     NSDictionary* attempt=c->finalization.value()[@"attempt"];
+    const double readDeadline=std::min(deadline,[attempt[@"expires"] doubleValue]);
+    NSDictionary* policy=sealedObject(c,SignedObjectPurpose::policy,policyDigest,readDeadline,actualPolicy);
+    NSDictionary* compatibility=sealedObject(c,SignedObjectPurpose::compatibility,compatibilityDigest,readDeadline,actualCompatibility);
     if(!policy||!compatibility||actualPolicy!=policyDigest||actualCompatibility!=compatibilityDigest||
        ![policy[@"compatibilityDigest"] isEqual:[NSString stringWithUTF8String:compatibilityDigest.c_str()]]||
        ![attempt[@"candidateDigest"] isEqual:[NSString stringWithUTF8String:c->context.digest.c_str()]]||
        ![policy[@"build"] isEqual:attempt[@"build"]]||![policy[@"buildRoot"] isEqual:attempt[@"buildRoot"]]||
        ![policy[@"sourceDigest"] isEqual:attempt[@"sourceDigest"]]||![policy[@"productDigest"] isEqual:attempt[@"productDigest"]]||
        !arbol_boundary::lockIdentity(c->context.owner)||!arbol_boundary::lockIdentity(c->context.build)||
-       !c->finalization.metadata()) return fail(env);
+       !c->finalization.metadata()||arbol_boundary::clockMs()>=readDeadline) return fail(env);
     c->policyDigest=actualPolicy; c->compatibilityDigest=actualCompatibility;
     napi_value out; napi_get_undefined(env,&out); return out;
   } @catch(NSException*) { return fail(env); } }
@@ -889,20 +893,56 @@ static bool currentMarker(Custody* c,std::string& raw,struct stat& st,bool& abse
   if(ok&&absent) { struct stat check{}; errno=0; ok=fstatat(fd,"engine.json",&check,AT_SYMLINK_NOFOLLOW)<0&&errno==ENOENT; }
   if(close(fd)) ok=false; return ok;
 }
-static NSDictionary* sealedObject(const std::string& path,std::string& digest) {
-  if(!arbol_boundary::canonical(path)) return nil;
-  int fd=open(path.c_str(),O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC); if(fd<0) return nil;
+// Only this exact signed compatibility inventory has the package's one-MiB
+// codec. Small policy, all attempts/Close/markers and the separate exit receipt
+// codecs retain their original independent bounds and schemas.
+static NSDictionary* sealedObject(Custody* custody,SignedObjectPurpose purpose,const std::string& expected,
+  double deadline,std::string& digest) {
+  digest.clear();
+  if(!custody||!nativeCustodies.count(custody)||!std::isfinite(deadline)||arbol_boundary::clockMs()>=deadline||
+     !arbol_attempt::pattern([NSString stringWithUTF8String:expected.c_str()],@"^[0-9a-f]{64}$")) return nil;
+  std::string path; size_t maximum;
+  switch(purpose) {
+    case SignedObjectPurpose::policy: path=custody->context.bundle+"/Contents/Resources/host-policy.json"; maximum=16383; break;
+    case SignedObjectPurpose::compatibility: path=custody->context.bundle+"/Contents/Resources/native-compatibility.json"; maximum=1048576; break;
+    default: return nil;
+  }
+  if(!arbol_boundary::canonical(path)||arbol_boundary::clockMs()>=deadline) return nil;
+  arbol_exit::NativeFile file; file.fd=open(path.c_str(),O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
+  const int fd=file.fd; if(fd<0) return nil;
   struct stat first{},named{},last{},after{}; std::string bytes;
-  bool ok=!fstat(fd,&first)&&!lstat(path.c_str(),&named)&&S_ISREG(first.st_mode)&&first.st_nlink==1&&
-    !(first.st_mode&0022)&&(first.st_uid==geteuid()||first.st_uid==0)&&arbol_attempt::sameFile(first,named)&&first.st_size>0&&first.st_size<16384;
+  bool ok=arbol_boundary::clockMs()<deadline&&!fstat(fd,&first)&&!lstat(path.c_str(),&named)&&S_ISREG(first.st_mode)&&first.st_nlink==1&&
+    !(first.st_mode&0022)&&(first.st_uid==geteuid()||first.st_uid==0)&&arbol_attempt::sameFile(first,named)&&
+    first.st_size>0&&(uint64_t)first.st_size<=maximum;
   char buffer[4096];
   while(ok&&bytes.size()<=(size_t)first.st_size) {
+    if(arbol_boundary::clockMs()>=deadline) { ok=false; break; }
     ssize_t n=read(fd,buffer,std::min(sizeof(buffer),(size_t)first.st_size+1-bytes.size()));
     if(n>0) bytes.append(buffer,n); else if(!n) break; else if(errno!=EINTR) ok=false;
   }
-  ok=ok&&bytes.size()==(size_t)first.st_size&&!fstat(fd,&last)&&!lstat(path.c_str(),&after)&&
-    arbol_attempt::sameFile(first,last)&&arbol_attempt::sameFile(last,after);
-  if(close(fd)) ok=false; if(ok) digest=[arbol_attempt::digest(bytes) UTF8String]; return ok?arbol_attempt::json(bytes):nil;
+  ok=ok&&arbol_boundary::clockMs()<deadline&&bytes.size()==(size_t)first.st_size&&!fstat(fd,&last)&&!lstat(path.c_str(),&after)&&
+    arbol_attempt::sameFile(first,last)&&arbol_attempt::sameFile(last,after)&&arbol_boundary::canonical(path);
+  NSDictionary* value=nil;
+  if(ok) {
+    // The independently preverified/retained expected digest is checked before
+    // UTF-8 or JSON decoding. These exact same-description bytes teach no trust.
+    digest=[arbol_attempt::digest(bytes) UTF8String];
+    ok=digest==expected&&arbol_boundary::clockMs()<deadline;
+  }
+  if(ok) {
+    if(purpose==SignedObjectPurpose::policy) value=arbol_attempt::json(bytes);
+    else if(bytes.find('\0')==std::string::npos) {
+      NSData* data=[NSData dataWithBytes:bytes.data() length:bytes.size()];
+      if([[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]&&arbol_boundary::clockMs()<deadline) {
+        NSError* error=nil; id decoded=[NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
+        if(!error&&[decoded isKindOfClass:NSDictionary.class]) value=decoded;
+      }
+    }
+    ok=value&&arbol_boundary::clockMs()<deadline&&!fstat(fd,&last)&&!lstat(path.c_str(),&after)&&
+      arbol_attempt::sameFile(first,last)&&arbol_attempt::sameFile(last,after)&&arbol_boundary::canonical(path);
+  }
+  if(!file.finish()) ok=false;
+  return ok&&arbol_boundary::clockMs()<deadline?value:nil;
 }
 static bool emptyNativeDirectory(NSString* path) {
   if(!arbol_boundary::canonical(path.fileSystemRepresentation)) return false;
@@ -932,11 +972,11 @@ static bool priorMarkerMatches(Custody* c,const std::string& raw,const struct st
     [marker[@"identity"] isEqual:arbol_exit::fileIdentity(st)]&&[marker[@"digest"] isEqual:arbol_attempt::digest(raw)]&&
     [marker[@"value"] isEqual:arbol_attempt::json(raw)];
 }
-static bool signedDirty(Custody* c,const std::string& dirtyRaw,const std::string& previous,bool absent) {
+static bool signedDirty(Custody* c,const std::string& dirtyRaw,const std::string& previous,bool absent,double deadline) {
   NSDictionary* dirty=arbol_attempt::json(dirtyRaw),*attempt=c->finalization.value()[@"attempt"];
   std::string policyHash,compatibilityHash;
-  NSDictionary* policy=sealedObject(c->context.bundle+"/Contents/Resources/host-policy.json",policyHash);
-  NSDictionary* compatibility=sealedObject(c->context.bundle+"/Contents/Resources/native-compatibility.json",compatibilityHash);
+  NSDictionary* policy=sealedObject(c,SignedObjectPurpose::policy,c->policyDigest,deadline,policyHash);
+  NSDictionary* compatibility=sealedObject(c,SignedObjectPurpose::compatibility,c->compatibilityDigest,deadline,compatibilityHash);
   if(policyHash!=c->policyDigest||compatibilityHash!=c->compatibilityDigest||!policy||!compatibility||!nativeMarker(dirty)||![dirty[@"cleanExit"] isEqual:@NO]||
      ![policy[@"purpose"] isEqual:@"isolated-qualification"]||![policy[@"build"] isEqual:attempt[@"build"]]||
      ![policy[@"buildRoot"] isEqual:attempt[@"buildRoot"]]||![policy[@"sourceDigest"] isEqual:attempt[@"sourceDigest"]]||
@@ -971,9 +1011,10 @@ static napi_value beginHostMarkerMutation(napi_env env,napi_callback_info info) 
     if(!c->finalization.currentAttempt(c->context,permit->claim,permit->currentRaw,permit->attempt,deadline)||
        ![permit->attempt[@"phase"] isEqual:@"claimed"]||![permit->attempt[@"stage"] isEqual:@"retained"]||
        [permit->attempt[@"expires"] doubleValue]<=arbol_boundary::clockMs()) return fail(env);
+    const double mutationDeadline=std::min(deadline,[permit->attempt[@"expires"] doubleValue]);
     std::string previous; struct stat st{}; bool absent;
-    if(!currentMarker(c,previous,st,absent)||!priorMarkerMatches(c,previous,st,absent)||!signedDirty(c,dirty,previous,absent)||
-       arbol_boundary::clockMs()>=deadline) { permit->relinquish(); return fail(env); }
+    if(!currentMarker(c,previous,st,absent)||!priorMarkerMatches(c,previous,st,absent)||!signedDirty(c,dirty,previous,absent,mutationDeadline)||
+       arbol_boundary::clockMs()>=mutationDeadline) { permit->relinquish(); return fail(env); }
     NSMutableDictionary* next=[permit->attempt mutableCopy]; next[@"stage"]=@"mutation-started";
     permit->dirtyRaw=dirty;
     if(!arbol_attempt::transition(permit->attempt,next,arbol_attempt::Role::engine)||
