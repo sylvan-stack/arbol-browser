@@ -4,6 +4,7 @@
 #import <Security/Security.h>
 #include "../../watchdog/boundary.hpp"
 #include "attempt.hpp"
+#include "../../watchdog/exit.hpp"
 #include <CommonCrypto/CommonDigest.h>
 #include <mach-o/loader.h>
 #include <mach-o/fat.h>
@@ -154,7 +155,8 @@ static bool payload(NSString* bundle, NSDictionary* manifest) {
 }
 int main(int argc, const char* argv[]) {
   @autoreleasepool {
-    @try {
+    arbol_exit::NoUseOriginal noUse;
+    try { @try {
       expiry=arbol_boundary::clockMs()+30000;
       if (argc != 3 || strcmp(argv[1], "--arbol-host-request") || argv[2][0] != '/' || getppid() != 1 || setpgid(0, 0) || getpgrp() != getpid()) return 4;
       NSOperatingSystemVersion os = NSProcessInfo.processInfo.operatingSystemVersion;
@@ -201,8 +203,16 @@ int main(int argc, const char* argv[]) {
           ![attempt[@"sourceDigest"] isEqual:hostPolicy[@"sourceDigest"]] || ![attempt[@"productDigest"] isEqual:hostPolicy[@"productDigest"]]) return 4;
       NSMutableDictionary* claimed=[attempt mutableCopy]; claimed[@"phase"]=@"claimed"; claimed[@"bootstrap"]=arbol_attempt::processRecord(getpid());
       std::string claimedRaw=arbol_attempt::bytes(claimed);
-      if(!arbol_attempt::transition(attempt,claimed,arbol_attempt::Role::bootstrap) || !arbol_attempt::replace(claim.at,prior,false,claimedRaw) ||
-          !arbol_boundary::lockIdentity(build)) return 4;
+      if(!arbol_attempt::transition(attempt,claimed,arbol_attempt::Role::bootstrap)) return 4;
+      // Capture before the actual write attempt, including an ambiguously
+      // failed replacement. The one native terminal guard covers every later
+      // return and both C++/Objective-C exceptions without inventing an Owner.
+      noUse.capture(argv[2],bundle.fileSystemRepresentation,build,claimed,@"outer",prior);
+      if(!arbol_attempt::replace(claim.at,prior,false,claimedRaw)) {
+        (void)noUse.confirmUnclaimed(claim,prior); // exact actual still-held Claim
+        return 4;
+      }
+      if(!arbol_boundary::lockIdentity(build)) return 4;
       NSDictionary* transport=@{@"format":@1,@"kind":@"host-build",@"requestPath":[NSString stringWithUTF8String:argv[2]],
         @"claimDigest":arbol_attempt::digest(claimedRaw),@"bootstrap":claimed[@"bootstrap"],@"guard":arbol_boundary::capsuleLock(build),@"descriptor":@(build.fd)};
       int capsule=arbol_boundary::capsuleDescriptor(arbol_attempt::bytes(transport));
@@ -220,7 +230,9 @@ int main(int argc, const char* argv[]) {
       char* environment[] = {home.data(), user.data(), custody.data(), inherited.data(), (char*)"PATH=/usr/bin:/bin", (char*)"TMPDIR=/private/tmp", nullptr};
       char* args[] = {(char*)engine.fileSystemRepresentation, (char*)"--site-per-process", (char*)"--disable-features=MacAccessibilityTextOperation", (char*)entry.fileSystemRepresentation, (char*)"--arbol-host-request", (char*)argv[2], nullptr};
       if(!inTime() || !arbol_boundary::lockIdentity(build)) return 4;
-      execve(engine.fileSystemRepresentation, args, environment); return 4;
-    } @catch (NSException*) { return 4; }
+      noUse.beforeExec();
+      execve(engine.fileSystemRepresentation, args, environment);
+      int failure=errno; noUse.returnedExecFailure(failure); return 4;
+    } @catch (NSException*) { return 4; } } catch(...) { return 4; }
   }
 }

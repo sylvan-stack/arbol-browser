@@ -1386,4 +1386,203 @@ public:
   }
   bool ready(arbol_boundary::Context& c) const { return held(c)&&state_->fatal.load(std::memory_order_acquire)==0; }
 };
+// A distinct pre-profile-use terminal producer. This never substitutes for
+// HostCapability enrollment, full-family dirty closure or a storage flush.
+// All setters are native-only, one-way and precede possible actual permission.
+class NoUseOriginal {
+  bool attempted_=false,valid_=false,uncertain_=false,publicationAttempted_=false,committed_=false;
+  bool execIntent_=false,execFailedReturned_=false,ownerAttempted_=false,noClaimConfirmed_=false;
+  uint32_t permissions_=0; int execError_=0; double metadataDeadline_=0;
+  std::string requestPath_,bundle_,initialRaw_,baselineRaw_,closedRaw_;
+  NSDictionary* baseline_=nil,*actor_=nil; NSString* stage_=nil;
+  arbol_boundary::Lock build_,owner_;
+  bool self() const {
+    if(!valid_||uncertain_||permissions_||!arbol_boundary::lockIdentity(build_)||
+       (ownerAttempted_&&!arbol_boundary::lockIdentity(owner_))||!arbol_attempt::currentProcess(actor_,true)) return false;
+    std::string image=[actor_[@"executable"] UTF8String];
+    bool outer=[stage_ isEqual:@"outer"];
+    if(image!=bundle_+(outer?"/Contents/MacOS/arbol-browser-native":"/Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron")||
+       [actor_[@"group"] intValue]!=getpid()||!arbol_boundary::signature(image,!outer)) return false;
+    return !outer||!execIntent_||(execFailedReturned_&&execError_!=0);
+  }
+  bool emptyCensus() {
+    if(!self()) return false;
+    std::vector<pid_t> pids(16385); unsigned present=0;
+    int bytes=proc_listpids(PROC_PGRP_ONLY,getpgrp(),pids.data(),(int)(pids.size()*sizeof(pid_t)));
+    if(bytes<0||bytes%sizeof(pid_t)||(size_t)bytes>=pids.size()*sizeof(pid_t)) return false;
+    for(int i=0;i<bytes/(int)sizeof(pid_t);++i) {
+      if(pids[i]<=0) continue;
+      if(pids[i]!=getpid()) { uncertain_=true; return false; }
+      if(!arbol_attempt::currentProcess(actor_,true)) return false; ++present;
+    }
+    if(present!=1) return false;
+    bytes=proc_listpids(PROC_UID_ONLY,geteuid(),pids.data(),(int)(pids.size()*sizeof(pid_t)));
+    if(bytes<0||bytes%sizeof(pid_t)||(size_t)bytes>=pids.size()*sizeof(pid_t)) return false;
+    uint64_t start=strtoull([actor_[@"startId"] UTF8String],nullptr,10); int version=[actor_[@"pidVersion"] intValue];
+    for(int i=0;i<bytes/(int)sizeof(pid_t);++i) {
+      if(pids[i]<=0||pids[i]==getpid()) continue; arbol_boundary::Identity actual; arbol_boundary::Info detail{};
+      int state=arbol_boundary::observe(pids[i],actual,&detail); if(!state) continue; if(state<0) return false;
+      // No supported descendant ever had a native spawn permission. Even a
+      // same-publisher child is not silently adopted into a no-use witness.
+      if(detail.unique.parent==start&&detail.unique.originalParentVersion==version) { uncertain_=true; return false; }
+    }
+    return self();
+  }
+  bool current(NSDictionary* value) const {
+    if(!arbol_attempt::record(value)||!arbol_attempt::immutable(baseline_,value)||
+       ![value[@"bootstrap"] isEqual:baseline_[@"bootstrap"]]||![value[@"engine"] isEqual:baseline_[@"engine"]]||
+       ![value[@"stage"] isEqual:@"untransferred"]||value[@"terminal"]!=NSNull.null||
+       ![@[@"claimed",@"cancelled"] containsObject:value[@"phase"]]||
+       !arbol_attempt::sameRuntimeBinding(baseline_[@"runtime"],value[@"runtime"])) return false;
+    return value[@"runtime"]==NSNull.null||([value[@"runtime"][@"phase"] isEqual:@"starting"]&&
+      [value[@"runtime"][@"pid"] isEqual:actor_[@"pid"]]&&[value[@"runtime"][@"processStartId"] isEqual:actor_[@"startId"]]);
+  }
+  bool priorData(int history,NSDictionary* __strong& prior,std::string& headRaw,bool& absent) const {
+    if(!arbol_attempt::readAt(history,"previous-claim.json",headRaw,absent)) return false;
+    if(absent) { prior=(id)NSNull.null; return true; }
+    NSDictionary* head=arbol_attempt::json(headRaw);
+    if(!arbol_attempt::record(head)||![head[@"phase"] isEqual:@"closed"]||
+       ![head[@"profile"] isEqual:baseline_[@"profile"]]||![head[@"profileInstance"] isEqual:baseline_[@"profileInstance"]]||head[@"terminal"]==NSNull.null) return false;
+    NSString* name=[head[@"terminal"][@"path"] lastPathComponent];
+    if([@[@"activation.json",@"terminal.json"] containsObject:name]) { prior=head; return true; }
+    if(![name isEqual:@"unused.json"]) return false;
+    NSString* path=head[@"terminal"][@"path"];
+    NSString* expected=[[[[baseline_[@"profile"] stringByDeletingLastPathComponent].stringByDeletingLastPathComponent
+      stringByAppendingPathComponent:@"exit-evidence"] stringByAppendingPathComponent:baseline_[@"profilePathHash"]] stringByAppendingPathComponent:head[@"request"]];
+    if(![path.stringByDeletingLastPathComponent isEqual:expected]||!arbol_boundary::canonical(path.fileSystemRepresentation)) return false;
+    NativeFile directory; directory.fd=open(expected.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    std::string raw; struct stat identity{};
+    if(directory.fd<0||!readNativeFile(directory.fd,"unused.json",raw,identity,exitReceiptLimit)||
+       ![arbol_attempt::digest(raw) isEqual:head[@"terminal"][@"digest"]]) return false;
+    NSDictionary* previous=parseExitReceipt(raw); prior=previous[@"priorDataClaim"];
+    if(![previous[@"kind"] isEqual:@"unused-host-terminal"]||!arbol_attempt::record(previous[@"attempt"])||
+       !arbol_attempt::immutable(previous[@"attempt"],head)||!prior||!directory.finish()) return false;
+    if(prior==(id)NSNull.null) return true;
+    return arbol_attempt::record(prior)&&[prior[@"phase"] isEqual:@"closed"]&&
+      [prior[@"profile"] isEqual:baseline_[@"profile"]]&&[prior[@"profileInstance"] isEqual:baseline_[@"profileInstance"]]&&
+      [@[@"activation.json",@"terminal.json"] containsObject:[prior[@"terminal"][@"path"] lastPathComponent]];
+  }
+public:
+  NoUseOriginal()=default; NoUseOriginal(const NoUseOriginal&)=delete;
+  ~NoUseOriginal() { if(attempted_) finish(); }
+  // Called on the actual native transition path before its write attempt. A
+  // partly failed write is reconciled under the same genuine Claim; it cannot
+  // become a bare post-claim return. Failure to capture retains the real FD.
+  void capture(const std::string& request,const std::string& bundle,const arbol_boundary::Lock& build,
+    NSDictionary* baseline,NSString* stage,const std::string& initial={}) {
+    if(attempted_) { uncertain_=true; return; } attempted_=true;
+    build_=build; build_.fd=fcntl(build.fd,F_DUPFD_CLOEXEC,64);
+    requestPath_=request; bundle_=bundle; baselineRaw_=arbol_attempt::bytes(baseline); baseline_=arbol_attempt::json(baselineRaw_); initialRaw_=initial;
+    actor_=arbol_attempt::processRecord(getpid()); stage_=stage;
+    if(!arbol_attempt::record(baseline_)||![baseline_[@"stage"] isEqual:@"untransferred"]||
+       ![baseline_[@"phase"] isEqual:@"claimed"]||!actor_||![@[@"outer",@"post-exec",@"adopted"] containsObject:stage_]||
+       ![baseline_[@"buildGuard"] isEqual:[NSString stringWithUTF8String:build.path.c_str()]]||
+       ![baseline_[@"buildRoot"] isEqual:[[NSString stringWithUTF8String:bundle.c_str()] stringByDeletingLastPathComponent]]) return;
+    NSDictionary* parent=baseline_[@"bootstrap"];
+    if(!arbol_attempt::process(parent)) return;
+    if([stage_ isEqual:@"outer"]) { if(![actor_ isEqual:parent]||baseline_[@"engine"]!=NSNull.null||baseline_[@"runtime"]!=NSNull.null) return; }
+    else {
+      for(NSString* field in @[@"pid",@"uid",@"startId",@"group",@"session",@"parentStartId",@"parentPidVersion"])
+        if(![actor_[field] isEqual:parent[field]]) return;
+      if([actor_[@"pidVersion"] isEqual:parent[@"pidVersion"]]) return;
+      if([stage_ isEqual:@"post-exec"]&&(baseline_[@"engine"]!=NSNull.null||baseline_[@"runtime"]!=NSNull.null)) return;
+      if([stage_ isEqual:@"adopted"]&&![baseline_[@"engine"] isEqual:actor_]) return;
+    }
+    valid_=true; if(!self()) valid_=false;
+  }
+  bool confirmUnclaimed(const arbol_attempt::Claim& claim,const std::string& expected) {
+    // Only the actual failed outer transition calls this BEFORE releasing its
+    // still-held short Claim. This one-way native fact survives later genuine
+    // cancellation/replacement, and authorizes no access to that newer record.
+    if(initialRaw_.empty()||expected!=initialRaw_||execIntent_||permissions_||!self()||
+       claim.fd<0||claim.at.lock!=claim.fd||!arbol_attempt::unchanged(claim.at)) return false;
+    std::string actual; bool absent;
+    if(!arbol_attempt::readAt(claim.at.directory,"claim.json",actual,absent)||absent||actual!=expected) return false;
+    NSDictionary* pending=arbol_attempt::json(actual);
+    if(!arbol_attempt::record(pending)||!arbol_attempt::immutable(pending,baseline_)||![pending[@"phase"] isEqual:@"pending"]||
+       pending[@"bootstrap"]!=NSNull.null||pending[@"engine"]!=NSNull.null||pending[@"runtime"]!=NSNull.null||pending[@"terminal"]!=NSNull.null||
+       !emptyCensus()||!arbol_attempt::unchanged(claim.at)) return false;
+    noClaimConfirmed_=true; return true;
+  }
+  void bindOwner(const arbol_boundary::Lock& owner) {
+    if(ownerAttempted_) { if(![arbol_boundary::capsuleLock(owner_) isEqual:arbol_boundary::capsuleLock(owner)]) uncertain_=true; return; }
+    ownerAttempted_=true; owner_=owner; owner_.fd=fcntl(owner.fd,F_DUPFD_CLOEXEC,64);
+    if(owner.path!=std::string([baseline_[@"profile"] UTF8String])+"/owner.lock"||owner.heldMode!=LOCK_EX||!arbol_boundary::lockIdentity(owner_)) uncertain_=true;
+  }
+  void spawnIntent() { permissions_|=1; }
+  void markerPermission() { permissions_|=2; }
+  void sessionPermission() { permissions_|=4; }
+  void beforeExec() { execIntent_=true; }
+  void returnedExecFailure(int failure) { if(execIntent_&&failure) { execError_=failure; execFailedReturned_=true; } else uncertain_=true; }
+  bool attempted() const { return attempted_; }
+  bool committed() const { return committed_; }
+  bool publish() {
+    if(!attempted_||!self()||!emptyCensus()) return false;
+    if(noClaimConfirmed_) return true; // no touching any later attempt
+    arbol_attempt::Claim claim; std::string raw; NSDictionary* value=nil;
+    double lockDeadline=arbol_boundary::clockMs()+1000;
+    if(!claim.acquire(requestPath_,lockDeadline)||!claim.read(raw,value)) return false;
+    if(committed_) return raw==closedRaw_&&self()&&emptyCensus();
+    // An actual outer write which did NOT claim can exit without certifying
+    // someone else's profile. This is not the claimed no-use proof route.
+    if(!initialRaw_.empty()&&raw==initialRaw_&&[value[@"phase"] isEqual:@"pending"]&&
+       value[@"bootstrap"]==NSNull.null&&value[@"engine"]==NSNull.null&&value[@"runtime"]==NSNull.null) return self()&&emptyCensus();
+    if(!current(value)||publicationAttempted_) return false;
+    publicationAttempted_=true; metadataDeadline_=arbol_boundary::clockMs()+1000;
+    NSString* profile=value[@"profile"],*state=profile.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent;
+    if(!arbol_boundary::canonical(state.fileSystemRepresentation)||!arbol_boundary::privateAncestors(std::string(state.fileSystemRepresentation)+"/exit-evidence")) return false;
+    NativeFile stateRoot,exits,history,directory;
+    stateRoot.fd=open(state.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    struct stat stateIdentity{},exitsIdentity{},historyIdentity{},directoryIdentity{};
+    if(stateRoot.fd<0||fstat(stateRoot.fd,&stateIdentity)||!S_ISDIR(stateIdentity.st_mode)||stateIdentity.st_uid!=geteuid()||
+       (stateIdentity.st_mode&07777)!=0700||!privateDirectoryAt(stateRoot.fd,"exit-evidence",exitsIdentity)||exitsIdentity.st_dev!=stateIdentity.st_dev) return false;
+    exits.fd=openat(stateRoot.fd,"exit-evidence",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if(exits.fd<0||!privateDirectoryAt(exits.fd,[value[@"profilePathHash"] UTF8String],historyIdentity)||historyIdentity.st_dev!=stateIdentity.st_dev) return false;
+    history.fd=openat(exits.fd,[value[@"profilePathHash"] UTF8String],O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if(history.fd<0||!privateDirectoryAt(history.fd,[value[@"request"] UTF8String],directoryIdentity)||directoryIdentity.st_dev!=stateIdentity.st_dev) return false;
+    directory.fd=openat(history.fd,[value[@"request"] UTF8String],O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    NSDictionary* prior=nil; std::string headRaw; bool headAbsent;
+    if(directory.fd<0||!priorData(history.fd,prior,headRaw,headAbsent)||!self()||!emptyCensus()||arbol_boundary::clockMs()>=metadataDeadline_) return false;
+    NSString* boot=bootSession(); if(!boot) return false;
+    NSDictionary* receipt=@{@"format":@1,@"kind":@"unused-host-terminal",@"bootSession":boot,@"actorStage":stage_,@"actor":actor_,
+      @"attempt":value,@"baseline":baseline_,@"baselineDigest":arbol_attempt::digest(baselineRaw_),@"bundle":[NSString stringWithUTF8String:bundle_.c_str()],
+      @"locks":@{@"build":arbol_boundary::capsuleLock(build_),@"owner":ownerAttempted_?(id)arbol_boundary::capsuleLock(owner_):(id)NSNull.null},
+      @"priorDataClaim":prior,@"marker":@{@"kind":@"unobserved"},
+      @"nativeFacts":@{@"spawnIntent":@NO,@"markerPermission":@NO,@"sessionPermission":@NO,@"execIntent":@(execIntent_),
+        @"execReturnedFailure":@(execFailedReturned_),@"execError":@(execError_),@"ownerAcquired":@(ownerAttempted_),@"fullEnrollmentClaimed":@NO},
+      @"census":@{@"kind":@"native-no-spawn-with-fresh-empty-supported-descendants",@"group":actor_[@"group"],@"session":actor_[@"session"]},
+      @"observedUs":@((uint64_t)(arbol_boundary::clockMs()*1000)),@"metadataDeadlineUs":@((uint64_t)(metadataDeadline_*1000)),
+      @"originalAdmissionExpiryUs":@((uint64_t)([value[@"expires"] doubleValue]*1000))};
+    std::string bytes=exitReceiptBytes(receipt); struct stat published{};
+    if(bytes.empty()||!publishNativeReceipt(directory.fd,"unused.json",bytes,metadataDeadline_,published)||!self()||!emptyCensus()) return false;
+    NSDictionary* checkedPrior=nil; std::string checkedHead; bool checkedAbsent;
+    if(!priorData(history.fd,checkedPrior,checkedHead,checkedAbsent)||checkedHead!=headRaw||checkedAbsent!=headAbsent||![checkedPrior isEqual:prior]) return false;
+    NSString* receiptPath=[[[[state stringByAppendingPathComponent:@"exit-evidence"] stringByAppendingPathComponent:value[@"profilePathHash"]]
+      stringByAppendingPathComponent:value[@"request"]] stringByAppendingPathComponent:@"unused.json"];
+    NSMutableDictionary* closed=[value mutableCopy]; closed[@"phase"]=@"closed";
+    closed[@"terminal"]=@{@"path":receiptPath,@"digest":arbol_attempt::digest(bytes)}; closedRaw_=arbol_attempt::bytes(closed);
+    if(arbol_boundary::clockMs()>=metadataDeadline_||!arbol_attempt::transition(value,closed,arbol_attempt::Role::terminal)||
+       !arbol_attempt::replace(claim.at,raw,false,closedRaw_)) return false;
+    NativeFile proof; proof.fd=openat(claim.at.directory,"claim.json",O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
+    struct stat held{},named{},after{}; std::string checked;
+    if(proof.fd<0||fstat(proof.fd,&held)||fsync(proof.fd)||fcntl(proof.fd,F_FULLFSYNC)||fsync(claim.at.directory)||
+       !readNativeFile(claim.at.directory,"claim.json",checked,named,arbol_attempt::limit)||checked!=closedRaw_||fstat(proof.fd,&after)||
+       !arbol_attempt::sameFile(held,after)||!arbol_attempt::sameFile(after,named)||!arbol_attempt::unchanged(claim.at)||
+       !self()||!emptyCensus()||arbol_boundary::clockMs()>=metadataDeadline_||
+       !proof.finish()||!directory.finish()||!history.finish()||!exits.finish()||!stateRoot.finish()) return false;
+    committed_=true; return true;
+  }
+  void finish() noexcept {
+    if(!attempted_) return;
+    for(;;) {
+      bool done=false;
+      @autoreleasepool { @try { try { done=publish(); } catch(...) {} } @catch(NSException*) {} }
+      if(done) return;
+      // No caller deadline is renewed and no profile data is opened. Actual
+      // ambiguous transfer/publication retains the existing original OFDs.
+      usleep(10000);
+    }
+  }
+};
+
 } // namespace arbol_exit
