@@ -58,10 +58,47 @@ static Context record(const std::string& raw,bool primary,Identity& producer) {
 static void poison(arbol_exit::HostCapability* cap,uint64_t reason) {
   if(cap&&cap->present()) cap->shared()->poison(reason);
 }
+// The sole controlled final-release route for original monitors. Host-private
+// failed enrollment never downgrades to the Native-only legacy exit path.
+[[noreturn]] static void finishMonitor(Context* c,arbol_exit::HostCapability* cap,int status,bool handoff=false,double roundLimit=0) {
+  if(!cap) _exit(status); // legacy Native-only caller has no host finalization capability
+  for(;;) {
+    if(c&&c->authenticated) { (void)c->discoverCustody(); reap(c->custody); }
+    if(c&&cap->present()) {
+      if(cap->canExitCommitted(*c)) _exit(0);
+      if(cap->activationUnresolved()||cap->terminalUnresolved()||cap->storagePending()||cap->activationPending()) { usleep(10000); continue; }
+      if(handoff&&cap->canHandoff(*c,roundLimit)) _exit(status);
+      poison(cap,arbol_exit::identityLoss|arbol_exit::forced);
+      if(cap->publishDirtyMonitor(*c)) _exit(4);
+      // Unknown/missing enrollment or witness is retained refusal, not a new
+      // clean/dirty claim or permission to close the original descriptions.
+    }
+    // A failed HostCapability load cannot discard the independently genuine
+    // format-2 birth/OFD context's cleanup authority. It still cannot release.
+    if(c&&c->authenticated) {
+      c->enforce(); reap(c->custody);
+      const Identity& peer=getpid()==c->primary.pid?c->custody:c->primary;
+      if(c->engineGone()) (void)c->retireMonitorPeer(peer);
+      reap(c->custody); // only a genuine direct child is reapable by this holder
+    }
+    usleep(10000);
+  }
+}
 [[noreturn]] static void retainedRefusal(Context* c,arbol_exit::HostCapability* cap=nullptr) {
   poison(cap,arbol_exit::protocolLoss|arbol_exit::forced);
-  struct stat a{},b{}; if(!c&&(fstat(3,&a)||fstat(4,&b)||!S_ISREG(a.st_mode)||!S_ISREG(b.st_mode))) _exit(4);
-  for(;;) { if(cap&&cap->activationUnresolved()) { usleep(10000); continue; } if(c) { (void)c->discoverCustody(); c->enforce(); reap(c->custody); if(c->engineGone()) { const Identity& peer=getpid()==c->primary.pid?c->custody:c->primary; if(current(peer)==0) _exit(4); (void)c->retireMonitorPeer(peer); } } usleep(10000); }
+  if(cap) finishMonitor(c,cap,4);
+  struct stat a{},b{}; bool heldA=!fstat(3,&a)&&S_ISREG(a.st_mode),heldB=!fstat(4,&b)&&S_ISREG(b.st_mode);
+  if(!c&&!heldA&&!heldB) finishMonitor(nullptr,nullptr,4);
+  for(;;) {
+    if(c) {
+      (void)c->discoverCustody(); c->enforce(); reap(c->custody);
+      if(c->engineGone()) { const Identity& peer=getpid()==c->primary.pid?c->custody:c->primary;
+        if(c->originalGone(peer)) finishMonitor(c,nullptr,4);
+        (void)c->retireMonitorPeer(peer);
+      }
+    }
+    usleep(10000);
+  }
 }
 struct Channel {
   int input,output; std::string incoming,outgoing; bool failed=false,ended=false,brokenWrite=false,truncated=false;
@@ -183,12 +220,12 @@ struct Deadline {
     }
     if(!primary&&kCommitted&&clockMs()<expires&&currentQuiescence()&&current(c.custody)==1) {
       if(cap) { cap->shared()->custodyConsentUs.store((uint64_t)(clockMs()*1000),std::memory_order_release); cap->shared()->custodyConsent.store(1,std::memory_order_release); }
-      _exit(0);
+      finishMonitor(&c,cap,0,true,expires);
     }
     int state=current(peer);
     if(state<0) poison(cap,arbol_exit::identityLoss);
     if(!state) {
-      if(!cap) _exit(0); // Native-only legacy has no finalization authority
+      if(!cap) finishMonitor(&c,nullptr,0); // Native-only legacy has no finalization authority
       if((!c.originalGone(peer)||(watched&&!peerWatch.observed()))&&clockMs()<expires) { usleep(1000); continue; }
       bool consent=primary&&gotK&&cap->shared()->primaryConsent.load(std::memory_order_acquire)==1&&
         cap->shared()->custodyConsent.load(std::memory_order_acquire)==1;
@@ -226,7 +263,7 @@ struct Deadline {
       }
       // Clean only after the independent retained original completed the real
       // durable journal/marker/activation. Dirty final witness is leaf14.1.
-      _exit(ordinary?0:4);
+      finishMonitor(&c,cap,ordinary?0:4);
     }
     pair.flush(expires);
     if(primary&&initialSent&&pair.outgoing.empty()&&!pair.failed) tCommitted=true;
@@ -234,7 +271,7 @@ struct Deadline {
     if(clockMs()>=expires) {
       poison(cap,arbol_exit::peerLoss|arbol_exit::forced);
       (void)c.retireMonitorPeer(peer); reap(peer);
-      if(c.engineGone()&&current(peer)==0) _exit(cap?4:0);
+      if(c.engineGone()&&c.originalGone(peer)) finishMonitor(&c,cap,cap?4:0);
     }
     usleep(5000);
   }
@@ -501,7 +538,7 @@ static int runCustody(Context& c,double deadline,arbol_exit::ExitWatch& watch,ar
 }
 
 int main(int argc,const char* argv[]) {
-  signal(SIGPIPE,SIG_IGN); double deadline=clockMs()+1000; Context c; bool parsed=false; arbol_exit::ExitWatch watch; arbol_exit::HostCapability hostCap;
+  signal(SIGPIPE,SIG_IGN); double deadline=clockMs()+1000; Context c; bool parsed=false,hostWanted=argc==3; arbol_exit::ExitWatch watch; arbol_exit::HostCapability hostCap;
   Identity birth; Info birthInfo{}; int birthSession=getsid(0); bool birthValid=observe(getpid(),birth,&birthInfo)==1;
   @autoreleasepool {
     @try { try {
@@ -515,6 +552,6 @@ int main(int argc,const char* argv[]) {
       if(!watch.enroll(c.main)) throw 4;
       if(host&&!hostCap.enrolled(c,primary,watch)) throw 4;
       return primary?runPrimary(c,deadline,watch,host?&hostCap:nullptr):runCustody(c,deadline,watch,host?&hostCap:nullptr);
-    } catch(...) { c.cleanupOnly=true; retainedRefusal(parsed?&c:nullptr,hostCap.present()?&hostCap:nullptr); } } @catch(NSException*) { c.cleanupOnly=true; retainedRefusal(parsed?&c:nullptr,hostCap.present()?&hostCap:nullptr); }
+    } catch(...) { c.cleanupOnly=true; retainedRefusal(parsed?&c:nullptr,hostWanted?&hostCap:nullptr); } } @catch(NSException*) { c.cleanupOnly=true; retainedRefusal(parsed?&c:nullptr,hostWanted?&hostCap:nullptr); }
   }
 }

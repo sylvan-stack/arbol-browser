@@ -673,6 +673,17 @@ inline bool publishNativeReceipt(int directory,const std::string& name,const std
   if(renameatx_np(directory,temporary.c_str(),directory,name.c_str(),RENAME_EXCL)) return false;
   return publishedNativeFile(directory,name,raw,file,identity,deadline)&&file.finish();
 }
+inline bool terminalEngineMarker(NSDictionary* value) {
+  uint64_t epoch;
+  return arbol_attempt::keys(value,@[@"format",@"profileInstance",@"engine",@"dataEpoch",@"lastWriterBuild",@"lastWriterChromium",@"lastWriterElectron",@"requiredReader",@"cleanExit"])&&
+    [value[@"format"] isEqual:@1]&&[value[@"engine"] isEqual:@"chromium"]&&
+    arbol_attempt::pattern(value[@"profileInstance"],@"^prf_[A-Za-z0-9_-]{22}$")&&arbol_attempt::uintNumber(value[@"dataEpoch"],epoch)&&epoch>0&&
+    arbol_attempt::pattern(value[@"lastWriterBuild"],@"^[1-9a-f][0-9a-f]{0,15}$")&&
+    [value[@"lastWriterChromium"] isKindOfClass:NSString.class]&&[value[@"lastWriterChromium"] length]>0&&
+    [value[@"lastWriterElectron"] isKindOfClass:NSString.class]&&[value[@"lastWriterElectron"] length]>0&&
+    [value[@"requiredReader"] isKindOfClass:NSString.class]&&[value[@"requiredReader"] length]>0&&[value[@"requiredReader"] length]<=256&&
+    value[@"cleanExit"]&&CFGetTypeID((__bridge CFTypeRef)value[@"cleanExit"])==CFBooleanGetTypeID();
+}
 struct ActivationResult {
   std::atomic<int> state{0}; double acknowledged=0;
   std::string path,digest;
@@ -684,6 +695,7 @@ class HostCapability {
   NSDictionary* value_=nil; std::string raw_; bool attempted_=false,valid_=false;
   NSDictionary* ordinaryProof_=nil; double ordinaryDeadline_=0;
   NSDictionary* quiescenceProof_=nil;
+  bool terminalAttempted_=false,terminalUnresolved_=false,terminalCommitted_=false; double terminalDeadline_=0;
   std::shared_ptr<StorageResult> storageJob_; NSDictionary* storageProof_=nil; bool storageAttempted_=false;
   std::shared_ptr<ActivationResult> activationJob_; std::thread* activationThread_=nullptr; bool activationAttempted_=false;
   std::thread* storageThread_=nullptr; // one native process-lifetime handle, never a joinable temporary destructor
@@ -1225,6 +1237,126 @@ public:
     }
     return 0;
   }
+  bool originalMonitor(arbol_boundary::Context& c) const {
+    if(!present()||getpid()==c.main.pid||state_->enrolled.load(std::memory_order_acquire)!=7||
+       !state_->main.is(c.main)||!state_->primary.is(c.primary)||!state_->custody.is(c.custody)||
+       !arbol_boundary::lockIdentity(c.owner)||!arbol_boundary::lockIdentity(c.build)||!metadata()) return false;
+    if(role_==1&&getpid()==c.primary.pid) return c.primaryMonitor();
+    return role_==2&&getpid()==c.custody.pid&&c.monitor(c.custody,true);
+  }
+  bool canHandoff(arbol_boundary::Context& c,double roundLimit) {
+    return originalMonitor(c)&&role_==2&&arbol_boundary::clockMs()<roundLimit&&!activationUnresolved()&&!terminalUnresolved_&&
+      state_->custodyConsent.load(std::memory_order_acquire)==1&&state_->custodyConsentUs.load(std::memory_order_acquire)&&
+      c.primaryMonitor()&&arbol_boundary::current(c.primary)==1&&c.engineGone()&&family_&&family_->complete()&&family_->seal();
+  }
+  bool canExitCommitted(arbol_boundary::Context& c) {
+    return activationCommitted()&&activationJob_&&activationJob_->state.load(std::memory_order_acquire)==1&&
+      activationJob_->acknowledged<ordinaryDeadline_&&!activationPending()&&!storagePending()&&role_==1&&
+      originalMonitor(c)&&c.engineGone()&&c.originalGone(c.custody)&&family_&&family_->complete();
+  }
+  // Dirty termination certifies no flush and never changes engine.json. It
+  // binds either the actual accepted dirty inode, the exact planned dirty
+  // digest after an interrupted mutation, or the unchanged authenticated prior.
+  id terminalMarker(arbol_boundary::Context& c) const {
+    if(!present()||!metadata()||!arbol_boundary::lockIdentity(c.owner)||!arbol_boundary::lockIdentity(c.build)) return nil;
+    if(state_->markerBound.load(std::memory_order_acquire)==1) return boundMarker(c);
+    NSString* profile=value_[@"attempt"][@"profile"]; NativeFile root;
+    root.fd=open(profile.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC); if(root.fd<0) return nil;
+    struct stat directory{},named{},markerIdentity{}; std::string raw;
+    if(fstat(root.fd,&directory)||![fileIdentity(directory) isEqual:value_[@"profileDirectory"]]) return nil;
+    errno=0; bool absent=fstatat(root.fd,"engine.json",&named,AT_SYMLINK_NOFOLLOW)<0;
+    if(absent&&errno!=ENOENT) return nil;
+    id marker=NSNull.null;
+    if(!absent) {
+      if(!readNativeFile(root.fd,"engine.json",raw,markerIdentity,arbol_attempt::limit)) return nil;
+      NSDictionary* actual=arbol_attempt::json(raw);
+      if(!terminalEngineMarker(actual)||![actual[@"profileInstance"] isEqual:value_[@"attempt"][@"profileInstance"]]) return nil;
+      marker=@{@"identity":fileIdentity(markerIdentity),@"digest":arbol_attempt::digest(raw),@"value":actual};
+      if(state_->mutation.load(std::memory_order_acquire)==1&&state_->expectedMarkerDigest[0]&&
+         [marker[@"digest"] isEqual:[NSString stringWithUTF8String:state_->expectedMarkerDigest]]&&[actual[@"cleanExit"] isEqual:@NO]) {
+        if(!root.finish()||!metadata()) return nil; return marker;
+      }
+    }
+    NSDictionary* prior=value_[@"prior"];
+    bool matches=[prior[@"kind"] isEqual:@"absent"]&&absent;
+    if([@[@"activated",@"terminal"] containsObject:prior[@"kind"]]) {
+      NSString* path=prior[@"path"],*state=profile.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent;
+      NSString* prefix=[[state stringByAppendingPathComponent:@"exit-evidence"] stringByAppendingPathComponent:value_[@"attempt"][@"profilePathHash"]];
+      if(![path hasPrefix:[prefix stringByAppendingString:@"/"]]||![@[@"activation.json",@"terminal.json"] containsObject:path.lastPathComponent]||
+         !arbol_boundary::canonical(path.fileSystemRepresentation)) return nil;
+      NativeFile parent; parent.fd=open(path.stringByDeletingLastPathComponent.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+      std::string previous; struct stat identity{};
+      if(parent.fd<0||!readNativeFile(parent.fd,path.lastPathComponent.UTF8String,previous,identity,exitReceiptLimit)||
+         ![arbol_attempt::digest(previous) isEqual:prior[@"digest"]]) return nil;
+      NSDictionary* receipt=parseExitReceipt(previous);
+      matches=receipt&&[receipt[@"profileInstance"] isEqual:value_[@"attempt"][@"profileInstance"]]&&
+        [receipt[@"profilePathHash"] isEqual:value_[@"attempt"][@"profilePathHash"]]&&[receipt[@"profileDirectory"] isEqual:value_[@"profileDirectory"]]&&
+        [receipt[@"marker"] isEqual:marker];
+      if(!parent.finish()) return nil;
+    }
+    if(absent) { errno=0; if(fstatat(root.fd,"engine.json",&named,AT_SYMLINK_NOFOLLOW)>=0||errno!=ENOENT) return nil; }
+    if(!root.finish()||!metadata()||!arbol_boundary::lockIdentity(c.owner)||!arbol_boundary::lockIdentity(c.build)) return nil;
+    return matches?marker:nil;
+  }
+  bool dirtyMonitorCurrent(arbol_boundary::Context& c,double deadline) {
+    if(!originalMonitor(c)||activationCommitted()||activationUnresolved()||storagePending()||activationPending()||
+       state_->fatal.load(std::memory_order_acquire)==0||arbol_boundary::clockMs()>=deadline||!c.engineGone()||!family_||!family_->complete()) return false;
+    const auto& peer=role_==1?c.custody:c.primary;
+    return c.originalGone(peer)&&arbol_boundary::clockMs()<deadline;
+  }
+  bool publishDirtyMonitor(arbol_boundary::Context& c) {
+    if(terminalCommitted_) return originalMonitor(c)&&c.engineGone()&&c.originalGone(role_==1?c.custody:c.primary);
+    if(terminalAttempted_||!originalMonitor(c)||activationCommitted()||activationUnresolved()||storagePending()||activationPending()) return false;
+    state_->poison(forced); // irreversible dirty attribution precedes its final proof
+    // No engine or caller deadline is renewed. This separate one-shot bounded
+    // METADATA phase starts only after genuine whole-engine/peer quiescence.
+    // Late dirty evidence can serve a later independent reader, never turn an
+    // expired Close into success; its original cutoffs remain recorded below.
+    if(!c.engineGone()||!c.originalGone(role_==1?c.custody:c.primary)||!family_||!family_->complete()) return false;
+    terminalAttempted_=true;
+    terminalDeadline_=arbol_boundary::clockMs()+1000;
+    if(!dirtyMonitorCurrent(c,terminalDeadline_)||!family_->seal()) return false;
+    terminalUnresolved_=true;
+    @try { try {
+      arbol_attempt::Claim claim; std::string raw; NSDictionary* current=nil;
+      if(!currentAttempt(c,claim,raw,current,terminalDeadline_)) return false;
+      id marker=terminalMarker(c); NSDictionary* frontier=family_->frontierTuple(); Identity self;
+      if(!marker||!frontier||arbol_boundary::observe(getpid(),self)!=1||
+         !arbol_boundary::same(self,role_==1?c.primary:c.custody)||!dirtyMonitorCurrent(c,terminalDeadline_)) return false;
+      NSDictionary* receipt=@{@"format":@1,@"kind":@"terminal-exit",@"disposition":@"dirty",@"bootSession":value_[@"bootSession"],
+        @"profileInstance":current[@"profileInstance"],@"profilePathHash":current[@"profilePathHash"],@"profileDirectory":value_[@"profileDirectory"],
+        @"profileRecordDigest":value_[@"profileRecordDigest"],@"request":current[@"request"],@"build":current[@"build"],
+        @"sourceDigest":current[@"sourceDigest"],@"productDigest":current[@"productDigest"],@"candidateDigest":current[@"candidateDigest"],
+        @"capability":value_,@"capabilityDigest":arbol_attempt::digest(raw_),@"attempt":current,@"runtime":value_[@"runtime"],
+        @"main":value_[@"main"],@"primary":arbol_boundary::capsuleIdentity(c.primary),@"custody":arbol_boundary::capsuleIdentity(c.custody),
+        @"lastHolder":arbol_boundary::capsuleIdentity(self,c.session),@"lastRole":role_==1?@"primary":@"custody",@"marker":marker,@"family":frontier,
+        @"nativeState":@{@"fatal":@(state_->fatal.load(std::memory_order_acquire)),@"fatalCutoffUs":@(state_->fatalCutoffUs.load(std::memory_order_acquire)),
+          @"enrolled":@(state_->enrolled.load(std::memory_order_acquire)),@"transfer":@(state_->transfer.load(std::memory_order_acquire)),
+          @"mutation":@(state_->mutation.load(std::memory_order_acquire)),@"markerBound":@(state_->markerBound.load(std::memory_order_acquire)),
+          @"sealedSession":@(state_->admitted.load(std::memory_order_acquire)),@"activation":@(state_->activation.load(std::memory_order_acquire))},
+        @"originalClose":@{@"receivedUs":@(state_->closeReceivedUs.load(std::memory_order_acquire)),
+          @"graceUs":@(state_->closeGraceUs.load(std::memory_order_acquire)),@"overallUs":@(state_->closeOverallUs.load(std::memory_order_acquire))},
+        @"observedUs":@((uint64_t)(arbol_boundary::clockMs()*1000)),@"metadataDeadlineUs":@((uint64_t)(terminalDeadline_*1000))};
+      std::string bytes=exitReceiptBytes(receipt); if(bytes.empty()) return false;
+      NSString* path=value_[@"receiptDirectory"][@"path"]; NativeFile directory;
+      directory.fd=open(path.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC); struct stat identity{},published{};
+      if(directory.fd<0||fstat(directory.fd,&identity)||![fileIdentity(identity) isEqual:value_[@"receiptDirectory"][@"identity"]]||
+         !publishNativeReceipt(directory.fd,"terminal.json",bytes,terminalDeadline_,published)||!dirtyMonitorCurrent(c,terminalDeadline_)||
+         ![terminalMarker(c) isEqual:marker]||![family_->frontierTuple() isEqual:frontier]) return false;
+      NSMutableDictionary* closed=[current mutableCopy]; closed[@"phase"]=@"closed";
+      closed[@"terminal"]=@{@"path":[path stringByAppendingPathComponent:@"terminal.json"],@"digest":arbol_attempt::digest(bytes)};
+      std::string next=arbol_attempt::bytes(closed);
+      if(!arbol_attempt::transition(current,closed,arbol_attempt::Role::terminal)||!arbol_attempt::replace(claim.at,raw,false,next)) return false;
+      NativeFile proof; proof.fd=openat(claim.at.directory,"claim.json",O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
+      std::string checked; struct stat before{},after{},named{};
+      if(proof.fd<0||fstat(proof.fd,&before)||fsync(proof.fd)||fcntl(proof.fd,F_FULLFSYNC)||fsync(claim.at.directory)||
+         !readNativeFile(claim.at.directory,"claim.json",checked,named,arbol_attempt::limit)||checked!=next||fstat(proof.fd,&after)||
+         !arbol_attempt::sameFile(before,after)||!arbol_attempt::sameFile(after,named)||!arbol_attempt::unchanged(claim.at)||
+         !dirtyMonitorCurrent(c,terminalDeadline_)||![terminalMarker(c) isEqual:marker]||!proof.finish()||!directory.finish()) return false;
+      terminalCommitted_=true; terminalUnresolved_=false; return true;
+    } catch(...) { return false; } } @catch(NSException*) { return false; }
+  }
+  bool terminalUnresolved() const { return terminalUnresolved_; }
   bool held(arbol_boundary::Context& c) const {
     return present()&&exclusiveWriter()&&state_->enrolled.load(std::memory_order_acquire)==7&&
       state_->main.is(c.main)&&state_->primary.is(c.primary)&&state_->custody.is(c.custody)&&
