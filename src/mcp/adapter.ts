@@ -116,7 +116,10 @@ export class BrowserMcpAdapter implements McpApplication {
           return envelope({ error: redactedBrowserError(error.detail) }, true);
         throw error;
       }
-      if (this.closed || runtime.signal.aborted || context.signal.aborted) throw new Error();
+      if (this.closed || runtime.signal.aborted) throw new Error();
+      // A normal host result may win the race with this tool's MCP cancel.
+      // Validate the genuine outcome independently of cancellation; SDK and
+      // transport suppress this request without releasing unrelated authority.
       try {
         if (!validToolResult(selected.name, value)) throw new Error();
         boundedContent(selected.name, value);

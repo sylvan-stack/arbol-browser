@@ -68,7 +68,10 @@ export class BoundedMcpTransport implements McpTransport {
     this.io.stdin.on('data', this.data);
     this.io.stdin.once('end', this.lost); this.io.stdin.once('close', this.lost); this.io.stdin.on('error', this.lost);
     this.io.stdout.on('error', this.lost); this.io.stdout.once('close', this.lost); this.io.stdout.once('finish', this.lost);
-    if (this.io.stdin.readableEnded || this.io.stdin.destroyed || this.io.stdout.destroyed || this.io.stdout.writableEnded) this.lost();
+    if (this.io.stdin.readableEnded || this.io.stdin.destroyed || this.io.stdout.destroyed || this.io.stdout.writableEnded) {
+      this.lost(); return;
+    }
+    if (this.dead) return;
     this.heartbeat = setInterval(() => {
       if (!this.initializationCommitted || this.dead) return;
       if (this.ping && performance.now() - this.ping.sent >= 6000) { this.lost(); return; }
@@ -101,15 +104,24 @@ export class BoundedMcpTransport implements McpTransport {
     }
   };
   private receive(value: unknown, received: number): void {
-    if (!object(value) || value.jsonrpc !== '2.0') { void this.reject(null, -32600); return; }
-    if (!('method' in value)) {
-      // Transport-owned liveness has one outstanding ping, no page messages.
+    if (!object(value)) { void this.reject(null, -32600); return; }
+    if (!('method' in value) && ('result' in value || 'error' in value)) {
+      // Apparent peer responses may only answer the actual outstanding ping.
+      // A missing method without a result/error is instead a malformed request.
       if (!this.ping || value.id !== this.ping.id || !JSONRPCMessageSchema.safeParse(value).success ||
           !object(value.result) || Object.keys(value.result).length !== 0) { this.lost(); return; }
       this.ping = undefined; return;
     }
-    if (typeof value.method !== 'string' || !fields(value, ['jsonrpc', 'id', 'method', 'params']) ||
-        ('params' in value && !object(value.params))) { void this.reject(id(value.id) ? value.id : null, -32600); return; }
+    const requestId = id(value.id) ? value.id : null;
+    const externalKey = requestId === null ? undefined : key(requestId);
+    // Reserve before any echo, even for malformed method/envelope/params. A
+    // second identifiable use closes before it can publish another result.
+    if (externalKey !== undefined) {
+      if (this.seen.has(externalKey) || this.count >= MCP_LIMITS.requests) { this.lost(); return; }
+      this.seen.add(externalKey); ++this.count;
+    }
+    if (value.jsonrpc !== '2.0' || typeof value.method !== 'string' || !fields(value, ['jsonrpc', 'id', 'method', 'params']) ||
+        ('params' in value && !object(value.params))) { void this.reject(requestId, -32600); return; }
     const params = object(value.params) ? value.params : {};
     if (!('id' in value)) {
       if (value.method === 'notifications/initialized') {
@@ -133,10 +145,7 @@ export class BoundedMcpTransport implements McpTransport {
       }
       return; // Unknown notifications have no response and confer no capability.
     }
-    if (!id(value.id)) { void this.reject(null, -32600); return; }
-    const externalKey = key(value.id);
-    if (this.seen.has(externalKey) || this.count >= MCP_LIMITS.requests) { this.lost(); return; }
-    this.seen.add(externalKey); ++this.count;
+    if (!id(value.id) || externalKey === undefined) { void this.reject(null, -32600); return; }
     let valid = false;
     switch (value.method) {
       case 'initialize': valid = fields(params, ['protocolVersion', 'capabilities', 'clientInfo', '_meta']) && InitializeRequestSchema.safeParse(value).success; break;
