@@ -37,8 +37,10 @@ export const launchServices: LaunchPort = Object.freeze({
     const layout = selectedLayout(selection, join(selection.directory, 'ArbolBrowser.app/Contents/Resources/browser'));
     const account = userInfo(); if (account.uid !== process.geteuid?.()) return Promise.reject(profileUnavailable());
     return new Promise((resolve, reject) => {
+      const timeout = Math.floor(deadline - now());
+      if (!Number.isFinite(timeout) || timeout < 1) { reject(profileUnavailable()); return; }
       execFile(layout.launcher, [layout.bundle, requestPath],
-        { timeout: Math.max(1, deadline - now()), maxBuffer: 128,
+        { timeout, maxBuffer: 128,
           env: { HOME: account.homedir, USER: account.username, PATH: '/usr/bin:/bin' } }, (error, stdout) => {
           if (error || !/^[1-9][0-9]*\n$/.test(stdout) || !Number.isSafeInteger(Number(stdout.trim()))) {
             reject(profileUnavailable()); return;
