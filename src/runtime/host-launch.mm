@@ -16,6 +16,8 @@ struct Reply {
   Outcome outcome = Outcome::pending;
   bool callbackStarted = false;
   int pid = 0;
+  bool error = false, app = false;
+  unsigned branch = 0, phase = 0;
 };
 
 // This authenticates only the fixed exec's PID hint. The caller still requires
@@ -119,22 +121,17 @@ int main(int argc, const char* argv[]) {
             }
           }
         } @catch (NSException*) { accepted = false; } } catch (...) { accepted = false; }
-        Outcome outcome;
         { std::lock_guard<std::mutex> held(reply->mutex);
           if (reply->outcome == Outcome::pending) {
+            reply->error = error != nil; reply->app = app != nil;
+            reply->branch = branch; reply->phase = phase;
             if (arbol_boundary::clockMs() >= deadline) reply->outcome = Outcome::timedOut;
             else {
               reply->outcome = accepted ? Outcome::accepted : Outcome::refused;
               if (accepted) reply->pid = pid;
             }
           }
-          outcome = reply->outcome;
         }
-        // One fixed-size private diagnostic from the genuine callback. No PID,
-        // paths, request/profile bytes, result tokens or raw errors are logged.
-        os_log_with_type(OS_LOG_DEFAULT,OS_LOG_TYPE_DEFAULT,
-          "host-launch callback error=%{private}d app=%{private}d branch=%{private}u phase=%{private}u outcome=%{private}u",
-          error != nil,app != nil,branch,phase,(unsigned)outcome);
       }];
     while (arbol_boundary::clockMs() < deadline) {
       { std::lock_guard<std::mutex> held(reply->mutex);
@@ -142,13 +139,22 @@ int main(int argc, const char* argv[]) {
       }
       [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.025]];
     }
-    std::lock_guard<std::mutex> held(reply->mutex);
-    if (arbol_boundary::clockMs() >= deadline) {
-      if (reply->outcome == Outcome::pending) reply->outcome = Outcome::timedOut;
-      return 4;
+    Outcome outcome; int pid; bool callback, error, app; unsigned branch, phase;
+    { std::lock_guard<std::mutex> held(reply->mutex);
+      if (arbol_boundary::clockMs() >= deadline && reply->outcome == Outcome::pending)
+        reply->outcome = Outcome::timedOut;
+      outcome = reply->outcome; pid = reply->pid; callback = reply->callbackStarted;
+      error = reply->error; app = reply->app; branch = reply->branch; phase = reply->phase;
     }
-    if (reply->outcome != Outcome::accepted || reply->pid <= 1) return 4;
-    std::printf("%d\n",reply->pid); std::fflush(stdout);
+    // One bounded local system diagnostic, before main can exit normally.
+    // Only allowlisted fixed booleans/enums are observable: no PID, paths,
+    // request/profile bytes, result tokens or raw errors. Never wait for a late
+    // callback to finish its validation or diagnostic after the cutoff.
+    os_log_with_type(OS_LOG_DEFAULT,OS_LOG_TYPE_DEFAULT,
+      "host-launch reply callback=%{public}d error=%{public}d app=%{public}d branch=%{public}u phase=%{public}u outcome=%{public}u",
+      callback,error,app,branch,phase,(unsigned)outcome);
+    if (outcome != Outcome::accepted || pid <= 1 || arbol_boundary::clockMs() >= deadline) return 4;
+    std::printf("%d\n",pid); std::fflush(stdout);
     return 0;
   }
 }
