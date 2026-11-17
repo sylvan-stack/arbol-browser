@@ -5,7 +5,7 @@ import { unavailable } from '../contracts/errors.js';
 import { bindingKey } from '../native/retirement.js';
 import type { DocumentReceipt } from './authority.js';
 import type { HostDocuments, HostDocument, DocumentPreparation, PhysicalFrame } from './documents.js';
-import { PresentationSuperseded, presentationCategory } from './documents.js';
+import { PresentationSuperseded, presentationCategory, physicalFrames } from './documents.js';
 import { staleSnapshot } from './authority.js';
 import { assertPageSurface, type PageSurface } from './windows.js';
 import type { TabTarget } from './tabs.js';
@@ -41,6 +41,19 @@ export type ActionEvent =
   | Readonly<{ kind: 'drag'; data: ActionDragData }>;
 interface ActionObserver { session: string | undefined; frame: InspectionFrame; check(): void;
   receive(event: ActionEvent): void; close(): void }
+type FrameScalars = Readonly<Pick<PhysicalFrame, 'process' | 'osProcess' | 'routing' | 'token' | 'node'>>;
+interface PassiveContext {
+  readonly id: number; readonly unique: string; readonly physical: FrameScalars;
+}
+interface ActionWorld {
+  readonly name: string; frame: string; session: string | undefined; physical: FrameScalars; context?: PassiveContext;
+}
+function frameScalars(frame: PhysicalFrame): FrameScalars {
+  return Object.freeze({ process: frame.process, osProcess: frame.osProcess, routing: frame.routing, token: frame.token, node: frame.node });
+}
+function samePhysical(a: FrameScalars, b: FrameScalars): boolean {
+  return a.process === b.process && a.osProcess === b.osProcess && a.routing === b.routing && a.token === b.token && a.node === b.node;
+}
 function actionEvent(method: string, raw: unknown): ActionEvent | undefined {
   if (!['Runtime.executionContextCreated', 'Runtime.executionContextDestroyed', 'Runtime.executionContextsCleared',
     'Runtime.bindingCalled', 'Input.dragIntercepted'].includes(method)) return;
@@ -96,6 +109,7 @@ interface Channel {
   resources: Set<string>;
   animations: Set<string>;
   actionObservers: Set<ActionObserver>;
+  actionWorld?: ActionWorld;
   surface?: object;
 }
 function emptyAck(value: unknown): void {
@@ -107,6 +121,17 @@ export class PageReadiness implements DocumentPreparation {
   private readonly channels = new WeakMap<PageSurface, Channel>();
   constructor(readonly boundary: NativeFailureBoundary, readonly documents: HostDocuments) {
     assertNativeFailureBoundary(boundary); if (documents.boundary !== boundary) throw unavailable('browser');
+    documents.subscribe(event => {
+      const channel = this.channels.get(event.page); if (!channel) return;
+      if (event.kind === 'changed' || event.kind === 'closed') {
+        // Logical renewal always expires action listeners/receipts. Only a
+        // scalar physical/context identity can survive same-document renewal.
+        for (const observer of [...channel.actionObservers]) observer.close();
+        const world = channel.actionWorld;
+        if (world && (event.kind === 'closed' || !event.receipt || !samePhysical(world.context?.physical ?? world.physical, event.receipt.frame)))
+          delete world.context;
+      }
+    });
   }
   private native(): void { assertNativeFailureBoundary(this.boundary); }
   private synchronous(assertCurrent: () => void): void {
@@ -123,8 +148,10 @@ export class PageReadiness implements DocumentPreparation {
     this.channels.set(page, channel);
     debugger_.on('message', (_event, method, params, sessionId) => {
       if (!channel.active || this.channels.get(page) !== channel) return;
-      if (channel.actionObservers.size) {
+      if (channel.actionObservers.size || (channel.actionWorld && ['Runtime.executionContextCreated',
+        'Runtime.executionContextDestroyed', 'Runtime.executionContextsCleared'].includes(method))) {
         const projected = actionEvent(method, params);
+        if (projected) this.contextEvent(channel, sessionId || undefined, projected);
         if (projected) for (const observer of [...channel.actionObservers]) {
           if (observer.session !== (sessionId || undefined)) continue;
           try {
@@ -161,6 +188,7 @@ export class PageReadiness implements DocumentPreparation {
     debugger_.on('detach', () => {
       if (!channel.active) return;
       channel.active = false;
+      if (channel.actionWorld) delete channel.actionWorld.context;
       for (const observer of [...channel.actionObservers]) observer.close();
       this.documents.channelLost(page, channel.identity); // literal original page/channel, never target.page
     });
@@ -288,6 +316,42 @@ export class PageReadiness implements DocumentPreparation {
     channel.actionObservers.add(observer); signal.addEventListener('abort', remove, { once: true });
     return remove;
   }
+  /** Register only the one fixed private world. Passive state has no document
+   * lease, action listener, arbitrary payload or second event history. */
+  registerActionWorld(frame: InspectionFrame, guard: () => void, name: string): void {
+    this.assertInspection(frame, guard);
+    if (!/^arbol_action_[0-9a-f]{32}$/.test(name) || !frame.physical || frame.session !== undefined || frame.physical !== frame.receipt.frame) throw staleSnapshot();
+    const channel = this.owned(frame.receipt.page), physical = frameScalars(frame.physical);
+    const current = channel.actionWorld;
+    if (current) {
+      if (current.name !== name) throw staleSnapshot();
+      if (current.frame !== frame.frameId || current.session !== frame.session ||
+          !samePhysical(current.context?.physical ?? current.physical, physical)) delete current.context;
+      current.frame = frame.frameId; current.session = frame.session; current.physical = physical;
+    } else channel.actionWorld = { name, frame: frame.frameId, session: frame.session, physical };
+  }
+  private contextEvent(channel: Channel, session: string | undefined, event: ActionEvent): void {
+    const world = channel.actionWorld; if (!world || world.session !== session) return;
+    if (event.kind === 'cleared' || event.kind === 'lost' || (event.kind === 'destroyed' &&
+        (world.context?.id === event.id || world.context?.unique === event.unique))) delete world.context;
+    else if (event.kind === 'context' && event.name === world.name && event.frame === world.frame && !event.default) {
+      try {
+        this.assertChannel(channel);
+        const root = physicalFrames(channel.page).find(frame => frame.handle === channel.contents.mainFrame);
+        if (!root) throw staleSnapshot();
+        // Numeric ids are routing only. The next action must also obtain a
+        // fresh exact-frame createIsolatedWorld ack and use this unique id.
+        world.context = Object.freeze({ id: event.id, unique: event.unique, physical: frameScalars(root) });
+      } catch { delete world.context; }
+    }
+  }
+  actionContext(frame: InspectionFrame, guard: () => void, name: string): Readonly<{ id: number; unique: string }> {
+    this.assertInspection(frame, guard); const channel = this.owned(frame.receipt.page), world = channel.actionWorld;
+    const context = world?.context;
+    if (!world || world.name !== name || world.frame !== frame.frameId || world.session !== frame.session ||
+        !context || !frame.physical || !samePhysical(context.physical, frame.physical)) throw staleSnapshot();
+    return Object.freeze({ id: context.id, unique: context.unique });
+  }
   /** A real compositor observation, scoped to the original page. This is an
    * invalidation epoch only: it is not a layout-coupled screenshot token. */
   watchSurface(receipt: HostDocument, guard: () => void): {
@@ -405,6 +469,7 @@ export class PageReadiness implements DocumentPreparation {
   close(page: PageSurface): void {
     const channel = this.channels.get(page); if (!channel || !channel.active) return;
     channel.active = false; // before detach callbacks can reenter
+    if (channel.actionWorld) delete channel.actionWorld.context;
     for (const observer of [...channel.actionObservers]) observer.close();
     if (!channel.contents.isDestroyed() && channel.debugger.isAttached()) channel.debugger.detach();
   }

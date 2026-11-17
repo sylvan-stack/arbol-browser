@@ -182,6 +182,8 @@ export class TrustedObservation {
     if (this.closed || this.invalid || this.registration.failed || this.registration.active !== this.scope ||
         !this.context || this.registration.context?.unique !== this.context.unique ||
         this.registration.context.id !== this.context.id || this.context.receipt !== this.target.frame.receipt) throw staleSnapshot();
+    const current = this.target.inspection.readiness.actionContext(this.target.frame, this.target.guard, this.registration.world);
+    if (current.id !== this.context.id || current.unique !== this.context.unique) throw staleSnapshot();
   };
   private command(method: string, params?: object, guard = this.guard): Promise<unknown> {
     return this.target.inspection.readiness.command(this.target.frame.receipt.page, guard, method, params, this.target.frame.session);
@@ -189,6 +191,7 @@ export class TrustedObservation {
   private async install(): Promise<void> {
     const { target, registration } = this;
     const initial = () => { target.guard(); if (this.closed || registration.active !== this.scope || registration.failed) throw staleSnapshot(); };
+    target.inspection.readiness.registerActionWorld(target.frame, initial, registration.world);
     this.remove = target.inspection.readiness.observeActions(target.frame, initial, target.execution.signal, event => this.receive(event));
     target.execution.signal.addEventListener('abort', this.abort, { once: true });
     if (!registration.setup) {
@@ -205,8 +208,11 @@ export class TrustedObservation {
     await registration.setup; initial();
     const world = await this.command('Page.createIsolatedWorld', { frameId: target.frame.frameId, worldName: registration.world,
       grantUniveralAccess: false }, initial) as { executionContextId?: number };
-    initial(); const context = registration.context;
-    if (!context || context.receipt !== target.frame.receipt || world.executionContextId !== context.id) throw staleSnapshot();
+    initial();
+    const projected = target.inspection.readiness.actionContext(target.frame, initial, registration.world);
+    const context: Context = Object.freeze({ receipt: target.frame.receipt, id: projected.id, unique: projected.unique });
+    if (world.executionContextId !== context.id) throw staleSnapshot();
+    registration.context = context;
     this.context = context; this.guard();
     const classified = await target.inspection.fields.classify(target.frame, this.guard); this.guard();
     const field = classified.nodes.get(target.backend);
@@ -496,7 +502,12 @@ export class TrustedObservation {
       } catch {
         // A failed cleanup on a surviving original context must not accumulate
         // listeners/objects on the next action. New documents start inert.
-        if (registration.context?.receipt === target.frame.receipt) registration.failed = true;
+        try {
+          const current = target.inspection.readiness.actionContext(target.frame, () => {
+            target.inspection.authority.assertHealthy(); target.inspection.documents.assertCurrent(target.execution.stamp.target, target.frame.receipt);
+          }, registration.world);
+          if (current.unique === this.context?.unique) registration.failed = true;
+        } catch { /* The original context/document is gone; no successor cleanup. */ }
       } finally {
         if (registration.active === this.scope) delete registration.active;
         this.issued.clear(); this.pending.clear(); delete this.monitor;
