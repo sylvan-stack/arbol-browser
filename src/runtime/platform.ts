@@ -36,6 +36,7 @@ export interface WatchdogCustody {
 export type PriorMarkerExpectation = Readonly<{ kind: 'absent' } | { kind: 'activated' | 'terminal'; path: string; digest: string }>;
 export interface HostFinalizationInput {
   readonly requestPath: string;
+  readonly signedPolicy: Readonly<{ policyDigest: string; compatibilityDigest: string }>;
   readonly runtime: import('./instance.js').RuntimeRecord;
   /** Expectation only. Independent PreviousExit and actual post-enrollment
    * marker binding must still verify it before any engine/data admission. */
@@ -78,7 +79,7 @@ interface NativeSupport {
   acceptHostMarkerMutation(handle: object): void;
   assertHostMarker(handle: object): void;
   abortHostMarkerMutation(handle: object): never;
-  prepareHostFinalization(handle: object, input: string): void;
+  prepareHostFinalization(handle: object, input: string, policyDigest: string, compatibilityDigest: string): void;
   spawnWatchdog(handle: object): { pid: number; reader: number; writer: number };
   assertHostFinalization(handle: object): void;
   latchWatchdogFatal(handle: object): void;
@@ -153,9 +154,9 @@ export function loadPlatform(): PlatformPort {
           return Object.freeze({ ...value });
         },
         prepareHost(input: HostFinalizationInput) {
-          const encoded = JSON.stringify(input);
+          const encoded = JSON.stringify({ requestPath: input.requestPath, runtime: input.runtime, prior: input.prior });
           if (!encoded || Buffer.byteLength(encoded) > 16384) throw unavailable('browser');
-          call(() => native.prepareHostFinalization(handle, encoded));
+          call(() => native.prepareHostFinalization(handle, encoded, input.signedPolicy.policyDigest, input.signedPolicy.compatibilityDigest));
         },
         assertHost: () => call(() => native.assertHostFinalization(handle)),
         assertMarker: () => call(() => native.assertHostMarker(handle)),

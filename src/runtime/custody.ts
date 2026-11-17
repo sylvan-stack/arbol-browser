@@ -57,7 +57,8 @@ export async function prepareHostCustody(host: VerifiedHost, instance: InstanceO
       instance.record.build !== host.identity.layout.build || instance.record.phase !== 'starting' ||
       instance.record.profileInstance !== instance.owner.profile.record.instance) throw unavailable('browser');
   const input = Object.freeze({ requestPath: join(instance.location.leaf, `launch-${request}.json`),
-    runtime: instance.record, prior: Object.freeze({ ...prior }) });
+    runtime: instance.record, prior: Object.freeze({ ...prior }),
+    signedPolicy: Object.freeze({ policyDigest: host.policyDigest, compatibilityDigest: host.policy.compatibilityDigest }) });
   const native = await withOwnerLockForCustody(instance.owner, platform, owner =>
     withBuildLockForCustody(build, platform, heldBuild => {
       assertTime(deadline);

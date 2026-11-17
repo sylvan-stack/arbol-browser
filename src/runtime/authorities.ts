@@ -85,6 +85,7 @@ export interface HostPolicy {
 export interface VerifiedHost {
   readonly identity: PackagedIdentity; readonly policy: Readonly<HostPolicy>;
   readonly signed: SignedBundle;
+  readonly policyDigest: string;
   readonly guardIdentity: Readonly<{ device: string; inode: string; uid: number }>;
   assertTrusted(deadline: number): Promise<void>;
 }
@@ -193,7 +194,7 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
         await realpath(selection.guard) !== selection.guard) throw unavailable('browser');
     assertBudget(limit);
   };
-  const result: VerifiedHost = Object.freeze({ identity, policy, signed, guardIdentity,
+  const result: VerifiedHost = Object.freeze({ identity, policy, signed, policyDigest: rawPolicy.digest, guardIdentity,
     async assertTrusted(limit: number) {
       if (!verifiedHosts.has(result)) throw unavailable('browser');
       assertBudget(limit); signed.assertIdentity(limit);

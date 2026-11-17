@@ -378,6 +378,7 @@ struct Custody {
   int reader=-1,writer=-1; bool endpointsPublished=false;
   RetainedPipe retainedReader,retainedWriter;
   MarkerPermit* mutation=nullptr; bool markerAttempted=false;
+  std::string policyDigest,compatibilityDigest;
 };
 static std::set<Custody*> nativeCustodies;
 static bool custodyAttempted = false;
@@ -412,13 +413,32 @@ static napi_value custodyDescriptors(napi_env env,napi_callback_info info) {
   napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg); if(!c) return fail(env);
   napi_value out; if(napi_create_array_with_length(env,3,&out)!=napi_ok || napi_set_element(env,out,0,number(env,c->context.owner.fd))!=napi_ok || napi_set_element(env,out,1,number(env,c->context.build.fd))!=napi_ok || napi_set_element(env,out,2,number(env,c->capsule))!=napi_ok) return fail(env); return out;
 }
+static NSDictionary* sealedObject(const std::string& path,std::string& digest);
 static napi_value prepareHostFinalization(napi_env env,napi_callback_info info) {
-  napi_value args[2]; size_t n=2; std::string input;
-  if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok||n!=2||!boundedText(env,args[1],input)) return fail(env);
+  napi_value args[4]; size_t n=4; std::string input,policyDigest,compatibilityDigest;
+  if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok||n!=4||!boundedText(env,args[1],input)||
+     !boundedText(env,args[2],policyDigest)||!boundedText(env,args[3],compatibilityDigest)||
+     !arbol_attempt::pattern([NSString stringWithUTF8String:policyDigest.c_str()],@"^[0-9a-f]{64}$")||
+     !arbol_attempt::pattern([NSString stringWithUTF8String:compatibilityDigest.c_str()],@"^[0-9a-f]{64}$")) return fail(env);
   auto* c=custodyArgument(env,args[0]); if(!c||c->hostRequired||c->spawned||!c->continuousBuild) return fail(env);
   c->hostRequired=true; // a failed host preparation cannot fall back to legacy
   @autoreleasepool { @try {
     if(!c->finalization.prepare(c->context,input,arbol_boundary::clockMs()+1000)) return fail(env);
+    // Expected hashes arrive only through the canonical previously verified
+    // HostCustody route. Capture both actual physical sealed files before any
+    // enrollment; a consistent replacement pair cannot teach us new trust.
+    std::string actualPolicy,actualCompatibility;
+    NSDictionary* policy=sealedObject(c->context.bundle+"/Contents/Resources/host-policy.json",actualPolicy);
+    NSDictionary* compatibility=sealedObject(c->context.bundle+"/Contents/Resources/native-compatibility.json",actualCompatibility);
+    NSDictionary* attempt=c->finalization.value()[@"attempt"];
+    if(!policy||!compatibility||actualPolicy!=policyDigest||actualCompatibility!=compatibilityDigest||
+       ![policy[@"compatibilityDigest"] isEqual:[NSString stringWithUTF8String:compatibilityDigest.c_str()]]||
+       ![attempt[@"candidateDigest"] isEqual:[NSString stringWithUTF8String:c->context.digest.c_str()]]||
+       ![policy[@"build"] isEqual:attempt[@"build"]]||![policy[@"buildRoot"] isEqual:attempt[@"buildRoot"]]||
+       ![policy[@"sourceDigest"] isEqual:attempt[@"sourceDigest"]]||![policy[@"productDigest"] isEqual:attempt[@"productDigest"]]||
+       !arbol_boundary::lockIdentity(c->context.owner)||!arbol_boundary::lockIdentity(c->context.build)||
+       !c->finalization.metadata()) return fail(env);
+    c->policyDigest=actualPolicy; c->compatibilityDigest=actualCompatibility;
     napi_value out; napi_get_undefined(env,&out); return out;
   } @catch(NSException*) { return fail(env); } }
 }
@@ -553,16 +573,42 @@ static bool nativeMarker(NSDictionary* value) {
     [value[@"requiredReader"] isKindOfClass:NSString.class]&&[value[@"requiredReader"] length]>0&&[value[@"requiredReader"] length]<=256&&
     CFGetTypeID((__bridge CFTypeRef)value[@"cleanExit"])==CFBooleanGetTypeID();
 }
+// Bytes and their identity come from ONE actual description, including the
+// final path check before close. A second fstatat after a closed reader could
+// otherwise pair old bytes with a replacement inode.
+static bool markerAt(int directory,std::string& raw,struct stat& st,bool& absent) {
+  raw.clear(); absent=false;
+  int fd=openat(directory,"engine.json",O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
+  if(fd<0) { absent=errno==ENOENT; return absent; }
+  struct stat before{},named{},last{},after{};
+  bool ok=!fstat(fd,&before)&&!fstatat(directory,"engine.json",&named,AT_SYMLINK_NOFOLLOW)&&
+    arbol_attempt::privateFile(before)&&arbol_attempt::sameFile(before,named)&&before.st_size>0&&before.st_size<16384;
+  char buffer[4096];
+  while(ok&&raw.size()<=(size_t)before.st_size) {
+    ssize_t n=read(fd,buffer,std::min(sizeof(buffer),(size_t)before.st_size+1-raw.size()));
+    if(n>0) raw.append(buffer,n); else if(!n) break; else if(errno!=EINTR) ok=false;
+  }
+  ok=ok&&raw.size()==(size_t)before.st_size&&!fstat(fd,&last)&&!fstatat(directory,"engine.json",&after,AT_SYMLINK_NOFOLLOW)&&
+    arbol_attempt::sameFile(before,last)&&arbol_attempt::sameFile(last,after);
+  if(ok) st=last; if(close(fd)) ok=false; return ok;
+}
 static bool currentMarker(Custody* c,std::string& raw,struct stat& st,bool& absent) {
   if(!c->finalization.present()||!c->finalization.metadata()) return false;
-  NSString* profile=c->finalization.value()[@"attempt"][@"profile"];
+  NSDictionary* capability=c->finalization.value(); NSString* profile=capability[@"attempt"][@"profile"];
   int fd=open(profile.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC); if(fd<0) return false;
-  bool ok=arbol_attempt::readAt(fd,"engine.json",raw,absent);
-  if(ok&&!absent) ok=!fstatat(fd,"engine.json",&st,AT_SYMLINK_NOFOLLOW)&&arbol_attempt::privateFile(st)&&nativeMarker(arbol_attempt::json(raw))&&
-    [arbol_attempt::json(raw)[@"profileInstance"] isEqual:c->finalization.value()[@"attempt"][@"profileInstance"]];
+  struct stat root{},named{},after{},lastName{};
+  bool ok=!fstat(fd,&root)&&!lstat(profile.fileSystemRepresentation,&named)&&S_ISDIR(root.st_mode)&&
+    [arbol_exit::fileIdentity(root) isEqual:capability[@"profileDirectory"]]&&root.st_dev==named.st_dev&&root.st_ino==named.st_ino&&
+    markerAt(fd,raw,st,absent);
+  if(ok&&!absent) ok=nativeMarker(arbol_attempt::json(raw))&&
+    [arbol_attempt::json(raw)[@"profileInstance"] isEqual:capability[@"attempt"][@"profileInstance"]];
+  ok=ok&&!fstat(fd,&after)&&!lstat(profile.fileSystemRepresentation,&lastName)&&
+    [arbol_exit::fileIdentity(after) isEqual:capability[@"profileDirectory"]]&&after.st_dev==lastName.st_dev&&after.st_ino==lastName.st_ino&&
+    arbol_boundary::lockIdentity(c->context.owner)&&arbol_boundary::lockIdentity(c->context.build);
+  if(ok&&absent) { struct stat check{}; errno=0; ok=fstatat(fd,"engine.json",&check,AT_SYMLINK_NOFOLLOW)<0&&errno==ENOENT; }
   if(close(fd)) ok=false; return ok;
 }
-static NSDictionary* sealedObject(const std::string& path) {
+static NSDictionary* sealedObject(const std::string& path,std::string& digest) {
   if(!arbol_boundary::canonical(path)) return nil;
   int fd=open(path.c_str(),O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC); if(fd<0) return nil;
   struct stat first{},named{},last{},after{}; std::string bytes;
@@ -575,7 +621,7 @@ static NSDictionary* sealedObject(const std::string& path) {
   }
   ok=ok&&bytes.size()==(size_t)first.st_size&&!fstat(fd,&last)&&!lstat(path.c_str(),&after)&&
     arbol_attempt::sameFile(first,last)&&arbol_attempt::sameFile(last,after);
-  if(close(fd)) ok=false; return ok?arbol_attempt::json(bytes):nil;
+  if(close(fd)) ok=false; if(ok) digest=[arbol_attempt::digest(bytes) UTF8String]; return ok?arbol_attempt::json(bytes):nil;
 }
 static bool emptyNativeDirectory(NSString* path) {
   if(!arbol_boundary::canonical(path.fileSystemRepresentation)) return false;
@@ -606,9 +652,10 @@ static bool priorMarkerMatches(Custody* c,const std::string& raw,const struct st
 }
 static bool signedDirty(Custody* c,const std::string& dirtyRaw,const std::string& previous,bool absent) {
   NSDictionary* dirty=arbol_attempt::json(dirtyRaw),*attempt=c->finalization.value()[@"attempt"];
-  NSDictionary* policy=sealedObject(c->context.bundle+"/Contents/Resources/host-policy.json");
-  NSDictionary* compatibility=sealedObject(c->context.bundle+"/Contents/Resources/native-compatibility.json");
-  if(!policy||!compatibility||!nativeMarker(dirty)||![dirty[@"cleanExit"] isEqual:@NO]||
+  std::string policyHash,compatibilityHash;
+  NSDictionary* policy=sealedObject(c->context.bundle+"/Contents/Resources/host-policy.json",policyHash);
+  NSDictionary* compatibility=sealedObject(c->context.bundle+"/Contents/Resources/native-compatibility.json",compatibilityHash);
+  if(policyHash!=c->policyDigest||compatibilityHash!=c->compatibilityDigest||!policy||!compatibility||!nativeMarker(dirty)||![dirty[@"cleanExit"] isEqual:@NO]||
      ![policy[@"purpose"] isEqual:@"isolated-qualification"]||![policy[@"build"] isEqual:attempt[@"build"]]||
      ![policy[@"buildRoot"] isEqual:attempt[@"buildRoot"]]||![policy[@"sourceDigest"] isEqual:attempt[@"sourceDigest"]]||
      ![policy[@"productDigest"] isEqual:attempt[@"productDigest"]]||
