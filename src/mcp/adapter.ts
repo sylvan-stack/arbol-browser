@@ -3,12 +3,13 @@ import { ErrorCode, type CallToolRequest, type CallToolResult } from '@modelcont
 import type { RuntimeClient } from '../runtime/transport.js';
 import type { Stdio } from '../runtime/ports.js';
 import type { Contract } from '../contracts/generated.js';
-import { BrowserFailure, type BrowserError } from '../contracts/errors.js';
+import { BrowserFailure } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
 import { BoundedMcpTransport, MCP_LIMITS } from './framing.js';
 import { serveMcp, type McpApplication, type McpCallContext, type McpIdentity } from './server.js';
 import { protocolError } from './lifecycle.js';
 import { advertisedTools, toolParams, toolDuration, validToolResult } from './tools.js';
+import { createMcpDiagnostics, redactedBrowserError, type McpDiagnostics } from './diagnostics.js';
 
 export interface AgentAttachmentRequest {
   readonly profile: string; readonly label: string; readonly signal: AbortSignal; readonly deadline: number;
@@ -53,7 +54,7 @@ export class BrowserMcpAdapter implements McpApplication {
   private removeLost: (() => void) | undefined;
   private readonly pending = new Map<string | number, string>();
   constructor(private readonly profile: string, private readonly factory: FreshAgentAttachmentFactory,
-    private readonly transport: BoundedMcpTransport) {
+    private readonly transport: BoundedMcpTransport, private readonly diagnostic: McpDiagnostics = () => {}) {
     if (!validator('browser.ProfileId')(profile)) throw protocolError(ErrorCode.InvalidParams);
   }
   async initialize(label: string, signal: AbortSignal, deadline: number): Promise<void> {
@@ -73,7 +74,7 @@ export class BrowserMcpAdapter implements McpApplication {
               runtime.hello.profile !== this.profile || !runtime.hello.attachment || runtime.signal.aborted)
             throw new Error();
           this.runtime = runtime;
-          const lost = () => { this.close(); void this.transport.close(); };
+          const lost = () => { this.diagnostic('runtime_lost'); this.close(); void this.transport.close(); };
           runtime.signal.addEventListener('abort', lost, { once: true });
           this.removeLost = () => runtime.signal.removeEventListener('abort', lost);
           if (runtime.signal.aborted) { lost(); throw new Error(); }
@@ -81,7 +82,7 @@ export class BrowserMcpAdapter implements McpApplication {
       });
       await Promise.race([attempt, cancelled]);
       if (this.closed || signal.aborted || !this.runtime || this.runtime.signal.aborted) throw new Error();
-    } catch { this.close(); throw protocolError(ErrorCode.InternalError); }
+    } catch { this.diagnostic('attachment_failed'); this.close(); throw protocolError(ErrorCode.InternalError); }
     finally { signal.removeEventListener('abort', cancel); }
   }
   list() { return advertisedTools(); }
@@ -92,7 +93,7 @@ export class BrowserMcpAdapter implements McpApplication {
     let issued = false, cancelSent = false;
     const cancel = () => {
       if (!issued || cancelSent || !runtime || this.closed) return;
-      cancelSent = true;
+      cancelSent = true; this.diagnostic('request_cancelled');
       void runtime.cancel(id).catch(() => { this.close(); void this.transport.close(); });
     };
     try {
@@ -112,7 +113,7 @@ export class BrowserMcpAdapter implements McpApplication {
       try { value = await operation; }
       catch (error) {
         if (error instanceof BrowserFailure && validator('browser.BrowserError')(error.detail))
-          return envelope({ error: error.detail }, true);
+          return envelope({ error: redactedBrowserError(error.detail) }, true);
         throw error;
       }
       if (this.closed || runtime.signal.aborted || context.signal.aborted) throw new Error();
@@ -121,7 +122,7 @@ export class BrowserMcpAdapter implements McpApplication {
         boundedContent(selected.name, value);
         return selected.name === 'browser_screenshot' ? screenshot(value as Contract<'browser.ScreenshotPayload'>)
           : envelope(value as Record<string, unknown>, false);
-      } catch { this.close(); void this.transport.close(); throw protocolError(ErrorCode.InternalError); }
+      } catch { this.diagnostic('invalid_runtime_result'); this.close(); void this.transport.close(); throw protocolError(ErrorCode.InternalError); }
     } catch {
       this.close(); void this.transport.close(); throw protocolError(ErrorCode.InternalError);
     } finally {
@@ -141,7 +142,8 @@ export class BrowserMcpAdapter implements McpApplication {
  * mutation is installed here; production CLI composition belongs to ABR-30. */
 export async function runMcp(io: Stdio, identity: McpIdentity, factory: FreshAgentAttachmentFactory,
   profile = 'default'): Promise<void> {
-  const transport = new BoundedMcpTransport(io), adapter = new BrowserMcpAdapter(profile, factory, transport);
-  try { await serveMcp(transport, identity, adapter); }
+  const diagnostic = createMcpDiagnostics(io.stderr);
+  const transport = new BoundedMcpTransport(io), adapter = new BrowserMcpAdapter(profile, factory, transport, diagnostic);
+  try { await serveMcp(transport, identity, adapter, diagnostic); }
   finally { adapter.close(); await transport.close(); }
 }
