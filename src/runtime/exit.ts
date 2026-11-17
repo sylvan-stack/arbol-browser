@@ -125,8 +125,9 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
             withBuildLockForCustody(currentBuild, platform, next => invoke(data, next)) : invoke(data);
           return dataBuild ? withBuildLockForCustody(dataBuild, platform, data => withNext(data)) : withNext();
         }));
-      assertExitInspectionReceipt(result); await owner.assert(); await build.assert(); await dataBuild?.assert();
-      await currentBuild?.assert(); await location.assert(); assertTime(deadline);
+      assertExitInspectionReceipt(result); await owner.assert();
+      for (const original of new Set([build, dataBuild, currentBuild])) if (original) await original.assert();
+      await location.assert(); assertTime(deadline);
       if (actualMode === 'host') {
         const proofs = priorProofs.get(owner); priorProofs.delete(owner);
         for (const proof of proofs?.values() ?? []) release.push(proof.build);
