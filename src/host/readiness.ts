@@ -96,11 +96,14 @@ function actionEvent(method: string, raw: unknown): ActionEvent | undefined {
   }
   return Object.freeze({ kind: 'lost' });
 }
+export interface MutationBracket { check(): Promise<void>; close(): Promise<void> }
+interface ContentContext { readonly id: number; readonly unique: string; gone: boolean }
+interface ContentWorld { readonly name: string; readonly physical: FrameScalars; context?: ContentContext; readonly notifications: Set<() => void>; readonly active: Set<object> }
 interface DefaultContext { readonly id: number; readonly unique: string; readonly frame: string }
 interface DebuggerOwner { events: number; readonly limit: number; bad: boolean; readonly done: Promise<void>; finish(): void }
 interface ChildSession {
   readonly targetId: string; readonly parent: string | undefined;
-  readonly contexts: Map<string, DefaultContext>; detached: boolean; prepared?: Promise<void>; debuggerOwner?: DebuggerOwner;
+  readonly contexts: Map<string, DefaultContext>; readonly worlds: Map<string, ContentWorld>; detached: boolean; prepared?: Promise<void>; debuggerOwner?: DebuggerOwner;
 }
 interface FrameRoute { readonly id: string; readonly loader: string; readonly parent: string | undefined }
 interface FrameGraph {
@@ -141,6 +144,41 @@ interface Channel {
 function emptyAck(value: unknown): void {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length) throw staleSnapshot();
 }
+/** Isolated native DOM objects only. Every open-shadow scope is latched before
+ * AX reads, but composition inside every shadow host is still excluded by DOM
+ * classification: manual slot assignment has no complete mutation signal. */
+const mutationProgram = `(() => {
+  'use strict'; let dirty=false, live=true;
+  const scopes=[], hosts=[], roots=[];
+  const observe=root=>{const observer=new MutationObserver(()=>{dirty=true;});
+    observer.observe(root,{subtree:true,attributes:true,childList:true,characterData:true});scopes.push(observer);};
+  observe(document);
+  const inventory=(watch)=>{
+    const foundHosts=[],foundRoots=[],queue=[document];let count=0;
+    for(let index=0;index<queue.length;index++){
+      const root=queue[index],walker=document.createTreeWalker(root,NodeFilter.SHOW_ELEMENT);
+      for(let node=walker.nextNode();node;node=walker.nextNode()){
+        if(++count>100000)throw Error('bound');
+        const shadow=node.shadowRoot;
+        if(shadow){if(foundRoots.length>=256)throw Error('bound');foundHosts.push(node);foundRoots.push(shadow);queue.push(shadow);if(watch)observe(shadow);}
+      }
+    }
+    return {hosts:foundHosts,roots:foundRoots};
+  };
+  try{const initial=inventory(true);hosts.push(...initial.hosts);roots.push(...initial.roots);}
+  catch{for(const observer of scopes)observer.disconnect();throw Error('scope');}
+  return Object.freeze({
+    check(){if(!live)return false;
+      for(const observer of scopes)if(observer.takeRecords().length)dirty=true;
+      let current;try{current=inventory(false);}catch{return false;}
+      if(current.hosts.length!==hosts.length||current.roots.length!==roots.length)return false;
+      for(let i=0;i<hosts.length;i++)if(current.hosts[i]!==hosts[i]||current.roots[i]!==roots[i]||!hosts[i].isConnected)return false;
+      for(const observer of scopes)if(observer.takeRecords().length)dirty=true;
+      return !dirty;
+    },
+    close(){live=false;for(const observer of scopes)observer.disconnect();scopes.length=0;hosts.length=0;roots.length=0;return true;}
+  });
+})()`;
 /** The supported host's sole per-physical-page CDP owner, never a TCP endpoint,
  * renderer capability or default Tools implementation. */
 export class PageReadiness implements DocumentPreparation {
@@ -170,7 +208,7 @@ export class PageReadiness implements DocumentPreparation {
     if (page.retirement()) throw staleSnapshot();
     const contents = page.view.webContents, debugger_ = contents.debugger;
     if (contents.isDestroyed() || debugger_.isAttached()) throw unavailable('browser');
-    const channel: Channel = { page, contents, debugger: debugger_, identity: Object.freeze({}), active: true, detached: false, graphEpoch: 0, root: { targetId: '', parent: undefined, contexts: new Map(), detached: false }, interception: 'unknown', epoch: 0, unknownActivity: false, sessions: new Map(), observers: new Set(), resources: new Set(), animations: new Set(), actionObservers: new Set() };
+    const channel: Channel = { page, contents, debugger: debugger_, identity: Object.freeze({}), active: true, detached: false, graphEpoch: 0, root: { targetId: '', parent: undefined, contexts: new Map(), worlds: new Map(), detached: false }, interception: 'unknown', epoch: 0, unknownActivity: false, sessions: new Map(), observers: new Set(), resources: new Set(), animations: new Set(), actionObservers: new Set() };
     this.channels.set(page, channel);
     debugger_.on('message', (_event, method, params, sessionId) => {
       if (!channel.active || this.channels.get(page) !== channel) return;
@@ -273,7 +311,7 @@ export class PageReadiness implements DocumentPreparation {
         channel.unknownActivity = true; if (channel.challenge) channel.challenge.failed = true; return;
       }
       channel.sessions.set(data.sessionId, { targetId: data.targetInfo.targetId, parent: session,
-        contexts: new Map(), detached: false }); return;
+        contexts: new Map(), worlds: new Map(), detached: false }); return;
     }
     if (method === 'Target.detachedFromTarget') {
       changed(); const state = channel.sessions.get(data?.sessionId);
@@ -283,7 +321,22 @@ export class PageReadiness implements DocumentPreparation {
     if (['Page.frameAttached', 'Page.frameDetached', 'Page.frameNavigated', 'Page.navigatedWithinDocument'].includes(method)) changed();
     const state = session === undefined ? channel.root : channel.sessions.get(session);
     if (!state) { if (channel.challenge) channel.challenge.failed = true; return; }
-    if (method === 'Runtime.executionContextsCleared') { state.contexts.clear(); changed(); }
+    if (method === 'Runtime.executionContextsCleared') {
+      state.contexts.clear(); changed();
+      for (const world of state.worlds.values()) { if (world.context) world.context.gone = true; delete world.context; for (const notify of world.notifications) notify(); }
+    }
+    if (method === 'Runtime.executionContextDestroyed') for (const world of state.worlds.values()) {
+      if (world.context && (world.context.id === data?.executionContextId || world.context.unique === data?.executionContextUniqueId)) {
+        world.context.gone = true; delete world.context; for (const notify of world.notifications) notify();
+      }
+    }
+    if (method === 'Runtime.executionContextCreated' && data?.context?.auxData?.isDefault === false) {
+      const c = data.context, world = state.worlds.get(c.auxData.frameId);
+      if (world && c.name === world.name && scalar(c.uniqueId) && Number.isSafeInteger(c.id) && c.id > 0) {
+        if (world.context && (world.context.id !== c.id || world.context.unique !== c.uniqueId)) world.context.gone = true;
+        world.context = { id: c.id, unique: c.uniqueId, gone: false }; for (const notify of world.notifications) notify();
+      }
+    }
     if (method === 'Runtime.executionContextDestroyed') {
       for (const [frame, context] of state.contexts) if (context.id === data?.executionContextId || context.unique === data?.executionContextUniqueId) {
         state.contexts.delete(frame); changed();
@@ -440,12 +493,6 @@ export class PageReadiness implements DocumentPreparation {
           if (!next) break;
           await this.prepareInspection(channel, next[0], check); prepared.add(next[1]);
         }
-        // Preserve the released root's actual frontend DOM invalidation until
-        // the reviewed bounded replacement exists. DOM.enable alone does not
-        // bind nodes: pinned Blink can omit attribute/insertion notifications
-        // for unbound nodes, so equal sampled classifications cannot fence ABA.
-        // This is the retained root mirror, not child-content qualification.
-        await this.command(receipt.page, check, 'DOM.getDocument', { depth: -1, pierce: true });
         const graph = await this.frameGraph(channel, check);
         const root = [...graph.local.get(undefined)!.values()].find(f => f.parent === undefined)!;
         const routes = new Map<PhysicalFrame, { route: FrameRoute; session: string | undefined; context: DefaultContext | undefined }>();
@@ -549,6 +596,104 @@ export class PageReadiness implements DocumentPreparation {
     const graph = await this.frameGraph(seal.channel, () => this.assertInspection(frame, guard));
     if (graph.signature !== seal.graph.signature) throw staleSnapshot();
     for (const value of frames) if (value.physical) this.assertInspection(value, guard);
+  }
+  /** One fixed original-frame mutation latch, with its group reserved before
+   * any evaluation (including possible exception-object allocation). Cleanup
+   * never reuses the read guard or a replacement context/document. */
+  async mutationBracket(frame: InspectionFrame, guard: () => void): Promise<MutationBracket> {
+    this.assertInspection(frame, guard);
+    const channel = this.owned(frame.receipt.page), state = this.state(channel, frame.session), physical = frame.physical!;
+    let world = state.worlds.get(frame.frameId);
+    if (world && !samePhysical(world.physical, physical)) {
+      if (world.active.size) throw staleSnapshot(); state.worlds.delete(frame.frameId); world = undefined;
+    }
+    if (!world) {
+      if (state.worlds.size >= 256) throw staleSnapshot();
+      world = { name: `arbol_content_${randomBytes(16).toString('hex')}`, physical: frameScalars(physical), notifications: new Set(), active: new Set() };
+      state.worlds.set(frame.frameId, world);
+    }
+    const originalWorld = world;
+    if (world.active.size >= 4) throw staleSnapshot();
+    const token = Object.freeze({}), key = `arbol_observer_${randomBytes(16).toString('hex')}`, group = `arbol-content-${randomBytes(16).toString('hex')}`;
+    world.active.add(token);
+    let context: ContentContext | undefined, installed = false, closed = false, closing: Promise<void> | undefined;
+    const expiry = performance.now() + 5000; let timer: ReturnType<typeof setTimeout> | undefined;
+    const current = () => {
+      this.assertInspection(frame, guard);
+      if (closed || performance.now() >= expiry || !originalWorld.active.has(token) || state.worlds.get(frame.frameId) !== originalWorld ||
+          (context && (context.gone || originalWorld.context !== context))) throw staleSnapshot();
+    };
+    const boolean = (value: unknown) => {
+      const raw = value as { result?: { type?: string; value?: unknown }; exceptionDetails?: unknown };
+      if (raw?.exceptionDetails || raw?.result?.type !== 'boolean' || raw.result.value !== true) throw staleSnapshot();
+    };
+    const evaluate = async (expression: string) => {
+      current(); if (!context) throw staleSnapshot();
+      const unique = context.unique;
+      const result = await this.deadline(Math.min(expiry, performance.now() + 1000), current, check =>
+        this.command(frame.receipt.page, check, 'Runtime.evaluate', { expression, uniqueContextId: unique,
+          objectGroup: group, returnByValue: true, awaitPromise: false, includeCommandLineAPI: false }, frame.session));
+      current(); boolean(result);
+    };
+    const close = (): Promise<void> => {
+      if (closing) return closing;
+      let readable = true; try { current(); } catch { readable = false; }
+      let contentClean = readable;
+      closed = true; if (timer) clearTimeout(timer);
+      closing = (async () => {
+        let clean = false;
+        const exact = () => {
+          if (this.originalDebugger(channel, frame.session, state) === 'detached') return 'detached';
+          if (!originalWorld.active.has(token)) throw staleSnapshot(); return 'live';
+        };
+        try {
+          if (exact() === 'detached') clean = true;
+          else await this.deadline(performance.now() + 2000, () => { exact(); }, async check => {
+            let observerClean = !installed || Boolean(context?.gone);
+            if (context?.gone) contentClean = false;
+            try {
+              if (installed && context && !context.gone) {
+                check();
+                const value = await channel.debugger.sendCommand('Runtime.evaluate', {
+                  expression: `(() => {const value=globalThis["${key}"];if(!value)return false;const valid=${readable ? 'value.check()' : 'false'};const ok=value.close();delete globalThis["${key}"];return ok===true?valid:null;})()`,
+                  uniqueContextId: context.unique, objectGroup: group, returnByValue: true, awaitPromise: false, includeCommandLineAPI: false }, frame.session);
+                check();
+                const result = value as { result?: { type?: string; value?: unknown }; exceptionDetails?: unknown };
+                if (result?.exceptionDetails || result?.result?.type !== 'boolean' || typeof result.result.value !== 'boolean') throw staleSnapshot();
+                contentClean = contentClean && result.result.value; observerClean = true;
+              }
+            } finally {
+              check(); emptyAck(await channel.debugger.sendCommand('Runtime.releaseObjectGroup', { objectGroup: group }, frame.session)); check();
+            }
+            if (!observerClean) throw staleSnapshot(); clean = true;
+          });
+        } catch { try { clean = exact() === 'detached'; } catch { /* unresolved exact original */ } }
+        if (!clean) {
+          channel.poisoned = true; this.documents.channelLost(channel.page, channel.identity);
+          void channel.page.retire().catch(() => this.boundary.fatal.fail('native_retirement_unavailable'));
+          throw staleSnapshot();
+        }
+        originalWorld.active.delete(token);
+        if (!contentClean) throw staleSnapshot();
+      })();
+      return closing;
+    };
+    timer = setTimeout(() => { void close().catch(() => {}); }, Math.max(1, expiry - performance.now()));
+    let notify = () => {};
+    try {
+      const created = new Promise<void>(resolve => { notify = resolve; }); originalWorld.notifications.add(notify);
+      const value = await this.deadline(Math.min(expiry, performance.now() + 1000), current, check =>
+        this.command(frame.receipt.page, check, 'Page.createIsolatedWorld', {
+          frameId: frame.frameId, worldName: originalWorld.name, grantUniveralAccess: false }, frame.session)) as { executionContextId?: number };
+      if (!originalWorld.context) await this.deadline(performance.now() + 1000, current, async () => { await created; });
+      context = originalWorld.context;
+      if (!context || context.gone || value.executionContextId !== context.id) throw staleSnapshot();
+      current(); installed = true; // before an applied command can lose its reply
+      await evaluate(`(() => {if(Object.prototype.hasOwnProperty.call(globalThis,"${key}"))return false;globalThis["${key}"]=${mutationProgram};return true;})()`);
+      await evaluate(`globalThis["${key}"].check()`);
+      return Object.freeze({ check: () => evaluate(`globalThis["${key}"].check()`), close });
+    } catch (error) { await close(); throw error; }
+    finally { originalWorld.notifications.delete(notify); }
   }
   async inspect(frame: InspectionFrame, assertCurrent: () => void, method: InspectionMethod, params?: object): Promise<unknown> {
     const guard = () => this.assertInspection(frame, assertCurrent);

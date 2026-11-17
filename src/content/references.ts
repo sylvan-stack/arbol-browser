@@ -21,7 +21,8 @@ export async function revalidateOriginal(reference: OriginalReference, inspect: 
   guard: () => void, editing = false): Promise<OriginalNode> {
   guard(); const current = await inspect(reference, guard); guard();
   if (current.frame.receipt !== reference.frame.receipt || current.frame.physical !== reference.frame.physical ||
-      current.frame.frameId !== reference.frame.frameId || current.frame.session !== reference.frame.session ||
+      current.frame.frameId !== reference.frame.frameId || current.frame.loaderId !== reference.frame.loaderId ||
+      current.frame.parent?.physical !== reference.frame.parent?.physical || current.frame.ownerBackend !== reference.frame.ownerBackend || current.frame.session !== reference.frame.session ||
       current.backend !== reference.backend || current.signature !== reference.signature ||
       current.editable !== reference.editable || (editing && !current.editable)) throw staleSnapshot();
   return current;

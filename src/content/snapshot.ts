@@ -5,7 +5,7 @@ import type { HostDocument, HostDocuments } from '../host/documents.js';
 import type { InspectionFrame, PageReadiness } from '../host/readiness.js';
 import { TabAuthority, staleSnapshot } from '../host/authority.js';
 import { owningQueue, type ActionExecution } from '../host/actions.js';
-import { boundedTree, type AXNode, type SnapshotNode } from './tree.js';
+import { boundedTree, linkedTree, type FrameTreePart, type AXNode, type SnapshotNode } from './tree.js';
 import { InspectionCache } from './cache.js';
 import { revalidateOriginal, type OriginalNode } from './references.js';
 import { classifiedRefusal, type SensitiveFields } from './sensitive.js';
@@ -53,11 +53,15 @@ export class SnapshotInspection {
     // Target preparation is a read. Under a mutation execution it must not
     // allocate an issued-input slot/continuation or change dispatch outcome.
     const current = await revalidateOriginal(original, (node, check) => this.fields.original(node, check), guard, editing);
-    guard(); return current;
+    guard();
+    // Child inspection is useful independently of input. The original action
+    // producer still proves only root hit/focus routes and its own action world.
+    if (mutation && (current.frame.physical !== current.frame.receipt.frame || current.frame.session !== undefined)) throw staleSnapshot();
+    this.readiness.assertInspection(current.frame, guard); return current;
   }
   async snapshot(input: Contract<'browser.SnapshotInput'>, execution: ActionExecution, identity: string): Promise<Contract<'browser.SnapshotResult'>> {
     const guard = this.guard(execution), stamp = execution.stamp;
-    let raw: FrameTreeRead | undefined, inserted = false;
+    const raw: FrameTreeRead[] = []; let inserted = false;
     try {
       guard();
       if (input.tab !== stamp.target.id || input.controlGeneration !== stamp.generation) throw staleSnapshot();
@@ -65,59 +69,66 @@ export class SnapshotInspection {
       guard();
       const frames = await execution.dispatch(() => this.readiness.inspection(stamp.document as HostDocument, guard)), frame = frames[0];
       if (!frame?.physical) throw classifiedRefusal();
-      const before = this.readiness.observation(frame.receipt).epoch;
-      const dom = await execution.dispatch(() => this.fields.classify(frame, guard));
-      raw = await execution.dispatch(() => readAccessibility(this.readiness, frame, guard, frames.length - 1));
-      guard();
-      const after = await execution.dispatch(() => this.fields.classify(frame, guard));
-      if (dom.signature !== after.signature || this.readiness.observation(frame.receipt).epoch !== before) throw staleSnapshot();
-      const roots = scoped ? raw.nodes.filter(node => node.backendDOMNodeId === scoped.backend) :
-        raw.nodes.filter(node => node.parentId === undefined && node.backendDOMNodeId !== undefined &&
-          dom.nodes.get(node.backendDOMNodeId)?.tag === '#DOCUMENT');
-      if (roots.length !== 1) throw staleSnapshot();
-      const root = roots[0]!, nodes = [...raw.nodes];
-      if (!scoped && raw.unavailable) {
-        // Synthetic ids stay entirely internal; each unavailable marker goes
-        // through the same depth/node/byte allocator and has no original ref.
-        const ids = new Set(nodes.map(node => node.nodeId)), children = [...(root.childIds ?? [])];
-        for (let index = 0; index < raw.unavailable; index++) {
-          const id = `arbol-unavailable-${index}`; if (ids.has(id)) throw staleSnapshot();
-          nodes.push({ nodeId: id }); children.push(id);
+      const selected = scoped ? frames.find(value => value.physical === scoped.frame.physical && value.frameId === scoped.frame.frameId &&
+        value.session === scoped.frame.session && value.loaderId === scoped.frame.loaderId) : frame;
+      if (!selected?.physical) throw staleSnapshot();
+      const proven = frames.filter(value => value.physical);
+      return await this.fields.bracket(proven, guard, async check => {
+        const before = this.readiness.observation(frame.receipt).epoch;
+        const doms = await execution.dispatch(() => this.fields.classifyFrames(proven, guard));
+        await check();
+        const selectedDOM = doms.get(selected); if (!selectedDOM?.accessible) throw classifiedRefusal();
+        const parts: FrameTreePart[] = []; let count = 0, bytes = 0;
+        for (const current of scoped ? [selected] : proven) {
+          const dom = doms.get(current)!; if (!dom.accessible) continue;
+          const read = await execution.dispatch(() => readAccessibility(this.readiness, current, guard, 0)); raw.push(read);
+          if ((count += read.nodes.length) > 100000) throw classifiedRefusal();
+          for (const node of read.nodes) if ((bytes += Buffer.byteLength(JSON.stringify(node), 'utf8')) > 16 * 1024 * 1024) throw classifiedRefusal();
+          parts.push({ frame: current, nodes: read.nodes, dom });
         }
-        const index = nodes.indexOf(root); nodes[index] = { ...root, childIds: children };
-      }
-      this.cache.insert(identity, stamp); inserted = true;
-      let textTruncated = false;
-      const bounded = boundedTree(nodes, root.nodeId, node => {
-        const field = node.backendDOMNodeId === undefined ? undefined : dom.nodes.get(node.backendDOMNodeId);
-        if (field && ['IFRAME', 'FRAME', 'OBJECT', 'EMBED'].includes(field.tag))
-          return { role: 'unknown', state: { unavailable: true } };
-        const projected = this.fields.project(node, dom);
-        const limited = !projected.value.state?.sensitive && !projected.value.state?.unavailable &&
-          ((typeof node.name?.value === 'string' && Array.from(node.name.value).length > 4096) ||
-          (typeof node.role?.value === 'string' && Array.from(node.role.value).length > 80) || projected.value.state?.valueTruncated);
-        if (limited) textTruncated = true;
-        if (projected.original && !limited && !projected.value.state?.unavailable && !projected.value.state?.sensitive)
-          projected.value.ref = this.cache.add(identity, stamp, projected.original);
-        return projected.value;
+        await check();
+        const after = await execution.dispatch(() => this.fields.classifyFrames(proven, guard));
+        await check();
+        for (const current of proven) if (doms.get(current)!.signature !== after.get(current)!.signature ||
+          doms.get(current)!.lineage !== after.get(current)!.lineage || doms.get(current)!.accessible !== after.get(current)!.accessible) throw staleSnapshot();
+        await this.readiness.verifyInspection(proven, guard);
+        if (this.readiness.observation(frame.receipt).epoch !== before) throw staleSnapshot();
+        const tree = linkedTree(parts, selected, scoped?.backend, !scoped && frames.some(value => !value.physical));
+        this.cache.insert(identity, stamp); inserted = true;
+        let textTruncated = false;
+        const bounded = boundedTree(tree.nodes, tree.root, node => {
+          const part = tree.source.get(node);
+          if (!part) return { role: 'unknown', state: { unavailable: true } };
+          const field = node.backendDOMNodeId === undefined ? undefined : part.dom.nodes.get(node.backendDOMNodeId);
+          if (field && ['IFRAME', 'FRAME', 'OBJECT', 'EMBED'].includes(field.tag))
+            return tree.linked.has(node) ? { role: 'iframe', state: {} } : { role: 'unknown', state: { unavailable: true } };
+          const projected = this.fields.project(node, part.dom);
+          const limited = !projected.value.state?.sensitive && !projected.value.state?.unavailable &&
+            ((typeof node.name?.value === 'string' && Array.from(node.name.value).length > 4096) ||
+            (typeof node.role?.value === 'string' && Array.from(node.role.value).length > 80) || projected.value.state?.valueTruncated);
+          if (limited) textTruncated = true;
+          if (projected.original && !limited && !projected.value.state?.unavailable && !projected.value.state?.sensitive)
+            projected.value.ref = this.cache.add(identity, stamp, projected.original);
+          return projected.value;
+        });
+        const refs = new Set<string>();
+        const collect = (node: SnapshotNode) => { if (node.ref) refs.add(node.ref); for (const child of node.children ?? []) collect(child); };
+        for (const node of bounded.tree) collect(node); this.cache.retain(identity, refs);
+        const truncated = bounded.truncated || textTruncated;
+        if (truncated && input.allowTruncation === false) throw new BrowserFailure({ code: 'snapshot_truncated',
+          message: 'The complete page exceeds snapshot bounds.', retryable: true, remedy: 'Request a smaller current subtree.' });
+        const result: Contract<'browser.SnapshotResult'> = { tab: stamp.target.id, snapshot: identity,
+          navigation: stamp.document.navigation, controlGeneration: stamp.generation, domRevision: before,
+          url: publicURL(selectedDOM.address), title: selectedDOM.title, tree: bounded.tree, truncated };
+        if (Buffer.byteLength(JSON.stringify(result), 'utf8') > 512 * 1024) throw new BrowserFailure({ code: 'snapshot_truncated',
+          message: 'The complete snapshot exceeds browser capacity.', retryable: true, remedy: 'Request a smaller current subtree.' });
+        await check(); await this.readiness.verifyInspection(proven, guard); guard(); return result;
       });
-      const refs = new Set<string>();
-      const collect = (node: SnapshotNode) => { if (node.ref) refs.add(node.ref); for (const child of node.children ?? []) collect(child); };
-      for (const node of bounded.tree) collect(node); this.cache.retain(identity, refs);
-      const truncated = bounded.truncated || textTruncated;
-      if (truncated && input.allowTruncation === false) throw new BrowserFailure({ code: 'snapshot_truncated',
-        message: 'The complete page exceeds snapshot bounds.', retryable: true, remedy: 'Request a smaller current subtree.' });
-      const result: Contract<'browser.SnapshotResult'> = { tab: stamp.target.id, snapshot: identity,
-        navigation: stamp.document.navigation, controlGeneration: stamp.generation, domRevision: before,
-        url: publicURL(dom.address), title: dom.title, tree: bounded.tree, truncated };
-      if (Buffer.byteLength(JSON.stringify(result), 'utf8') > 512 * 1024) throw new BrowserFailure({ code: 'snapshot_truncated',
-        message: 'The complete snapshot exceeds browser capacity.', retryable: true, remedy: 'Request a smaller current subtree.' });
-      guard(); return result;
     } catch (error) {
       if (inserted) this.cache.drop(identity); throw error;
     } finally {
       // Drop temporary AX names/values after projection, failure or revocation.
-      if (raw) for (const node of raw.nodes) { delete node.name; delete node.value; delete node.properties; }
+      for (const read of raw) for (const node of read.nodes) { delete node.name; delete node.value; delete node.properties; }
     }
   }
   close(): void { this.cache.close(); }
