@@ -214,12 +214,22 @@ struct SharedState {
   std::atomic<uint32_t> shutdownOrder{0};
   std::atomic<uint64_t> shutdownTimes[4]{{0},{0},{0},{0}};
   std::atomic<uint32_t> ordinaryPostExitEligible{0};
+  // 0=no clean mutation, 1=in-flight mutation/publication, 2=acknowledged commit,
+  // 3=refused unresolved mutation, 4=refused before any clean mutation.
+  // Commit versus every fatal/expiry refusal has ONE irreversible CAS winner.
+  std::atomic<uint32_t> activation{0};
   // Verified native mutation preparation publishes this before permission to
   // write. A later independent holder can authenticate an uncertain resulting
   // dirty marker; it never predicts or grants its replacement inode.
   char expectedMarkerDigest[65]{};
   MarkerBinding marker{};
-  void poison(uint64_t reason) { fatal.fetch_or(reason,std::memory_order_acq_rel); }
+  void poison(uint64_t reason) {
+    uint32_t value=activation.load(std::memory_order_acquire);
+    while((value==0||value==1)&&!activation.compare_exchange_weak(value,value==0?4:3,std::memory_order_acq_rel)) {}
+    // A post-commit reason remains recorded, but cannot retroactively erase
+    // the genuine acknowledged cut which won before this fatal publication.
+    fatal.fetch_or(reason,std::memory_order_acq_rel);
+  }
   void declareFatal() {
     uint64_t cutoff=(uint64_t)((arbol_boundary::clockMs()+1000)*1000),old=fatalCutoffUs.load(std::memory_order_acquire);
     while((!old||cutoff<old)&&!fatalCutoffUs.compare_exchange_weak(old,cutoff,std::memory_order_acq_rel)) {}
@@ -569,6 +579,66 @@ public:
     out.files=files; out.directories=directories; out.digest=after; return within();
   }
 };
+// Strict private receipt I/O. Each published tuple comes from the same
+// retained actual description and its final no-follow named-path check.
+struct NativeFile {
+  int fd=-1; NativeFile()=default; NativeFile(const NativeFile&)=delete;
+  ~NativeFile() { if(fd>=0) close(fd); }
+  bool finish() { if(fd<0) return true; int original=fd; fd=-1; return !close(original); }
+};
+inline bool readNativeFile(int directory,const std::string& name,std::string& raw,struct stat& identity,size_t limit=262144) {
+  NativeFile file; file.fd=openat(directory,name.c_str(),O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC); if(file.fd<0) return false;
+  struct stat first{},named{},last{},after{}; raw.clear();
+  bool ok=!fstat(file.fd,&first)&&!fstatat(directory,name.c_str(),&named,AT_SYMLINK_NOFOLLOW)&&
+    arbol_attempt::privateFile(first)&&arbol_attempt::sameFile(first,named)&&first.st_size>0&&(uint64_t)first.st_size<=limit;
+  char bytes[4096];
+  while(ok&&raw.size()<=(size_t)first.st_size) {
+    ssize_t n=read(file.fd,bytes,std::min(sizeof(bytes),(size_t)first.st_size+1-raw.size()));
+    if(n>0) raw.append(bytes,n); else if(!n) break; else if(errno!=EINTR) ok=false;
+  }
+  ok=ok&&raw.size()==(size_t)first.st_size&&!fstat(file.fd,&last)&&!fstatat(directory,name.c_str(),&after,AT_SYMLINK_NOFOLLOW)&&
+    arbol_attempt::sameFile(first,last)&&arbol_attempt::sameFile(last,after);
+  if(!file.finish()) ok=false; if(ok) identity=last; return ok;
+}
+inline bool writeNativeFile(int directory,const std::string& temporary,const std::string& raw,double deadline,NativeFile& file) {
+  if(raw.empty()||raw.size()>262144||arbol_boundary::clockMs()>=deadline) return false;
+  file.fd=openat(directory,temporary.c_str(),O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC,0600);
+  if(file.fd<0||fchmod(file.fd,0600)) return false;
+  size_t at=0;
+  while(at<raw.size()) {
+    if(arbol_boundary::clockMs()>=deadline) return false;
+    ssize_t n=write(file.fd,raw.data()+at,raw.size()-at);
+    if(n>0) at+=n; else if(n<0&&errno==EINTR) continue; else return false;
+  }
+  return !fsync(file.fd)&&arbol_boundary::clockMs()<deadline&&!fcntl(file.fd,F_FULLFSYNC)&&arbol_boundary::clockMs()<deadline;
+}
+inline bool publishedNativeFile(int directory,const std::string& name,const std::string& raw,NativeFile& file,struct stat& identity,double deadline) {
+  struct stat held{},named{},last{},after{};
+  if(arbol_boundary::clockMs()>=deadline||fstat(file.fd,&held)||fstatat(directory,name.c_str(),&named,AT_SYMLINK_NOFOLLOW)||
+     !arbol_attempt::privateFile(held)||!arbol_attempt::sameFile(held,named)||held.st_size!=(off_t)raw.size()) return false;
+  std::string actual(raw.size()+1,'\0'); size_t at=0;
+  while(at<actual.size()) {
+    if(arbol_boundary::clockMs()>=deadline) return false;
+    ssize_t n=pread(file.fd,actual.data()+at,actual.size()-at,at);
+    if(n>0) at+=n; else if(n<0&&errno==EINTR) continue; else if(!n) break; else return false;
+  }
+  actual.resize(at);
+  if(actual!=raw||fsync(directory)||arbol_boundary::clockMs()>=deadline||fcntl(file.fd,F_FULLFSYNC)||
+     fstat(file.fd,&last)||fstatat(directory,name.c_str(),&after,AT_SYMLINK_NOFOLLOW)||
+     !arbol_attempt::sameFile(held,last)||!arbol_attempt::sameFile(last,after)||arbol_boundary::clockMs()>=deadline) return false;
+  identity=last; return true;
+}
+inline bool publishNativeReceipt(int directory,const std::string& name,const std::string& raw,double deadline,struct stat& identity) {
+  std::string temporary=".receipt-"+std::string(NSUUID.UUID.UUIDString.UTF8String); NativeFile file;
+  if(!writeNativeFile(directory,temporary,raw,deadline,file)) return false;
+  // RENAME_EXCL never overwrites a prior immutable receipt or another attempt.
+  if(renameatx_np(directory,temporary.c_str(),directory,name.c_str(),RENAME_EXCL)) return false;
+  return publishedNativeFile(directory,name,raw,file,identity,deadline)&&file.finish();
+}
+struct ActivationResult {
+  std::atomic<int> state{0}; double acknowledged=0;
+  std::string path,digest;
+};
 class HostCapability {
   int capsule_=-1,stateFd_=-1; SharedState* state_=nullptr;
   int reads_[3]{-1,-1,-1},writes_[3]{-1,-1,-1}; unsigned role_=0;
@@ -577,6 +647,7 @@ class HostCapability {
   NSDictionary* ordinaryProof_=nil; double ordinaryDeadline_=0;
   NSDictionary* quiescenceProof_=nil;
   std::shared_ptr<StorageResult> storageJob_; NSDictionary* storageProof_=nil; bool storageAttempted_=false;
+  std::shared_ptr<ActivationResult> activationJob_; std::thread* activationThread_=nullptr; bool activationAttempted_=false;
   std::thread* storageThread_=nullptr; // one native process-lifetime handle, never a joinable temporary destructor
   bool ledgerDescriptor(int fd,unsigned index,bool writable,bool header=true) const {
     NSArray* streams=value_[@"family"];
@@ -992,6 +1063,125 @@ public:
     return 1;
   }
   NSDictionary* storageProof() const { return storageProof_; }
+  bool performActivation(arbol_boundary::Context& c,ActivationResult& result) {
+    const double deadline=ordinaryDeadline_;
+    arbol_attempt::Claim claim; std::string currentRaw; NSDictionary* current=nil;
+    if(!storageProof_||!ordinaryCurrent(c,deadline)||!currentAttempt(c,claim,currentRaw,current,deadline)||
+       ![current[@"phase"] isEqual:@"closing"]||![current[@"stage"] isEqual:@"admitted"]||
+       ![boundMarker(c) isEqual:ordinaryProof_[@"marker"]]||![family_->frontierTuple() isEqual:ordinaryProof_[@"family"]]) return false;
+    NSString* receiptPath=value_[@"receiptDirectory"][@"path"],*profile=value_[@"attempt"][@"profile"];
+    NativeFile receipts,root;
+    receipts.fd=open(receiptPath.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    root.fd=open(profile.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    struct stat receiptRoot{},profileRoot{};
+    if(receipts.fd<0||root.fd<0||fstat(receipts.fd,&receiptRoot)||fstat(root.fd,&profileRoot)||
+       ![fileIdentity(receiptRoot) isEqual:value_[@"receiptDirectory"][@"identity"]]||
+       ![fileIdentity(profileRoot) isEqual:value_[@"profileDirectory"]]||receiptRoot.st_dev!=profileRoot.st_dev||!metadata()) return false;
+    Identity last; if(arbol_boundary::observe(getpid(),last)!=1||!arbol_boundary::same(last,c.primary)) return false;
+    NSDictionary* journal=@{@"format":@1,@"kind":@"post-exit-journal",@"capability":value_,@"capabilityDigest":arbol_attempt::digest(raw_),
+      @"ordinary":ordinaryProof_,@"storage":storageProof_,@"lastHolder":arbol_boundary::capsuleIdentity(last,c.session)};
+    std::string journalRaw=arbol_attempt::bytes(journal); struct stat journalIdentity{};
+    if(!publishNativeReceipt(receipts.fd,"proof.json",journalRaw,deadline,journalIdentity)||
+       !ordinaryCurrent(c,deadline)||![boundMarker(c) isEqual:ordinaryProof_[@"marker"]]) return false;
+    // The journal and emitted-storage acknowledgements precede ANY clean-bit
+    // mutation. Preserve the normative closed marker schema exactly.
+    NSMutableDictionary* clean=[ordinaryProof_[@"marker"][@"value"] mutableCopy]; clean[@"cleanExit"]=@YES;
+    std::string cleanRaw=arbol_attempt::bytes(clean),temporary=".engine-"+std::string(NSUUID.UUID.UUIDString.UTF8String);
+    NativeFile cleanFile; struct stat cleanIdentity{};
+    uint32_t untouched=0;
+    if(!state_->activation.compare_exchange_strong(untouched,1,std::memory_order_acq_rel)) return false;
+    if(!writeNativeFile(root.fd,temporary,cleanRaw,deadline,cleanFile)||!ordinaryCurrent(c,deadline)||
+       ![boundMarker(c) isEqual:ordinaryProof_[@"marker"]]||!arbol_attempt::unchanged(claim.at)||
+       renameat(root.fd,temporary.c_str(),root.fd,"engine.json")||
+       !publishedNativeFile(root.fd,"engine.json",cleanRaw,cleanFile,cleanIdentity,deadline)||!cleanFile.finish()) return false;
+    NSDictionary* cleanMarker=@{@"identity":fileIdentity(cleanIdentity),@"digest":arbol_attempt::digest(cleanRaw),@"value":clean};
+    std::string actualClean,actualJournal; struct stat checkedClean{},checkedJournal{};
+    if(!ordinaryCurrent(c,deadline)||!readNativeFile(root.fd,"engine.json",actualClean,checkedClean)||actualClean!=cleanRaw||
+       !arbol_attempt::sameFile(cleanIdentity,checkedClean)||!readNativeFile(receipts.fd,"proof.json",actualJournal,checkedJournal)||
+       actualJournal!=journalRaw||!arbol_attempt::sameFile(journalIdentity,checkedJournal)||
+       ![family_->frontierTuple() isEqual:ordinaryProof_[@"family"]]) return false;
+    NSDictionary* activation=@{@"format":@1,@"kind":@"activated-exit",@"bootSession":value_[@"bootSession"],
+      @"profileInstance":current[@"profileInstance"],@"profilePathHash":current[@"profilePathHash"],@"request":current[@"request"],
+      @"build":current[@"build"],@"sourceDigest":current[@"sourceDigest"],@"productDigest":current[@"productDigest"],@"candidateDigest":current[@"candidateDigest"],
+      @"profileDirectory":value_[@"profileDirectory"],@"capabilityDigest":arbol_attempt::digest(raw_),@"marker":cleanMarker,
+      @"journal":@{@"path":[receiptPath stringByAppendingPathComponent:@"proof.json"],@"identity":fileIdentity(journalIdentity),@"digest":arbol_attempt::digest(journalRaw)},
+      @"main":value_[@"main"],@"primary":arbol_boundary::capsuleIdentity(c.primary),@"custody":arbol_boundary::capsuleIdentity(c.custody),
+      @"lastHolder":arbol_boundary::capsuleIdentity(last,c.session),@"deadlineUs":@((uint64_t)(deadline*1000))};
+    std::string activationRaw=arbol_attempt::bytes(activation); struct stat activationIdentity{};
+    if(!ordinaryCurrent(c,deadline)||!publishNativeReceipt(receipts.fd,"activation.json",activationRaw,deadline,activationIdentity)||
+       !ordinaryCurrent(c,deadline)||!arbol_attempt::unchanged(claim.at)) return false;
+    // This existing native terminal reference is written ONLY after actual
+    // activation file+parent synchronization acknowledgement inside the
+    // original cutoff. Independent readers require it, the complete matching
+    // activation/journal/marker and later actual last-holder absence. A lone
+    // clean bit or an interrupted/late unacknowledged activation grants nothing.
+    NSString* activationPath=[receiptPath stringByAppendingPathComponent:@"activation.json"];
+    NSMutableDictionary* closed=[current mutableCopy]; closed[@"phase"]=@"closed";
+    closed[@"terminal"]=@{@"path":activationPath,@"digest":arbol_attempt::digest(activationRaw)};
+    std::string closedRaw=arbol_attempt::bytes(closed);
+    if(!arbol_attempt::transition(current,closed,arbol_attempt::Role::terminal)||
+       !arbol_attempt::replace(claim.at,currentRaw,false,closedRaw)) return false;
+    NativeFile finalClaim; finalClaim.fd=openat(claim.at.directory,"claim.json",O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
+    std::string checkedClaim; struct stat claimIdentity{},heldClaim{},afterClaim{};
+    if(finalClaim.fd<0||fstat(finalClaim.fd,&heldClaim)||!arbol_attempt::privateFile(heldClaim)||
+       fsync(finalClaim.fd)||fcntl(finalClaim.fd,F_FULLFSYNC)||fsync(claim.at.directory)||
+       !readNativeFile(claim.at.directory,"claim.json",checkedClaim,claimIdentity)||checkedClaim!=closedRaw||
+       fstat(finalClaim.fd,&afterClaim)||!arbol_attempt::sameFile(heldClaim,afterClaim)||!arbol_attempt::sameFile(afterClaim,claimIdentity)||
+       !arbol_attempt::unchanged(claim.at)||!ordinaryCurrent(c,deadline)||!finalClaim.finish()||!root.finish()||!receipts.finish()) return false;
+    result.path=activationPath.fileSystemRepresentation; result.digest=[arbol_attempt::digest(activationRaw) UTF8String];
+    result.acknowledged=arbol_boundary::clockMs();
+    if(result.acknowledged>=deadline||state_->fatal.load(std::memory_order_acquire)) { state_->poison(storageLoss); return false; }
+    uint32_t inFlight=1;
+    return state_->activation.compare_exchange_strong(inFlight,2,std::memory_order_acq_rel);
+  }
+  bool activationUnresolved() const {
+    if(!present()) return false; uint32_t value=state_->activation.load(std::memory_order_acquire); return value==1||value==3;
+  }
+  bool activationCommitted() const { return present()&&state_->activation.load(std::memory_order_acquire)==2; }
+  bool activationPending() const { return activationJob_&&activationJob_->state.load(std::memory_order_acquire)==0; }
+  bool startActivation(arbol_boundary::Context& c) {
+    if(activationAttempted_) return false; activationAttempted_=true;
+    if(!storageProof_||!ordinaryCurrent(c,ordinaryDeadline_)||storagePending()||!arbol_boundary::retainNativeImage()) return false;
+    arbol_boundary::Context retained=c;
+    retained.owner.fd=fcntl(c.owner.fd,F_DUPFD_CLOEXEC,64); retained.build.fd=fcntl(c.build.fd,F_DUPFD_CLOEXEC,64);
+    if(!arbol_boundary::lockIdentity(retained.owner)||!arbol_boundary::lockIdentity(retained.build)) {
+      if(retained.owner.fd>=0) close(retained.owner.fd); if(retained.build.fd>=0) close(retained.build.fd); return false;
+    }
+    try {
+      activationJob_=std::make_shared<ActivationResult>(); auto result=activationJob_;
+      activationThread_=new std::thread([this,result,retained]() mutable {
+        bool ok=false;
+        @autoreleasepool { @try { try { ok=performActivation(retained,*result); } catch(...) { ok=false; } } @catch(NSException*) { ok=false; } }
+        // No proof, mutation or I/O remains after successful publication. Native
+        // original descriptions remain held in the live main protocol thread.
+        close(retained.owner.fd); close(retained.build.fd);
+        if(activationCommitted()) ok=true; // no later delivery/cleanup exception erases a won commit
+        if(!ok) state_->poison(storageLoss);
+        result->state.store(ok?1:-1,std::memory_order_release);
+      });
+      try { activationThread_->detach(); } catch(...) {} // retain one truthful process-lifetime handle
+      return true;
+    } catch(...) {
+      close(retained.owner.fd); close(retained.build.fd); if(activationJob_) activationJob_->state.store(-1,std::memory_order_release); return false;
+    }
+  }
+  int pollActivation(arbol_boundary::Context& c) {
+    if(!activationJob_) return -1;
+    int result=activationJob_->state.load(std::memory_order_acquire);
+    if(activationCommitted()) {
+      // The exact native commit already won. Join the actual retained worker's
+      // completion, even when the CLI's delivery window has since expired.
+      if(!result) return 0;
+      return result==1&&activationJob_->acknowledged<ordinaryDeadline_&&arbol_boundary::current(c.primary)==1&&
+        arbol_boundary::lockIdentity(c.owner)&&arbol_boundary::lockIdentity(c.build)?1:-1;
+    }
+    if(result<0||arbol_boundary::clockMs()>=ordinaryDeadline_||state_->fatal.load(std::memory_order_acquire)) {
+      state_->poison(storageLoss); // CAS refusal prevents a later worker commit
+      if(activationCommitted()) return 0; // commit won the same actual arbitration
+      return -1;
+    }
+    return 0;
+  }
   bool held(arbol_boundary::Context& c) const {
     return present()&&exclusiveWriter()&&state_->enrolled.load(std::memory_order_acquire)==7&&
       state_->main.is(c.main)&&state_->primary.is(c.primary)&&state_->custody.is(c.custody)&&

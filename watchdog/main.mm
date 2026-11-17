@@ -61,7 +61,7 @@ static void poison(arbol_exit::HostCapability* cap,uint64_t reason) {
 [[noreturn]] static void retainedRefusal(Context* c,arbol_exit::HostCapability* cap=nullptr) {
   poison(cap,arbol_exit::protocolLoss|arbol_exit::forced);
   struct stat a{},b{}; if(!c&&(fstat(3,&a)||fstat(4,&b)||!S_ISREG(a.st_mode)||!S_ISREG(b.st_mode))) _exit(4);
-  for(;;) { if(c) { (void)c->discoverCustody(); c->enforce(); reap(c->custody); if(c->engineGone()) { const Identity& peer=getpid()==c->primary.pid?c->custody:c->primary; if(current(peer)==0) _exit(4); (void)c->retireMonitorPeer(peer); } } usleep(10000); }
+  for(;;) { if(cap&&cap->activationUnresolved()) { usleep(10000); continue; } if(c) { (void)c->discoverCustody(); c->enforce(); reap(c->custody); if(c->engineGone()) { const Identity& peer=getpid()==c->primary.pid?c->custody:c->primary; if(current(peer)==0) _exit(4); (void)c->retireMonitorPeer(peer); } } usleep(10000); }
 }
 struct Channel {
   int input,output; std::string incoming,outgoing; bool failed=false,ended=false,brokenWrite=false,truncated=false;
@@ -207,8 +207,21 @@ struct Deadline {
         }
       }
       else poison(cap,arbol_exit::peerLoss);
-      // No clean marker or flush receipt here. The later native independent
-      // finalizer/dirty witness owns this last-holder exit boundary.
+      if(ordinary) {
+        if(!cap->startActivation(c)) ordinary=false;
+        else {
+          int activated=0;
+          while((activated=cap->pollActivation(c))==0) usleep(1000);
+          ordinary=activated==1;
+        }
+        if(!ordinary) {
+          poison(cap,arbol_exit::storageLoss);
+          while(cap->activationPending()) usleep(10000);
+          retainedRefusal(&c,cap);
+        }
+      }
+      // Clean only after the independent retained original completed the real
+      // durable journal/marker/activation. Dirty final witness is leaf14.1.
       _exit(ordinary?0:4);
     }
     pair.flush(expires);
