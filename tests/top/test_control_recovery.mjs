@@ -8,11 +8,13 @@ export async function controlHealthBoundary(c) {
     const opened = await tool(client, 'browser_tab_open', { url: page.url('health') });
     assert.equal(opened.tab.pageAvailability, 'ready'); assert.equal(opened.tab.inputReady, true);
     await until(() => page.observations.find(o => o.name === 'health'));
-    await page.hang('health');
+    const armedAt = performance.now(); await page.hang('health');
     const fault = await until(async () => {
       const tab = (await tool(client, 'browser_tabs_list')).tabs.find(t => t.tab === opened.tab.tab);
       return tab && tab.pageAvailability !== 'ready' ? tab : undefined;
     }, 8000);
+    await save(c.output + '/fault-observed.json', { armedAt, observedAt: performance.now(), originalTab: opened.tab, fault });
+    assert.equal(fault.pageAvailability, 'unresponsive', 'Generic unavailability is not proof of the injected hang diagnosis');
     assert.equal(fault.controller, 'user'); assert.equal(fault.inputReady, false);
     assert.equal(fault.observationSuspended, true); assert.ok(fault.controlGeneration > opened.tab.controlGeneration);
     await delay(1200);
