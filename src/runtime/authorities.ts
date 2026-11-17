@@ -1,14 +1,15 @@
 /** Node-safe physical package identity. Cryptographic authority is established
  * separately; an editable metadata object or launcher environment is no trust. */
 import { createRequire } from 'node:module';
-import { join, isAbsolute, resolve } from 'node:path';
+import { join, isAbsolute, resolve, dirname, basename } from 'node:path';
+import { userInfo } from 'node:os';
 import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { unavailable } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
 import { selectedLayout, type BuildSelection, type PackagedLayout } from './selection.js';
 import type { Contract } from '../contracts/generated.js';
-import { stateDirectory as ownerStateDirectory, directory } from '../profiles/paths.js';
+import { directory, assertDirectory } from '../profiles/paths.js';
 import type { SignedBundle } from '../native/manifest.js';
 
 const { constants, promises: { open, realpath, lstat } } = createRequire(import.meta.url)(
@@ -84,6 +85,7 @@ export interface HostPolicy {
 export interface VerifiedHost {
   readonly identity: PackagedIdentity; readonly policy: Readonly<HostPolicy>;
   readonly signed: SignedBundle;
+  readonly guardIdentity: Readonly<{ device: string; inode: string; uid: number }>;
   assertTrusted(deadline: number): Promise<void>;
 }
 const verifiedHosts = new WeakSet<object>();
@@ -94,6 +96,34 @@ function canonicalPath(value: unknown): value is string {
   return typeof value === 'string' && isAbsolute(value) && resolve(value) === value && !value.includes('\0');
 }
 function below(path: string, parent: string): boolean { return path === parent || path.startsWith(parent + '/'); }
+/** Resolve even a not-yet-created protected location through its real nearest
+ * ancestor. An existing installation alias must not hide its physical target. */
+async function protectedLocation(path: string, deadline: number): Promise<string> {
+  const tail: string[] = []; let current = path;
+  for (;;) {
+    assertBudget(deadline);
+    try { await lstat(current); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || current === dirname(current)) throw unavailable('browser');
+      tail.unshift(basename(current)); current = dirname(current); continue;
+    }
+    // A dangling existing alias is uncertainty, not an absent normal install.
+    const physical = await realpath(current); assertBudget(deadline); return join(physical, ...tail);
+  }
+}
+async function assertIsolation(layout: PackagedLayout, state: string, deadline: number): Promise<void> {
+  const account = userInfo();
+  if (!process.geteuid || account.uid !== process.geteuid() || !canonicalPath(account.homedir)) throw unavailable('browser');
+  assertBudget(deadline);
+  const accountHome = await realpath(account.homedir);
+  for (const protectedPath of [join(accountHome, 'Library/Application Support/Arbol/builds'),
+    join(accountHome, 'Library/Application Support/Arbol/browser')]) {
+    const physical = await protectedLocation(protectedPath, deadline);
+    for (const actual of [layout.buildRoot, state])
+      if (below(actual, physical) || below(physical, actual)) throw unavailable('browser');
+  }
+  for (const path of [dirname(layout.buildRoot), layout.buildRoot, state]) { assertBudget(deadline); await directory(path); }
+}
 function readPolicy(input: unknown): Readonly<HostPolicy> {
   const value = input as HostPolicy;
   if (!value || Object.keys(value).sort().join(',') !== hostPolicyKeys || value.format !== 1 ||
@@ -145,15 +175,25 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
       manifest.writerKey !== policy.readerKey ||
       manifests.stable(manifest.compatibleReaderKeys) !== manifests.stable(policy.readableReaderKeys) ||
       manifests.stable(manifest.readableDataEpochs) !== manifests.stable(policy.readableDataEpochs)) throw unavailable('browser');
-  const ownerState = ownerStateDirectory();
   if (below(policy.stateRoot, layout.buildRoot)) throw unavailable('browser');
-  if (below(policy.stateRoot, ownerState) || below(ownerState, policy.stateRoot) ||
-        manifest.qualification !== `host-isolated:1:${policy.productDigest}` ||
+  if (manifest.qualification !== `host-isolated:1:${policy.productDigest}` ||
         policy.readerKey !== `host-isolated:1:${policy.productDigest}`) throw unavailable('browser');
     // Explicit disposable roots are prepared by the separately authorized
     // qualifier; no environment or request may relocate them or create a bypass.
-  assertBudget(deadline); await directory(policy.stateRoot); assertBudget(deadline);
-  const result: VerifiedHost = Object.freeze({ identity, policy, signed,
+  await assertIsolation(layout, policy.stateRoot, deadline);
+  const usesIdentity = await directory(dirname(selection.guard)); assertBudget(deadline);
+  const guard = await lstat(selection.guard, { bigint: true });
+  const guardIdentity = Object.freeze({ device: String(guard.dev), inode: String(guard.ino), uid: Number(guard.uid) });
+  const assertGuard = async (limit: number) => {
+    assertBudget(limit);
+    await assertDirectory(dirname(selection.guard), usesIdentity);
+    const current = await lstat(selection.guard, { bigint: true });
+    if (!current.isFile() || current.nlink !== 1n || (current.mode & 0o7777n) !== 0o600n ||
+        current.uid !== BigInt(userInfo().uid) || current.dev !== guard.dev || current.ino !== guard.ino ||
+        await realpath(selection.guard) !== selection.guard) throw unavailable('browser');
+    assertBudget(limit);
+  };
+  const result: VerifiedHost = Object.freeze({ identity, policy, signed, guardIdentity,
     async assertTrusted(limit: number) {
       if (!verifiedHosts.has(result)) throw unavailable('browser');
       assertBudget(limit); signed.assertIdentity(limit);
@@ -162,6 +202,8 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
           (await physicalJson(join(layout.bundle, 'Contents/Resources/native-compatibility.json'), 1048576, limit)).digest !== compatibility.digest)
         throw unavailable('browser');
       assertBudget(limit);
+      await assertIsolation(layout, policy.stateRoot, limit);
+      await assertGuard(limit);
       for (const path of [layout.buildRoot, layout.bundle, layout.payload]) { assertBudget(limit); await directory(path, false); }
       signed.assertIdentity(limit); assertBudget(limit);
     } });
