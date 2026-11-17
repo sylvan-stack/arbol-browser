@@ -1,7 +1,9 @@
 import { nativeImage, type NativeImage } from 'electron';
 import type { Contract } from '../contracts/generated.js';
-import type { CaptureProof, CaptureStamp } from './capture-proof.js';
+import { CaptureProof, type CaptureStamp } from './capture-proof.js';
 import { classifiedRefusal } from './sensitive.js';
+import type { ActionExecution } from '../host/actions.js';
+import type { SnapshotInspection } from './snapshot.js';
 
 const pngSignature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 function dimensions(png: Buffer): { width: number; height: number } {
@@ -59,4 +61,18 @@ export async function captureViewport(proof: CaptureProof, stamp: CaptureStamp, 
   } finally {
     pixels.data = ''; raw?.fill(0); bitmap?.fill(0); output?.fill(0); image = undefined; masked = undefined;
   }
+}
+/** The actual provider always joins cleanup, including quiesce/pixel/proof
+ * failure. A failed restoration retains the real queue reservation and invokes
+ * the existing health/retirement chain; it is never a successful screenshot. */
+export async function inspectScreenshot(inspection: SnapshotInspection, execution: ActionExecution,
+  snapshot: string): Promise<Contract<'browser.ScreenshotPayload'>> {
+  const guard = inspection.guard(execution);
+  guard(); inspection.authority.requireSnapshot(snapshot, execution.stamp, false);
+  const proof = new CaptureProof(inspection.documents, inspection.readiness, inspection.fields, execution);
+  try {
+    const stamp = await proof.quiesce();
+    const result = await captureViewport(proof, stamp, snapshot);
+    guard(); inspection.authority.requireSnapshot(snapshot, execution.stamp, false); return result;
+  } finally { await proof.restore(); }
 }
