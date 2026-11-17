@@ -112,7 +112,20 @@ struct Deadline {
   const Identity peer=primary?c.custody:c.primary; const uint64_t token=1; const double requested=clockMs(),expires=requested+1000;
   arbol_exit::ExitWatch peerWatch; bool watched=cap&&peerWatch.enroll(peer),gotK=false,gotP=false,gotT=false,tCommitted=false;
   if(cap&&!watched) poison(cap,arbol_exit::peerLoss);
-  pair.outgoing.clear(); pair.send(std::string(primary?"T ":"P ")+std::to_string(token)+"\n");
+  pair.outgoing.clear();
+  bool initialSent=false,kSent=false,kCommitted=false,pendingFamily=false;
+  auto proofBound=[&] {
+    double bound=cap?std::min(expires,mainLimit):expires;
+    if(cap) { uint64_t fatal=cap->shared()->fatalCutoffUs.load(std::memory_order_acquire); if(fatal) bound=std::min(bound,(double)fatal/1000); }
+    return bound;
+  };
+  auto currentQuiescence=[&] {
+    bool complete=c.engineGone();
+    if(!complete) { pendingFamily=true; return false; }
+    // A late successful poll cannot backdate the newly completed union.
+    if(pendingFamily&&clockMs()>=proofBound()) poison(cap,arbol_exit::identityLoss|arbol_exit::forced);
+    return true;
+  };
   for(;;) {
     if(watched&&!peerWatch.poll()) poison(cap,arbol_exit::watchLoss);
     auto lines=pair.readLines(); if(!first.empty()) { lines.insert(lines.begin(),first.begin(),first.end()); first.clear(); }
@@ -140,34 +153,33 @@ struct Deadline {
         gotK=true; if(cap) cap->shared()->primaryConsent.store(1,std::memory_order_release);
       } else if(!primary&&f.kind=='T') {
         if(gotT) { poison(cap,arbol_exit::protocolLoss); continue; } gotT=true;
-        pair.outgoing.clear(); pair.send("K "+std::to_string(token)+"\n");
-        while(!pair.outgoing.empty()&&!pair.failed&&clockMs()<expires) { pair.flush(expires); usleep(1000); }
-        // The actual original consent is published while this native process
-        // is still live, only after the matching K committed to its real pipe.
-        if(pair.outgoing.empty()&&!pair.failed&&c.engineGone()&&current(c.custody)==1) {
-          if(cap) cap->shared()->custodyConsent.store(1,std::memory_order_release);
-          _exit(0);
-        }
-        poison(cap,arbol_exit::peerLoss|arbol_exit::forced);
+        // Keep this exact T and its original round cutoff while current
+        // native ledger/family proof is pending. K is produced below only
+        // after a fresh complete proof, never merely on receipt of T.
       } else poison(cap,arbol_exit::protocolLoss);
     }
     reap(peer);
     if(!lockIdentity(c.owner)||!lockIdentity(c.build)) {
       poison(cap,arbol_exit::identityLoss|arbol_exit::forced); c.enforce(); usleep(10000); continue;
     }
-    if(!c.engineGone()) {
-      // Another original can finish a genuinely enrolled capture/absence
-      // increment just as this holder starts its T/K round. Pending durable
-      // evidence is not immediate identity failure, nor a deadline renewal.
-      double bound=std::min(expires,mainLimit);
-      if(cap) {
-        uint64_t fatal=cap->shared()->fatalCutoffUs.load(std::memory_order_acquire);
-        if(fatal) bound=std::min(bound,(double)fatal/1000);
-      }
-      if(!cap||cap->shared()->family.uncertain.load(std::memory_order_acquire)||clockMs()>=bound) {
+    if(!currentQuiescence()) {
+      if(!cap||cap->shared()->family.uncertain.load(std::memory_order_acquire)||clockMs()>=proofBound()) {
         poison(cap,arbol_exit::identityLoss|arbol_exit::forced); c.enforce();
       }
       usleep(1000); continue;
+    }
+    if(!initialSent&&clockMs()<expires) {
+      pair.send(std::string(primary?"T ":"P ")+std::to_string(token)+"\n"); initialSent=true;
+    }
+    if(!primary&&gotT&&!kSent&&clockMs()<expires) {
+      pair.outgoing.clear(); pair.send("K "+std::to_string(token)+"\n"); kSent=true;
+    }
+    if(!primary&&kSent&&!kCommitted) {
+      pair.flush(expires); kCommitted=pair.outgoing.empty()&&!pair.failed;
+    }
+    if(!primary&&kCommitted&&clockMs()<expires&&currentQuiescence()&&current(c.custody)==1) {
+      if(cap) cap->shared()->custodyConsent.store(1,std::memory_order_release);
+      _exit(0);
     }
     int state=current(peer);
     if(state<0) poison(cap,arbol_exit::identityLoss);
@@ -185,7 +197,7 @@ struct Deadline {
       _exit(ordinary?0:4);
     }
     pair.flush(expires);
-    if(primary&&pair.outgoing.empty()&&!pair.failed) tCommitted=true;
+    if(primary&&initialSent&&pair.outgoing.empty()&&!pair.failed) tCommitted=true;
     if(pair.failed&&(!pair.ended||pair.truncated||!gotK)) poison(cap,arbol_exit::peerLoss);
     if(clockMs()>=expires) {
       poison(cap,arbol_exit::peerLoss|arbol_exit::forced);
