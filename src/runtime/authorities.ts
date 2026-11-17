@@ -175,7 +175,7 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
       manifest.writerKey !== policy.readerKey ||
       manifests.stable(manifest.compatibleReaderKeys) !== manifests.stable(policy.readableReaderKeys) ||
       manifests.stable(manifest.readableDataEpochs) !== manifests.stable(policy.readableDataEpochs)) throw unavailable('browser');
-  if (below(policy.stateRoot, layout.buildRoot)) throw unavailable('browser');
+  if (below(policy.stateRoot, layout.buildRoot) || below(layout.buildRoot, policy.stateRoot)) throw unavailable('browser');
   if (manifest.qualification !== `host-isolated:1:${policy.productDigest}` ||
         policy.readerKey !== `host-isolated:1:${policy.productDigest}`) throw unavailable('browser');
     // Explicit disposable roots are prepared by the separately authorized
