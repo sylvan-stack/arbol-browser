@@ -27,7 +27,7 @@ export type SignedVerificationPhase = 'bundle-selection' | 'initial-snapshot' |
   'outer-signature-verification' | 'outer-signature-details' | 'outer-signature-entitlements' |
   'nested-signature-verification' | 'nested-signature-details' | 'nested-signature-entitlements' |
   'publisher' | 'compatibility' | 'inventory' | 'final-snapshot' | 'final-physical-comparison' |
-  'repeated-snapshot' | 'repeated-physical' | 'repeated-manifest' | 'repeated-cutoff' | 'snapshot-receipt';
+  'repeated-snapshot' | 'repeated-physical' | 'repeated-manifest' | 'repeated-cutoff' | 'snapshot-receipt' | 'verification-cutoff';
 const verificationFailures = new WeakMap<Error, SignedVerificationPhase>();
 function noteVerificationFailure(error: unknown, phase: SignedVerificationPhase): void {
   try { if (error instanceof Error && !verificationFailures.has(error)) verificationFailures.set(error, phase); }
@@ -70,7 +70,7 @@ export function stable(value: unknown): string {
   return JSON.stringify(value);
 }
 function budget(deadline: number): number {
-  if (deadline !== Infinity && (!Number.isFinite(deadline) || performance.now() >= deadline)) refuse();
+  if (deadline !== Infinity && (!Number.isFinite(deadline) || performance.now() >= deadline)) refuseVerification('verification-cutoff');
   return deadline === Infinity ? 5000 : Math.max(1, Math.min(5000, Math.floor(deadline - performance.now())));
 }
 /** Hash and inspect one verified description, with exactly one overflow byte.
