@@ -88,6 +88,9 @@ export interface PlatformPort {
   inspectExit(owner: HeldLock, build: HeldLock, input: NativeExitInput, deadline: number): Promise<ExitInspectionReceipt>;
   /** One-use fixed-exec native adoption. No numeric FD or role is accepted. */
   adoptHostBuild(requestPath: string, guard: string, bundle: string): HeldLock;
+  /** Actual adopted original only: authentic no-use terminal or retained real
+   * custody unwind, never normal adoption from cancellation or a public kill. */
+  terminateAdoptedHost(build: HeldLock, owner?: HeldLock): never;
   /** Kernel continuous time shared by native outer, host and both monitors. */
   continuousTime(): number;
   captureCloseBudget(): CloseBudget;
@@ -144,6 +147,7 @@ interface NativeSupport {
   assertHostFinalization(handle: object): void;
   latchWatchdogFatal(handle: object): void;
   adoptHostBuild(requestPath: string, guard: string, bundle: string): object;
+  terminateAdoptedHost(build: object, owner: object | null): never;
   continuousTime(): number;
   processProvenance(pid: number): ProcessProvenance | null;
   readLaunchAttempt(handle: object): string | null;
@@ -178,7 +182,7 @@ export function loadPlatform(): PlatformPort {
   let native: NativeSupport;
   try {
     native = createRequire(import.meta.url)(fileURLToPath(new URL('../../native/platform.node', import.meta.url)));
-    for (const name of ['beginExitInspection', 'pollExitInspection', 'cancelExitInspection', 'beginHostSessionUse', 'acceptHostSessionUse', 'abortHostSessionUse', 'recordPagesRetired', 'recordDOMRequested', 'recordCookieAcknowledged', 'recordQuitIntended', 'captureCloseBudget', 'beginCloseStamp', 'pollCloseStamp', 'cancelCloseStamp', 'beginCloseRetirement', 'pollCloseRetirement', 'consumeCloseRequest', 'armLocalClose', 'beginHostMarkerMutation', 'acceptHostMarkerMutation', 'assertHostMarker', 'abortHostMarkerMutation', 'latchWatchdogFatal', 'prepareHostFinalization', 'spawnWatchdog', 'assertHostFinalization', 'adoptHostBuild', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
+    for (const name of ['beginExitInspection', 'pollExitInspection', 'cancelExitInspection', 'beginHostSessionUse', 'acceptHostSessionUse', 'abortHostSessionUse', 'recordPagesRetired', 'recordDOMRequested', 'recordCookieAcknowledged', 'recordQuitIntended', 'captureCloseBudget', 'beginCloseStamp', 'pollCloseStamp', 'cancelCloseStamp', 'beginCloseRetirement', 'pollCloseRetirement', 'consumeCloseRequest', 'armLocalClose', 'beginHostMarkerMutation', 'acceptHostMarkerMutation', 'assertHostMarker', 'abortHostMarkerMutation', 'latchWatchdogFatal', 'prepareHostFinalization', 'spawnWatchdog', 'assertHostFinalization', 'adoptHostBuild', 'terminateAdoptedHost', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
       if (typeof native[name] !== 'function') throw new Error('Missing process support');
   } catch { throw unavailable('profile'); }
   const call = <T>(operation: () => T): T => {
@@ -321,6 +325,11 @@ export function loadPlatform(): PlatformPort {
         if (state !== 0 || current >= budget.overall) throw unavailable('browser');
         await setTimeout(Math.min(10, Math.max(1, budget.overall - current)));
       }
+    },
+    terminateAdoptedHost(build: HeldLock, owner?: HeldLock): never {
+      const actual = locks.get(build), actualOwner = owner ? locks.get(owner) : null;
+      if (!actual || (owner && !actualOwner)) throw unavailable('browser');
+      build.assertIdentity(); owner?.assertIdentity(); return call(() => native.terminateAdoptedHost(actual, actualOwner ?? null));
     },
     async inspectExit(owner: HeldLock, build: HeldLock, input: NativeExitInput, deadline: number): Promise<ExitInspectionReceipt> {
       const actualOwner = locks.get(owner), actualBuild = locks.get(build);

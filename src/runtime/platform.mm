@@ -467,12 +467,16 @@ static napi_value writeLaunchAttempt(napi_env env, napi_callback_info info) {
 }
 
 static bool adoptionAttempted=false;
+// Genuine process-lifetime native state. No destructor/finalizer runs its
+// terminal loop on ordinary Node teardown after actual transfer/session use.
+static arbol_exit::NoUseOriginal* adoptedNoUse=nullptr;
+static HeldLock* adoptedBuild=nullptr;
 static napi_value adoptHostBuild(napi_env env,napi_callback_info info) {
   napi_value args[3]; size_t n=3; std::string requestPath,guard,bundle;
   if(adoptionAttempted) return fail(env); adoptionAttempted=true;
   if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok || n!=3 || !string(env,args[0],requestPath) ||
       !string(env,args[1],guard) || !string(env,args[2],bundle)) return fail(env);
-  @autoreleasepool { @try {
+  @autoreleasepool { try { @try {
     std::string root,expected; if(!arbol_attempt::bundleGuard(bundle,root,expected)||expected!=guard) return fail(env);
     const char* inherited=getenv("ARBOL_BROWSER_BUILD_CAPSULE");
     if(!inherited || !*inherited || strspn(inherited,"0123456789")!=strlen(inherited) || strlen(inherited)>9) return fail(env);
@@ -500,10 +504,19 @@ static napi_value adoptHostBuild(napi_env env,napi_callback_info info) {
        flock(fd,LOCK_SH|LOCK_NB) || !arbol_boundary::lockIdentity(original)) return fail(env);
     arbol_attempt::Claim claim; std::string prior; NSDictionary* attempt=nil;
     if(!claim.acquire(requestPath,arbol_boundary::clockMs()+2000)||!claim.read(prior,attempt)||
-       !arbol_attempt::launchRequest(claim,requestPath,attempt)||![arbol_attempt::digest(prior) isEqual:transport[@"claimDigest"]] ||
-       ![attempt[@"bootstrap"] isEqual:transport[@"bootstrap"]]||![attempt[@"buildRoot"] isEqual:[NSString stringWithUTF8String:root.c_str()]] ||
-       ![attempt[@"buildGuard"] isEqual:[NSString stringWithUTF8String:guard.c_str()]] ||
-       ![attempt[@"phase"] isEqual:@"claimed"] || ![attempt[@"stage"] isEqual:@"untransferred"] || attempt[@"engine"]!=NSNull.null) return fail(env);
+       !arbol_attempt::launchRequest(claim,requestPath,attempt)||
+       ![attempt[@"bootstrap"] isEqual:transport[@"bootstrap"]]||![attempt[@"buildRoot"] isEqual:[NSString stringWithUTF8String:root.c_str()]]||
+       ![attempt[@"buildGuard"] isEqual:[NSString stringWithUTF8String:guard.c_str()]]||
+       ![attempt[@"stage"] isEqual:@"untransferred"]||attempt[@"engine"]!=NSNull.null||attempt[@"runtime"]!=NSNull.null||attempt[@"terminal"]!=NSNull.null) return fail(env);
+    bool cancelled=[attempt[@"phase"] isEqual:@"cancelled"];
+    if(!cancelled&&![attempt[@"phase"] isEqual:@"claimed"]) return fail(env);
+    NSMutableDictionary* originalClaim=[attempt mutableCopy]; originalClaim[@"phase"]=@"claimed";
+    std::string originalRaw=arbol_attempt::bytes(originalClaim);
+    // Cancellation is terminal-only and may change ONLY phase. Its actual
+    // native canonical reconstruction must match the real inherited capsule's
+    // earlier claimed digest exactly. No cancelled original resumes adoption.
+    if(![arbol_attempt::digest(cancelled?originalRaw:prior) isEqual:transport[@"claimDigest"]]||
+       (!cancelled&&originalRaw!=prior)) return fail(env);
     NSDictionary* self=arbol_attempt::processRecord(getpid()); NSDictionary* outer=attempt[@"bootstrap"];
     if(!self || ![outer[@"executable"] isEqual:[NSString stringWithUTF8String:(bundle+"/Contents/MacOS/arbol-browser-native").c_str()]] ||
        ![self[@"executable"] isEqual:[NSString stringWithUTF8String:(bundle+"/Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron").c_str()]] ||
@@ -511,15 +524,32 @@ static napi_value adoptHostBuild(napi_env env,napi_callback_info info) {
        !arbol_boundary::signature([self[@"executable"] UTF8String],true)) return fail(env);
     for(NSString* key in @[@"pid",@"uid",@"startId",@"group",@"session",@"parentStartId",@"parentPidVersion"])
       if(![outer[key] isEqual:self[key]]) return fail(env);
-    if([self[@"group"] intValue]!=getpid() || getppid()!=1) return fail(env);
+    if([self[@"group"] intValue]!=getpid()||getppid()!=1||!arbol_boundary::retainNativeImage()) return fail(env);
+    adoptedNoUse=new arbol_exit::NoUseOriginal;
+    adoptedNoUse->capture(requestPath,bundle,original,originalClaim,@"post-exec");
+    auto terminalOnly=[&]() -> void {
+      // Release only this short transition; original Build OFDs remain held.
+      if(claim.fd>=0) { int held=claim.fd; claim.fd=-1; (void)close(held); }
+      adoptedNoUse->terminate();
+    };
+    if(cancelled||[attempt[@"expires"] doubleValue]<=arbol_boundary::clockMs()) { terminalOnly(); return fail(env); }
     NSMutableDictionary* next=[attempt mutableCopy]; next[@"engine"]=self;
-    if(!arbol_attempt::transition(attempt,next,arbol_attempt::Role::engine)||
-       !arbol_attempt::replace(claim.at,prior,false,arbol_attempt::bytes(next)) || !arbol_boundary::lockIdentity(original) ||
-       fcntl(fd,F_SETFD,FD_CLOEXEC) || close(capsule)) return fail(env);
+    std::string nextRaw=arbol_attempt::bytes(next);
+    if(!arbol_attempt::transition(attempt,next,arbol_attempt::Role::engine)) { terminalOnly(); return fail(env); }
+    bool installed=arbol_attempt::replace(claim.at,prior,false,nextRaw);
+    bool captured=adoptedNoUse->acceptAdopted(claim,nextRaw);
+    if(!installed||!captured||!arbol_boundary::lockIdentity(original)||fcntl(fd,F_SETFD,FD_CLOEXEC)||close(capsule)) {
+      terminalOnly(); return fail(env);
+    }
     auto* lock=new HeldLock{fd,guard,guardStat.st_dev,guardStat.st_ino,LOCK_SH,true};
-    liveLocks.insert(lock); napi_value out;
-    if(napi_create_external(env,lock,finalize,nullptr,&out)!=napi_ok) return fail(env); return out;
-  } @catch(NSException*) { return fail(env); } }
+    adoptedBuild=lock; liveLocks.insert(lock); napi_value out;
+    if(napi_create_external(env,lock,finalize,nullptr,&out)!=napi_ok) { terminalOnly(); return fail(env); }
+    return out;
+  } @catch(NSException*) {
+    if(adoptedNoUse) adoptedNoUse->terminate(); return fail(env);
+  } } catch(...) {
+    if(adoptedNoUse) adoptedNoUse->terminate(); return fail(env);
+  } }
 }
 
 // Process-lifetime native custody is intentionally not garbage-collected. Once
@@ -577,6 +607,11 @@ static napi_value prepareWatchdogCustody(napi_env env, napi_callback_info info) 
   auto* c = new Custody; c->context.bundle=bundle; c->context.digest=digest;
   c->continuousBuild=static_cast<HeldLock*>(b)->retained;
   c->context.owner=duplicateHeld(static_cast<HeldLock*>(a)); c->context.build=duplicateHeld(static_cast<HeldLock*>(b));
+  if(c->continuousBuild) {
+    if(!adoptedNoUse) return fail(env);
+    adoptedNoUse->bindOwner(c->context.owner);
+    if(!adoptedNoUse->matches(bundle,digest,c->context.build)) return fail(env);
+  }
   c->context.session=getsid(0);
   bool valid=arbol_boundary::observe(getpid(),c->context.main)==1 && c->context.initial();
   if(valid) { c->capsule=arbol_boundary::capsuleDescriptor(arbol_boundary::capsuleBytes(c->context,true)); valid=c->capsule>=0; }
@@ -693,6 +728,10 @@ static bool nativePipe(int (&ends)[2]) {
 static napi_value spawnWatchdog(napi_env env,napi_callback_info info) {
   napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg);
   if(!c||c->spawned||c->bound||(c->continuousBuild&&!c->hostRequired)||(c->hostRequired&&!c->finalization.present())) return fail(env);
+  if(c->continuousBuild) {
+    if(!adoptedNoUse||!adoptedNoUse->matches(c->context.bundle,c->context.digest,c->context.build)) return fail(env);
+    adoptedNoUse->spawnIntent(); // irreversible BEFORE any possible actual spawn
+  }
   c->spawned=true;
   @autoreleasepool { @try {
     arbol_attempt::Claim claim; std::string old; NSDictionary* attempt=nil;
@@ -924,6 +963,7 @@ static napi_value beginHostMarkerMutation(napi_env env,napi_callback_info info) 
   if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok||n!=2||!boundedText(env,args[1],dirty)) return fail(env);
   auto* c=custodyArgument(env,args[0]);
   if(!c||!c->bound||c->markerAttempted||!c->finalization.ready(c->context)) return fail(env);
+  if(c->continuousBuild) { if(!adoptedNoUse) return fail(env); adoptedNoUse->markerPermission(); }
   c->markerAttempted=true;
   @autoreleasepool { @try {
     auto* permit=new MarkerPermit; permit->custody=c; markerPermits.insert(permit); c->mutation=permit;
@@ -1008,6 +1048,7 @@ static napi_value beginHostSessionUse(napi_env env,napi_callback_info info) {
   if(!c||!c->hostRequired||!c->bound||c->sessionAttempted||c->mutation||getpid()!=c->context.main.pid||
      !c->finalization.ready(c->context)||c->finalization.shared()->markerBound.load(std::memory_order_acquire)!=1||
      c->finalization.shared()->admitted.load(std::memory_order_acquire)) return fail(env);
+  if(c->continuousBuild) { if(!adoptedNoUse) return fail(env); adoptedNoUse->sessionPermission(); }
   c->sessionAttempted=true;
   @autoreleasepool { @try {
     auto* permit=new SessionUseNative; permit->custody=c; sessionUses.insert(permit); c->sessionUse=permit;
@@ -1111,6 +1152,8 @@ static napi_value latchWatchdogFatal(napi_env env,napi_callback_info info) {
 // No application/native-input cleanup is entered here. Both native lock
 // descriptions remain retained for the lifetime of this nonreturning path.
 [[noreturn]] static void terminateCustody(Custody* c) {
+  if(c->continuousBuild&&adoptedNoUse&&adoptedNoUse->matches(c->context.bundle,c->context.digest,c->context.build)&&
+     adoptedNoUse->mayFinalize()&&!c->spawned&&!c->markerAttempted&&!c->sessionAttempted) adoptedNoUse->terminate();
   // Irreversible attribution precedes discovery, retirement or any signal.
   if(c->finalization.present()) c->finalization.shared()->poison(arbol_exit::protocolLoss|arbol_exit::forced);
   if(c->mutation) { c->mutation->relinquish(); c->mutation=nullptr; }
@@ -1137,6 +1180,26 @@ static napi_value latchWatchdogFatal(napi_env env,napi_callback_info info) {
     // Uncertainty is retained fatal custody, never permission to return/unlock.
     usleep(10000);
   }
+}
+static napi_value terminateAdoptedHost(napi_env env,napi_callback_info info) {
+  napi_value args[2]; size_t n=2; void *buildValue=nullptr,*ownerValue=nullptr; napi_valuetype kind;
+  if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok||n!=2||
+     napi_get_value_external(env,args[0],&buildValue)!=napi_ok||napi_typeof(env,args[1],&kind)!=napi_ok||
+     (kind!=napi_null&&napi_get_value_external(env,args[1],&ownerValue)!=napi_ok)) return fail(env);
+  auto* build=static_cast<HeldLock*>(buildValue); struct stat identity{};
+  if(!liveLocks.count(build)||build!=adoptedBuild||!build->retained||!matches(build,&identity)||!adoptedNoUse) return fail(env);
+  if(kind!=napi_null) {
+    auto* owner=static_cast<HeldLock*>(ownerValue); struct stat actual{};
+    if(!liveLocks.count(owner)||owner->mode!=LOCK_EX||!matches(owner,&actual)) return fail(env);
+    auto retained=duplicateHeld(owner); adoptedNoUse->bindOwner(retained);
+    if(retained.fd>=0) (void)close(retained.fd); // NoUse owns its own genuine duplicate
+  }
+  if(adoptedNoUse->mayFinalize()) adoptedNoUse->terminate();
+  for(auto* c:nativeCustodies) if(c->continuousBuild&&c->context.build.device==(uint64_t)build->dev&&
+    c->context.build.inode==build->ino&&getpid()==c->context.main.pid) terminateCustody(c);
+  // An original with possible transfer but no authentic captured custody must
+  // retain its Build; no public kill or no-use downgrade can resolve it.
+  adoptedNoUse->terminate();
 }
 static napi_value terminateProfileNow(napi_env env,napi_callback_info info) {
   napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg);
@@ -1589,6 +1652,7 @@ static napi_value cancelExitInspection(napi_env env,napi_callback_info info) {
 
 static napi_value init(napi_env env, napi_value exports) {
   napi_property_descriptor properties[] = {
+    {"terminateAdoptedHost",nullptr,terminateAdoptedHost,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"beginExitInspection",nullptr,beginExitInspection,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"pollExitInspection",nullptr,pollExitInspection,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"cancelExitInspection",nullptr,cancelExitInspection,nullptr,nullptr,nullptr,napi_default,nullptr},

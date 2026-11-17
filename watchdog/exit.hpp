@@ -1516,6 +1516,40 @@ public:
   void returnedExecFailure(int failure) { if(execIntent_&&failure) { execError_=failure; execFailedReturned_=true; } else uncertain_=true; }
   bool attempted() const { return attempted_; }
   bool committed() const { return committed_; }
+  bool mayFinalize() const { return attempted_&&valid_&&!permissions_&&!uncertain_; }
+  bool matches(const std::string& bundle,const std::string& digest,const arbol_boundary::Lock& build) const {
+    return attempted_&&valid_&&bundle==bundle_&&[baseline_[@"candidateDigest"] isEqual:[NSString stringWithUTF8String:digest.c_str()]]&&
+      [arbol_boundary::capsuleLock(build_) isEqual:arbol_boundary::capsuleLock(build)];
+  }
+  bool acceptAdopted(const arbol_attempt::Claim& claim,const std::string& raw,bool terminalOnly=false) {
+    // Actual engine adoption is not a profile-use permission. Capture only its
+    // genuine guarded successful bytes, including a returned ambiguous write
+    // whose actual current record is now exactly that native result.
+    if(![stage_ isEqual:@"post-exec"]||!self()||permissions_||claim.fd<0||!arbol_attempt::unchanged(claim.at)) return false;
+    std::string actual; bool absent;
+    if(!arbol_attempt::readAt(claim.at.directory,"claim.json",actual,absent)||absent||actual!=raw) return false;
+    NSDictionary* next=arbol_attempt::json(raw);
+    if(!arbol_attempt::record(next)||!arbol_attempt::immutable(baseline_,next)||
+       (!([next[@"phase"] isEqual:@"claimed"]||(terminalOnly&&[next[@"phase"] isEqual:@"cancelled"])))||
+       ![next[@"stage"] isEqual:@"untransferred"]||![next[@"bootstrap"] isEqual:baseline_[@"bootstrap"]]||
+       ![next[@"engine"] isEqual:actor_]||next[@"runtime"]!=NSNull.null||next[@"terminal"]!=NSNull.null) return false;
+    NSMutableDictionary* adopted=[next mutableCopy]; adopted[@"phase"]=@"claimed";
+    baselineRaw_=arbol_attempt::bytes(adopted); baseline_=arbol_attempt::json(baselineRaw_); stage_=@"adopted";
+    return self()&&arbol_attempt::unchanged(claim.at);
+  }
+  [[noreturn]] void terminate() noexcept {
+    finish();
+    for(;;) {
+      @autoreleasepool { @try { try {
+        if(committed_&&self()) {
+          arbol_boundary::Identity original{[actor_[@"pid"] intValue],strtoull([actor_[@"startId"] UTF8String],nullptr,10),
+            [actor_[@"pidVersion"] intValue],[actor_[@"uid"] unsignedIntValue],[actor_[@"group"] unsignedIntValue]};
+          (void)arbol_boundary::signalExact(original,SIGKILL);
+        }
+      } catch(...) {} } @catch(NSException*) {} }
+      usleep(10000);
+    }
+  }
   bool publish() {
     if(!attempted_||!self()||!emptyCensus()) return false;
     if(noClaimConfirmed_) return true; // no touching any later attempt
@@ -1523,6 +1557,12 @@ public:
     double lockDeadline=arbol_boundary::clockMs()+1000;
     if(!claim.acquire(requestPath_,lockDeadline)||!claim.read(raw,value)) return false;
     if(committed_) return raw==closedRaw_&&self()&&emptyCensus();
+    if([stage_ isEqual:@"post-exec"]&&value[@"engine"]!=NSNull.null) {
+      // A caught adoption failure may follow an actually installed engine
+      // record. Reconcile only this exact original under the real Claim, and
+      // use it solely for terminal proof, never resume active adoption.
+      if(!acceptAdopted(claim,raw,true)) return false;
+    }
     // An actual outer write which did NOT claim can exit without certifying
     // someone else's profile. This is not the claimed no-use proof route.
     if(!initialRaw_.empty()&&raw==initialRaw_&&[value[@"phase"] isEqual:@"pending"]&&
