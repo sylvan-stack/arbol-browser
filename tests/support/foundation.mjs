@@ -43,7 +43,8 @@ export function execute(command, args, options = {}) {
   return { child, done };
 }
 export async function cli(context, args, input = '') {
-  const result = await execute(join(context.candidate, 'bin/arbol-browser'), args,
+  const result = await execute(process.execPath, [fileURLToPath(import.meta.url), '--fixture-cli',
+    JSON.stringify({ candidate: context.candidate, state: context.state, args })],
     { cwd: context.root, env: environment(context), input }).done;
   const lines = result.stdout.trim().split('\n').filter(Boolean);
   if (args[0] === 'mcp') assert.equal(result.stdout, '', 'MCP failure must not emit a CLI JSON result');
@@ -52,6 +53,21 @@ export async function cli(context, args, input = '') {
     result.value = JSON.parse(lines[0]);
   }
   return result;
+}
+
+// Preserve the Foundation's explicit no-host scope using the same physical
+// packaged production modules. The sealed production entry runs separately in
+// Control; this worker supplies neither integration nor any admission authority.
+if (process.argv[2] === '--fixture-cli') {
+  const input = JSON.parse(process.argv[3]);
+  const [{ runCli }, { createProfileService }, { loadPlatform }, { createProcessService, createProfileRuntime }] = await Promise.all([
+    load(input, 'cli/main'), load(input, 'profiles/manage'), load(input, 'runtime/platform'), load(input, 'runtime/lifecycle')]);
+  const metadata = JSON.parse(await readFile(join(input.candidate, 'metadata.json'), 'utf8'));
+  const platform = loadPlatform(), selection = { build: metadata.component.build, explicit: false, directory: input.candidate, guard: '' };
+  process.exitCode = await runCli(input.args, {
+    profiles: createProfileService({ state: input.state, platform: () => platform, runtime: createProfileRuntime(platform, selection) }),
+    process: createProcessService({ state: input.state, selection, platform: () => platform }),
+  });
 }
 export async function snapshot(root) {
   const result = {};

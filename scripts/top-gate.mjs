@@ -73,15 +73,16 @@ if (args.length === 6) {
   assert.equal(args[4], '--native-consumer');
   assert.equal(args[5], nativeConsumer.manifest, 'Only the pinned ABR-46 manifest can qualify this gate');
 }
-const candidate = await realpath(args[1]), output = resolve(args[3]);
-const protectedRoots = [resolve(repository), candidate, dirname(nativeConsumer.manifest), '/Users/msix/Artifacts'];
+const buildRoot = await realpath(args[1]), candidate = join(buildRoot, 'ArbolBrowser.app/Contents/Resources/browser'), output = resolve(args[3]);
+assert.equal(await realpath(candidate), candidate, 'The ordinary sealed host payload must be canonical');
+const protectedRoots = [resolve(repository), buildRoot, dirname(nativeConsumer.manifest), '/Users/msix/Artifacts'];
 assert.ok(!protectedRoots.some(path => output === path || output.startsWith(path + sep)),
   'Qualification evidence must be outside the checkout, candidate and artifact trees');
 if (!embedded) {
   assert.equal(await realpath(dirname(output)), dirname(output), 'Qualification output must have a canonical parent');
   await mkdir(output, { mode: 0o700 }); // refuse reuse of prior evidence
   const file = join(output, 'result.json');
-  const gate = { format: 2, candidate, output, selection: allCases.map(([id]) => id), cases: [], startedAt: new Date().toISOString(), passed: false };
+  const gate = { format: 3, buildRoot, candidate, output, selection: allCases.map(([id]) => id), cases: [], startedAt: new Date().toISOString(), passed: false };
   const save = () => writeFile(file, JSON.stringify(gate, null, 2) + '\n', { mode: 0o600 });
   try {
     const inventory = await readSelection();
@@ -97,12 +98,17 @@ if (!embedded) {
     assert.deepEqual(admitted, { manifest: nativeConsumer.manifest, digest: nativeConsumer.digest,
       codeCommit: native.commit, sourceDigest: native.sourceDigest, compatibilityDigest: native.manifest.sha256 });
     const foundationSource = inventoryDigest(await sourceInventory());
+    execFileSync('/usr/bin/codesign', ['--verify', '--strict', '--deep', '-R',
+      '=anchor apple generic and certificate leaf[subject.OU] = "7V372XL59S" and identifier "com.sylvan-stack.arbol-browser.native-candidate"',
+      join(buildRoot, 'ArbolBrowser.app')], { stdio: 'pipe' });
+    gate.signedBundle = { path: join(buildRoot, 'ArbolBrowser.app'), publisherVerified: true,
+      inventory: inventoryDigest(await (await import('./package-base.mjs')).inventory(join(buildRoot, 'ArbolBrowser.app'))) };
     const foundationOutput = join(output, 'foundation'), home = join(foundationOutput, 'runtime-home');
     await mkdir(foundationOutput, { mode: 0o700 });
     await mkdir(home, { mode: 0o700 });
     await save();
     const result = spawnSync(join(candidate, 'runtime/Electron.app/Contents/MacOS/Electron'),
-      [fileURLToPath(import.meta.url), '--candidate', candidate, '--out', foundationOutput, '--embedded'], {
+      [fileURLToPath(import.meta.url), '--candidate', buildRoot, '--out', foundationOutput, '--embedded'], {
         cwd: repository, env: { HOME: home, PATH: '/usr/bin:/bin', ELECTRON_RUN_AS_NODE: '1', LANG: 'en_US.UTF-8' },
         stdio: 'inherit', timeout: 90000,
       });
