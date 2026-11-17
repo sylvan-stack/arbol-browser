@@ -1,12 +1,24 @@
 import { basename, dirname, join, resolve } from 'node:path';
 import { lstat } from 'node:fs/promises';
 import { directory, assertDirectory, privateFile, sameIdentity, identity, profileUnavailable } from '../profiles/paths.js';
-import type { PlatformPort } from './platform.js';
+import type { PlatformPort, HeldLock } from './platform.js';
 import type { BuildSelection } from './selection.js';
 import type { BuildGuard } from './start.js';
 
 export interface BuildLease extends BuildGuard {
   readonly selection: BuildSelection;
+}
+const buildDescriptions = new WeakMap<BuildLease, { platform: PlatformPort; held: HeldLock }>();
+/** Only the original real description behind this module's lease is handed to
+ * the exact native platform. There is no descriptor export by guard pathname.
+ * Native custody, not the JS reference or callback, retains it through exit. */
+export async function withBuildLockForCustody<T>(lease: BuildLease, platform: PlatformPort,
+  handover: (held: HeldLock) => T): Promise<T> {
+  const source = buildDescriptions.get(lease);
+  if (!source || source.platform !== platform || typeof handover !== 'function') throw profileUnavailable();
+  await lease.assert();
+  if (buildDescriptions.get(lease) !== source) throw profileUnavailable();
+  source.held.assertIdentity(); return handover(source.held);
 }
 /** Reacquire the launcher's exact stable .uses/<hex> shared kernel flock.
  * This is Build-use protection, never publisher/native/engine compatibility
@@ -43,7 +55,8 @@ export async function acquireBuildLease(input: BuildSelection, platform: Platfor
     },
     /** Only before engine use, after verified host-ready (starter), or after
      * complete original-main/helper exit and flush. No timeout/finally release. */
-    release() { if (!released) { held.assertIdentity(); released = true; held.release(); } },
+    release() { if (!released) { held.assertIdentity(); released = true; buildDescriptions.delete(lease); held.release(); } },
   });
+  buildDescriptions.set(lease, { platform, held });
   try { await lease.assert(); return lease; } catch (error) { lease.release(); throw error; }
 }

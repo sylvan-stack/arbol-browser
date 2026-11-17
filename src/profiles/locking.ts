@@ -14,6 +14,19 @@ export interface OwnerLease {
   readonly profile: ProfileSnapshot;
   assert(): Promise<void>; release(): void;
 }
+const ownerDescriptions = new WeakMap<OwnerLease, { platform: PlatformPort; held: HeldLock }>();
+/** Internal custody handover, not a serializable key or a path-to-FD lookup.
+ * Only this module's genuine still-held lease and its exact platform qualify.
+ * Native prepareWatchdogCustody validates both actual descriptions again and
+ * duplicates them together before any engine access; this callback releases none. */
+export async function withOwnerLockForCustody<T>(lease: OwnerLease, platform: PlatformPort,
+  handover: (held: HeldLock) => T): Promise<T> {
+  const source = ownerDescriptions.get(lease);
+  if (!source || source.platform !== platform || typeof handover !== 'function') throw profileUnavailable();
+  await lease.assert();
+  if (ownerDescriptions.get(lease) !== source) throw profileUnavailable();
+  source.held.assertIdentity(); return handover(source.held);
+}
 async function acquire(platform: PlatformPort, path: string, deadline: number, wait: boolean): Promise<HeldLock | null> {
   do {
     if (performance.now() >= deadline) throw profileUnavailable();
@@ -63,8 +76,9 @@ export async function ownerLock(profile: ProfileSnapshot, platform: PlatformPort
       privateFile(now);
       if (!sameIdentity(identity(now), expected)) throw profileUnavailable();
     },
-    release() { if (!released) { released = true; held.release(); } },
+    release() { if (!released) { released = true; ownerDescriptions.delete(lease); held.release(); } },
   });
+  ownerDescriptions.set(lease, { platform, held });
   try { await lease.assert(); return lease; } catch (error) { lease.release(); throw error; }
 }
 /** Startup uses the published lock only; callers retain it through all helper exit/flush. */
