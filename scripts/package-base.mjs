@@ -5,10 +5,10 @@ import { createReadStream, existsSync } from 'node:fs';
 import { cp, lstat, mkdir, readFile, readdir, readlink, writeFile, chmod, rename } from 'node:fs/promises';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-export const root = fileURLToPath(new URL('../', import.meta.url));
+export const root = resolve(fileURLToPath(new URL('../', import.meta.url)));
 const hash = value => createHash('sha256').update(value).digest('hex');
 export async function inventory(directory, selectedRoots) {
-  const files = {};
+  const files = Object.create(null);
   async function walk(path) {
     for (const entry of (path === directory && selectedRoots ? selectedRoots : await readdir(path)).sort()) {
       const full = join(path, entry), stat = await lstat(full), key = relative(directory, full);
@@ -28,12 +28,22 @@ export async function inventory(directory, selectedRoots) {
   return files;
 }
 export async function sourceInventory() {
-  const entries = {};
+  const entries = Object.create(null);
   for (const name of ['package.json', 'package-lock.json', 'arbol-build.json', 'tsconfig.json'])
     entries[name] = hash(await readFile(join(root, name)));
   if (existsSync(join(root, 'entitlements.plist'))) entries['entitlements.plist'] = hash(await readFile(join(root, 'entitlements.plist')));
   for (const name of ['src', 'scripts', 'native', 'watchdog'])
     for (const [path, digest] of Object.entries(await inventory(join(root, name)))) entries[`${name}/${path}`] = digest;
+  return Object.fromEntries(Object.entries(entries).sort(([a], [b]) => a.localeCompare(b, 'en')));
+}
+/** Exact implementation projection for source review across a later testing
+ * commit. Only the existing test gate and Arbol check array are excluded; every
+ * product/compiler/signing source, dependency and build recipe remains bound. */
+export async function productInventory() {
+  const entries = await sourceInventory();
+  delete entries['scripts/top-gate.mjs'];
+  const build = JSON.parse(await readFile(join(root, 'arbol-build.json'), 'utf8'));
+  delete build.checks; entries['arbol-build.json'] = hash(JSON.stringify(build));
   return Object.fromEntries(Object.entries(entries).sort(([a], [b]) => a.localeCompare(b, 'en')));
 }
 export const inventoryDigest = files => hash(JSON.stringify(files));
