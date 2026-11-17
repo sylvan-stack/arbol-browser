@@ -130,7 +130,7 @@ struct Deadline {
     usleep(5000);
   }
 }
-[[noreturn]] static void protocolLoop(Context& c,Channel& pair,bool primary,double start,arbol_exit::ExitWatch& watch) {
+[[noreturn]] static void protocolLoop(Context& c,Channel& pair,bool primary,double start,arbol_exit::ExitWatch& watch,arbol_exit::HostCapability* cap) {
   Channel host(primary?0:6,primary?1:7); Deadline deadline(start);
   struct Pending { uint64_t sequence; double sent; }; std::deque<Pending> pending;
   if(primary) host.send("R 1 "+std::to_string(c.main.pid)+"\n");
@@ -138,6 +138,7 @@ struct Deadline {
   for(;;) {
     double now=clockMs();
     if(!watch.poll()) deadline.lost(now);
+    if(cap&&(!cap->present()||cap->shared()->fatal.load(std::memory_order_acquire))) deadline.lost(now);
     // Latch before touching traffic. Late H or a queued A cannot revive an
     // already expired window, even when this executor itself was delayed.
     if(primary&&!pending.empty()&&now-pending.front().sent>=1000) deadline.lost(now);
@@ -185,7 +186,7 @@ static void pipeDescriptors(int (&out)[2]) {
   out[0]=fcntl(raw[0],F_DUPFD_CLOEXEC,10); out[1]=fcntl(raw[1],F_DUPFD_CLOEXEC,10); close(raw[0]); close(raw[1]);
   if(out[0]<0||out[1]<0) throw 4;
 }
-static Channel launchCustody(Context& c,double deadline) {
+static Channel launchCustody(Context& c,double deadline,arbol_exit::HostCapability* cap) {
   int init= capsuleDescriptor(capsuleBytes(c,false)),forward[2],reply[2]; if(init<0) throw 4; pipeDescriptors(forward); pipeDescriptors(reply);
   int owner=fcntl(3,F_DUPFD_CLOEXEC,10),build=fcntl(4,F_DUPFD_CLOEXEC,10);
   posix_spawn_file_actions_t actions; posix_spawnattr_t attr;
@@ -194,7 +195,9 @@ static Channel launchCustody(Context& c,double deadline) {
     !posix_spawn_file_actions_adddup2(&actions,init,5)&&!posix_spawn_file_actions_adddup2(&actions,forward[0],6)&&!posix_spawn_file_actions_adddup2(&actions,reply[1],7)&&
     !posix_spawn_file_actions_addopen(&actions,0,"/dev/null",O_RDONLY,0)&&!posix_spawn_file_actions_addopen(&actions,1,"/dev/null",O_WRONLY,0)&&!posix_spawn_file_actions_addopen(&actions,2,"/dev/null",O_WRONLY,0)&&
     !posix_spawnattr_setpgroup(&attr,c.main.group)&&!posix_spawnattr_setflags(&attr,POSIX_SPAWN_SETPGROUP|POSIX_SPAWN_CLOEXEC_DEFAULT);
-  std::string helper=c.helper(); char* args[]={helper.data(),(char*)"--custody",nullptr}; char* env[]={(char*)"PATH=/usr/bin:/bin",nullptr}; pid_t pid=0;
+  if(ok&&cap) ok=cap->present()&&!posix_spawn_file_actions_adddup2(&actions,cap->capsule(),8)&&
+    !posix_spawn_file_actions_adddup2(&actions,cap->stateDescriptor(),9);
+  std::string helper=c.helper(); char* args[]={helper.data(),(char*)"--custody",cap?(char*)"--host-finalization":nullptr,nullptr}; char* env[]={(char*)"PATH=/usr/bin:/bin",nullptr}; pid_t pid=0;
   int result=ok?posix_spawn(&pid,helper.c_str(),&actions,&attr,args,env):EINVAL;
   posix_spawn_file_actions_destroy(&actions); posix_spawnattr_destroy(&attr);
   close(owner); close(build); close(init); close(forward[0]); close(reply[1]);
@@ -202,68 +205,73 @@ static Channel launchCustody(Context& c,double deadline) {
   // Capture the actual child even if its validation fails: failed-attempt
   // retirement must not forget a child which already owns duplicate locks.
   if(observe(pid,c.custody)!=1||!c.monitor(c.custody,true)) throw 4;
+  if(cap&&!cap->shared()->custody.bind(c.custody,deadline)) throw 4;
   Channel pair(reply[0],forward[1]);
   std::string expected="C 1 "+std::to_string(c.custody.pid)+" "+std::to_string(c.custody.start);
   for(;;) { if(clockMs()>=deadline||pair.failed||current(c.custody)!=1) throw 4;
     auto lines=pair.readLines(); if(lines.size()==1&&lines[0]==expected&&c.monitor(c.custody,true)&&c.monitor(c.primary,true)&&c.initial()) return pair;
     if(!lines.empty()) throw 4; usleep(1000); }
 }
-static bool liveStart(Context& c,double deadline) {
-  return clockMs()<deadline&&c.initial()&&lockIdentity(c.owner)&&lockIdentity(c.build);
+static bool liveStart(Context& c,double deadline,arbol_exit::HostCapability* cap) {
+  return clockMs()<deadline&&c.initial()&&lockIdentity(c.owner)&&lockIdentity(c.build)&&
+    (!cap||(cap->present()&&cap->metadata()&&!cap->shared()->fatal.load(std::memory_order_acquire)));
 }
-static int runPrimary(Context& c,double deadline,arbol_exit::ExitWatch& watch) {
+static int runPrimary(Context& c,double deadline,arbol_exit::ExitWatch& watch,arbol_exit::HostCapability* cap) {
   // authenticateBirth deliberately granted cleanup only. Live original-main
   // proof is needed before any child handover or external readiness.
   c.cleanupOnly=false;
-  if(!liveStart(c,deadline)||!c.monitor(c.primary,true)||!watch.enrolledAlive(c.main)) { c.cleanupOnly=true; throw 4; }
-  Channel pair=launchCustody(c,deadline); // primary still anchors the old group
-  if(!liveStart(c,deadline)||!c.monitor(c.primary,true)||!c.monitor(c.custody,true)) { c.cleanupOnly=true; throw 4; }
+  if(!liveStart(c,deadline,cap)||!c.monitor(c.primary,true)||!watch.enrolledAlive(c.main)) { c.cleanupOnly=true; throw 4; }
+  Channel pair=launchCustody(c,deadline,cap); // primary still anchors the old group
+  if(!liveStart(c,deadline,cap)||!c.monitor(c.primary,true)||!c.monitor(c.custody,true)) { c.cleanupOnly=true; throw 4; }
   // C acknowledged actual descriptors/provenance in this continuously held
   // group. It now has a real second anchor; only this transition leaves it.
   if(setpgid(0,0)||getpgrp()!=getpid()||!c.monitor(c.primary,false)||!c.monitor(c.custody,true)) throw 4;
   c.primaryOutside=true; pair.send("G 1\n");
   for(;;) {
-    if(!liveStart(c,deadline)||pair.failed||!c.primaryMonitor()||!c.monitor(c.custody,true)) throw 4;
+    if(!liveStart(c,deadline,cap)||pair.failed||!c.primaryMonitor()||!c.monitor(c.custody,true)) throw 4;
     pair.flush(); auto lines=pair.readLines();
     if(lines.size()==1&&lines[0]=="J 1"&&pair.outgoing.empty()) break;
     if(!lines.empty()) throw 4; usleep(1000);
   }
-  if(!liveStart(c,deadline)||!c.primaryMonitor()||!c.monitor(c.custody,true)) throw 4;
+  if(!liveStart(c,deadline,cap)||!c.primaryMonitor()||!c.monitor(c.custody,true)||(cap&&!cap->ready(c))) throw 4;
   if(!watch.enrolledAlive(c.main)) throw 4;
-  protocolLoop(c,pair,true,deadline-1000,watch);
+  protocolLoop(c,pair,true,deadline-1000,watch,cap);
 }
-static int runCustody(Context& c,double deadline,arbol_exit::ExitWatch& watch) {
+static int runCustody(Context& c,double deadline,arbol_exit::ExitWatch& watch,arbol_exit::HostCapability* cap) {
   c.cleanupOnly=false;
-  if(!liveStart(c,deadline)||!c.monitor(c.primary,true)||!c.monitor(c.custody,true)||!watch.enrolledAlive(c.main)) { c.cleanupOnly=true; throw 4; }
+  if(!liveStart(c,deadline,cap)||!c.monitor(c.primary,true)||!c.monitor(c.custody,true)||!watch.enrolledAlive(c.main)) { c.cleanupOnly=true; throw 4; }
   Channel pair(6,7); pair.send("C 1 "+std::to_string(c.custody.pid)+" "+std::to_string(c.custody.start)+"\n");
-  while(!pair.outgoing.empty()) { if(!liveStart(c,deadline)||pair.failed||!c.primaryMonitor()) throw 4; pair.flush(); usleep(1000); }
+  while(!pair.outgoing.empty()) { if(!liveStart(c,deadline,cap)||pair.failed||!c.primaryMonitor()) throw 4; pair.flush(); usleep(1000); }
   // A producer death before G is cleanup-only, whether or not C was consumed.
   // Our actual inherited membership/OFDs do not depend on a parent's callback.
   for(;;) {
-    if(!liveStart(c,deadline)||pair.failed||current(c.primary)!=1||!c.monitor(c.custody,true)) throw 4;
+    if(!liveStart(c,deadline,cap)||pair.failed||current(c.primary)!=1||!c.monitor(c.custody,true)) throw 4;
     auto lines=pair.readLines();
     if(lines.size()==1&&lines[0]=="G 1"&&c.monitor(c.primary,false)) { c.primaryOutside=true; break; }
     if(!lines.empty()) throw 4; usleep(1000);
   }
-  if(!liveStart(c,deadline)||!c.primaryMonitor()) throw 4;
+  if(!liveStart(c,deadline,cap)||!c.primaryMonitor()||(cap&&!cap->ready(c))) throw 4;
   pair.send("J 1\n");
-  while(!pair.outgoing.empty()) { if(!liveStart(c,deadline)||pair.failed||!c.primaryMonitor()) throw 4; pair.flush(); usleep(1000); }
+  while(!pair.outgoing.empty()) { if(!liveStart(c,deadline,cap)||pair.failed||!c.primaryMonitor()) throw 4; pair.flush(); usleep(1000); }
   if(!watch.enrolledAlive(c.main)) throw 4;
-  protocolLoop(c,pair,false,deadline-1000,watch);
+  protocolLoop(c,pair,false,deadline-1000,watch,cap);
 }
 
 int main(int argc,const char* argv[]) {
-  signal(SIGPIPE,SIG_IGN); double deadline=clockMs()+1000; Context c; bool parsed=false; arbol_exit::ExitWatch watch;
+  signal(SIGPIPE,SIG_IGN); double deadline=clockMs()+1000; Context c; bool parsed=false; arbol_exit::ExitWatch watch; arbol_exit::HostCapability hostCap;
   Identity birth; Info birthInfo{}; int birthSession=getsid(0); bool birthValid=observe(getpid(),birth,&birthInfo)==1;
   @autoreleasepool {
     @try { try {
-      if(argc!=2) throw 4;
+      if(argc!=2&&argc!=3) throw 4;
+      bool host=argc==3; if(host&&strcmp(argv[2],"--host-finalization")) throw 4;
       bool primary=!strcmp(argv[1],"--watchdog"),custody=!strcmp(argv[1],"--custody");
       if((!primary&&!custody)||!birthValid) throw 4;
       Identity producer; std::string raw=startup(deadline); c=record(raw,primary,producer); parsed=true;
       if(!c.authenticateBirth(birth,birthInfo,birthSession,producer,primary)) throw 4;
+      if(host&&!hostCap.load(c,primary,deadline)) throw 4;
       if(!watch.enroll(c.main)) throw 4;
-      return primary?runPrimary(c,deadline,watch):runCustody(c,deadline,watch);
+      if(host&&!hostCap.enrolled(c,primary,watch)) throw 4;
+      return primary?runPrimary(c,deadline,watch,host?&hostCap:nullptr):runCustody(c,deadline,watch,host?&hostCap:nullptr);
     } catch(...) { c.cleanupOnly=true; retainedRefusal(parsed?&c:nullptr); } } @catch(NSException*) { c.cleanupOnly=true; retainedRefusal(parsed?&c:nullptr); }
   }
 }

@@ -18,10 +18,23 @@ export interface HeldLock {
 export interface WatchdogCustody {
   readonly descriptors: readonly [number, number];
   readonly startupDescriptor: number;
+  /** Only actual native spawn transports the private finalization/state FDs.
+   * These numbers are genuine pipe endpoints, never a shared-state writer. */
+  spawn(): Readonly<{ pid: number; reader: number; writer: number }>;
+  prepareHost(input: HostFinalizationInput): void;
+  assertHost(): void;
   capture(primaryPid: number): void;
   bind(): void;
   assert(): void;
   terminate(): never;
+}
+export type PriorMarkerExpectation = Readonly<{ kind: 'absent' } | { kind: 'activated' | 'terminal'; path: string; digest: string }>;
+export interface HostFinalizationInput {
+  readonly requestPath: string;
+  readonly runtime: import('./instance.js').RuntimeRecord;
+  /** Expectation only. Independent PreviousExit and actual post-enrollment
+   * marker binding must still verify it before any engine/data admission. */
+  readonly prior: PriorMarkerExpectation;
 }
 const custodyReceipts = new WeakSet<object>();
 export function assertWatchdogCustody(value: WatchdogCustody): void {
@@ -37,6 +50,10 @@ export interface PlatformPort {
    * No caller-supplied destination or engine/profile payload read is exposed. */
   readLaunchAttempt(lock: HeldLock): string | null;
   writeLaunchAttempt(lock: HeldLock, expected: string | null, next: string): void;
+  /** Prepare once from genuine original leases, then the existing canonical
+   * bootstrap.arm consumes this exact custody/tuple; it never creates another.
+   * Native retained descriptions, not this handover slot, protect the lifetime. */
+  prepareHostCustody(owner: HeldLock, build: HeldLock, bundle: string, snapshotDigest: string, input: HostFinalizationInput): WatchdogCustody;
   prepareWatchdogCustody(owner: HeldLock, build: HeldLock, bundle: string, snapshotDigest: string): WatchdogCustody;
 
   /** Same-parent atomic directory publication; refuses every existing destination. */
@@ -52,6 +69,9 @@ export interface PlatformPort {
   peerIdentity(socketFd: number): ProcessIdentity;
 }
 interface NativeSupport {
+  prepareHostFinalization(handle: object, input: string): void;
+  spawnWatchdog(handle: object): { pid: number; reader: number; writer: number };
+  assertHostFinalization(handle: object): void;
   adoptHostBuild(requestPath: string, guard: string, bundle: string): object;
   continuousTime(): number;
   processProvenance(pid: number): ProcessProvenance | null;
@@ -87,7 +107,7 @@ export function loadPlatform(): PlatformPort {
   let native: NativeSupport;
   try {
     native = createRequire(import.meta.url)(fileURLToPath(new URL('../../native/platform.node', import.meta.url)));
-    for (const name of ['adoptHostBuild', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
+    for (const name of ['prepareHostFinalization', 'spawnWatchdog', 'assertHostFinalization', 'adoptHostBuild', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
       if (typeof native[name] !== 'function') throw new Error('Missing process support');
   } catch { throw unavailable('profile'); }
   const call = <T>(operation: () => T): T => {
@@ -104,6 +124,34 @@ export function loadPlatform(): PlatformPort {
       },
     });
     locks.set(lease, handle); return lease;
+  };
+  let hostHandover: { owner: HeldLock; build: HeldLock; bundle: string; digest: string;
+    custody: WatchdogCustody; consumed: boolean; prepared: boolean } | undefined;
+  const makeCustody = (owner: HeldLock, build: HeldLock, bundle: string, digest: string): WatchdogCustody => {
+      const a = locks.get(owner), b = locks.get(build);
+      if (!a || !b || a === b || !isAbsolute(bundle) || !/^[0-9a-f]{64}$/.test(digest)) throw unavailable('browser');
+      owner.assertIdentity(); build.assertIdentity();
+      const handle = call(() => native.prepareWatchdogCustody(a, b, bundle, digest));
+      const descriptors = call(() => native.custodyDescriptors(handle));
+      if (descriptors.length !== 3 || descriptors.some(fd => !Number.isInteger(fd) || fd < 3) || new Set(descriptors).size !== 3) throw unavailable('browser');
+      const receipt: WatchdogCustody = Object.freeze({ descriptors: Object.freeze([descriptors[0], descriptors[1]] as const), startupDescriptor: descriptors[2],
+        spawn() {
+          const value = call(() => native.spawnWatchdog(handle));
+          if (!value || Object.keys(value).sort().join(',') !== 'pid,reader,writer' ||
+              !Number.isSafeInteger(value.pid) || value.pid <= 1 ||
+              ![value.reader, value.writer].every(fd => Number.isSafeInteger(fd) && fd >= 3) || value.reader === value.writer) throw unavailable('browser');
+          return Object.freeze({ ...value });
+        },
+        prepareHost(input: HostFinalizationInput) {
+          const encoded = JSON.stringify(input);
+          if (!encoded || Buffer.byteLength(encoded) > 16384) throw unavailable('browser');
+          call(() => native.prepareHostFinalization(handle, encoded));
+        },
+        assertHost: () => call(() => native.assertHostFinalization(handle)),
+        capture: (pid: number) => call(() => native.captureWatchdog(handle, pid)),
+        bind: () => call(() => native.watchdogBind(handle)), assert: () => call(() => native.watchdogAssert(handle)),
+        terminate: (): never => { native.terminateProfileNow(handle); throw unavailable('browser'); } });
+      custodyReceipts.add(receipt); return receipt;
   };
   const port: PlatformPort = Object.freeze({
     adoptHostBuild(requestPath: string, guard: string, bundle: string): HeldLock {
@@ -139,18 +187,19 @@ export function loadPlatform(): PlatformPort {
           (expected !== null && (typeof expected !== 'string' || !expected.length || Buffer.byteLength(expected) > 16384))) throw unavailable('profile');
       lock.assertIdentity(); call(() => native.writeLaunchAttempt(handle, expected, next)); lock.assertIdentity();
     },
+    prepareHostCustody(owner: HeldLock, build: HeldLock, bundle: string, digest: string, input: HostFinalizationInput): WatchdogCustody {
+      if (hostHandover || process.type !== 'browser') throw unavailable('browser');
+      const custody = makeCustody(owner, build, bundle, digest);
+      hostHandover = { owner, build, bundle, digest, custody, consumed: false, prepared: false };
+      try { custody.prepareHost(input); hostHandover.prepared = true; return custody; }
+      catch { return custody.terminate(); }
+    },
     prepareWatchdogCustody(owner: HeldLock, build: HeldLock, bundle: string, digest: string): WatchdogCustody {
-      const a = locks.get(owner), b = locks.get(build);
-      if (!a || !b || a === b || !isAbsolute(bundle) || !/^[0-9a-f]{64}$/.test(digest)) throw unavailable('browser');
-      owner.assertIdentity(); build.assertIdentity();
-      const handle = call(() => native.prepareWatchdogCustody(a, b, bundle, digest));
-      const descriptors = call(() => native.custodyDescriptors(handle));
-      if (descriptors.length !== 3 || descriptors.some(fd => !Number.isInteger(fd) || fd < 3) || new Set(descriptors).size !== 3) throw unavailable('browser');
-      const receipt: WatchdogCustody = Object.freeze({ descriptors: Object.freeze([descriptors[0], descriptors[1]] as const), startupDescriptor: descriptors[2],
-        capture: (pid: number) => call(() => native.captureWatchdog(handle, pid)),
-        bind: () => call(() => native.watchdogBind(handle)), assert: () => call(() => native.watchdogAssert(handle)),
-        terminate: (): never => { native.terminateProfileNow(handle); throw unavailable('browser'); } });
-      custodyReceipts.add(receipt); return receipt;
+      if (!hostHandover) return makeCustody(owner, build, bundle, digest);
+      const actual = hostHandover;
+      if (!actual.prepared || actual.consumed || actual.owner !== owner || actual.build !== build || actual.bundle !== bundle || actual.digest !== digest)
+        throw unavailable('browser');
+      owner.assertIdentity(); build.assertIdentity(); actual.consumed = true; return actual.custody;
     },
     publishDirectory(source: string, destination: string): void {
       if (![source, destination].every(path => isAbsolute(path) && !path.includes('\0'))) throw unavailable('profile');

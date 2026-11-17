@@ -3,6 +3,8 @@
 #include <node_api.h>
 #include "../../watchdog/boundary.hpp"
 #include "attempt.hpp"
+#include "../../watchdog/exit.hpp"
+#include <spawn.h>
 #include <set>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -349,7 +351,11 @@ static napi_value adoptHostBuild(napi_env env,napi_callback_info info) {
 
 // Process-lifetime native custody is intentionally not garbage-collected. Once
 // created it has no unlock/disarm export; retained originals survive JS failure.
-struct Custody { arbol_boundary::Context context; int capsule=-1; bool bound = false; };
+struct Custody {
+  arbol_boundary::Context context; int capsule=-1; bool bound=false,continuousBuild=false,hostRequired=false,spawned=false;
+  arbol_exit::HostCapability finalization;
+  int reader=-1,writer=-1; bool endpointsPublished=false;
+};
 static std::set<Custody*> nativeCustodies;
 static bool custodyAttempted = false;
 static Custody* custodyArgument(napi_env env, napi_value value) {
@@ -370,6 +376,7 @@ static napi_value prepareWatchdogCustody(napi_env env, napi_callback_info info) 
       !string(env,args[2],bundle) || napi_get_value_string_utf8(env,args[3],digest,sizeof(digest),&length) != napi_ok || length != 64) return fail(env);
   for (size_t i=0;i<64;++i) if (!((digest[i]>='0' && digest[i]<='9') || (digest[i]>='a' && digest[i]<='f'))) return fail(env);
   auto* c = new Custody; c->context.bundle=bundle; c->context.digest=digest;
+  c->continuousBuild=static_cast<HeldLock*>(b)->retained;
   c->context.owner=duplicateHeld(static_cast<HeldLock*>(a)); c->context.build=duplicateHeld(static_cast<HeldLock*>(b));
   c->context.session=getsid(0);
   bool valid=arbol_boundary::observe(getpid(),c->context.main)==1 && c->context.initial();
@@ -382,17 +389,84 @@ static napi_value custodyDescriptors(napi_env env,napi_callback_info info) {
   napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg); if(!c) return fail(env);
   napi_value out; if(napi_create_array_with_length(env,3,&out)!=napi_ok || napi_set_element(env,out,0,number(env,c->context.owner.fd))!=napi_ok || napi_set_element(env,out,1,number(env,c->context.build.fd))!=napi_ok || napi_set_element(env,out,2,number(env,c->capsule))!=napi_ok) return fail(env); return out;
 }
+static napi_value prepareHostFinalization(napi_env env,napi_callback_info info) {
+  napi_value args[2]; size_t n=2; std::string input;
+  if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok||n!=2||!boundedText(env,args[1],input)) return fail(env);
+  auto* c=custodyArgument(env,args[0]); if(!c||c->hostRequired||c->spawned||!c->continuousBuild) return fail(env);
+  c->hostRequired=true; // a failed host preparation cannot fall back to legacy
+  @autoreleasepool { @try {
+    if(!c->finalization.prepare(c->context,input,arbol_boundary::clockMs()+1000)) return fail(env);
+    napi_value out; napi_get_undefined(env,&out); return out;
+  } @catch(NSException*) { return fail(env); } }
+}
+static bool nativePipe(int (&ends)[2]) {
+  int raw[2]; if(pipe(raw)) return false;
+  ends[0]=fcntl(raw[0],F_DUPFD_CLOEXEC,10); ends[1]=fcntl(raw[1],F_DUPFD_CLOEXEC,10);
+  close(raw[0]); close(raw[1]);
+  if(ends[0]<0||ends[1]<0) { if(ends[0]>=0) close(ends[0]); if(ends[1]>=0) close(ends[1]); return false; } return true;
+}
+static napi_value spawnWatchdog(napi_env env,napi_callback_info info) {
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg);
+  if(!c||c->spawned||c->bound||(c->continuousBuild&&!c->hostRequired)||(c->hostRequired&&!c->finalization.present())) return fail(env);
+  c->spawned=true;
+  @autoreleasepool { @try {
+    arbol_attempt::Claim claim; std::string old; NSDictionary* attempt=nil;
+    if(c->hostRequired) {
+      if(!c->finalization.currentAttempt(c->context,claim,old,attempt,arbol_boundary::clockMs()+1000)||
+         ![attempt[@"phase"] isEqual:@"claimed"]||![attempt[@"stage"] isEqual:@"untransferred"]||
+         [attempt[@"expires"] doubleValue]<=arbol_boundary::clockMs()) return fail(env);
+      NSMutableDictionary* next=[attempt mutableCopy]; next[@"stage"]=@"transferring";
+      if(!arbol_attempt::transition(attempt,next,arbol_attempt::Role::engine)||
+         !arbol_attempt::replace(claim.at,old,false,arbol_attempt::bytes(next))) return fail(env);
+      c->finalization.shared()->transfer.store(1,std::memory_order_release);
+    }
+    if(!c->context.initial()) return fail(env);
+    int down[2]{-1,-1},up[2]{-1,-1};
+    if(!nativePipe(down)) return fail(env);
+    if(!nativePipe(up)) { close(down[0]); close(down[1]); return fail(env); }
+    c->reader=up[0]; c->writer=down[1];
+    posix_spawn_file_actions_t actions; posix_spawnattr_t attr;
+    bool actionsReady=!posix_spawn_file_actions_init(&actions),attrReady=!posix_spawnattr_init(&attr);
+    bool ok=actionsReady&&attrReady;
+    if(ok) ok=!posix_spawn_file_actions_adddup2(&actions,c->context.owner.fd,3)&&!posix_spawn_file_actions_adddup2(&actions,c->context.build.fd,4)&&
+      !posix_spawn_file_actions_adddup2(&actions,c->capsule,5)&&!posix_spawn_file_actions_adddup2(&actions,down[0],0)&&
+      !posix_spawn_file_actions_adddup2(&actions,up[1],1)&&!posix_spawn_file_actions_addopen(&actions,2,"/dev/null",O_WRONLY,0)&&
+      !posix_spawnattr_setflags(&attr,POSIX_SPAWN_CLOEXEC_DEFAULT);
+    if(ok&&c->hostRequired) ok=!posix_spawn_file_actions_adddup2(&actions,c->finalization.capsule(),8)&&
+      !posix_spawn_file_actions_adddup2(&actions,c->finalization.stateDescriptor(),9);
+    std::string helper=c->context.helper(); char* argv[]={helper.data(),(char*)"--watchdog",c->hostRequired?(char*)"--host-finalization":nullptr,nullptr};
+    char* environment[]={(char*)"PATH=/usr/bin:/bin",nullptr}; pid_t pid=0;
+    int result=ok?posix_spawn(&pid,helper.c_str(),&actions,&attr,argv,environment):EINVAL;
+    if(actionsReady) posix_spawn_file_actions_destroy(&actions); if(attrReady) posix_spawnattr_destroy(&attr);
+    close(down[0]); close(up[1]);
+    if(result) return fail(env);
+    arbol_boundary::Info birth{}; arbol_boundary::Identity original;
+    if(arbol_boundary::observe(pid,original,&birth)!=1) return fail(env);
+    c->context.primary=original; // retain the actual child even if validation fails
+    if(birth.unique.parent!=c->context.main.start||birth.unique.originalParentVersion!=c->context.main.version||
+       (!c->context.monitor(original,true)&&!c->context.monitor(original,false))) return fail(env);
+    if(c->hostRequired&&!c->finalization.shared()->primary.bind(original,arbol_boundary::clockMs()+1000)) return fail(env);
+    // The exact child executes cleanup even if its producer never resumes.
+    // Its one legal setpgid may occur before/between the parent observations;
+    // neither group alone is a substitute for the later actual C/G/J proof.
+    for(int fd : {c->reader,c->writer}) { int flags=fcntl(fd,F_GETFL); if(flags<0||fcntl(fd,F_SETFL,flags|O_NONBLOCK)) return fail(env); }
+    c->endpointsPublished=true; napi_value out;
+    if(napi_create_object(env,&out)!=napi_ok||!property(env,out,"pid",number(env,pid))||
+       !property(env,out,"reader",number(env,c->reader))||!property(env,out,"writer",number(env,c->writer))) return fail(env);
+    return out;
+  } @catch(NSException*) { return fail(env); } }
+}
 static napi_value captureWatchdog(napi_env env,napi_callback_info info) {
   napi_value args[2]; size_t n=2; int pid; arbol_boundary::Info detail{}; arbol_boundary::Identity child; std::string path;
   if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok||n!=2||!integer(env,args[1],&pid)) return fail(env);
-  auto* c=custodyArgument(env,args[0]); if(!c||c->bound||arbol_boundary::observe(pid,child,&detail)!=1||child.uid!=geteuid()||
+  auto* c=custodyArgument(env,args[0]); if(!c||!c->spawned||c->bound||arbol_boundary::observe(pid,child,&detail)!=1||child.uid!=geteuid()||
     detail.unique.parent!=c->context.main.start||!arbol_boundary::executable(child,path)||path!=c->context.helper()||!arbol_boundary::signature(path,false)) return fail(env);
   if(c->context.primary.pid&&!arbol_boundary::same(c->context.primary,child)) return fail(env);
   c->context.primary=child; napi_value out; napi_get_undefined(env,&out); return out;
 }
 static napi_value watchdogBind(napi_env env,napi_callback_info info) {
   napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg);
-  if(!c || c->bound || !c->context.monitor(c->context.primary,false)) return fail(env);
+  if(!c || !c->spawned || c->bound || !c->context.monitor(c->context.primary,false)) return fail(env);
   std::vector<pid_t> pids(4097); int bytes=proc_listpids(PROC_PGRP_ONLY,c->context.main.group,pids.data(),(int)(pids.size()*sizeof(pid_t))); int found=0;
   if(bytes<0 || bytes%sizeof(pid_t) || (size_t)bytes>=pids.size()*sizeof(pid_t)) return fail(env);
   for(int i=0;i<bytes/(int)sizeof(pid_t);++i) { arbol_boundary::Identity id; arbol_boundary::Info detail{}; std::string path;
@@ -403,11 +477,29 @@ static napi_value watchdogBind(napi_env env,napi_callback_info info) {
   }
   std::vector<arbol_boundary::Identity> engines;
   if(found!=1 || !c->context.census(engines) || !arbol_boundary::lockIdentity(c->context.owner) || !arbol_boundary::lockIdentity(c->context.build)) return fail(env);
+  if(c->hostRequired) {
+    if(!c->finalization.ready(c->context)) return fail(env);
+    arbol_attempt::Claim claim; std::string raw; NSDictionary* current=nil;
+    if(!c->finalization.currentAttempt(c->context,claim,raw,current,arbol_boundary::clockMs()+1000)||
+       ![current[@"phase"] isEqual:@"claimed"]||![current[@"stage"] isEqual:@"transferring"]||
+       [current[@"expires"] doubleValue]<=arbol_boundary::clockMs()) return fail(env);
+    NSMutableDictionary* next=[current mutableCopy]; next[@"stage"]=@"retained";
+    if(!arbol_attempt::transition(current,next,arbol_attempt::Role::engine)||
+       !arbol_attempt::replace(claim.at,raw,false,arbol_attempt::bytes(next))) return fail(env);
+    c->finalization.shared()->transfer.store(2,std::memory_order_release);
+  }
   c->bound=true; napi_value out; napi_get_undefined(env,&out); return out;
 }
 static napi_value watchdogAssert(napi_env env,napi_callback_info info) {
   napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg);
   if(!c || !c->bound || arbol_boundary::current(c->context.main)!=1 || arbol_boundary::current(c->context.primary)!=1 || arbol_boundary::current(c->context.custody)!=1 || !arbol_boundary::lockIdentity(c->context.owner) || !arbol_boundary::lockIdentity(c->context.build)) return fail(env);
+  if(c->hostRequired && (!c->finalization.ready(c->context)||!c->finalization.controls(c->context,arbol_boundary::clockMs()+100))) return fail(env);
+  napi_value out; napi_get_undefined(env,&out); return out;
+}
+static napi_value assertHostFinalization(napi_env env,napi_callback_info info) {
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg);
+  if(!c||!c->hostRequired||!c->bound||!c->finalization.ready(c->context)||
+     c->finalization.shared()->transfer.load(std::memory_order_acquire)!=2) return fail(env);
   napi_value out; napi_get_undefined(env,&out); return out;
 }
 
@@ -433,6 +525,9 @@ static napi_value terminateProfileNow(napi_env env,napi_callback_info info) {
 }
 static napi_value init(napi_env env, napi_value exports) {
   napi_property_descriptor properties[] = {
+    {"prepareHostFinalization",nullptr,prepareHostFinalization,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"spawnWatchdog",nullptr,spawnWatchdog,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"assertHostFinalization",nullptr,assertHostFinalization,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"adoptHostBuild",nullptr,adoptHostBuild,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"continuousTime",nullptr,continuousTime,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"processProvenance",nullptr,processProvenance,nullptr,nullptr,nullptr,napi_default,nullptr},
