@@ -11,7 +11,7 @@ import type { InspectionFrame, PageReadiness } from './readiness.js';
 import { assertPageSurface, type PageSurface } from './windows.js';
 import type { TabTarget } from './tabs.js';
 
-export type UserPermission = 'geolocation' | 'notifications' | 'clipboard-read' | 'clipboard-sanitized-write' |
+export type UserPermission = 'geolocation' | 'notifications' | 'clipboard-read' |
   'fullscreen' | 'pointerLock';
 export interface UserPermissionScope {
   readonly target: TabTarget; readonly page: PageSurface; readonly document: HostDocument;
@@ -35,7 +35,9 @@ interface PageRecord {
   active: boolean;
 }
 const installed = new WeakSet<object>();
-const userPermissions = new Set<string>(['geolocation', 'notifications', 'clipboard-read', 'clipboard-sanitized-write', 'fullscreen', 'pointerLock']);
+// BRW-D36 denies write consent even to a current user-controlled tab. Read
+// consent remains independent; no policy callback can approve clipboard writes.
+const userPermissions = new Set<string>(['geolocation', 'notifications', 'clipboard-read', 'fullscreen', 'pointerLock']);
 const chooserKey = (frame: InspectionFrame) => JSON.stringify([frame.session ?? null, frame.frameId]);
 function unavailableBoundary(): BrowserFailure {
   return new BrowserFailure({ code: 'unsupported', message: 'The required agent capability boundary is unavailable.', retryable: false,
@@ -48,7 +50,8 @@ function acknowledge(value: unknown): void {
 /** Source contribution for ABR-30 composition, never an installed Session or a
  * successful admission default. In particular, consent handlers do NOT enforce
  * Chromium's transient-activation synchronous script copy/cut path. That real
- * mechanism is still missing and assertAgentAdmission explicitly refuses it. */
+ * process-wide protection must come from the native provider. Until verified,
+ * assertAgentAdmission explicitly refuses agent admission. */
 export class HostCapabilities {
   private readonly records = new Map<TabTarget, PageRecord>();
   private readonly contents = new WeakMap<WebContents, PageRecord>();
