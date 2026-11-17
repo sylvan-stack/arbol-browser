@@ -206,6 +206,9 @@ export class ActionQueue implements HandoffOperations {
           const code = current instanceof BrowserFailure ? current.detail.code : 'internal'; reject(this.failure(task, code));
         }
       } finally {
+        // A sequence reserved before its first actual side effect is only a
+        // preparation marker. It cannot strand the tab after known no issue.
+        if (!task.dispatched && task.issued.size === 0) task.sequences.clear();
         task.workDone = true; task.cleanup(); this.safe(task);
         if (!task.mutation) { if (task.countedRead) { --this.reads; if (task.screenshot) --this.screenshots; } }
         else {
@@ -297,6 +300,15 @@ export class ActionQueue implements HandoffOperations {
     return task ? Object.freeze({ target: task.stamp.target, mutation: task.mutation,
       ...(task.action ? { action: task.action } : {}),
       dispatchOutcome: task.settled ? 'completed' : task.dispatched ? 'outcome_unknown' : 'not_dispatched' }) : undefined;
+  }
+  /** Read only the authentic task behind this execution. Providers cannot
+   * manufacture terminal queue state with a completed-shaped result. */
+  settledStamp(execution: ActionExecution): AuthorityStamp {
+    const task = this.executions.get(execution);
+    if (!task || !task.mutation || !task.started || task.workDone || task.retired || !task.terminal || !task.settled ||
+        !task.dispatched || task.issued.size || task.sequences.size || task.controller.signal.aborted || performance.now() >= task.deadline)
+      throw task ? this.failure(task, 'control_refused') : refused('control_refused');
+    const stamp = task.resultStamp ?? task.stamp; this.authority.check(stamp, true); return stamp;
   }
   cancel(recipient: string, request: string): void {
     const task = [...this.tasks].find(task => task.stamp.attachment.id === recipient && task.request === request);

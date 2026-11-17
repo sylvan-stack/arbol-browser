@@ -7,11 +7,45 @@ import type { PageReadiness } from './readiness.js';
 import { HostSecretFields, SensitiveFields } from '../content/sensitive.js';
 import { SnapshotInspection } from '../content/snapshot.js';
 import { inspectScreenshot } from '../content/capture.js';
+import { navigateTrusted } from '../automation/navigation.js';
+import { clickTrusted } from '../automation/click.js';
+import { pressTrusted } from '../automation/keyboard.js';
+import { typeTrusted } from '../automation/typing.js';
+import { scrollTrusted } from '../automation/scroll.js';
+import { dragTrusted } from '../automation/drag.js';
+import { retireUnsettled, settledResult } from '../automation/outcomes.js';
 
 export type HostToolOperation = OwnershipOperations['agent'];
 export interface HostToolProviders {
   readonly inspection?: HostToolOperation;
   readonly mutation?: HostToolOperation;
+}
+/** ABR-30 composes this callback with createInspectionTools.agent inside the
+ * genuine OwnershipOperations.agent. Open/Close/release/cancel keep their
+ * existing protected ownership ports; this contribution enables no host. */
+export function createTrustedActionTools(inspection: SnapshotInspection): { readonly agent: HostToolOperation; close(): void } {
+  let closed = false;
+  const agent: HostToolOperation = async (request, execution) => {
+    if (closed) throw unavailable('browser');
+    const params = request.params;
+    try {
+      let result;
+      switch (params.name) {
+        case 'browser_navigate': result = await navigateTrusted(inspection, execution, params.arguments); break;
+        case 'browser_click': result = await clickTrusted(inspection, execution, params.arguments); break;
+        case 'browser_press_key': result = await pressTrusted(inspection, execution, params.arguments); break;
+        case 'browser_type': result = await typeTrusted(inspection, execution, params.arguments); break;
+        case 'browser_scroll': result = await scrollTrusted(inspection, execution, params.arguments); break;
+        case 'browser_drag': result = await dragTrusted(inspection, execution, params.arguments); break;
+        default: throw unavailable('browser');
+      }
+      if (closed) throw unavailable('browser');
+      return settledResult(inspection, execution, result);
+    } catch (error) {
+      retireUnsettled(inspection, execution, request.id); throw error;
+    }
+  };
+  return Object.freeze({ agent, close() { closed = true; } });
 }
 /** Install through createHostToolOperations.inspection inside the genuine
  * OwnershipOperations.agent callback. ABR-30 owns packaged host composition;
