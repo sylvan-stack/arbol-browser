@@ -23,6 +23,9 @@ export interface WatchdogCustody {
   spawn(): Readonly<{ pid: number; reader: number; writer: number }>;
   prepareHost(input: HostFinalizationInput): void;
   assertHost(): void;
+  /** Native shared attribution precedes any JS/native cleanup; no raw flags. */
+  latchFatal(): void;
+  now(): number;
   capture(primaryPid: number): void;
   bind(): void;
   assert(): void;
@@ -72,6 +75,7 @@ interface NativeSupport {
   prepareHostFinalization(handle: object, input: string): void;
   spawnWatchdog(handle: object): { pid: number; reader: number; writer: number };
   assertHostFinalization(handle: object): void;
+  latchWatchdogFatal(handle: object): void;
   adoptHostBuild(requestPath: string, guard: string, bundle: string): object;
   continuousTime(): number;
   processProvenance(pid: number): ProcessProvenance | null;
@@ -107,7 +111,7 @@ export function loadPlatform(): PlatformPort {
   let native: NativeSupport;
   try {
     native = createRequire(import.meta.url)(fileURLToPath(new URL('../../native/platform.node', import.meta.url)));
-    for (const name of ['prepareHostFinalization', 'spawnWatchdog', 'assertHostFinalization', 'adoptHostBuild', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
+    for (const name of ['latchWatchdogFatal', 'prepareHostFinalization', 'spawnWatchdog', 'assertHostFinalization', 'adoptHostBuild', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
       if (typeof native[name] !== 'function') throw new Error('Missing process support');
   } catch { throw unavailable('profile'); }
   const call = <T>(operation: () => T): T => {
@@ -148,6 +152,8 @@ export function loadPlatform(): PlatformPort {
           call(() => native.prepareHostFinalization(handle, encoded));
         },
         assertHost: () => call(() => native.assertHostFinalization(handle)),
+        latchFatal: () => call(() => native.latchWatchdogFatal(handle)),
+        now: () => call(() => native.continuousTime()),
         capture: (pid: number) => call(() => native.captureWatchdog(handle, pid)),
         bind: () => call(() => native.watchdogBind(handle)), assert: () => call(() => native.watchdogAssert(handle)),
         terminate: (): never => { native.terminateProfileNow(handle); throw unavailable('browser'); } });

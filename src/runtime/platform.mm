@@ -351,10 +351,30 @@ static napi_value adoptHostBuild(napi_env env,napi_callback_info info) {
 
 // Process-lifetime native custody is intentionally not garbage-collected. Once
 // created it has no unlock/disarm export; retained originals survive JS failure.
+struct RetainedPipe {
+  int fd=-1,access=-1; struct stat identity{};
+  bool retain(int actual,int direction) {
+    if(fd>=0) return false; struct stat before{},after{};
+    int flags=fcntl(actual,F_GETFL);
+    if(flags<0||(flags&O_ACCMODE)!=direction||fstat(actual,&before)||!S_ISFIFO(before.st_mode)) return false;
+    fd=fcntl(actual,F_DUPFD_CLOEXEC,10); access=direction;
+    if(fd<0||fstat(fd,&after)||!S_ISFIFO(after.st_mode)||before.st_dev!=after.st_dev||before.st_ino!=after.st_ino||
+       (fcntl(fd,F_GETFL)&O_ACCMODE)!=direction) return false;
+    identity=after; return true;
+  }
+  bool valid() const {
+    struct stat now{}; int flags=fcntl(fd,F_GETFL),descriptorFlags=fcntl(fd,F_GETFD);
+    return fd>=3&&flags>=0&&(flags&O_ACCMODE)==access&&descriptorFlags>=0&&(descriptorFlags&FD_CLOEXEC)&&
+      !fstat(fd,&now)&&S_ISFIFO(now.st_mode)&&now.st_dev==identity.st_dev&&now.st_ino==identity.st_ino;
+  }
+  // No close/destructor/FD export. These exact native-created original pipe
+  // descriptions last until actual main-process death, not Node teardown.
+};
 struct Custody {
   arbol_boundary::Context context; int capsule=-1; bool bound=false,continuousBuild=false,hostRequired=false,spawned=false;
   arbol_exit::HostCapability finalization;
   int reader=-1,writer=-1; bool endpointsPublished=false;
+  RetainedPipe retainedReader,retainedWriter;
 };
 static std::set<Custody*> nativeCustodies;
 static bool custodyAttempted = false;
@@ -425,6 +445,9 @@ static napi_value spawnWatchdog(napi_env env,napi_callback_info info) {
     if(!nativePipe(down)) return fail(env);
     if(!nativePipe(up)) { close(down[0]); close(down[1]); return fail(env); }
     c->reader=up[0]; c->writer=down[1];
+    // Provenance is the actual pipe() pair owned by this one native spawn,
+    // never a caller-provided numeric FD whose fstat merely looks plausible.
+    if(!c->retainedReader.retain(c->reader,O_RDONLY)||!c->retainedWriter.retain(c->writer,O_WRONLY)) return fail(env);
     posix_spawn_file_actions_t actions; posix_spawnattr_t attr;
     bool actionsReady=!posix_spawn_file_actions_init(&actions),attrReady=!posix_spawnattr_init(&attr);
     bool ok=actionsReady&&attrReady;
@@ -459,14 +482,18 @@ static napi_value spawnWatchdog(napi_env env,napi_callback_info info) {
 static napi_value captureWatchdog(napi_env env,napi_callback_info info) {
   napi_value args[2]; size_t n=2; int pid; arbol_boundary::Info detail{}; arbol_boundary::Identity child; std::string path;
   if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok||n!=2||!integer(env,args[1],&pid)) return fail(env);
-  auto* c=custodyArgument(env,args[0]); if(!c||!c->spawned||c->bound||arbol_boundary::observe(pid,child,&detail)!=1||child.uid!=geteuid()||
-    detail.unique.parent!=c->context.main.start||!arbol_boundary::executable(child,path)||path!=c->context.helper()||!arbol_boundary::signature(path,false)) return fail(env);
-  if(c->context.primary.pid&&!arbol_boundary::same(c->context.primary,child)) return fail(env);
-  c->context.primary=child; napi_value out; napi_get_undefined(env,&out); return out;
+  auto* c=custodyArgument(env,args[0]); if(!c||!c->spawned||!c->endpointsPublished||c->bound||!c->context.primary.pid||pid!=c->context.primary.pid||
+    arbol_boundary::observe(pid,child,&detail)!=1||!arbol_boundary::same(c->context.primary,child)||child.uid!=geteuid()||
+    detail.unique.parent!=c->context.main.start||detail.unique.originalParentVersion!=c->context.main.version||
+    !arbol_boundary::executable(child,path)||path!=c->context.helper()||!arbol_boundary::signature(path,false)||
+    (!c->context.monitor(child,true)&&!c->context.monitor(child,false))) return fail(env);
+  // Confirmation only: never replace the native spawn's original from a PID.
+  napi_value out; napi_get_undefined(env,&out); return out;
 }
 static napi_value watchdogBind(napi_env env,napi_callback_info info) {
   napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg);
-  if(!c || !c->spawned || c->bound || !c->context.monitor(c->context.primary,false)) return fail(env);
+  if(!c || !c->spawned || !c->endpointsPublished || c->bound || !c->retainedReader.valid()||!c->retainedWriter.valid()||
+     !c->context.monitor(c->context.primary,false)) return fail(env);
   std::vector<pid_t> pids(4097); int bytes=proc_listpids(PROC_PGRP_ONLY,c->context.main.group,pids.data(),(int)(pids.size()*sizeof(pid_t))); int found=0;
   if(bytes<0 || bytes%sizeof(pid_t) || (size_t)bytes>=pids.size()*sizeof(pid_t)) return fail(env);
   for(int i=0;i<bytes/(int)sizeof(pid_t);++i) { arbol_boundary::Identity id; arbol_boundary::Info detail{}; std::string path;
@@ -493,7 +520,12 @@ static napi_value watchdogBind(napi_env env,napi_callback_info info) {
 static napi_value watchdogAssert(napi_env env,napi_callback_info info) {
   napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg);
   if(!c || !c->bound || arbol_boundary::current(c->context.main)!=1 || arbol_boundary::current(c->context.primary)!=1 || arbol_boundary::current(c->context.custody)!=1 || !arbol_boundary::lockIdentity(c->context.owner) || !arbol_boundary::lockIdentity(c->context.build)) return fail(env);
-  if(c->hostRequired && (!c->finalization.ready(c->context)||!c->finalization.controls(c->context,arbol_boundary::clockMs()+100))) return fail(env);
+  if(!c->retainedReader.valid()||!c->retainedWriter.valid()) return fail(env);
+  if(c->hostRequired) {
+    auto* state=c->finalization.shared(); uint64_t reasons=state->fatal.load(std::memory_order_acquire),cutoff=state->fatalCutoffUs.load(std::memory_order_acquire);
+    if((reasons&~arbol_exit::admissionLoss)||(reasons&&(!cutoff||arbol_boundary::clockMs()*1000>=cutoff))||
+       !c->finalization.held(c->context)||!c->finalization.controls(c->context,arbol_boundary::clockMs()+100)) return fail(env);
+  }
   napi_value out; napi_get_undefined(env,&out); return out;
 }
 static napi_value assertHostFinalization(napi_env env,napi_callback_info info) {
@@ -502,12 +534,20 @@ static napi_value assertHostFinalization(napi_env env,napi_callback_info info) {
      c->finalization.shared()->transfer.load(std::memory_order_acquire)!=2) return fail(env);
   napi_value out; napi_get_undefined(env,&out); return out;
 }
+static napi_value latchWatchdogFatal(napi_env env,napi_callback_info info) {
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg);
+  if(!c||getpid()!=c->context.main.pid||arbol_boundary::current(c->context.main)!=1) return fail(env);
+  if(c->finalization.present()) c->finalization.shared()->declareFatal();
+  napi_value out; napi_get_undefined(env,&out); return out;
+}
 
 // No application/native-input cleanup is entered here. Both native lock
 // descriptions remain retained for the lifetime of this nonreturning path.
 static napi_value terminateProfileNow(napi_env env,napi_callback_info info) {
   napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg);
   if(!c || getpid()!=c->context.main.pid || arbol_boundary::current(c->context.main)!=1) return fail(env);
+  // Irreversible attribution precedes discovery, retirement or any signal.
+  if(c->finalization.present()) c->finalization.shared()->poison(arbol_exit::protocolLoss|arbol_exit::forced);
   for(;;) {
     (void)c->context.discoverCustody();
     c->context.enforce(true);
@@ -528,6 +568,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"prepareHostFinalization",nullptr,prepareHostFinalization,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"spawnWatchdog",nullptr,spawnWatchdog,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"assertHostFinalization",nullptr,assertHostFinalization,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"latchWatchdogFatal",nullptr,latchWatchdogFatal,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"adoptHostBuild",nullptr,adoptHostBuild,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"continuousTime",nullptr,continuousTime,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"processProvenance",nullptr,processProvenance,nullptr,nullptr,nullptr,napi_default,nullptr},

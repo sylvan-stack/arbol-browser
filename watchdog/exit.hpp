@@ -7,6 +7,8 @@
 #include <sys/sysctl.h>
 #include <atomic>
 #include <new>
+#include <thread>
+#include <memory>
 namespace arbol_exit {
 using arbol_boundary::Identity;
 class ExitWatch {
@@ -25,11 +27,11 @@ public:
     queue_=kqueue(); if(queue_<0 || fcntl(queue_,F_SETFD,FD_CLOEXEC)) { uncertain_=true; return false; }
     struct kevent change{},receipt{}; timespec zero{};
     EV_SET(&change,(uintptr_t)original.pid,EVFILT_PROC,EV_ADD|EV_ENABLE|EV_CLEAR|EV_RECEIPT,
-      NOTE_EXIT|NOTE_EXITSTATUS,0,this);
+      NOTE_EXIT|NOTE_EXITSTATUS|NOTE_EXEC,0,this);
     int count=kevent(queue_,&change,1,&receipt,1,&zero);
     constexpr uint16_t receiptFlags=EV_ADD|EV_ENABLE|EV_CLEAR|EV_RECEIPT|EV_ERROR;
     if(count!=1 || receipt.ident!=(uintptr_t)original.pid || receipt.filter!=EVFILT_PROC ||
-       !(receipt.flags&EV_ERROR) || (receipt.flags&~receiptFlags) || receipt.fflags!=(NOTE_EXIT|NOTE_EXITSTATUS) ||
+       !(receipt.flags&EV_ERROR) || (receipt.flags&~receiptFlags) || receipt.fflags!=(NOTE_EXIT|NOTE_EXITSTATUS|NOTE_EXEC) ||
        receipt.data!=0 || receipt.udata!=this ||
        arbol_boundary::current(original)!=1) { uncertain_=true; return false; }
     original_=original; enrolled_=true; return true;
@@ -47,6 +49,8 @@ public:
     constexpr uint16_t permitted=EV_ADD|EV_ENABLE|EV_CLEAR|EV_ONESHOT|EV_EOF;
     if(event.ident!=(uintptr_t)original_.pid || event.filter!=EVFILT_PROC || event.udata!=this ||
        (event.flags&~permitted) || !(event.flags&EV_EOF) || !(event.flags&EV_ONESHOT) ||
+       // A separate or coalesced NOTE_EXEC is irreversible identity drift,
+       // including exec+exit between polls. Never adopt its later zero status.
        event.fflags!=(NOTE_EXIT|NOTE_EXITSTATUS) || event.data<0 || event.data>INT_MAX) {
       uncertain_=true; return false;
     }
@@ -62,6 +66,40 @@ public:
   double observedAt() const { return observed_; }
   int status() const { return status_; }
   const Identity& original() const { return original_; }
+};
+
+/** An exiting-list query can wait on another zombie/reap controller. It never
+ * runs on a monitor's protocol thread and supplies no completion/flush proof.
+ * The exact enrolled NOTE_EXIT and original fixed deadline remain mandatory. */
+class KernelExitProbe {
+public:
+  enum Result { pending=-1,uncertain=-2,live=0,exiting=1,absent=2 };
+private:
+  struct Answer { std::atomic<int> result{pending}; };
+  std::shared_ptr<Answer> answer_;
+public:
+  bool start(const Identity& original) {
+    if(answer_) return false;
+    answer_=std::make_shared<Answer>(); auto answer=answer_;
+    try { std::thread([answer,original] {
+      arbol_boundary::Info info{}; errno=0;
+      // The pinned private combined identity layout is already used by the
+      // Native boundary. Nonzero arg additionally includes exiting/zombie
+      // lookup; SDK PROC_FLAG_INEXIT is exit-in-progress, never a flush receipt.
+      int n=proc_pidinfo(original.pid,18,1,&info,sizeof(info)); int result=uncertain;
+      if(!n&&errno==ESRCH) result=absent;
+      else if(n==sizeof(info)&&info.bsd.pbi_pid==(uint32_t)original.pid&&info.unique.start) {
+        Identity actual{original.pid,info.unique.start,info.unique.version,info.bsd.pbi_uid,info.bsd.pbi_pgid};
+        if(actual.start!=original.start) result=absent;
+        else if(arbol_boundary::same(actual,original)&&actual.group==original.group)
+          result=(info.bsd.pbi_flags&PROC_FLAG_INEXIT)?exiting:live;
+      }
+      answer->result.store(result,std::memory_order_release);
+    }).detach(); } catch(...) { answer_->result.store(uncertain,std::memory_order_release); return false; }
+    return true;
+  }
+  Result result() const { return answer_?(Result)answer_->result.load(std::memory_order_acquire):pending; }
+  bool started() const { return (bool)answer_; }
 };
 
 enum FatalReason : uint64_t { protocolLoss=1,forced=2,identityLoss=4,watchLoss=8,storageLoss=16,admissionLoss=32,peerLoss=64 };
@@ -88,12 +126,25 @@ struct MarkerBinding {
 struct SharedState {
   char magic[8]={'A','B','R','2','9','S','1','\0'},capabilityDigest[65]{};
   uint64_t bytes=sizeof(SharedState); std::atomic<uint64_t> fatal{0};
+  std::atomic<uint64_t> fatalCutoffUs{0};
   IdentitySlot main,primary,custody;
   std::atomic<uint32_t> enrolled{0},transfer{0},mutation{0},markerBound{0},admitted{0};
   std::atomic<uint32_t> cookieAcknowledged{0},domRequested{0},quitRequested{0},retiredPages{0};
   std::atomic<uint32_t> primaryConsent{0},custodyConsent{0};
+  std::atomic<uint32_t> ordinaryPostExitEligible{0};
+  // Verified native mutation preparation publishes this before permission to
+  // write. A later independent holder can authenticate an uncertain resulting
+  // dirty marker; it never predicts or grants its replacement inode.
+  char expectedMarkerDigest[65]{};
   MarkerBinding marker{};
   void poison(uint64_t reason) { fatal.fetch_or(reason,std::memory_order_acq_rel); }
+  void declareFatal() {
+    uint64_t cutoff=(uint64_t)((arbol_boundary::clockMs()+1000)*1000),old=fatalCutoffUs.load(std::memory_order_acquire);
+    while((!old||cutoff<old)&&!fatalCutoffUs.compare_exchange_weak(old,cutoff,std::memory_order_acq_rel)) {}
+    // Publish the bound before the admission loss. This preserves F's existing
+    // one-second forwarding/receipt window; a genuine hard loss remains sooner.
+    poison(admissionLoss);
+  }
 };
 static_assert(std::atomic<uint64_t>::is_always_lock_free && std::atomic<uint32_t>::is_always_lock_free);
 inline bool anonymousFile(int fd,bool writable,size_t size) {
@@ -298,12 +349,13 @@ public:
       child.st_dev==root.st_dev&&[fileIdentity(child) isEqual:value_[@"receiptDirectory"][@"identity"]];
     if(close(fd)) valid=false; return valid;
   }
-  bool ready(arbol_boundary::Context& c) const {
-    return present()&&state_->fatal.load(std::memory_order_acquire)==0&&state_->enrolled.load(std::memory_order_acquire)==7&&
+  bool held(arbol_boundary::Context& c) const {
+    return present()&&state_->enrolled.load(std::memory_order_acquire)==7&&
       state_->main.is(c.main)&&state_->primary.is(c.primary)&&state_->custody.is(c.custody)&&
       arbol_boundary::current(c.main)==1&&arbol_boundary::current(c.primary)==1&&arbol_boundary::current(c.custody)==1&&
       getpgid(c.main.pid)==(int)c.main.group&&getsid(c.main.pid)==c.session&&c.primaryMonitor()&&c.monitor(c.custody,true)&&
       arbol_boundary::lockIdentity(c.owner)&&arbol_boundary::lockIdentity(c.build)&&metadata();
   }
+  bool ready(arbol_boundary::Context& c) const { return held(c)&&state_->fatal.load(std::memory_order_acquire)==0; }
 };
 } // namespace arbol_exit

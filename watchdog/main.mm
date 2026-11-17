@@ -55,18 +55,22 @@ static Context record(const std::string& raw,bool primary,Identity& producer) {
 }
 // Refusal never advertises R or gives up the only retained descriptions. An
 // already identified family can be enforced; unknown input cannot select PIDs.
-[[noreturn]] static void retainedRefusal(Context* c) {
+static void poison(arbol_exit::HostCapability* cap,uint64_t reason) {
+  if(cap&&cap->present()) cap->shared()->poison(reason);
+}
+[[noreturn]] static void retainedRefusal(Context* c,arbol_exit::HostCapability* cap=nullptr) {
+  poison(cap,arbol_exit::protocolLoss|arbol_exit::forced);
   struct stat a{},b{}; if(!c&&(fstat(3,&a)||fstat(4,&b)||!S_ISREG(a.st_mode)||!S_ISREG(b.st_mode))) _exit(4);
   for(;;) { if(c) { (void)c->discoverCustody(); c->enforce(); reap(c->custody); if(c->engineGone()) { const Identity& peer=getpid()==c->primary.pid?c->custody:c->primary; if(current(peer)==0) _exit(4); (void)c->retireMonitorPeer(peer); } } usleep(10000); }
 }
 struct Channel {
-  int input,output; std::string incoming,outgoing; bool failed=false;
+  int input,output; std::string incoming,outgoing; bool failed=false,ended=false,brokenWrite=false,truncated=false;
   Channel(int in,int out):input(in),output(out) { nonblocking(input); nonblocking(output); }
   void send(const std::string& line) { if(line.size()>128||outgoing.size()+line.size()>4096) {failed=true;return;} outgoing+=line; }
   void flush(double expires=0) {
     while(!outgoing.empty()&&!failed) { if(expires&&clockMs()>=expires) { failed=true; return; } ssize_t n=write(output,outgoing.data(),outgoing.size());
       if(n>0) outgoing.erase(0,(size_t)n); else if(n<0&&errno==EINTR) continue;
-      else if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK)) break; else failed=true; }
+      else if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK)) break; else { brokenWrite=n<0&&errno==EPIPE; failed=true; } }
   }
   std::vector<std::string> readLines() {
     std::vector<std::string> lines; char bytes[512];
@@ -75,7 +79,7 @@ struct Channel {
       if(n>0) { for(ssize_t i=0;i<n;++i) { unsigned char ch=bytes[i];
         if(ch=='\n') { lines.push_back(incoming); incoming.clear(); if(lines.size()>32) failed=true; }
         else if(ch<32||ch>126||incoming.size()>=127) failed=true; else incoming+=(char)ch; } }
-      else if(n==0) failed=true; else if(errno==EINTR) continue; else if(errno!=EAGAIN&&errno!=EWOULDBLOCK) failed=true; else break;
+      else if(n==0) { failed=ended=true; truncated=!incoming.empty(); } else if(errno==EINTR) continue; else if(errno!=EAGAIN&&errno!=EWOULDBLOCK) failed=true; else break;
     } return lines;
   }
 };
@@ -87,9 +91,9 @@ static bool frame(const std::string& line,Frame& result,const std::string& allow
   result={line[0],value}; return true;
 }
 struct Deadline {
-  double expires; bool fatal=false,received=false,elapsed=false; uint64_t sequence=0;
+  double expires; bool fatal=false,received=false,elapsed=false,sealed=false,hardLoss=false; uint64_t sequence=0;
   explicit Deadline(double start):expires(start+2500) {}
-  bool expired(double now) { if(now>=expires) fatal=elapsed=true; return elapsed; }
+  bool expired(double now) { if((!sealed||fatal)&&now>=expires) fatal=elapsed=hardLoss=true; return elapsed; }
   bool accept(const Frame& value,double now) {
     if(expired(now)) return false;
     if(received&&value.sequence<=sequence) return false;
@@ -98,34 +102,81 @@ struct Deadline {
     else if(!fatal) expires=now+2500;
     return true;
   }
-  void lost(double now) { fatal=elapsed=true; expires=std::min(expires,now); }
+  void seal() { sealed=elapsed=true; } // closes renewal only, never a completion proof
+  void lost(double now) { fatal=elapsed=sealed=hardLoss=true; expires=std::min(expires,now); }
 };
-[[noreturn]] static void retirePair(Context& c,Channel& pair,bool primary) {
-  // External R/H/A/F authority is already dead. T/K/P cannot be reached before
-  // this independent original-main/engine disappearance proof.
-  const Identity peer=primary?c.custody:c.primary; uint64_t token=1; double requested=clockMs();
-  pair.send(std::string(primary?"T ":"P ")+std::to_string(token)+"\n");
+[[noreturn]] static void retirePair(Context& c,Channel& pair,bool primary,arbol_exit::HostCapability* cap=nullptr,
+  arbol_exit::ExitWatch* mainWatch=nullptr,double mainLimit=0,std::vector<std::string> first={}) {
+  // No R/H/A/F renewal survives this independently observed quiescence. A/K
+  // history is not current T/K consent, and peer EOF is not peer exit proof.
+  const Identity peer=primary?c.custody:c.primary; const uint64_t token=1; const double requested=clockMs(),expires=requested+1000;
+  arbol_exit::ExitWatch peerWatch; bool watched=cap&&peerWatch.enroll(peer),gotK=false,gotP=false,gotT=false,tCommitted=false;
+  if(cap&&!watched) poison(cap,arbol_exit::peerLoss);
+  pair.outgoing.clear(); pair.send(std::string(primary?"T ":"P ")+std::to_string(token)+"\n");
   for(;;) {
-    reap(peer);
-    if(!c.engineGone()||!lockIdentity(c.owner)||!lockIdentity(c.build)) { usleep(10000); continue; }
-    int state=current(peer); if(!state) _exit(0);
-    for(const auto& line:pair.readLines()) {
-      Frame f; if(frame(line,f,"A")) continue; // pending pre-quiescence receipt, never authority
-      if(!frame(line,f,"TKP")) continue;
-      if(primary&&f.kind=='P') { token=f.sequence; requested=clockMs(); pair.outgoing.clear(); pair.send("T "+std::to_string(token)+"\n"); }
-      else if(!primary&&f.kind=='T') {
-        token=f.sequence; requested=clockMs(); pair.outgoing.clear(); pair.send("K "+std::to_string(token)+"\n");
-        // Keep actual descriptions until the last send is complete. An old A
-        // or bare live PID cannot substitute for the fresh current T.
-        while(!pair.outgoing.empty()&&!pair.failed&&clockMs()-requested<1000) { pair.flush(); usleep(1000); }
-        if(pair.outgoing.empty()&&!pair.failed&&c.engineGone()) _exit(0);
-      }
-      // K acknowledges consent only; primary still waits/reaps actual death.
+    if(watched&&!peerWatch.poll()) poison(cap,arbol_exit::watchLoss);
+    auto lines=pair.readLines(); if(!first.empty()) { lines.insert(lines.begin(),first.begin(),first.end()); first.clear(); }
+    if(pair.failed&&(!pair.ended||pair.truncated)) poison(cap,arbol_exit::protocolLoss);
+    // Inspect the complete received batch before any K/exit branch so an
+    // already-received F or malformed suffix cannot disappear behind it.
+    unsigned tCount=0,kCount=0,pCount=0;
+    for(const auto& line:lines) {
+      Frame f;
+      if(frame(line,f,"HFA")) { if(f.kind=='F') poison(cap,arbol_exit::admissionLoss); }
+      else if(!frame(line,f,"TKP")||f.sequence!=token) poison(cap,arbol_exit::protocolLoss);
+      else if((f.kind=='T'&&(primary||++tCount>1))||(f.kind=='K'&&(!primary||++kCount>1))||
+              (f.kind=='P'&&(!primary||++pCount>1))) poison(cap,arbol_exit::protocolLoss);
     }
-    pair.flush();
-    if(clockMs()-requested>=1000) {
+    for(const auto& line:lines) {
+      Frame f;
+      if(frame(line,f,"HFA")) { if(f.kind=='F') poison(cap,arbol_exit::admissionLoss); continue; }
+      if(!frame(line,f,"TKP")||f.sequence!=token) { poison(cap,arbol_exit::protocolLoss); continue; }
+      if(primary&&f.kind=='P') {
+        // Our one T is already issued for this round. The simultaneous P
+        // neither duplicates T nor resets the original absolute cutoff.
+        if(gotP) poison(cap,arbol_exit::protocolLoss); gotP=true;
+      } else if(primary&&f.kind=='K') {
+        if(!tCommitted||gotK) { poison(cap,arbol_exit::protocolLoss); continue; }
+        gotK=true; if(cap) cap->shared()->primaryConsent.store(1,std::memory_order_release);
+      } else if(!primary&&f.kind=='T') {
+        if(gotT) { poison(cap,arbol_exit::protocolLoss); continue; } gotT=true;
+        pair.outgoing.clear(); pair.send("K "+std::to_string(token)+"\n");
+        while(!pair.outgoing.empty()&&!pair.failed&&clockMs()<expires) { pair.flush(expires); usleep(1000); }
+        // The actual original consent is published while this native process
+        // is still live, only after the matching K committed to its real pipe.
+        if(pair.outgoing.empty()&&!pair.failed&&c.engineGone()&&current(c.custody)==1) {
+          if(cap) cap->shared()->custodyConsent.store(1,std::memory_order_release);
+          _exit(0);
+        }
+        poison(cap,arbol_exit::peerLoss|arbol_exit::forced);
+      } else poison(cap,arbol_exit::protocolLoss);
+    }
+    reap(peer);
+    if(!c.engineGone()||!lockIdentity(c.owner)||!lockIdentity(c.build)) {
+      poison(cap,arbol_exit::identityLoss|arbol_exit::forced); c.enforce(); usleep(10000); continue;
+    }
+    int state=current(peer);
+    if(state<0) poison(cap,arbol_exit::identityLoss);
+    if(!state) {
+      if(!cap) _exit(0); // Native-only legacy has no finalization authority
+      if(watched&&!peerWatch.observed()&&clockMs()<expires) { usleep(1000); continue; }
+      bool consent=primary&&gotK&&cap->shared()->primaryConsent.load(std::memory_order_acquire)==1&&
+        cap->shared()->custodyConsent.load(std::memory_order_acquire)==1;
+      bool ordinary=consent&&watched&&peerWatch.ordinaryBefore(expires)&&mainWatch&&mainWatch->ordinaryBefore(mainLimit)&&
+        cap->shared()->fatal.load(std::memory_order_acquire)==0;
+      if(ordinary) cap->shared()->ordinaryPostExitEligible.store(1,std::memory_order_release);
+      else poison(cap,arbol_exit::peerLoss);
+      // No clean marker or flush receipt here. The later native independent
+      // finalizer/dirty witness owns this last-holder exit boundary.
+      _exit(ordinary?0:4);
+    }
+    pair.flush(expires);
+    if(primary&&pair.outgoing.empty()&&!pair.failed) tCommitted=true;
+    if(pair.failed&&(!pair.ended||pair.truncated||!gotK)) poison(cap,arbol_exit::peerLoss);
+    if(clockMs()>=expires) {
+      poison(cap,arbol_exit::peerLoss|arbol_exit::forced);
       (void)c.retireMonitorPeer(peer); reap(peer);
-      if(c.engineGone()&&current(peer)==0) _exit(0);
+      if(c.engineGone()&&current(peer)==0) _exit(cap?4:0);
     }
     usleep(5000);
   }
@@ -134,26 +185,148 @@ struct Deadline {
   Channel host(primary?0:6,primary?1:7); Deadline deadline(start);
   struct Pending { uint64_t sequence; double sent; }; std::deque<Pending> pending;
   if(primary) host.send("R 1 "+std::to_string(c.main.pid)+"\n");
-  double blockedWrite=0,responseExpires=0;
+  double blockedWrite=0,responseExpires=0,terminalExpires=0; bool terminal=false,terminalHostDrained=false;
+  std::vector<std::string> pendingRetirement;
+  arbol_exit::KernelExitProbe probe;
+  auto liveLimit=[&] {
+    double limit=deadline.expires;
+    if(primary&&!pending.empty()) limit=std::min(limit,pending.front().sent+1000);
+    if(responseExpires) limit=std::min(limit,responseExpires);
+    if(blockedWrite) limit=std::min(limit,blockedWrite+1000);
+    return limit;
+  };
+  auto sealTerminal=[&] {
+    if(!terminal) { terminalExpires=liveLimit(); terminal=true; }
+    deadline.seal(); // never renew H/A or manufacture a receipt
+  };
+  auto observedExit=[&] {
+    if(!cap||!watch.observed()) return;
+    if(!terminal) terminalExpires=liveLimit();
+    if(!watch.ordinaryBefore(terminalExpires)) { deadline.lost(clockMs()); poison(cap,arbol_exit::watchLoss); }
+    sealTerminal();
+    if(primary&&!terminalHostDrained) {
+      terminalHostDrained=true;
+      // Kernel exit can race already buffered bytes. Drain only to classify
+      // actual F/malformed/partial history; never issue A or renew H here.
+      for(const auto& line:host.readLines()) {
+        Frame f;
+        if(!frame(line,f,"HF")) { deadline.lost(clockMs()); poison(cap,arbol_exit::protocolLoss); }
+        else if(f.kind=='F') { cap->shared()->declareFatal(); deadline.fatal=true; deadline.expires=std::min(deadline.expires,clockMs()+1000); }
+      }
+      if(host.truncated||!host.incoming.empty()||(host.failed&&!host.ended&&!host.brokenWrite)) {
+        deadline.lost(clockMs()); poison(cap,arbol_exit::protocolLoss);
+      }
+    }
+  };
+  auto kernelTerminal=[&] {
+    if(terminal) return true;
+    if(!cap) return false;
+    Identity actual; Info detail{}; int state=observe(c.main.pid,actual,&detail);
+    if(state<0 || (state==1&&(!same(actual,c.main)||actual.group!=c.main.group||!(detail.bsd.pbi_flags&PROC_FLAG_INEXIT)))) {
+      deadline.lost(clockMs()); poison(cap,arbol_exit::protocolLoss); return false;
+    }
+    // The genuine native-retained endpoints close only on original kernel FD
+    // teardown. A live original is always fatal. No-live lookup/EOF supplies
+    // only bounded terminal arbitration, never completion or clean evidence.
+    if(state==0&&!watch.observed()&&!probe.start(c.main)) { deadline.lost(clockMs()); return false; }
+    sealTerminal(); return true;
+  };
+  auto hostLoss=[&] {
+    if(!primary||!host.failed) return;
+    if(!cap||host.truncated||(!host.ended&&!host.brokenWrite)) { deadline.lost(clockMs()); return; }
+    (void)kernelTerminal();
+  };
+  auto holdRetirement=[&](const std::vector<std::string>& lines,char expected) {
+    if(!cap||!pendingRetirement.empty()) { deadline.lost(clockMs()); return; }
+    size_t count=0;
+    for(const auto& line:lines) {
+      Frame f;
+      if(frame(line,f,"HFA")) {
+        if(f.kind=='F') { cap->shared()->declareFatal(); deadline.fatal=true; deadline.expires=std::min(deadline.expires,clockMs()+1000); }
+        continue;
+      }
+      if(!frame(line,f,std::string(1,expected))||f.sequence!=1||++count!=1) { deadline.lost(clockMs()); return; }
+    }
+    if(count!=1||!kernelTerminal()) { deadline.lost(clockMs()); return; }
+    // Exactly one expected peer prompt may precede our own observation. This
+    // reserves no consent, emits no acknowledgement and never renews a bound.
+    pendingRetirement=lines;
+  };
+  auto maybeRetire=[&](const std::vector<std::string>& first=std::vector<std::string>{}) {
+    if(!watch.poll()) { deadline.lost(clockMs()); poison(cap,arbol_exit::watchLoss); }
+    observedExit();
+    if(probe.started()) {
+      auto result=probe.result();
+      if(result==arbol_exit::KernelExitProbe::uncertain||result==arbol_exit::KernelExitProbe::live) {
+        deadline.lost(clockMs()); poison(cap,arbol_exit::identityLoss);
+      } else if(result==arbol_exit::KernelExitProbe::pending&&!deadline.hardLoss) return;
+    }
+    // This handoff is itself a cleanup boundary; never leave attribution until
+    // the loop tail when a complete census may make this call nonreturning.
+    if(deadline.hardLoss) poison(cap,arbol_exit::protocolLoss|arbol_exit::forced);
+    else if(deadline.fatal&&cap) cap->shared()->declareFatal();
+    if(c.engineGone()&&(!cap||watch.observed()||deadline.hardLoss)) {
+      // The census itself may have been delayed. Its first complete result
+      // cannot be backdated from a late poll into the frozen live window.
+      if(cap&&terminal&&clockMs()>=terminalExpires) { deadline.lost(clockMs()); poison(cap,arbol_exit::identityLoss); }
+      retirePair(c,pair,primary,cap,&watch,terminalExpires?terminalExpires:liveLimit(),first);
+    }
+  };
   for(;;) {
     double now=clockMs();
-    if(!watch.poll()) deadline.lost(now);
-    if(cap&&(!cap->present()||cap->shared()->fatal.load(std::memory_order_acquire))) deadline.lost(now);
-    // Latch before touching traffic. Late H or a queued A cannot revive an
-    // already expired window, even when this executor itself was delayed.
-    if(primary&&!pending.empty()&&now-pending.front().sent>=1000) deadline.lost(now);
-    (void)deadline.expired(now);
+    if(!watch.poll()) { deadline.lost(now); poison(cap,arbol_exit::watchLoss); }
+    if(cap) {
+      if(!cap->present()) deadline.lost(now);
+      else {
+        uint64_t reasons=cap->shared()->fatal.load(std::memory_order_acquire),cutoff=cap->shared()->fatalCutoffUs.load(std::memory_order_acquire);
+        if(reasons&~arbol_exit::admissionLoss) deadline.lost(now);
+        else if(reasons) {
+          if(!cutoff) deadline.lost(now);
+          else { deadline.fatal=true; deadline.expires=std::min(deadline.expires,(double)cutoff/1000); }
+        }
+      }
+    }
+    observedExit();
+    if(!terminal) {
+      if(primary&&!pending.empty()&&now-pending.front().sent>=1000) deadline.lost(now);
+      (void)deadline.expired(now);
+    } else if(probe.started()) {
+      auto result=probe.result();
+      if(result==arbol_exit::KernelExitProbe::live||result==arbol_exit::KernelExitProbe::uncertain) {
+        deadline.lost(now); poison(cap,arbol_exit::identityLoss);
+      } else if(result==arbol_exit::KernelExitProbe::pending&&now>=terminalExpires) deadline.lost(now);
+    }
+    if(terminal&&!watch.observed()&&now>=terminalExpires) deadline.lost(now);
+    if(terminal&&now>=terminalExpires&&!c.engineGone()) { deadline.lost(now); poison(cap,arbol_exit::identityLoss); }
+    if(deadline.fatal) (void)deadline.expired(now);
+    maybeRetire(pendingRetirement);
     Channel& input=primary?host:pair;
-    if(!deadline.elapsed) for(const std::string& line:input.readLines()) {
-      now=clockMs(); Frame value;
-      if(primary&&!pending.empty()&&now-pending.front().sent>=1000) { deadline.lost(now); break; }
-      if(!frame(line,value,"HF")||!deadline.accept(value,now)) { deadline.lost(now); break; }
-      if(primary) { if(pending.size()>=16) { deadline.lost(now); break; } pending.push_back({value.sequence,now}); pair.send(line+"\n"); }
-      else pair.send("A "+std::to_string(value.sequence)+"\n");
+    if(!deadline.elapsed) {
+      auto lines=input.readLines(); hostLoss();
+      for(const std::string& line:lines) {
+        now=clockMs(); Frame value;
+        if(!frame(line,value,"HF")) {
+          Frame retirement;
+          if(!primary&&cap&&frame(line,retirement,"T")) { holdRetirement(lines,'T'); maybeRetire(pendingRetirement); break; }
+          deadline.lost(now); break;
+        }
+        if(value.kind=='F'&&cap) {
+          cap->shared()->declareFatal(); deadline.fatal=true;
+          deadline.expires=std::min(deadline.expires,now+1000);
+        }
+        // An F already in this batch is never discarded on terminal seal.
+        if(deadline.elapsed) continue;
+        if(primary&&!pending.empty()&&now-pending.front().sent>=1000) { deadline.lost(now); break; }
+        if(!deadline.accept(value,now)) { deadline.lost(now); break; }
+        if(primary) { if(pending.size()>=16) { deadline.lost(now); break; } pending.push_back({value.sequence,now}); pair.send(line+"\n"); }
+        else pair.send("A "+std::to_string(value.sequence)+"\n");
+      }
     }
     if(primary&&!deadline.expired(clockMs())) {
-      for(const std::string& line:pair.readLines()) {
+      auto pairLines=pair.readLines();
+      for(const std::string& line:pairLines) {
         now=clockMs(); Frame value;
+        if(cap&&frame(line,value,"P")) { holdRetirement(pairLines,'P'); maybeRetire(pendingRetirement); break; }
         if(deadline.expired(now)||!frame(line,value,"A")||pending.empty()||pending.front().sequence!=value.sequence||now-pending.front().sent>=1000) { deadline.lost(now); break; }
         double issuedDeadline=pending.front().sent+1000;
         responseExpires=responseExpires?std::min(responseExpires,issuedDeadline):issuedDeadline;
@@ -161,23 +334,24 @@ struct Deadline {
       }
     }
     now=clockMs();
-    if(primary&&((!pending.empty()&&now-pending.front().sent>=1000)||(responseExpires&&now>=responseExpires))) deadline.lost(now);
+    if(!terminal&&primary&&((!pending.empty()&&now-pending.front().sent>=1000)||(responseExpires&&now>=responseExpires))) deadline.lost(now);
     if(!deadline.expired(now)) {
       pair.flush(deadline.expires);
       now=clockMs(); if(responseExpires&&now>=responseExpires) deadline.lost(now);
       if(primary&&!deadline.expired(now)) host.flush(responseExpires?std::min(deadline.expires,responseExpires):deadline.expires);
     }
+    hostLoss();
     if(host.outgoing.empty()) responseExpires=0;
     now=clockMs();
     bool outputPending=!pair.outgoing.empty()||(primary&&!host.outgoing.empty());
-    if(outputPending) { if(!blockedWrite) blockedWrite=now; else if(now-blockedWrite>=1000) deadline.lost(now); } else blockedWrite=0;
+    if(!terminal&&outputPending) { if(!blockedWrite) blockedWrite=now; else if(now-blockedWrite>=1000) deadline.lost(now); }
+    else if(!terminal) blockedWrite=0;
     std::vector<Identity> observed;
     Identity peerNow; const Identity& peer=primary?c.custody:c.primary;
-    if(pair.failed||(primary&&host.failed)||observe(peer.pid,peerNow)!=1||!same(peer,peerNow)||peerNow.group!=(primary?c.main.group:(uint32_t)c.primary.pid)||!c.census(observed)||!lockIdentity(c.owner)||!lockIdentity(c.build)) deadline.lost(clockMs());
-    if(deadline.expired(clockMs())) c.enforce();
-    reap(c.custody);
-    if(c.engineGone()) retirePair(c,pair,primary);
-    usleep(5000);
+    if(pair.failed||observe(peer.pid,peerNow)!=1||!same(peer,peerNow)||peerNow.group!=(primary?c.main.group:(uint32_t)c.primary.pid)||
+       !c.census(observed)||!lockIdentity(c.owner)||!lockIdentity(c.build)) deadline.lost(clockMs());
+    if(deadline.hardLoss) { poison(cap,arbol_exit::protocolLoss|arbol_exit::forced); c.enforce(); }
+    reap(c.custody); maybeRetire(pendingRetirement); usleep(5000);
   }
 }
 
@@ -272,6 +446,6 @@ int main(int argc,const char* argv[]) {
       if(!watch.enroll(c.main)) throw 4;
       if(host&&!hostCap.enrolled(c,primary,watch)) throw 4;
       return primary?runPrimary(c,deadline,watch,host?&hostCap:nullptr):runCustody(c,deadline,watch,host?&hostCap:nullptr);
-    } catch(...) { c.cleanupOnly=true; retainedRefusal(parsed?&c:nullptr); } } @catch(NSException*) { c.cleanupOnly=true; retainedRefusal(parsed?&c:nullptr); }
+    } catch(...) { c.cleanupOnly=true; retainedRefusal(parsed?&c:nullptr,hostCap.present()?&hostCap:nullptr); } } @catch(NSException*) { c.cleanupOnly=true; retainedRefusal(parsed?&c:nullptr,hostCap.present()?&hostCap:nullptr); }
   }
 }
