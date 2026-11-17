@@ -3,6 +3,7 @@
 import { createRequire } from 'node:module';
 import { join, isAbsolute, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { unavailable } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
 import { selectedLayout, type BuildSelection, type PackagedLayout } from './selection.js';
@@ -10,7 +11,7 @@ import type { Contract } from '../contracts/generated.js';
 import { stateDirectory as ownerStateDirectory, directory } from '../profiles/paths.js';
 import type { SignedBundle } from '../native/manifest.js';
 
-const { constants, promises: { open, realpath } } = createRequire(import.meta.url)(
+const { constants, promises: { open, realpath, lstat } } = createRequire(import.meta.url)(
   process.type === 'browser' ? 'original-fs' : 'node:fs') as typeof import('node:fs');
 
 export interface PackagedIdentity {
@@ -25,27 +26,43 @@ export interface PhysicalJson { readonly value: unknown; readonly digest: string
 const digest = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
 /** Exact physical regular file; no Electron ASAR view or following a final link.
  * Signature/resource checks must additionally authenticate these bytes. */
-export async function physicalJson(path: string, limit = 1048576): Promise<PhysicalJson> {
-  if (await realpath(path) !== path) throw unavailable('browser');
+export async function physicalJson(path: string, limit = 1048576, deadline = Infinity): Promise<PhysicalJson> {
+  const check = () => { if (deadline !== Infinity) assertBudget(deadline); }; check();
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1048576 || await realpath(path) !== path) throw unavailable('browser');
   const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
-    const before = await file.stat({ bigint: true });
+    check();
+    const before = await file.stat({ bigint: true }), named = await lstat(path, { bigint: true });
     if (!before.isFile() || before.nlink !== 1n || (before.mode & 0o022n) !== 0n ||
+        !named.isFile() || named.dev !== before.dev || named.ino !== before.ino || named.nlink !== before.nlink ||
+        named.uid !== before.uid || named.mode !== before.mode ||
         before.size < 1n || before.size > BigInt(limit)) throw unavailable('browser');
-    const raw = await file.readFile(), after = await file.stat({ bigint: true });
+    const buffer = Buffer.alloc(Number(before.size) + 1); let length = 0;
+    while (length < buffer.length) {
+      check();
+      const read = await file.read(buffer, length, buffer.length - length, null);
+      if (!read.bytesRead) break; length += read.bytesRead;
+    }
+    const raw = buffer.subarray(0, length), after = await file.stat({ bigint: true }), lastName = await lstat(path, { bigint: true });
+    check();
     if (BigInt(raw.length) !== before.size || before.dev !== after.dev || before.ino !== after.ino ||
         before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs ||
+        !lastName.isFile() || lastName.dev !== after.dev || lastName.ino !== after.ino ||
+        lastName.nlink !== 1n || lastName.mode !== before.mode || lastName.uid !== before.uid ||
+        lastName.size !== after.size || lastName.mtimeNs !== after.mtimeNs || lastName.ctimeNs !== after.ctimeNs ||
         await realpath(path) !== path) throw unavailable('browser');
     return Object.freeze({ value: JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw)),
       digest: createHash('sha256').update(raw).digest('hex') });
   } catch { throw unavailable('browser'); } finally { await file.close(); }
 }
 export async function readPackagedIdentity(selection: BuildSelection, payload: string,
-  stateDirectory: string): Promise<PackagedIdentity> {
+  stateDirectory: string, deadline = Infinity): Promise<PackagedIdentity> {
   const layout = selectedLayout(selection, payload);
-  for (const path of [layout.buildRoot, layout.bundle, layout.payload])
+  for (const path of [layout.buildRoot, layout.bundle, layout.payload]) {
+    if (deadline !== Infinity) assertBudget(deadline);
     if (await realpath(path) !== path) throw unavailable('browser');
-  const metadata = await physicalJson(join(payload, 'metadata.json'));
+  }
+  const metadata = await physicalJson(join(payload, 'metadata.json'), 1048576, deadline);
   const value = metadata.value as Record<string, unknown>;
   const host = value?.host as Record<string, unknown>;
   const component = { ...(value?.component as object), stateDirectory };
@@ -67,7 +84,7 @@ export interface HostPolicy {
 export interface VerifiedHost {
   readonly identity: PackagedIdentity; readonly policy: Readonly<HostPolicy>;
   readonly signed: SignedBundle;
-  assertTrusted(): Promise<void>;
+  assertTrusted(deadline: number): Promise<void>;
 }
 const verifiedHosts = new WeakSet<object>();
 const hostPolicyKeys = ['format', 'purpose', 'build', 'buildRoot', 'stateRoot', 'sourceDigest', 'productDigest',
@@ -95,25 +112,30 @@ function readPolicy(input: unknown): Readonly<HostPolicy> {
   return Object.freeze({ ...value, readableReaderKeys: Object.freeze([...value.readableReaderKeys]),
     readableDataEpochs: Object.freeze([...value.readableDataEpochs]) });
 }
-export function assertVerifiedHost(value: VerifiedHost): void {
+export function assertVerifiedHost(value: VerifiedHost, deadline: number): void {
   if (!verifiedHosts.has(value)) throw unavailable('browser');
-  value.signed.assertIdentity();
+  assertBudget(deadline); value.signed.assertIdentity(deadline); assertBudget(deadline);
+}
+function assertBudget(deadline: number): void {
+  if (!Number.isFinite(deadline) || performance.now() >= deadline) throw unavailable('browser');
 }
 /** The trusted signing recipe issues a purpose-bound policy. Qualification uses
  * the real product providers on one isolated registered Build and private state;
  * it changes no Native check and cannot open the owner's production profiles.
  * The full source digest includes later testing-only source; productDigest pins
  * the separately reviewed actual product/compiler/sign inputs, never Git HEAD. */
-export async function verifyPackagedHost(selection: BuildSelection, payload: string): Promise<VerifiedHost> {
+export async function verifyPackagedHost(selection: BuildSelection, payload: string, deadline: number): Promise<VerifiedHost> {
+  assertBudget(deadline);
   const layout = selectedLayout(selection, payload);
   const manifestURL = new URL('../native/manifest.js', import.meta.url).href;
   const manifests = await import(manifestURL) as typeof import('../native/manifest.js');
   let signed: SignedBundle;
-  try { signed = manifests.verifySignedBundle(layout.bundle); } catch { throw unavailable('browser'); }
+  try { signed = manifests.verifySignedBundle(layout.bundle, deadline); } catch { throw unavailable('browser'); }
+  assertBudget(deadline);
   const policyFile = join(layout.bundle, 'Contents/Resources/host-policy.json');
-  const rawPolicy = await physicalJson(policyFile), policy = readPolicy(rawPolicy.value);
-  const identity = await readPackagedIdentity(selection, payload, policy.stateRoot);
-  const compatibility = await physicalJson(join(layout.bundle, 'Contents/Resources/native-compatibility.json'));
+  const rawPolicy = await physicalJson(policyFile, 1048576, deadline), policy = readPolicy(rawPolicy.value);
+  const identity = await readPackagedIdentity(selection, payload, policy.stateRoot, deadline);
+  const compatibility = await physicalJson(join(layout.bundle, 'Contents/Resources/native-compatibility.json'), 1048576, deadline);
   const manifest = signed.manifest;
   if (policy.purpose === 'blocked' || policy.build !== selection.build || policy.buildRoot !== layout.buildRoot ||
       policy.sourceDigest !== identity.sourceDigest || policy.productDigest !== identity.productDigest ||
@@ -129,21 +151,22 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
         policy.readerKey !== `host-isolated:1:${policy.productDigest}`) throw unavailable('browser');
     // Explicit disposable roots are prepared by the separately authorized
     // qualifier; no environment or request may relocate them or create a bypass.
-    await directory(policy.stateRoot);
+    assertBudget(deadline); await directory(policy.stateRoot); assertBudget(deadline);
   } else if (policy.stateRoot !== ownerState ||
       manifest.qualification !== `host-production:1:${policy.productDigest}:${policy.qualificationDigest}` ||
       policy.readableReaderKeys.some(key => key.includes('unqualified') || key.startsWith('host-isolated:')))
     throw unavailable('browser');
   const result: VerifiedHost = Object.freeze({ identity, policy, signed,
-    async assertTrusted() {
+    async assertTrusted(limit: number) {
       if (!verifiedHosts.has(result)) throw unavailable('browser');
-      signed.assertIdentity();
-      if ((await physicalJson(policyFile)).digest !== rawPolicy.digest ||
-          (await physicalJson(join(payload, 'metadata.json'))).digest !== identity.metadataDigest ||
-          (await physicalJson(join(layout.bundle, 'Contents/Resources/native-compatibility.json'))).digest !== compatibility.digest)
+      assertBudget(limit); signed.assertIdentity(limit);
+      if ((await physicalJson(policyFile, 1048576, limit)).digest !== rawPolicy.digest ||
+          (await physicalJson(join(payload, 'metadata.json'), 1048576, limit)).digest !== identity.metadataDigest ||
+          (await physicalJson(join(layout.bundle, 'Contents/Resources/native-compatibility.json'), 1048576, limit)).digest !== compatibility.digest)
         throw unavailable('browser');
-      for (const path of [layout.buildRoot, layout.bundle, layout.payload]) await directory(path, false);
-      signed.assertIdentity();
+      assertBudget(limit);
+      for (const path of [layout.buildRoot, layout.bundle, layout.payload]) { assertBudget(limit); await directory(path, false); }
+      signed.assertIdentity(limit); assertBudget(limit);
     } });
-  verifiedHosts.add(result); await result.assertTrusted(); return result;
+  assertBudget(deadline); verifiedHosts.add(result); await result.assertTrusted(deadline); return result;
 }
