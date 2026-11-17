@@ -27,6 +27,58 @@ export interface InspectionObservation {
   readonly resources: number;
   readonly animations: number;
 }
+export interface ActionDragData {
+  readonly items: readonly Readonly<{ mimeType: string; data: string; title?: string; baseURL?: string }>[];
+  readonly dragOperationsMask: number;
+}
+/** Closed host-private projections. No arbitrary debugger event or renderer
+ * object crosses this port. Context identity still needs action-side matching. */
+export type ActionEvent =
+  | Readonly<{ kind: 'context'; id: number; unique: string; name: string; frame: string; default: boolean }>
+  | Readonly<{ kind: 'destroyed'; id: number; unique: string }>
+  | Readonly<{ kind: 'cleared' | 'lost' }>
+  | Readonly<{ kind: 'binding'; name: string; payload: string; context: number }>
+  | Readonly<{ kind: 'drag'; data: ActionDragData }>;
+interface ActionObserver { session: string | undefined; frame: InspectionFrame; check(): void;
+  receive(event: ActionEvent): void; close(): void }
+function actionEvent(method: string, raw: unknown): ActionEvent | undefined {
+  if (!['Runtime.executionContextCreated', 'Runtime.executionContextDestroyed', 'Runtime.executionContextsCleared',
+    'Runtime.bindingCalled', 'Input.dragIntercepted'].includes(method)) return;
+  const data = raw as any;
+  const string = (value: unknown, limit: number): value is string => typeof value === 'string' && value.length <= limit;
+  const id = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
+  if (method === 'Runtime.executionContextsCleared') return Object.freeze({ kind: 'cleared' });
+  if (method === 'Runtime.executionContextCreated') {
+    const c = data?.context;
+    if (id(c?.id) && string(c.uniqueId, 256) && c.uniqueId && string(c.name, 128) &&
+        string(c.auxData?.frameId, 256) && typeof c.auxData?.isDefault === 'boolean')
+      return Object.freeze({ kind: 'context', id: c.id, unique: c.uniqueId, name: c.name,
+        frame: c.auxData.frameId, default: c.auxData.isDefault });
+  } else if (method === 'Runtime.executionContextDestroyed') {
+    if (id(data?.executionContextId) && string(data.executionContextUniqueId, 256))
+      return Object.freeze({ kind: 'destroyed', id: data.executionContextId, unique: data.executionContextUniqueId });
+  } else if (method === 'Runtime.bindingCalled') {
+    if (string(data?.name, 128) && string(data.payload, 2048) && id(data.executionContextId))
+      return Object.freeze({ kind: 'binding', name: data.name, payload: data.payload, context: data.executionContextId });
+  } else {
+    const drag = data?.data;
+    if (drag && Array.isArray(drag.items) && drag.items.length <= 16 &&
+        Number.isSafeInteger(drag.dragOperationsMask) && drag.dragOperationsMask >= 0 && drag.dragOperationsMask <= 31 &&
+        (drag.files === undefined || (Array.isArray(drag.files) && drag.files.length === 0))) {
+      let bytes = 0; const items: ActionDragData['items'][number][] = [];
+      for (const item of drag.items) {
+        if (!string(item?.mimeType, 128) || !string(item.data, 65536) ||
+            (item.title !== undefined && !string(item.title, 4096)) || (item.baseURL !== undefined && !string(item.baseURL, 8192)) ||
+            (bytes += Buffer.byteLength(item.data, 'utf8') + Buffer.byteLength(item.title ?? '', 'utf8') + Buffer.byteLength(item.baseURL ?? '', 'utf8')) > 65536)
+          return Object.freeze({ kind: 'lost' });
+        items.push(Object.freeze({ mimeType: item.mimeType, data: item.data,
+          ...(item.title !== undefined ? { title: item.title } : {}), ...(item.baseURL !== undefined ? { baseURL: item.baseURL } : {}) }));
+      }
+      return Object.freeze({ kind: 'drag', data: Object.freeze({ items: Object.freeze(items), dragOperationsMask: drag.dragOperationsMask }) });
+    }
+  }
+  return Object.freeze({ kind: 'lost' });
+}
 interface ChildSession { targetId: string; parent: string | undefined }
 interface Channel {
   readonly page: PageSurface;
@@ -43,6 +95,7 @@ interface Channel {
   observers: Set<() => void>;
   resources: Set<string>;
   animations: Set<string>;
+  actionObservers: Set<ActionObserver>;
   surface?: object;
 }
 function emptyAck(value: unknown): void {
@@ -66,10 +119,20 @@ export class PageReadiness implements DocumentPreparation {
     if (page.retirement()) throw staleSnapshot();
     const contents = page.view.webContents, debugger_ = contents.debugger;
     if (contents.isDestroyed() || debugger_.isAttached()) throw unavailable('browser');
-    const channel: Channel = { page, contents, debugger: debugger_, identity: Object.freeze({}), active: true, interception: 'unknown', epoch: 0, unknownActivity: false, sessions: new Map(), observers: new Set(), resources: new Set(), animations: new Set() };
+    const channel: Channel = { page, contents, debugger: debugger_, identity: Object.freeze({}), active: true, interception: 'unknown', epoch: 0, unknownActivity: false, sessions: new Map(), observers: new Set(), resources: new Set(), animations: new Set(), actionObservers: new Set() };
     this.channels.set(page, channel);
     debugger_.on('message', (_event, method, params, sessionId) => {
       if (!channel.active || this.channels.get(page) !== channel) return;
+      if (channel.actionObservers.size) {
+        const projected = actionEvent(method, params);
+        if (projected) for (const observer of [...channel.actionObservers]) {
+          if (observer.session !== (sessionId || undefined)) continue;
+          try {
+            observer.check();
+            if (projected.kind !== 'context' || projected.frame === observer.frame.frameId) observer.receive(projected);
+          } catch { observer.close(); }
+        }
+      }
       if (!/^(Target|Page|DOM|Animation|Network|Runtime)\./.test(method)) return;
       if (++channel.epoch >= Number.MAX_SAFE_INTEGER) return this.boundary.fatal.fail('native_boundary_unavailable');
       if (method === 'Target.attachedToTarget') {
@@ -98,6 +161,7 @@ export class PageReadiness implements DocumentPreparation {
     debugger_.on('detach', () => {
       if (!channel.active) return;
       channel.active = false;
+      for (const observer of [...channel.actionObservers]) observer.close();
       this.documents.channelLost(page, channel.identity); // literal original page/channel, never target.page
     });
     try { debugger_.attach('1.3'); this.assertChannel(channel); }
@@ -209,6 +273,20 @@ export class PageReadiness implements DocumentPreparation {
     this.documents.target(receipt); const channel = this.owned(receipt.page);
     if (channel.identity !== receipt.channel) throw staleSnapshot();
     channel.observers.add(notify); return () => { channel.observers.delete(notify); };
+  }
+  /** Ephemeral original-action notifications on the already attached debugger.
+   * No implicit attach, generic event route or guessed child identity exists. */
+  observeActions(frame: InspectionFrame, guard: () => void, signal: AbortSignal, receive: (event: ActionEvent) => void): () => void {
+    this.assertInspection(frame, guard); const channel = this.owned(frame.receipt.page);
+    if (signal.aborted || channel.actionObservers.size >= 8 || channel.identity !== frame.receipt.channel) throw staleSnapshot();
+    let active = true;
+    const remove = () => { if (!active) return; active = false; channel.actionObservers.delete(observer); signal.removeEventListener('abort', remove); };
+    const observer: ActionObserver = { frame, session: frame.session,
+      check: () => { if (!active) throw staleSnapshot(); this.assertInspection(frame, guard);
+        if (this.owned(frame.receipt.page) !== channel) throw staleSnapshot(); },
+      receive, close: () => { if (!active) return; remove(); try { receive(Object.freeze({ kind: 'lost' })); } catch { /* closed original scope */ } } };
+    channel.actionObservers.add(observer); signal.addEventListener('abort', remove, { once: true });
+    return remove;
   }
   /** A real compositor observation, scoped to the original page. This is an
    * invalidation epoch only: it is not a layout-coupled screenshot token. */
@@ -327,6 +405,7 @@ export class PageReadiness implements DocumentPreparation {
   close(page: PageSurface): void {
     const channel = this.channels.get(page); if (!channel || !channel.active) return;
     channel.active = false; // before detach callbacks can reenter
+    for (const observer of [...channel.actionObservers]) observer.close();
     if (!channel.contents.isDestroyed() && channel.debugger.isAttached()) channel.debugger.detach();
   }
 }
