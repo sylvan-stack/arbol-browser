@@ -358,8 +358,8 @@ export async function prepareUnsignedHost({ out, buildRoot, stateRoot, runtimeAr
   await writeExclusive(bundle + '.unsigned.json', JSON.stringify(record, null, 2) + '\n');
   return Object.freeze({ bundle, record, scratch });
 }
-export function hostLauncher(payloadRelative = '../ArbolBrowser.app/Contents/Resources/browser') {
-  if (!['..', '../ArbolBrowser.app/Contents/Resources/browser'].includes(payloadRelative)) fail('Invalid fixed launcher');
+export function hostLauncher(payloadRelative = '../app/ArbolBrowser.app/Contents/Resources/browser') {
+  if (!['..', '../app/ArbolBrowser.app/Contents/Resources/browser'].includes(payloadRelative)) fail('Invalid fixed launcher');
   return `#!/bin/sh
 set -eu
 payload=$(CDPATH= cd -- "$(/usr/bin/dirname -- "$0")/${payloadRelative}" && pwd)
@@ -464,8 +464,8 @@ async function syncDirectory(path) { const fd = await open(path, constants.O_RDO
 const imageStampFields = ['dev', 'ino', 'mode', 'uid', 'gid', 'nlink', 'size', 'mtimeNs', 'ctimeNs', 'birthtimeNs'];
 const stampFields = stamp => Object.fromEntries(imageStampFields.map((name, i) => [name, JSON.parse(stamp)[i]]));
 async function imageReceipt(owned, name, value) {
-  if (owned.image.length > 4096 || owned.installed.length > 4096) fail('Owned evidence path bound');
-  const bytes = canonical({ format: 1, image: owned.image, installed: owned.installed, ...value }) + '\n';
+  if (owned.image.length > 4096 || owned.installed.length > 4096 || owned.mount.length > 4096) fail('Owned evidence path bound');
+  const bytes = canonical({ format: 1, image: owned.image, mount: owned.mount, installed: owned.installed, ...value }) + '\n';
   if (Buffer.byteLength(bytes) > 16384) fail('Owned evidence record bound');
   await writeExclusive(join(dirname(owned.image), name), bytes);
   await syncDirectory(dirname(owned.image));
@@ -559,8 +559,21 @@ async function imageHash(fd, deadline) {
   return h.digest('hex');
 }
 async function readOnlyImageProof(owned, deadline) {
-  const { image, installed, imageFD, rootFD, imageStamp, rootStamp, imageDigest, parentIdentity, buildRoot } = owned;
+  const { image, mount, installed, imageFD, mountFD, rootFD, imageStamp, mountStamp, rootStamp, imageDigest, parentIdentity, buildRoot } = owned;
   const account = userInfo(), actualImage = await imageFD.stat({ bigint: true }), actualRoot = await rootFD.stat({ bigint: true });
+  const actualMount = await mountFD.stat({ bigint: true });
+  await imageOperand(owned, 'closed-application-child', join(buildRoot, 'app/ArbolBrowser.app'), installed);
+  await imageOperand(owned, 'closed-mount-root', join(buildRoot, 'app'), mount);
+  await imageOperand(owned, 'application-parent', mount, dirname(installed));
+  await imageOperand(owned, 'mount-canonical', true, await realpath(mount) === mount);
+  await imageOperand(owned, 'mount-fd-full-stamp', mountStamp, fullStamp(actualMount));
+  await imageOperand(owned, 'mount-name-full-stamp', mountStamp, fullStamp(await lstat(mount, { bigint: true })));
+  await imageOperand(owned, 'mount-directory', true, actualMount.isDirectory());
+  await imageOperand(owned, 'mount-owner', String(account.uid), String(actualMount.uid));
+  await imageOperand(owned, 'mount-group', String(account.gid), String(actualMount.gid));
+  await imageOperand(owned, 'mount-mode', '448', String(actualMount.mode & 0o7777n));
+  await imageOperand(owned, 'application-mount-device', String(actualMount.dev), String(actualRoot.dev));
+  await imageOperand(owned, 'distinct-mount-application', true, actualMount.dev !== actualRoot.dev || actualMount.ino !== actualRoot.ino);
   await imageOperand(owned, 'image-canonical', true, await realpath(image) === image);
   await imageOperand(owned, 'root-canonical', true, await realpath(installed) === installed);
   await imageOperand(owned, 'image-fd-full-stamp', imageStamp, fullStamp(actualImage));
@@ -584,17 +597,17 @@ async function readOnlyImageProof(owned, deadline) {
     if (row.diskimages2 !== false || row['image-type'] !== 'UDIF read-only' || row.writeable !== false ||
         row['image-encrypted'] !== false || row['owner-uid'] !== account.uid || !Array.isArray(row['system-entities']) ||
         Object.keys(row).some(key => /shadow|overlay/i.test(key))) fail('Unsupported owned image');
-    const mounted = row['system-entities'].filter(entity => entity['mount-point'] === installed);
+    const mounted = row['system-entities'].filter(entity => entity['mount-point'] === mount);
     if (mounted.length !== 1 || !/^\/dev\/disk[0-9]+s[0-9]+$/.test(mounted[0]['dev-entry'])) fail('Owned mount mapping refused');
-    return { pid: row['hdid-pid'], device: mounted[0]['dev-entry'], image, installed, owner: row['owner-uid'],
+    return { pid: row['hdid-pid'], device: mounted[0]['dev-entry'], image, mount, application: installed, owner: row['owner-uid'],
       entities: row['system-entities'], diskimages2: row.diskimages2, type: row['image-type'], writable: row.writeable };
   };
   const selected = select();
   if (owned.mapping && canonical(selected) !== canonical(owned.mapping)) fail('Original owned mount mapping changed');
   const volume = imagePlist('/usr/sbin/diskutil', ['info', '-plist', selected.device], deadline);
   const device = await lstat(selected.device, { bigint: true });
-  if (!device.isBlockDevice() || device.rdev !== actualRoot.dev || volume.DeviceNode !== selected.device ||
-      volume.MountPoint !== installed || volume.FilesystemType !== 'apfs' || volume.BusProtocol !== 'Disk Image' ||
+  if (!device.isBlockDevice() || device.rdev !== actualMount.dev || volume.DeviceNode !== selected.device ||
+      volume.MountPoint !== mount || volume.FilesystemType !== 'apfs' || volume.BusProtocol !== 'Disk Image' ||
       volume.Writable !== false || volume.WritableMedia !== false || volume.WritableVolume !== false) fail('Volume is not the owned read-only APFS root');
   const before = imageKernel(selected.pid, deadline), text = await lstat(imageHelper, { bigint: true });
   if (!text.isFile() || text.uid !== 0n || (text.mode & 0o022n) !== 0n || (text.mode & 0o111n) === 0n || await realpath(imageHelper) !== imageHelper) fail('Unsafe Apple helper');
@@ -620,6 +633,8 @@ async function readOnlyImageProof(owned, deadline) {
   await imageOperand(owned, 'continuity-image-name-full-stamp', imageStamp, fullStamp(await lstat(image, { bigint: true })));
   await imageOperand(owned, 'continuity-root-fd-full-stamp', rootStamp, fullStamp(await rootFD.stat({ bigint: true })));
   await imageOperand(owned, 'continuity-root-name-full-stamp', rootStamp, fullStamp(await lstat(installed, { bigint: true })));
+  await imageOperand(owned, 'continuity-mount-fd-full-stamp', mountStamp, fullStamp(await mountFD.stat({ bigint: true })));
+  await imageOperand(owned, 'continuity-mount-name-full-stamp', mountStamp, fullStamp(await lstat(mount, { bigint: true })));
   return selected;
 }
 
@@ -693,23 +708,29 @@ export async function prepareAllocatedHost(environment = process.env) {
     await assertAllocation();
     const source = await lstat(bundle, { bigint: true }), parent = await lstat(buildRoot, { bigint: true });
     if (!source.isDirectory() || source.dev !== parent.dev) fail('Sealed app is not on actual Building device');
-    const installed = join(buildRoot, 'ArbolBrowser.app'), parentIdentity = await privateDirectory(buildRoot, true);
+    const mount = join(buildRoot, 'app'), installed = join(mount, 'ArbolBrowser.app');
+    const parentIdentity = await privateDirectory(buildRoot, true);
     await assertAllocation();
     const volumeRoot = await mkdtemp(join(buildRoot, '.host-volume-')); await privateDirectory(volumeRoot, true);
     const image = join(volumeRoot, 'host.dmg'), deadline = performance.now() + 120000;
-    // A plain source root makes the image contain the signed app's root entries,
-    // rather than hdiutil's additional staging-app wrapper. Copy every entry.
+    // One plain source parent contains exactly one fixed application child.
+    // The existing bounded copy preserves every original signed root entry.
     const sourceIdentity = await privateDirectory(bundle, true), sourceStamp = fullStamp(source);
     const sourceEntries = (await readdir(bundle)).sort();
     if (!sourceEntries.length || canonical(await inventory(bundle)) !== canonical(signed.files)) fail('Sealed source differs before copying');
     await assertPhysicalCap(bundle);
     const plain = await mkdtemp(join(buildRoot, '.host-image-source-')), plainIdentity = await privateDirectory(plain, true);
     if ((await readdir(plain)).length) fail('Image source is not empty');
+    const application = join(plain, 'ArbolBrowser.app'); await mkdir(application, { mode: 0o700 });
+    const applicationIdentity = await privateDirectory(application, true);
+    if ((await readdir(application)).length) fail('Image application child is not empty');
     await assertAllocation();
-    imageCommand('/bin/cp', ['-pR', ...sourceEntries.map(name => join(bundle, name)), plain], deadline);
+    imageCommand('/bin/cp', ['-pR', ...sourceEntries.map(name => join(bundle, name)), application], deadline);
     if (canonical(await privateDirectory(plain, true)) !== canonical(plainIdentity) ||
-        canonical((await readdir(plain)).sort()) !== canonical(sourceEntries) ||
-        canonical(await inventory(plain)) !== canonical(signed.files)) fail('Plain image source differs from sealed original');
+        canonical((await readdir(plain)).sort()) !== canonical(['ArbolBrowser.app']) ||
+        canonical(await privateDirectory(application, true)) !== canonical(applicationIdentity) ||
+        canonical((await readdir(application)).sort()) !== canonical(sourceEntries) ||
+        canonical(await inventory(application)) !== canonical(signed.files)) fail('Plain image source differs from sealed original');
     await assertPhysicalCap(plain);
     if (canonical(await privateDirectory(bundle, true)) !== canonical(sourceIdentity) ||
         fullStamp(await lstat(bundle, { bigint: true })) !== sourceStamp ||
@@ -720,7 +741,7 @@ export async function prepareAllocatedHost(environment = process.env) {
       '-uid', String(account.uid), '-gid', String(account.gid), '-mode', '0700', '-format', 'UDRO', '-plist', image], deadline);
     await assertAllocation(); await chmod(image, 0o600);
     const imageFD = await open(image, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-    ownedVolume = { image, installed, imageFD, buildRoot, parentIdentity, deadline };
+    ownedVolume = { image, mount, installed, imageFD, buildRoot, parentIdentity, deadline };
     ownedVolume.originalImageStamp = fullStamp(await imageFD.stat({ bigint: true }));
     ownedVolume.imageDigest = await imageHash(imageFD, deadline);
     const imageHost = await imageContainingVolume(image, imageFD, deadline);
@@ -730,14 +751,16 @@ export async function prepareAllocatedHost(environment = process.env) {
         (await lstat(bundle, { bigint: true })).ino !== source.ino) fail('Sealed source changed before attachment');
     const mountpoint = await mkdtemp(join(buildRoot, '.host-mount-'));
     if ((await readdir(mountpoint)).length) fail('Mountpoint is not empty');
-    await assertAllocation(); support.publishDirectory(mountpoint, installed); await syncDirectory(buildRoot); await assertAllocation();
+    await assertAllocation(); support.publishDirectory(mountpoint, mount); await syncDirectory(buildRoot); await assertAllocation();
     // Non-kernel mode provides the actual userspace helper/backing-vnode proof.
     await constructionImage(ownedVolume, false);
     ownedVolume.attachmentAttempted = true;
-    imagePlist('/usr/bin/hdiutil', ['attach', image, '-readonly', '-nokernel', '-mountpoint', installed, '-noautoopen', '-plist'], deadline);
+    imagePlist('/usr/bin/hdiutil', ['attach', image, '-readonly', '-nokernel', '-mountpoint', mount, '-noautoopen', '-plist'], deadline);
     // Seal once after construction; every subsequent full-stamp check includes ctime.
     ownedVolume.imageStamp = await constructionImage(ownedVolume, true);
     await assertAllocation();
+    ownedVolume.mountFD = await open(mount, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    ownedVolume.mountStamp = fullStamp(await ownedVolume.mountFD.stat({ bigint: true }));
     ownedVolume.rootFD = await open(installed, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
     ownedVolume.rootStamp = fullStamp(await ownedVolume.rootFD.stat({ bigint: true }));
     ownedVolume.mapping = await readOnlyImageProof(ownedVolume, deadline);
@@ -752,6 +775,7 @@ export async function prepareAllocatedHost(environment = process.env) {
     await readOnlyImageProof(ownedVolume, ownedVolume.deadline);
     await writeExclusive(join(dirname(ownedVolume.image), 'mount-provenance.json'), canonical({ format: 1,
       image: ownedVolume.image, imageStamp: ownedVolume.imageStamp, imageSha256: ownedVolume.imageDigest,
+      mount: ownedVolume.mount, application: ownedVolume.installed, mountStamp: ownedVolume.mountStamp,
       rootStamp: ownedVolume.rootStamp, mapping: ownedVolume.mapping, parentIdentity: ownedVolume.parentIdentity,
       productionLifecycle: 'ABR-24 installation/remount/protection/notarization/exclusive-unmount-prune required' }) + '\n');
     await syncDirectory(dirname(ownedVolume.image)); await assertAllocation();
@@ -772,10 +796,11 @@ export async function prepareAllocatedHost(environment = process.env) {
   if (failure) {
     try {
       await assertAllocation(); await withdrawOwnEntry();
-      if (ownedVolume?.mapping && ownedVolume.rootFD) {
+      if (ownedVolume?.mapping && ownedVolume.rootFD && ownedVolume.mountFD) {
         const deadline = performance.now() + 120000;
         await readOnlyImageProof(ownedVolume, deadline); await assertAllocation();
         await ownedVolume.rootFD.close(); ownedVolume.rootFD = undefined;
+        await ownedVolume.mountFD.close(); ownedVolume.mountFD = undefined;
         // No product child has been launched by this adapter, the CLI entry is
         // withdrawn and the original allocation/guard remains held. Busy mounts
         // refuse ordinary detach and remain as diagnostic artifacts.
@@ -784,6 +809,7 @@ export async function prepareAllocatedHost(environment = process.env) {
     } catch (cleanup) { failure = new Error('Owned read-only volume cleanup uncertain; artifacts retained', { cause: failure }); }
   }
   try { await ownedVolume?.rootFD?.close(); } catch (error) { failure ??= error; }
+  try { await ownedVolume?.mountFD?.close(); } catch (error) { failure ??= error; }
   try { await ownedVolume?.imageFD?.close(); } catch (error) { failure ??= error; }
   // A failure closing a description also withdraws only this writer's entry.
   try { if (failure) { await assertAllocation(); await withdrawOwnEntry(); } } catch (error) { failure ??= error; }
