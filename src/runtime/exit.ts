@@ -10,7 +10,7 @@ import { assertProfile, readJson, type ProfileSnapshot } from '../profiles/recor
 import { statOrAbsent } from '../profiles/paths.js';
 import { ownerLock, withOwnerLockForCustody, type OwnerLease } from '../profiles/locking.js';
 import { acquireBuildLease, withBuildLockForCustody, type BuildLease } from './build-lease.js';
-import { assertVerifiedHost, verifyPackagedHost, type VerifiedHost } from './authorities.js';
+import { assertTrustedHost, verifyPackagedHost, type VerifiedHost } from './authorities.js';
 import { assertPlatform, assertExitInspectionReceipt, type PlatformPort, type ExitInspectionReceipt, type PriorMarkerExpectation } from './platform.js';
 import { withLaunchAttempt, type LaunchAttempt } from './process.js';
 import { now, assertTime, runtimeLocation, type RuntimeRecord } from './instance.js';
@@ -190,7 +190,7 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
     },
     async reserve(profile: ProfileSnapshot, owner: OwnerLease, host: VerifiedHost, build: BuildLease,
       pending: LaunchAttempt, deadline: number) {
-      assertVerifiedHost(host, deadline); await host.assertTrusted(deadline); await build.assert();
+      await assertTrustedHost(host, deadline); await build.assert();
       if (build.selection.directory !== host.identity.layout.buildRoot || pending.buildRoot !== build.selection.directory ||
           pending.candidateDigest !== host.signed.snapshotDigest || pending.sourceDigest !== host.identity.sourceDigest ||
           pending.productDigest !== host.identity.productDigest) throw unavailable('profile');

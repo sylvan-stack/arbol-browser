@@ -312,7 +312,9 @@ export async function assertProductionCloseReady(profile: ProfileSnapshot, recor
  * fake native effects or MCP dependency can open this production boundary. */
 export function createProductionProcessIntegration(host: VerifiedHost, selection: BuildSelection,
   platform: PlatformPort, exits: ProductionExitAuthority, observation?: OpenCommandObservation): ProcessIntegration {
-  assertPlatform(platform); assertProductionExitAuthority(exits); assertVerifiedHost(host, now() + 5000);
+  // CLI wiring follows full verification and native provider loading. Actual
+  // command admission and startup still perform their own complete checks.
+  assertPlatform(platform); assertProductionExitAuthority(exits); assertVerifiedHostMetadata(host, now() + 5000);
   if (host.identity.layout.build !== selection.build || host.identity.layout.buildRoot !== selection.directory ||
       selection.guard !== join(selection.directory, '../.uses', selection.build)) throw unavailable('browser');
   return Object.freeze({

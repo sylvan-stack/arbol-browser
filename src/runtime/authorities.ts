@@ -265,8 +265,7 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
     if (bootstrapSigned) {
       // The canonical bootstrap alone owns this Native candidate brand. Reuse
       // that exact original frozen object, with no second signer or snapshot.
-      signed = manifests.verifyNativeCandidate(layout.bundle, deadline);
-      if (signed !== bootstrapSigned) throw unavailable('browser');
+      signed = manifests.reuseNativeCandidateForHost(layout.bundle, bootstrapSigned, deadline);
     } else signed = manifests.verifySignedBundle(layout.bundle, deadline);
   } catch (error) {
     try {

@@ -867,3 +867,14 @@ export function verifyNativeCandidate(bundle: string, deadline = Infinity): Cand
   catch (error) { poisonedTrust = true; return refuseVerification('bundle-selection', error); }
 }
 
+/** The bootstrap already verified and loaded this exact Native candidate.
+ * Read-only continuity covers package metadata preparation. The host still
+ * checks the complete signed snapshot before beginning ownership. */
+export function reuseNativeCandidateForHost(bundle: string, candidate: CandidateTrust, deadline: number): CandidateTrust {
+  if (!trustedCandidate || poisonedTrust) return refuseVerification('bundle-selection');
+  if (resolve(bundle) !== trustedCandidate.bundle) { poisonedTrust = true; return refuseVerification('bundle-selection'); }
+  if (candidate !== trustedCandidate) return refuseVerification('bundle-selection');
+  if (!assertRetainedReadOnlyStorage(candidate, deadline)) candidate.assertIdentity(deadline);
+  return candidate;
+}
+
