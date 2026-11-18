@@ -659,7 +659,7 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
     closeManagement(context, request, write) {
       authorize(context, request);
       const openWindows = [...windows.keys()].map(host => host.window).filter(window => !window.isDestroyed());
-      if (openWindows.some(window => window.isFocused())) throw new ForegroundWorkRequired('window');
+      if ([...windows.keys()].some(host => host.hasForegroundWork())) throw new ForegroundWorkRequired('window');
       const ack = delivery.prepareClose(context, request, operations.info().profile);
       const closing = runtime!.beginManagementClose(context, request);
       // Native admission, complete ordinary fence and guarded ACK consumption
@@ -681,7 +681,7 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
           if (request.method === 'close') throw unavailable('browser');
           const host = windowForOpen();
           if (request.params.url !== undefined || tabs().all().length === 0) {
-            if (host.window.isFocused()) throw new ForegroundWorkRequired('window');
+            if (host.hasForegroundWork()) throw new ForegroundWorkRequired('window');
             await tabs().openUser(host, userURL(request.params.url ?? 'about:blank'));
           }
           live();
@@ -698,7 +698,7 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
             value = projectAgentTabs(tabs(), recipient, id => authority.connected(id)); proof = { kind: 'tabs', recipient };
           } else if (params.name === 'browser_tab_open') {
             const host = windowForOpen();
-            if (host.window.isFocused() && !tabs().selected(host)) throw new ForegroundWorkRequired('window');
+            if (host.hasForegroundWork() && !tabs().selected(host)) throw new ForegroundWorkRequired('window');
             const record: PendingOpen = { action: authority.opaque('act'), recipient, request: request.id, targets: new Map(),
               cancelled: false, committed: false, failedRoots: new Set() };
             opens.get(context)!.set(request.id, record); delivery.noteOutcome(context, request, { action: record.action, dispatchOutcome: 'not_dispatched' });
@@ -721,7 +721,7 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
             if (params.name === 'browser_release' || params.name === 'browser_tab_close') {
               authority.owner(target, recipient, generation);
               const host = target.page.window;
-              if (params.name === 'browser_tab_close' && host.window.isFocused() && host.selected() === target.page)
+              if (params.name === 'browser_tab_close' && host.hasForegroundWork() && host.selected() === target.page)
                 throw new ForegroundWorkRequired('window');
               const action = authority.opaque('act');
               delivery.noteOutcome(context, request, { action, dispatchOutcome: 'outcome_unknown' });

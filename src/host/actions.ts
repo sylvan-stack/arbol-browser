@@ -109,7 +109,7 @@ export class ActionQueue implements HandoffOperations {
     if (!task.mutation || task.dispatched) return;
     const { target, generation, document } = task.stamp;
     const host = document.page.window;
-    if (this.awaitingManualWork.get(target) === generation || (host.window.isFocused() && host.selected() === document.page))
+    if (this.awaitingManualWork.get(target) === generation || (host.hasForegroundWork() && host.selected() === document.page))
       throw new ForegroundWorkRequired('tab');
   }
   private safe(task: Task): void {

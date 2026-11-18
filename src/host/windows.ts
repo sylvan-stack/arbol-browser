@@ -38,6 +38,7 @@ export interface WindowHost {
   readonly origin: string;
   createPage(): PageSurface;
   assertHealthy(): void;
+  hasForegroundWork(): boolean;
   select(page: PageSurface, commit?: () => void): void;
   /** Physical selection, independent of a logical tab retaining a retired page. */
   selected(): PageSurface | undefined;
@@ -153,6 +154,8 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
   };
   const host: WindowHost = Object.freeze({ window, shell, origin: shellURL,
     assertHealthy() { assertWindowHost(host); boundary.fatal.assertHealthy(); boundary.native.assertIntegrity(); },
+    // An attached AppKit sheet can be key while its parent window is disabled.
+    hasForegroundWork: () => !window.isDestroyed() && (window.isFocused() || !window.isEnabled()),
     createPage(): PageSurface {
       assertWindowHost(host); boundary.fatal.assertHealthy(); boundary.native.assertIntegrity();
       if (closing) throw unavailable('browser');
@@ -220,13 +223,14 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
       const contents = view.webContents, emitter = contents as unknown as EventEmitter;
       const raw = EventEmitter.prototype.rawListeners.call(emitter, '-run-dialog');
       const listeners = EventEmitter.prototype.listeners.call(emitter, '-run-dialog');
-      const stock = raw[0];
+      type DialogReply = (accepted: boolean, value: string) => void;
+      const stock = raw[0] as ((info: unknown, reply: DialogReply) => unknown) | undefined;
       if (raw.length !== 1 || listeners.length !== 1 || stock !== listeners[0] || typeof stock !== 'function')
         return boundary.fatal.fail('native_boundary_unavailable');
-      const dialog = async (info: unknown, reply: (accepted: boolean, value: string) => void) => {
+      const dialog = async (info: unknown, reply: DialogReply) => {
         if (typeof reply !== 'function') return boundary.fatal.fail('native_boundary_unavailable');
         if (closing || retired || selected !== page || window.isDestroyed() || !window.isFocused() ||
-            category(page) !== 'presented' || page.binding().blocked) return reply(false, '');
+            !view.getVisible() || page.binding().blocked) return reply(false, '');
         return Reflect.apply(stock, contents, [info, reply]);
       };
       EventEmitter.prototype.removeListener.call(emitter, '-run-dialog', stock);
