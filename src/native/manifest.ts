@@ -275,7 +275,7 @@ const storageFinalizer = new FinalizationRegistry<readonly StorageDescription[]>
 });
 function appleQuery(program: string, args: string[], deadline: number, input?: string): string {
   const result = spawnSync(program, args, { input, timeout: budget(deadline), maxBuffer: nativeLimit,
-    encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
+    encoding: 'utf8', env: { PATH: '/usr/bin:/bin', LC_ALL: 'C' } });
   budget(deadline);
   if (result.error || result.status !== 0 || Buffer.byteLength(result.stdout) > nativeLimit) refuseVerification('storage-context');
   return result.stdout;
@@ -307,12 +307,29 @@ function retainedDescription(path: string, directory: boolean): StorageDescripti
     return Object.freeze({ fd, path, directory, stamp: physicalStamp(held) });
   } catch (error) { closeSync(fd); throw error; }
 }
+function containingVolume(path: string, deadline: number): Record<string, unknown> {
+  const original = lstatSync(path, { bigint: true });
+  if (realpathSync(path) !== path) return refuse();
+  const rows = appleQuery('/bin/df', ['-P', path], deadline).trim().split('\n');
+  if (rows.length !== 2 || !rows[0]?.startsWith('Filesystem')) return refuse();
+  const fields = rows[1]?.trim().split(/\s+/);
+  const devicePath = fields?.[0];
+  if (!fields || fields.length < 6 || !devicePath || !/^\/dev\/disk[0-9]+(?:s[0-9]+)*$/.test(devicePath) ||
+      fields.slice(1, 4).some(value => !/^[0-9]+$/.test(value)) || !/^[0-9]+%$/.test(fields[4] ?? '')) return refuse();
+  const device = lstatSync(devicePath, { bigint: true });
+  const volume = applePlist('/usr/sbin/diskutil', ['info', '-plist', devicePath], deadline);
+  if (!device.isBlockDevice() || device.rdev !== original.dev || volume.DeviceNode !== devicePath ||
+      typeof volume.MountPoint !== 'string' || realpathSync(volume.MountPoint) !== volume.MountPoint) return refuse();
+  const mounted = lstatSync(volume.MountPoint, { bigint: true });
+  if (!mounted.isDirectory() || mounted.dev !== original.dev ||
+      physicalStamp(lstatSync(path, { bigint: true })) !== physicalStamp(original) || realpathSync(path) !== path) return refuse();
+  return volume;
+}
 function storageMapping(root: string, deadline: number): { volume: Record<string, unknown>; image?: Record<string, unknown>; key: string } {
-  const volume = applePlist('/usr/sbin/diskutil', ['info', '-plist', root], deadline);
+  const volume = containingVolume(root, deadline);
   const info = applePlist('/usr/bin/hdiutil', ['info', '-plist'], deadline);
   if (!Array.isArray(info.images) || typeof volume.MountPoint !== 'string' ||
-      !(root === volume.MountPoint || root.startsWith(volume.MountPoint.endsWith('/') ? volume.MountPoint : volume.MountPoint + sep)) ||
-      typeof volume.DeviceNode !== 'string' || !/^\/dev\/disk[0-9]+s[0-9]+$/.test(volume.DeviceNode) ||
+      typeof volume.DeviceNode !== 'string' || !/^\/dev\/disk[0-9]+(?:s[0-9]+)*$/.test(volume.DeviceNode) ||
       !['apfs', 'hfs'].includes(String(volume.FilesystemType))) refuse();
   const matches: Record<string, unknown>[] = [];
   for (const item of info.images) {
