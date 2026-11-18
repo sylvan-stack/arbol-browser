@@ -460,6 +460,7 @@ function run(argv) {
 `;
 const imageHelper = '/System/Library/PrivateFrameworks/DiskImages.framework/Versions/A/Resources/diskimages-helper';
 const fullStamp = st => canonical([st.dev, st.ino, st.mode, st.uid, st.gid, st.nlink, st.size, st.mtimeNs, st.ctimeNs, st.birthtimeNs].map(String));
+async function syncDirectory(path) { const fd = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW); try { await fd.sync(); } finally { await fd.close(); } }
 const imageStampFields = ['dev', 'ino', 'mode', 'uid', 'gid', 'nlink', 'size', 'mtimeNs', 'ctimeNs', 'birthtimeNs'];
 const stampFields = stamp => Object.fromEntries(imageStampFields.map((name, i) => [name, JSON.parse(stamp)[i]]));
 async function imageReceipt(owned, name, value) {
@@ -670,7 +671,6 @@ export async function prepareAllocatedHost(environment = process.env) {
     if (!same(logIdentity, currentLog) || !same(logIdentity, namedLog) || currentLog.size < logIdentity.size) fail('Original append-only Build log changed');
     if ((await currentHostCompilation()).digest !== compiled.digest) fail('Compiled source changed while preparing Build');
   }
-  async function syncDirectory(path) { const fd = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW); try { await fd.sync(); } finally { await fd.close(); } }
   async function withdrawOwnEntry() {
     if (!published || !ownEntry) return;
     const path = join(buildRoot, 'bin/arbol-browser'), current = await lstat(path, { bigint: true });
