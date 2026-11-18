@@ -806,7 +806,9 @@ public:
     NSDictionary* proposed=arbol_attempt::json(input);
     if(!arbol_attempt::keys(proposed,@[@"requestPath",@"runtime",@"prior"]) || !arbol_attempt::path(proposed[@"requestPath"])) return false;
     std::string request=[proposed[@"requestPath"] UTF8String]; arbol_attempt::Claim claim; std::string attemptRaw; NSDictionary* attempt=nil;
+    arbol_attempt::PackagedLayout layout;
     if(!claim.acquire(request,deadline) || !claim.read(attemptRaw,attempt) || !arbol_attempt::launchRequest(claim,request,attempt) ||
+       !arbol_attempt::claimedLayout(attempt,layout)||layout.bundle!=c.bundle||layout.guard!=c.build.path||
        ![attempt[@"phase"] isEqual:@"claimed"] || ![attempt[@"stage"] isEqual:@"untransferred"] ||
        [attempt[@"expires"] doubleValue]<=arbol_boundary::clockMs() || !arbol_attempt::currentProcess(attempt[@"engine"],true) ||
        ![attempt[@"candidateDigest"] isEqual:[NSString stringWithUTF8String:c.digest.c_str()]] ||
@@ -896,13 +898,15 @@ public:
     if(attempted_) return false; attempted_=true;
     if(!anonymousBytes(8,raw_,deadline)||!anonymousFile(9,true,sizeof(SharedState))) return false;
     value_=arbol_attempt::json(raw_); NSDictionary* main=value_[@"main"],*locks=value_[@"locks"],*attempt=value_[@"attempt"];
+    arbol_attempt::PackagedLayout layout;
     if(!arbol_attempt::keys(value_,@[@"format",@"kind",@"bootSession",@"bundle",@"main",@"locks",@"attempt",@"attemptPath",@"profileDirectory",@"profileRecord",@"profileRecordDigest",@"directories",@"receiptDirectory",@"family",@"runtime",@"markerPath",@"prior"]) ||
        ![value_[@"format"] isEqual:@1]||![value_[@"kind"] isEqual:@"host-finalization"]||
        ![value_[@"bootSession"] isEqual:bootSession()]||
        ![value_[@"bundle"] isEqual:[NSString stringWithUTF8String:c.bundle.c_str()]]||
        ![main isEqual:arbol_boundary::capsuleIdentity(c.main,c.session)]||
        ![locks isEqual:@{@"owner":arbol_boundary::capsuleLock(c.owner),@"build":arbol_boundary::capsuleLock(c.build)}]||
-       !arbol_attempt::record(attempt)||![attempt[@"candidateDigest"] isEqual:[NSString stringWithUTF8String:c.digest.c_str()]]||
+       !arbol_attempt::record(attempt)||!arbol_attempt::claimedLayout(attempt,layout)||layout.bundle!=c.bundle||layout.guard!=c.build.path||
+       ![attempt[@"candidateDigest"] isEqual:[NSString stringWithUTF8String:c.digest.c_str()]]||
        ![value_[@"markerPath"] isEqual:[attempt[@"profile"] stringByAppendingPathComponent:@"engine.json"]]||
        !arbol_attempt::runtime(value_[@"runtime"],attempt)) return false;
     capsule_=fcntl(8,F_DUPFD_CLOEXEC,10); stateFd_=fcntl(9,F_DUPFD_CLOEXEC,10);
@@ -1474,10 +1478,11 @@ public:
     build_=build; build_.fd=fcntl(build.fd,F_DUPFD_CLOEXEC,64);
     requestPath_=request; bundle_=bundle; baselineRaw_=arbol_attempt::bytes(baseline); baseline_=arbol_attempt::json(baselineRaw_); initialRaw_=initial;
     actor_=arbol_attempt::processRecord(getpid()); stage_=stage;
-    if(!arbol_attempt::record(baseline_)||![baseline_[@"stage"] isEqual:@"untransferred"]||
+    arbol_attempt::PackagedLayout layout;
+    if(!arbol_attempt::record(baseline_)||!arbol_attempt::claimedLayout(baseline_,layout)||layout.bundle!=bundle||layout.guard!=build.path||
+       ![baseline_[@"stage"] isEqual:@"untransferred"]||
        ![baseline_[@"phase"] isEqual:@"claimed"]||!actor_||![@[@"outer",@"post-exec",@"adopted"] containsObject:stage_]||
-       ![baseline_[@"buildGuard"] isEqual:[NSString stringWithUTF8String:build.path.c_str()]]||
-       ![baseline_[@"buildRoot"] isEqual:[[NSString stringWithUTF8String:bundle.c_str()] stringByDeletingLastPathComponent]]) return;
+       ![baseline_[@"buildGuard"] isEqual:[NSString stringWithUTF8String:build.path.c_str()]]) return;
     NSDictionary* parent=baseline_[@"bootstrap"];
     if(!arbol_attempt::process(parent)) return;
     if([stage_ isEqual:@"outer"]) { if(![actor_ isEqual:parent]||baseline_[@"engine"]!=NSNull.null||baseline_[@"runtime"]!=NSNull.null) return; }

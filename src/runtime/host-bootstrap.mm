@@ -128,8 +128,10 @@ static NSString* digest(NSString* path, bool symlink, uint32_t& magic) {
 }
 #pragma clang diagnostic pop
 static bool payload(NSString* bundle, NSDictionary* manifest) {
+  arbol_attempt::PackagedLayout layout;
+  if (!arbol_attempt::packagedLayout(bundle.fileSystemRepresentation,layout)) return false;
   NSDictionary* files = manifest[@"files"]; if (![files isKindOfClass:[NSDictionary class]] || files.count < 3 || files.count > 4096) return false;
-  NSString* root = [bundle stringByAppendingPathComponent:@"Contents/Resources/browser"];
+  NSString* root = [NSString stringWithUTF8String:layout.payload.c_str()];
   NSString* prefix = [bundle stringByAppendingString:@"/"];
   NSDirectoryEnumerator* walk = [[NSFileManager defaultManager] enumeratorAtPath:root]; NSMutableDictionary* actual = [NSMutableDictionary new];
   if (!walk) return false;
@@ -162,19 +164,22 @@ int main(int argc, const char* argv[]) {
       NSOperatingSystemVersion os = NSProcessInfo.processInfo.operatingSystemVersion;
       if (os.majorVersion != 27 || os.minorVersion != 0 || os.patchVersion != 1 || sizeof(void*) != 8) return 4;
       NSString* bundle = NSBundle.mainBundle.bundlePath;
+      arbol_attempt::PackagedLayout layout;
+      if (!arbol_attempt::packagedLayout(bundle.fileSystemRepresentation,layout)) return 4;
       arbol_boundary::Lock build;
       if (!arbol_attempt::openBuild(bundle.fileSystemRepresentation,build)) return 4;
       // Read only authenticated private control metadata here, release the
       // short lock during signature work, then compare the exact version again.
-      std::string initialRaw; NSDictionary* initial=nil;
+      std::string initialRaw; NSDictionary* initial=nil; arbol_attempt::PackagedLayout initialLayout;
       { arbol_attempt::Claim early;
         if(!early.acquire(argv[2],std::min(expiry,arbol_boundary::clockMs()+2000)) || !early.read(initialRaw,initial) ||
-           !arbol_attempt::launchRequest(early,argv[2],initial) || ![initial[@"phase"] isEqual:@"pending"]) return 4;
+           !arbol_attempt::launchRequest(early,argv[2],initial) ||
+           !arbol_attempt::claimedLayout(initial,initialLayout) || initialLayout.bundle!=layout.bundle || initialLayout.guard!=build.path || ![initial[@"phase"] isEqual:@"pending"]) return 4;
         expiry=std::min(expiry,[initial[@"expires"] doubleValue]); if(!inTime()) return 4;
       }
       arbol_boundary::Identity original; std::string originalPath;
       if(arbol_boundary::observe(getpid(),original)!=1 || original.group!=(uint32_t)getpid() || getsid(0)<=0 ||
-          !arbol_boundary::executable(original,originalPath) || originalPath!=std::string(bundle.fileSystemRepresentation)+"/Contents/MacOS/arbol-browser-native") return 4;
+          !arbol_boundary::executable(original,originalPath) || originalPath!=layout.bootstrap) return 4;
       if (!signature(bundle, true, false)) return 4;
       NSDictionary* policy = json([bundle stringByAppendingPathComponent:@"Contents/Resources/publisher-requirement.json"]);
       if (![policy isEqual:@{@"team": team, @"bundleIdentifier": bundleID, @"requirement": publisher}]) return 4;
@@ -182,11 +187,11 @@ int main(int argc, const char* argv[]) {
       NSDictionary* runtime = @{@"electron": @"45.3.2", @"chromium": @"156.0.8078.100", @"node": @"24.22.2", @"napi": @"10", @"modules": @"150", @"platform": @"darwin", @"arch": @"arm64", @"macOS": @"27.0.1"};
       NSDictionary* features = @{@"sitePerProcess": @YES, @"disabledFeatures": @[@"MacAccessibilityTextOperation"], @"extraChromiumArguments": @[]};
       if (![manifest[@"runtime"] isEqual:runtime] || ![manifest[@"featureConfiguration"] isEqual:features] || ![manifest[@"publisherTeam"] isEqual:team] || ![manifest[@"bundleIdentifier"] isEqual:bundleID] || !payload(bundle, manifest) || !signature(bundle, true, false)) return 4;
-      NSString* root = [bundle stringByAppendingPathComponent:@"Contents/Resources/browser"];
+      NSString* root = [NSString stringWithUTF8String:layout.payload.c_str()];
       NSDictionary* hostPolicy=json([bundle stringByAppendingPathComponent:@"Contents/Resources/host-policy.json"]);
       NSDictionary* metadata=json([root stringByAppendingPathComponent:@"metadata.json"]);
-      if (![hostPolicy[@"purpose"] isEqual:@"isolated-qualification"] || ![hostPolicy[@"buildRoot"] isEqual:bundle.stringByDeletingLastPathComponent] ||
-          ![hostPolicy[@"build"] isEqual:bundle.stringByDeletingLastPathComponent.lastPathComponent] ||
+      if (![hostPolicy[@"purpose"] isEqual:@"isolated-qualification"] || ![hostPolicy[@"buildRoot"] isEqual:[NSString stringWithUTF8String:layout.buildRoot.c_str()]] ||
+          ![hostPolicy[@"build"] isEqual:[NSString stringWithUTF8String:layout.build.c_str()]] ||
           ![metadata[@"component"][@"build"] isEqual:hostPolicy[@"build"]] ||
           ![metadata[@"sourceDigest"] isEqual:hostPolicy[@"sourceDigest"]] || ![metadata[@"host"][@"productDigest"] isEqual:hostPolicy[@"productDigest"]] ||
           !isolated(hostPolicy[@"buildRoot"],hostPolicy[@"stateRoot"])) return 4;
@@ -199,7 +204,7 @@ int main(int argc, const char* argv[]) {
           ![attempt[@"buildGuard"] isEqual:[NSString stringWithUTF8String:build.path.c_str()]] ||
           !arbol_attempt::pattern([attempt[@"profile"] lastPathComponent],@"^[a-z](?:[a-z0-9-]{0,62}[a-z0-9])?$") ||
           ![attempt[@"profile"] isEqual:[[hostPolicy[@"stateRoot"] stringByAppendingPathComponent:@"profiles"] stringByAppendingPathComponent:[attempt[@"profile"] lastPathComponent]]] ||
-          ![attempt[@"starter"][@"executable"] isEqual:[root stringByAppendingPathComponent:@"runtime/Electron.app/Contents/MacOS/Electron"]] ||
+          ![attempt[@"starter"][@"executable"] isEqual:[NSString stringWithUTF8String:layout.engine.c_str()]] ||
           ![attempt[@"sourceDigest"] isEqual:hostPolicy[@"sourceDigest"]] || ![attempt[@"productDigest"] isEqual:hostPolicy[@"productDigest"]]) return 4;
       NSMutableDictionary* claimed=[attempt mutableCopy]; claimed[@"phase"]=@"claimed"; claimed[@"bootstrap"]=arbol_attempt::processRecord(getpid());
       std::string claimedRaw=arbol_attempt::bytes(claimed);
@@ -220,7 +225,7 @@ int main(int argc, const char* argv[]) {
       // End the short transition before exec. Only the original Build OFD and
       // unlinked read-only transport survive. Its bytes alone grant no trust.
       if(close(claim.fd)) return 4; claim.fd=-1;
-      NSString* engine = [root stringByAppendingPathComponent:@"runtime/Electron.app/Contents/MacOS/Electron"];
+      NSString* engine = [NSString stringWithUTF8String:layout.engine.c_str()];
       NSString* entry = [root stringByAppendingPathComponent:@"lib/host/main.mjs"];
       std::string home = "HOME=" + std::string(NSHomeDirectory().fileSystemRepresentation), user = "USER=" + std::string(NSUserName().UTF8String);
       // PID version changes across exec; record stable original identity here and

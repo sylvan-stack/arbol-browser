@@ -511,9 +511,10 @@ static napi_value adoptHostBuild(napi_env env,napi_callback_info info) {
     arbol_boundary::Lock original{fd,guard,(uint64_t)guardStat.st_dev,guardStat.st_ino,guardStat.st_uid,0600,LOCK_SH};
     if(!arbol_boundary::lockIdentity(original) || ![arbol_boundary::capsuleLock(original) isEqual:transport[@"guard"]] ||
        flock(fd,LOCK_SH|LOCK_NB) || !arbol_boundary::lockIdentity(original)) return fail(env);
-    arbol_attempt::Claim claim; std::string prior; NSDictionary* attempt=nil;
+    arbol_attempt::Claim claim; std::string prior; NSDictionary* attempt=nil; arbol_attempt::PackagedLayout layout;
     if(!claim.acquire(requestPath,arbol_boundary::clockMs()+2000)||!claim.read(prior,attempt)||
        !arbol_attempt::launchRequest(claim,requestPath,attempt)||
+       !arbol_attempt::claimedLayout(attempt,layout)||layout.bundle!=bundle||layout.buildRoot!=root||layout.guard!=guard||
        ![attempt[@"bootstrap"] isEqual:transport[@"bootstrap"]]||![attempt[@"buildRoot"] isEqual:[NSString stringWithUTF8String:root.c_str()]]||
        ![attempt[@"buildGuard"] isEqual:[NSString stringWithUTF8String:guard.c_str()]]||
        ![attempt[@"stage"] isEqual:@"untransferred"]||attempt[@"engine"]!=NSNull.null||attempt[@"runtime"]!=NSNull.null||attempt[@"terminal"]!=NSNull.null) return fail(env);
@@ -527,8 +528,8 @@ static napi_value adoptHostBuild(napi_env env,napi_callback_info info) {
     if(![arbol_attempt::digest(cancelled?originalRaw:prior) isEqual:transport[@"claimDigest"]]||
        (!cancelled&&originalRaw!=prior)) return fail(env);
     NSDictionary* self=arbol_attempt::processRecord(getpid()); NSDictionary* outer=attempt[@"bootstrap"];
-    if(!self || ![outer[@"executable"] isEqual:[NSString stringWithUTF8String:(bundle+"/Contents/MacOS/arbol-browser-native").c_str()]] ||
-       ![self[@"executable"] isEqual:[NSString stringWithUTF8String:(bundle+"/Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron").c_str()]] ||
+    if(!self || ![outer[@"executable"] isEqual:[NSString stringWithUTF8String:layout.bootstrap.c_str()]] ||
+       ![self[@"executable"] isEqual:[NSString stringWithUTF8String:layout.engine.c_str()]] ||
        [outer[@"pidVersion"] isEqual:self[@"pidVersion"]] || !arbol_boundary::signature(bundle,false) ||
        !arbol_boundary::signature([self[@"executable"] UTF8String],true)) return fail(env);
     for(NSString* key in @[@"pid",@"uid",@"startId",@"group",@"session",@"parentStartId",@"parentPidVersion"])
@@ -1652,7 +1653,9 @@ static bool ordinaryReceipt(NSDictionary* ordinary,NSDictionary* storage,NSDicti
 }
 static bool verifyClosedReceipt(NSDictionary* closed,NSDictionary* __strong& capability,NSDictionary* __strong& receipt,
   NSDictionary* __strong& frontier,ExitInspection& job,const arbol_boundary::Lock& proofBuild,NSString* bundle) {
-  if(!arbol_attempt::record(closed)||![closed[@"phase"] isEqual:@"closed"]||closed[@"terminal"]==NSNull.null||closed[@"engine"]==NSNull.null) return false;
+  arbol_attempt::PackagedLayout layout;
+  if(!arbol_attempt::record(closed)||!arbol_attempt::claimedLayout(closed,layout)||layout.bundle!=bundle.UTF8String||
+     layout.guard!=proofBuild.path||![closed[@"phase"] isEqual:@"closed"]||closed[@"terminal"]==NSNull.null||closed[@"engine"]==NSNull.null) return false;
   NSString* path=closed[@"terminal"][@"path"],*profile=closed[@"profile"];
   NSString* state=profile.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent;
   NSString* parent=[[[state stringByAppendingPathComponent:@"exit-evidence"] stringByAppendingPathComponent:closed[@"profilePathHash"]] stringByAppendingPathComponent:closed[@"request"]];
@@ -1739,7 +1742,8 @@ static bool verifyClosedReceipt(NSDictionary* closed,NSDictionary* __strong& cap
 // claim can be inferred from it. Its prior data writer is verified separately.
 static bool verifyUnusedReceipt(NSDictionary* closed,NSDictionary* __strong& receipt,ExitInspection& job) {
   using namespace arbol_attempt;
-  if(!record(closed)||![closed[@"phase"] isEqual:@"closed"]||![closed[@"stage"] isEqual:@"untransferred"]||
+  PackagedLayout layout;
+  if(!claimedLayout(closed,layout)||!record(closed)||![closed[@"phase"] isEqual:@"closed"]||![closed[@"stage"] isEqual:@"untransferred"]||
      closed[@"bootstrap"]==NSNull.null||closed[@"terminal"]==NSNull.null) return false;
   NSString* path=closed[@"terminal"][@"path"],*profile=closed[@"profile"];
   NSString* parent=[[[profile.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent
@@ -1750,7 +1754,7 @@ static bool verifyUnusedReceipt(NSDictionary* closed,NSDictionary* __strong& rec
      !keys(receipt,@[@"format",@"kind",@"bootSession",@"actorStage",@"actor",@"attempt",@"baseline",@"baselineDigest",@"bundle",@"locks",@"priorDataClaim",@"marker",@"nativeFacts",@"census",@"observedUs",@"metadataDeadlineUs",@"originalAdmissionExpiryUs"])||
      ![receipt[@"format"] isEqual:@1]||![receipt[@"kind"] isEqual:@"unused-host-terminal"]||
      !pattern(receipt[@"bootSession"],@"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")||
-     ![receipt[@"bundle"] isEqual:[closed[@"buildRoot"] stringByAppendingPathComponent:@"ArbolBrowser.app"]]||
+     ![receipt[@"bundle"] isEqual:[NSString stringWithUTF8String:layout.bundle.c_str()]]||
      ![receipt[@"bundle"] isEqual:job.input[@"bundle"]]||
      !keys(receipt[@"locks"],@[@"build",@"owner"])||
      ![receipt[@"locks"][@"build"] isEqual:arbol_boundary::capsuleLock(job.build)]||
@@ -1830,6 +1834,8 @@ static bool inspectExit(ExitInspection& job) {
      ![leaf.lastPathComponent isEqual:[input[@"profilePathHash"] substringToIndex:32]]||
      job.owner.path!=std::string(profile.fileSystemRepresentation)+"/owner.lock"||
      (reserve?(job.nextBuild.fd<0||!record(input[@"pending"])):input[@"pending"]!=NSNull.null)) return false;
+  PackagedLayout inputLayout;
+  if(!packagedLayout([input[@"bundle"] UTF8String],inputLayout)||inputLayout.guard!=job.build.path) return false;
   arbol_exit::NativeFile history; struct stat historyIdentity{};
   NSString* state=profile.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent;
   NSString* historyPath=[[state stringByAppendingPathComponent:@"exit-evidence"] stringByAppendingPathComponent:input[@"profilePathHash"]];
@@ -1869,10 +1875,11 @@ static bool inspectExit(ExitInspection& job) {
   if(withdraw) {
     // Owner custody grants cancellation only, never exit. A possible original
     // actor must still produce native no-use or complete enrolled closure.
-    if(!current||!expected||![current isEqual:expected]||![current[@"stage"] isEqual:@"untransferred"]||
+    PackagedLayout layout;
+    if(!current||!claimedLayout(current,layout)||!expected||![current isEqual:expected]||![current[@"stage"] isEqual:@"untransferred"]||
        ![@[@"pending",@"claimed",@"cancelled"] containsObject:current[@"phase"]]||current[@"terminal"]!=NSNull.null||
        job.build.path!=std::string([current[@"buildGuard"] UTF8String])||
-       ![input[@"bundle"] isEqual:[current[@"buildRoot"] stringByAppendingPathComponent:@"ArbolBrowser.app"]]||
+       ![input[@"bundle"] isEqual:[NSString stringWithUTF8String:layout.bundle.c_str()]]||
        !arbol_boundary::signature([input[@"bundle"] UTF8String],false)) return false;
     NSMutableDictionary* cancelled=[current mutableCopy]; cancelled[@"phase"]=@"cancelled";
     if(!record(cancelled)||!job.within()||!replace(claim.at,currentRaw,false,bytes(cancelled))) return false;
@@ -1924,9 +1931,10 @@ static bool inspectExit(ExitInspection& job) {
     if(!closed) {
       if(expected!=(id)NSNull.null||input[@"dataAttempt"]!=NSNull.null||input[@"previous"]!=NSNull.null||retire) return false;
     } else {
-      if(expected==(id)NSNull.null||![closed isEqual:expected]||!sameProfile(closed)||
+      PackagedLayout layout;
+      if(!claimedLayout(closed,layout)||expected==(id)NSNull.null||![closed isEqual:expected]||!sameProfile(closed)||
          job.build.path!=std::string([closed[@"buildGuard"] UTF8String])||
-         ![input[@"bundle"] isEqual:[closed[@"buildRoot"] stringByAppendingPathComponent:@"ArbolBrowser.app"]]||
+         ![input[@"bundle"] isEqual:[NSString stringWithUTF8String:layout.bundle.c_str()]]||
          !arbol_boundary::signature([input[@"bundle"] UTF8String],false)) return false;
       if(unused) {
         if(!verifyUnusedReceipt(closed,unusedReceipt,job)) return false;
@@ -1937,7 +1945,8 @@ static bool inspectExit(ExitInspection& job) {
       }
       if(data) {
         const auto& guard=unused?job.dataBuild:job.build;
-        NSString* bundle=[data[@"buildRoot"] stringByAppendingPathComponent:@"ArbolBrowser.app"];
+        PackagedLayout dataLayout; if(!claimedLayout(data,dataLayout)) return false;
+        NSString* bundle=[NSString stringWithUTF8String:dataLayout.bundle.c_str()];
         if(guard.fd<0||guard.path!=std::string([data[@"buildGuard"] UTF8String])||!arbol_boundary::signature(bundle.UTF8String,false)||
            !verifyClosedReceipt(data,capability,receipt,frontier,job,guard,bundle)||
            (!prior&&!receiptMarker(capability,receipt[@"marker"],job))) return false;
@@ -1974,13 +1983,13 @@ static bool inspectExit(ExitInspection& job) {
   };
   if(!verify()||!physical()||!unchanged(claim.at)||!reclaim()) return false;
   if(reserve) {
-    NSDictionary* next=input[@"pending"];
+    NSDictionary* next=input[@"pending"]; PackagedLayout nextLayout;
     // This privileged transition is distinct from generic Role::starter. Repeat
     // all terminal/prior-data/physical checks with this ONE genuine Claim held;
     // only then can the actual live starter replace the unchanged exact record.
-    if(!verify()||!physical()||!sameProfile(next)||!transition(nil,next,Role::starter)||
+    if(!verify()||!physical()||!sameProfile(next)||!claimedLayout(next,nextLayout)||!transition(nil,next,Role::starter)||
        job.nextBuild.path!=std::string([next[@"buildGuard"] UTF8String])||
-       !arbol_boundary::signature([[next[@"buildRoot"] stringByAppendingPathComponent:@"ArbolBrowser.app"] UTF8String],false)||
+       !arbol_boundary::signature(nextLayout.bundle,false)||
        (current&&[current[@"request"] isEqual:next[@"request"]])||historyMissing) return false;
     // Persist predecessor first, newest immutable reservation second, and only
     // then install pending atomically. Interrupted publication fails closed:

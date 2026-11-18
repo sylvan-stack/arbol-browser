@@ -70,6 +70,8 @@ bool lineage(const arbol_boundary::Identity& id, const arbol_boundary::Info& inf
 // A later complete coherent sample, never that inconclusive query, proves PID.
 Observation sample(NSString* application, NSDictionary* original,
     NSDictionary* __strong& live, unsigned& branch) {
+  arbol_attempt::PackagedLayout layout;
+  if (!arbol_attempt::packagedLayout(application.fileSystemRepresentation,layout)) return Observation::refused;
   int pid = [original[@"pid"] intValue];
   arbol_boundary::Identity first, last; arbol_boundary::Info before{}, after{};
   if (arbol_boundary::observe(pid,first,&before) != 1 ||
@@ -79,8 +81,8 @@ Observation sample(NSString* application, NSDictionary* original,
   if (arbol_boundary::observe(pid,last,&after) != 1 ||
       !lineage(last,after,getsid(pid),original)) return Observation::refused;
   int version = [original[@"pidVersion"] intValue];
-  NSString* outer = [application stringByAppendingPathComponent:@"Contents/MacOS/arbol-browser-native"];
-  NSString* engine = [application stringByAppendingPathComponent:@"Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron"];
+  NSString* outer = [NSString stringWithUTF8String:layout.bootstrap.c_str()];
+  NSString* engine = [NSString stringWithUTF8String:layout.engine.c_str()];
   if (found && image != outer.fileSystemRepresentation && image != engine.fileSystemRepresentation)
     return Observation::refused;
   if (first.version != last.version)
@@ -105,6 +107,8 @@ Observation inspect(arbol_attempt::Claim& claim, NSString* application, const st
   const std::string name = requestPath.substr(requestPath.rfind('/')+1);
   if (!claim.acquire(requestPath,std::min(deadline,arbol_boundary::clockMs()+2000)) ||
       !claim.read(raw,current) || !stable(claim,baseline,name)) return Observation::refused;
+  arbol_attempt::PackagedLayout layout;
+  if (!arbol_attempt::claimedLayout(current,layout) || layout.bundle!=application.fileSystemRepresentation) return Observation::refused;
   phase = 1;
   std::string liveRequest;
   if (!arbol_attempt::immutable(pending,current) ||
@@ -119,7 +123,7 @@ Observation inspect(arbol_attempt::Claim& claim, NSString* application, const st
   if (![@[@"claimed",@"ready"] containsObject:current[@"phase"]]) return Observation::refused;
   NSDictionary* original = current[@"bootstrap"];
   if (!arbol_attempt::process(original) || [original[@"group"] intValue] != [original[@"pid"] intValue] ||
-      ![original[@"executable"] isEqual:[application stringByAppendingPathComponent:@"Contents/MacOS/arbol-browser-native"]] ||
+      ![original[@"executable"] isEqual:[NSString stringWithUTF8String:layout.bootstrap.c_str()]] ||
       !arbol_boundary::canonical([original[@"executable"] fileSystemRepresentation])) return Observation::refused;
   phase = 3;
   NSDictionary* live = nil;
@@ -165,11 +169,11 @@ int main(int argc, const char* argv[]) {
     if (!application.isAbsolutePath || !request.isAbsolutePath) return 4;
     double deadline=arbol_boundary::clockMs()+28000;
     NSDictionary* pending = nil; std::string requestRaw; Baseline baseline;
-    { arbol_attempt::Claim claim; std::string raw; NSDictionary* attempt=nil;
+    { arbol_attempt::Claim claim; std::string raw; NSDictionary* attempt=nil; arbol_attempt::PackagedLayout layout;
       if(!claim.acquire(argv[2],std::min(deadline,arbol_boundary::clockMs()+2000)) || !claim.read(raw,attempt) ||
          !arbol_attempt::launchRequest(claim,argv[2],attempt) || ![attempt[@"phase"] isEqual:@"pending"] ||
          !arbol_attempt::currentProcess(attempt[@"starter"]) ||
-         ![application isEqual:[attempt[@"buildRoot"] stringByAppendingPathComponent:@"ArbolBrowser.app"]] ||
+         !arbol_attempt::claimedLayout(attempt,layout) || layout.bundle!=application.fileSystemRepresentation ||
          !arbol_boundary::canonical(application.fileSystemRepresentation)) return 4;
       std::string checkedRequest;
       const std::string name = request.lastPathComponent.UTF8String;
