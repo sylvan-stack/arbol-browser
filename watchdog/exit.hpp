@@ -253,7 +253,8 @@ struct SharedState {
   // dirty marker; it never predicts or grants its replacement inode.
   char expectedMarkerDigest[65]{};
   MarkerBinding marker{};
-  void poison(uint64_t reason,unsigned callerLine=__builtin_LINE()) {
+  void poison(uint64_t reason,unsigned callerLine=__builtin_LINE(),
+    arbol_boundary::FatalSource source=arbol_boundary::FatalSource::existingCaller) {
     uint32_t value=activation.load(std::memory_order_acquire);
     while((value==0||value==1)&&!activation.compare_exchange_weak(value,value==0?4:3,std::memory_order_acq_rel)) {}
     // A post-commit reason remains recorded, but cannot retroactively erase
@@ -263,8 +264,8 @@ struct SharedState {
       int savedErrno=errno;
       try {
         @try {
-          os_log_error(OS_LOG_DEFAULT,"arbol-browser-first-fatal reason=%{public}llu line=%{public}u",
-            (unsigned long long)reason,callerLine);
+          os_log_error(OS_LOG_DEFAULT,"arbol-browser-first-fatal reason=%{public}llu line=%{public}u source=%{public}u",
+            (unsigned long long)reason,callerLine,static_cast<unsigned>(source));
         } @catch(NSException*) {}
       } catch(...) {}
       errno=savedErrno;
@@ -355,14 +356,20 @@ class RetainedFamily final:public arbol_boundary::FamilyCapture {
     out[@"parentStartId"]=[NSString stringWithUTF8String:std::to_string(value.parentStart).c_str()];
     out[@"parentPidVersion"]=@(value.parentVersion); out[@"session"]=@(value.session); out[@"image"]=@(value.image); out[@"capturedUs"]=@(value.capturedUs); return out;
   }
-  bool append(std::vector<Job>& jobs) {
+  bool append(std::vector<Job>& jobs,unsigned& firstRefusalLine) {
+    // Owned by this one worker operation. Recording a failed site performs no
+    // syscall and cannot replace the original false result or errno.
+    auto refused=[&](unsigned callerLine=__builtin_LINE()) {
+      if(!firstRefusalLine) firstRefusalLine=callerLine;
+      return false;
+    };
     @autoreleasepool { @try {
-      if(!self()) return false;
-      LedgerFront before; if(!state_->family.roles[role_].frontier.read(before)||!physical(role_,before)) return false;
-      struct stat writing{}; if(fstat(writer_,&writing)||!before.file.is(writing)||(fcntl(writer_,F_GETFL)&O_ACCMODE)!=O_WRONLY) return false;
+      if(!self()) return refused();
+      LedgerFront before; if(!state_->family.roles[role_].frontier.read(before)||!physical(role_,before)) return refused();
+      struct stat writing{}; if(fstat(writer_,&writing)||!before.file.is(writing)||(fcntl(writer_,F_GETFL)&O_ACCMODE)!=O_WRONLY) return refused();
       LedgerFront next=before; std::string bytes; std::vector<Job> committed;
       for(const auto& job:jobs) {
-        if(next.count==UINT64_MAX||!compatible(job.value)) return false;
+        if(next.count==UINT64_MAX||!compatible(job.value)) return refused();
         auto& slot=state_->family.roles[job.origin].active[job.index];
         arbol_boundary::FamilyObservation current; uint64_t serial;
         uint64_t publication=slot.publication.load(std::memory_order_acquire);
@@ -370,28 +377,33 @@ class RetainedFamily final:public arbol_boundary::FamilyCapture {
         // An old queued observation may therefore be harmlessly superseded;
         // never charge or acknowledge the replacement original.
         if((publication>>2)>job.serial||((publication>>2)==job.serial&&!(publication&3))) continue;
-        if(!slot.read(current,serial)||serial!=job.serial||!arbol_boundary::same(current.original,job.value.original)) return false;
-        if(job.absence&&slot.resolver.load(std::memory_order_acquire)!=((job.serial<<2)|(role_+1))) return false;
+        if(!slot.read(current,serial)||serial!=job.serial||!arbol_boundary::same(current.original,job.value.original)) return refused();
+        if(job.absence&&slot.resolver.load(std::memory_order_acquire)!=((job.serial<<2)|(role_+1))) return refused();
         NSMutableDictionary* record=[@{@"format":@1,@"kind":job.absence?@"absence":@"capture",@"writerRole":@(role_),@"sequence":@(++next.count),
           @"originRole":@(job.origin),@"capture":@(job.serial),@"original":identity(job.value),@"previous":[NSString stringWithUTF8String:next.chain.c_str()]} mutableCopy];
         if(job.absence) {
-          if(!arbol_boundary::same(job.proof.original,job.value.original)||!job.proof.observedUs||(job.proof.kind!=1&&job.proof.kind!=2)) return false;
+          if(!arbol_boundary::same(job.proof.original,job.value.original)||!job.proof.observedUs||(job.proof.kind!=1&&job.proof.kind!=2)) return refused();
           record[@"proof"]=@{@"kind":job.proof.kind==1?@"complete-kernel-absence":@"unique-start-reuse",@"observedUs":@(job.proof.observedUs),
             @"replacement":job.proof.kind==2?arbol_boundary::capsuleIdentity(job.proof.replacement):(id)NSNull.null};
         }
-        std::string core=arbol_attempt::bytes(record); if(core.empty()) return false;
+        std::string core=arbol_attempt::bytes(record); if(core.empty()) return refused();
         next.chain=[arbol_attempt::digest(core) UTF8String]; record[@"digest"]=[NSString stringWithUTF8String:next.chain.c_str()];
-        std::string raw=arbol_attempt::bytes(record); if(raw.empty()||bytes.size()+raw.size()>1048576) return false;
+        std::string raw=arbol_attempt::bytes(record); if(raw.empty()||bytes.size()+raw.size()>1048576) return refused();
         next.tailOffset=before.file.size+bytes.size(); next.tailLength=raw.size(); bytes+=raw; committed.push_back(job);
       }
       if(committed.empty()) return true;
       // No unexpected edit or append may be hidden behind our next increment.
-      if(!physical(role_,before)) return false;
+      if(!physical(role_,before)) return refused();
       size_t at=0;
-      while(at<bytes.size()) { ssize_t n=pwrite(writer_,bytes.data()+at,bytes.size()-at,before.file.size+at); if(n>0) at+=n; else if(n<0&&errno==EINTR) continue; else return false; }
+      while(at<bytes.size()) {
+        ssize_t n=pwrite(writer_,bytes.data()+at,bytes.size()-at,before.file.size+at);
+        if(n>0) at+=n;
+        else if(n<0&&errno==EINTR) continue;
+        else return refused();
+      }
       if(fsync(writer_)||fcntl(writer_,F_FULLFSYNC)||fstat(writer_,&writing)||writing.st_size!=(off_t)(before.file.size+bytes.size())||
-         writing.st_dev!=(dev_t)before.file.device||writing.st_ino!=before.file.inode||!arbol_attempt::privateFile(writing)) return false;
-      next.file=LedgerStamp::from(writing); if(!physical(role_,next)||!state_->family.roles[role_].frontier.publish(next)) return false;
+         writing.st_dev!=(dev_t)before.file.device||writing.st_ino!=before.file.inode||!arbol_attempt::privateFile(writing)) return refused();
+      next.file=LedgerStamp::from(writing); if(!physical(role_,next)||!state_->family.roles[role_].frontier.publish(next)) return refused();
       for(const auto& job:committed) {
         auto& slot=state_->family.roles[job.origin].active[job.index];
         auto& acknowledgement=job.absence?slot.absenceAck:slot.captureAck;
@@ -402,9 +414,12 @@ class RetainedFamily final:public arbol_boundary::FamilyCapture {
       }
       state_->family.activity.fetch_add(1,std::memory_order_acq_rel);
       return true;
-    } @catch(NSException*) { return false; } }
+    } @catch(NSException*) { return refused(); } }
   }
-  void fail() { state_->family.roles[role_].failed.store(1,std::memory_order_release); refuse(); }
+  void fail(unsigned callerLine=__builtin_LINE()) {
+    state_->family.roles[role_].failed.store(1,std::memory_order_release);
+    refuse(callerLine,arbol_boundary::FatalSource::exitHeader);
+  }
   void run() {
     for(;;) {
       std::vector<Job> jobs;
@@ -413,8 +428,15 @@ class RetainedFamily final:public arbol_boundary::FamilyCapture {
         if(failed_) return;
         while(!queue_.empty()&&jobs.size()<64) { jobs.push_back(std::move(queue_.front())); queue_.pop_front(); }
       }
-      bool ok=false; try { ok=append(jobs); } catch(...) {}
-      if(!ok) { { std::lock_guard<std::mutex> held(mutex_); failed_=true; } fail(); return; }
+      unsigned firstRefusalLine=0;
+      bool ok=false;
+      try { ok=append(jobs,firstRefusalLine); }
+      catch(...) { if(!firstRefusalLine) firstRefusalLine=__builtin_LINE(); }
+      if(!ok) {
+        { std::lock_guard<std::mutex> held(mutex_); failed_=true; }
+        fail(firstRefusalLine);
+        return;
+      }
       { std::lock_guard<std::mutex> held(mutex_); if(queue_.empty()) state_->family.roles[role_].appendInFlight.store(0,std::memory_order_release); }
     }
   }
@@ -436,7 +458,11 @@ public:
     state_(state),role_(role),main_(main),session_(session),writer_(writer),capability_(capability),capabilityDigest_(digest) {
     for(unsigned i=0;i<3;++i) readers_[i]=readers[i];
   }
-  void refuse() override { state_->family.uncertain.store(1,std::memory_order_release); state_->poison(identityLoss); }
+  void refuse(unsigned callerLine=__builtin_LINE(),
+    arbol_boundary::FatalSource source=arbol_boundary::FatalSource::exitHeader) override {
+    state_->family.uncertain.store(1,std::memory_order_release);
+    state_->poison(identityLoss,callerLine,source);
+  }
   bool capture(const arbol_boundary::FamilyObservation& value) override {
     if(role_>2||!compatible(value)||!self()) { refuse(); return false; }
     auto& role=state_->family.roles[role_];

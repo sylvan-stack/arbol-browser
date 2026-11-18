@@ -225,11 +225,14 @@ struct FamilyObservation {
   Identity original{}; uint64_t parentStart=0,capturedUs=0;
   int32_t parentVersion=0; uint32_t session=0,image=0;
 };
+// Private diagnostic provenance only. Zero preserves the existing non-family
+// caller-line convention; the two family headers have distinct closed tags.
+enum class FatalSource : unsigned { existingCaller=0, boundaryHeader=1, exitHeader=2 };
 class FamilyCapture {
 public:
   virtual ~FamilyCapture()=default;
   virtual bool capture(const FamilyObservation& original)=0;
-  virtual void refuse()=0;
+  virtual void refuse(unsigned callerLine=__builtin_LINE(), FatalSource source=FatalSource::boundaryHeader)=0;
   virtual bool snapshot(std::vector<FamilyObservation>& values)=0;
   virtual bool retire(const KernelAbsence& proof)=0;
   virtual bool complete()=0;
@@ -242,7 +245,10 @@ struct Context {
   double lastFullCensus=0; bool fullCensusValid=false,originalGroupRetired=false,groupPending=false;
   std::map<int,std::shared_ptr<KernelAnswer>> groupGaps;
   FamilyCapture* family=nullptr; // actual native capability owns its lifetime
-  void uncertainFamily() { familyUncertain=true; if(family) family->refuse(); }
+  void uncertainFamily(unsigned callerLine=__builtin_LINE()) {
+    familyUncertain=true;
+    if(family) family->refuse(callerLine,FatalSource::boundaryHeader);
+  }
   bool originalGone(const Identity& id) {
     if(!id.pid) return true;
     if(exits.size()>=4096&&!exits.count(key(id))) { uncertainFamily(); return false; }
