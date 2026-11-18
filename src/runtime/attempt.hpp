@@ -85,6 +85,43 @@ inline bool runtime(NSDictionary* p, NSDictionary* attempt) {
     pattern(p[@"processStartId"],@"^[1-9][0-9]{0,19}$") &&
     [@[@"starting",@"ready",@"closing"] containsObject:p[@"phase"]] && path(p[@"agentSocket"]) && path(p[@"managementSocket"]);
 }
+// Closed structural mapping only: signatures, snapshots and original custody
+// remain separate checks at every consumer.
+struct PackagedLayout {
+  std::string build, buildRoot, guard, bundle, payload, launcher, bootstrap, engine;
+};
+inline bool packagedLayout(const std::string& bundle, PackagedLayout& out) {
+  NSString* app = [NSString stringWithUTF8String:bundle.c_str()];
+  if (!path(app) || ![app.lastPathComponent isEqual:@"ArbolBrowser.app"]) return false;
+  NSString* parent = app.stringByDeletingLastPathComponent;
+  NSString* root = [parent.lastPathComponent isEqual:@"app"] ? parent.stringByDeletingLastPathComponent : parent;
+  NSString* component = root.stringByDeletingLastPathComponent;
+  if (!pattern(root.lastPathComponent,@"^[1-9a-f][0-9a-f]{0,15}$") || ![component.lastPathComponent isEqual:@"arbol-browser"]) return false;
+  out.build = root.lastPathComponent.UTF8String; out.buildRoot = root.UTF8String; out.bundle = bundle;
+  out.guard = [[component stringByAppendingPathComponent:[@".uses/" stringByAppendingString:root.lastPathComponent]] UTF8String];
+  out.payload = bundle + "/Contents/Resources/browser";
+  out.launcher = out.payload + "/native/host-launch";
+  out.bootstrap = bundle + "/Contents/MacOS/arbol-browser-native";
+  out.engine = out.payload + "/runtime/Electron.app/Contents/MacOS/Electron";
+  return true;
+}
+inline bool claimedLayout(NSDictionary* attempt, PackagedLayout& out) {
+  NSDictionary* starter = attempt[@"starter"];
+  if (!process(starter)) return false;
+  std::string executable = [starter[@"executable"] UTF8String];
+  const std::string suffix = "/Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron";
+  if (executable.size() <= suffix.size() || executable.compare(executable.size()-suffix.size(),suffix.size(),suffix) ||
+      !packagedLayout(executable.substr(0,executable.size()-suffix.size()),out) || executable != out.engine ||
+      ![attempt[@"build"] isEqual:[NSString stringWithUTF8String:out.build.c_str()]] ||
+      ![attempt[@"buildRoot"] isEqual:[NSString stringWithUTF8String:out.buildRoot.c_str()]] ||
+      ![attempt[@"buildGuard"] isEqual:[NSString stringWithUTF8String:out.guard.c_str()]]) return false;
+  for (NSString* key in @[@"bootstrap",@"engine"]) {
+    id actor = attempt[key]; if (actor == NSNull.null) continue;
+    const std::string& expected = [key isEqual:@"bootstrap"] ? out.bootstrap : out.engine;
+    if (!process(actor) || ![actor[@"executable"] isEqual:[NSString stringWithUTF8String:expected.c_str()]]) return false;
+  }
+  return true;
+}
 inline bool record(NSDictionary* p) {
   uint64_t format;
   if (!keys(p,@[@"format",@"request",@"nonce",@"profile",@"profileInstance",@"profilePathHash",@"build",@"buildRoot",@"buildGuard",
@@ -118,7 +155,7 @@ inline bool record(NSDictionary* p) {
       ![p[@"runtime"][@"pid"] isEqual:p[@"engine"][@"pid"]] || ![p[@"runtime"][@"processStartId"] isEqual:p[@"engine"][@"startId"]])) return false;
   if (p[@"terminal"] != NSNull.null && !keys(p[@"terminal"],@[@"path",@"digest"])) return false;
   if (p[@"terminal"] != NSNull.null && (!path(p[@"terminal"][@"path"]) || !pattern(p[@"terminal"][@"digest"],@"^[0-9a-f]{64}$"))) return false;
-  return true;
+  PackagedLayout layout; return claimedLayout(p,layout);
 }
 inline bool immutable(NSDictionary* a, NSDictionary* b) {
   for (NSString* key in @[@"format",@"request",@"nonce",@"profile",@"profileInstance",@"profilePathHash",@"build",@"buildRoot",@"buildGuard",
@@ -296,12 +333,11 @@ inline bool launchRequest(const Claim& claim, const std::string& requestPath, NS
     [selection[@"guard"] isEqual:attempt[@"buildGuard"]] && unchanged(claim.at);
 }
 inline bool bundleGuard(const std::string& bundle, std::string& buildRoot, std::string& guard) {
-  if (!arbol_boundary::canonical(bundle) || bundle.size() < 18 || bundle.substr(bundle.size()-17) != "/ArbolBrowser.app") return false;
-  buildRoot = bundle.substr(0,bundle.size()-17);
+  PackagedLayout layout;
+  if (!arbol_boundary::canonical(bundle) || !packagedLayout(bundle,layout)) return false;
+  buildRoot = layout.buildRoot; guard = layout.guard;
   NSString* root = [NSString stringWithUTF8String:buildRoot.c_str()];
   NSString* component = root.stringByDeletingLastPathComponent;
-  if (!pattern(root.lastPathComponent,@"^[1-9a-f][0-9a-f]{0,15}$") || ![component.lastPathComponent isEqual:@"arbol-browser"]) return false;
-  guard = [[component stringByAppendingPathComponent:[@".uses/" stringByAppendingString:root.lastPathComponent]] UTF8String];
   for (const std::string& path : {buildRoot,std::string(component.UTF8String),guard.substr(0,guard.rfind('/'))}) {
     struct stat st{};
     if (!arbol_boundary::canonical(path) || lstat(path.c_str(),&st) || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode&07777)!=0700) return false;

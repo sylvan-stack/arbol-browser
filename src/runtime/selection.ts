@@ -6,25 +6,45 @@ export interface BuildSelection {
   readonly build: string; readonly explicit: boolean;
   readonly directory: string; readonly guard: string;
 }
-/** One production layout. Paths are structural identities, not signature proof.
+/** Closed production layouts. Paths are structural identities, not signature proof.
  * The registry owns buildRoot; every executable and metadata input is sealed
  * inside its single outer application. Foundation-only packages stay distinct. */
 export interface PackagedLayout {
   readonly build: string; readonly buildRoot: string; readonly bundle: string;
   readonly payload: string; readonly launcher: string; readonly engine: string;
+  readonly bootstrap: string;
   readonly cliEntry: string; readonly hostEntry: string;
 }
 export function packagedLayout(build: string, payload: string): PackagedLayout {
   if (!validator('browser.Build')(build) || !isAbsolute(payload) || resolve(payload) !== payload ||
       basename(payload) !== 'browser' || basename(dirname(payload)) !== 'Resources' ||
       basename(dirname(dirname(payload))) !== 'Contents') throw unavailable('browser');
-  const bundle = dirname(dirname(dirname(payload))), buildRoot = dirname(bundle);
+  const bundle = dirname(dirname(dirname(payload))), parent = dirname(bundle);
+  const buildRoot = basename(parent) === 'app' ? dirname(parent) : parent;
   if (basename(bundle) !== 'ArbolBrowser.app' || basename(buildRoot) !== build ||
       basename(dirname(buildRoot)) !== 'arbol-browser') throw unavailable('browser');
   return Object.freeze({ build, buildRoot, bundle, payload,
     launcher: join(payload, 'native/host-launch'),
+    bootstrap: join(bundle, 'Contents/MacOS/arbol-browser-native'),
     engine: join(payload, 'runtime/Electron.app/Contents/MacOS/Electron'),
     cliEntry: join(payload, 'lib/cli/main.mjs'), hostEntry: join(payload, 'lib/host/main.mjs') });
+}
+/** The immutable starter exists even before a bootstrap has claimed a launch.
+ * Later actor paths must agree; none may select a different package layout. */
+export function claimedLayout(attempt: {
+  readonly build: string; readonly buildRoot: string; readonly buildGuard: string;
+  readonly starter: { readonly executable: string };
+  readonly bootstrap: { readonly executable: string } | null;
+  readonly engine: { readonly executable: string } | null;
+}): PackagedLayout {
+  const suffix = '/runtime/Electron.app/Contents/MacOS/Electron';
+  if (!attempt.starter.executable.endsWith(suffix)) throw unavailable('browser');
+  const layout = selectedLayout({ build: attempt.build, directory: attempt.buildRoot,
+    guard: attempt.buildGuard, explicit: true }, attempt.starter.executable.slice(0, -suffix.length));
+  if (attempt.starter.executable !== layout.engine ||
+      (attempt.bootstrap !== null && attempt.bootstrap.executable !== layout.bootstrap) ||
+      (attempt.engine !== null && attempt.engine.executable !== layout.engine)) throw unavailable('browser');
+  return layout;
 }
 export function selectedLayout(selection: BuildSelection, payload: string): PackagedLayout {
   const layout = packagedLayout(selection.build, payload);
