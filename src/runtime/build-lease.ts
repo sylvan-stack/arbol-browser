@@ -5,7 +5,7 @@ import { directory, assertDirectory, privateFile, sameIdentity, identity, profil
 import type { PlatformPort, HeldLock } from './platform.js';
 import { selectedLayout, type BuildSelection } from './selection.js';
 import type { BuildGuard } from './start.js';
-import { assertTrustedHost, type VerifiedHost } from './authorities.js';
+import { assertHostStartupContinuity, assertTrustedHost, type VerifiedHost } from './authorities.js';
 import { assertPlatform } from './platform.js';
 import { withOwnerLockForCustody, type OwnerLease } from '../profiles/locking.js';
 
@@ -13,6 +13,16 @@ export interface BuildLease extends BuildGuard {
   readonly selection: BuildSelection;
 }
 const buildDescriptions = new WeakMap<BuildLease, { platform: PlatformPort; held: HeldLock }>();
+const adoptedStartupChecks = new WeakMap<BuildLease, { host: VerifiedHost; assert(deadline: number): Promise<void> }>();
+
+/** Limited to the exact original adopted Build. Other leases keep their full
+ * assertion, and matching an image description grants no content receipt. */
+export async function assertAdoptedBuildContinuity(lease: BuildLease, host: VerifiedHost, deadline: number): Promise<void> {
+  const original = adoptedStartupChecks.get(lease);
+  if (!original) return lease.assert();
+  if (original.host !== host) throw profileUnavailable();
+  await original.assert(deadline);
+}
 /** Only the original real description behind this module's lease is handed to
  * the exact native platform. There is no descriptor export by guard pathname.
  * Native custody, not the JS reference or callback, retains it through exit. */
@@ -86,7 +96,13 @@ export async function adoptHostBuildLease(host: VerifiedHost, platform: Platform
       },
       release(): never { throw profileUnavailable(); },
     });
-    buildDescriptions.set(lease, { platform, held }); assertOriginal(); return lease;
+    buildDescriptions.set(lease, { platform, held });
+    adoptedStartupChecks.set(lease, { host, async assert(limit) {
+      assertOriginal();
+      await assertHostStartupContinuity(host, performance.now() + 5000, Math.min(deadline, limit));
+      assertOriginal();
+    } });
+    assertOriginal(); return lease;
   } catch { return terminateCapturedHostBuild(token); }
 }
 /** Reacquire the launcher's exact stable .uses/<hex> shared kernel flock.

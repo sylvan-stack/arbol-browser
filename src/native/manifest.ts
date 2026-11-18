@@ -718,6 +718,23 @@ export function consumeSignedSnapshot(receipt: SignedSnapshotComparison, signed:
   }
 }
 
+/** The original read-only mapping is verified at initial trust. Keep its
+ * retained descriptions current without minting a complete comparison receipt. */
+export function assertRetainedReadOnlyStorage(signed: SignedBundle, deadline: number): boolean {
+  const snapshot = signedSnapshots.get(signed);
+  if (!snapshot || snapshot.poisoned || (signed === trustedCandidate && poisonedTrust))
+    return refuseVerification('storage-context');
+  if (!snapshot.storage) return false;
+  try {
+    storageAssert(snapshot.storage, deadline);
+    return true;
+  } catch (error) {
+    snapshot.poisoned = true;
+    if (signed === trustedCandidate) poisonedTrust = true;
+    throw error;
+  }
+}
+
 let attemptedTrust = false, poisonedTrust = false;
 let trustedCandidate: CandidateTrust | undefined;
 /** Complete physical signed bundle, including the outer seal and directories.

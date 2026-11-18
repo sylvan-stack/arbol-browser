@@ -95,6 +95,12 @@ export interface VerifiedHost {
 }
 const verifiedHosts = new WeakSet<object>();
 const armedHosts = new WeakMap<VerifiedHost, import('./custody.js').HostCustody>();
+const startupTrustChecks = new WeakMap<VerifiedHost, (deadline: number, originalStartupCutoff: number) => Promise<void>>();
+export async function assertHostStartupContinuity(host: VerifiedHost, deadline: number, originalStartupCutoff: number): Promise<void> {
+  const check = startupTrustChecks.get(host);
+  if (!check) throw unavailable('browser');
+  await check(deadline, originalStartupCutoff);
+}
 export function bindArmedHost(host: VerifiedHost, custody: import('./custody.js').HostCustody): void {
   if (!verifiedHosts.has(host) || custody.host !== host || armedHosts.has(host)) throw unavailable('browser');
   assertHostCustody(custody); armedHosts.set(host, custody);
@@ -308,64 +314,70 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
   // Observation only: earlier armed scans cannot consume final ready labels.
   let readyTrustObserved = false;
   const result: VerifiedHost = Object.freeze({ identity, policy, signed, policyDigest: rawPolicy.digest, guardIdentity,
-    async assertTrusted(limit: number, originalStartupCutoff?: number) {
-      if (!verifiedHosts.has(result)) throw unavailable('browser');
-      const custody = armedHosts.get(result);
-      let observeReady = false;
-      try {
-        // The original registry binds this frozen host to its actual custody
-        // and instance. Only startup uses the already captured Claim cutoff.
-        if (originalStartupCutoff !== undefined) {
-          if (custody && custody.host !== result) throw unavailable('browser');
-          if (!custody || custody.instance.record.phase === 'starting') limit = originalStartupCutoff;
-        }
-        assertBudget(limit); if (custody) assertHostCustody(custody);
-        try {
-          if (custody && custody.host === result && custody.instance.record.phase === 'ready' && !readyTrustObserved) {
-            readyTrustObserved = true; observeReady = true;
-          }
-        } catch { /* Observation never replaces verification or its failure. */ }
-        if (observeReady) noteHostStartup(custody, 'ready-trust-metadata-before');
-        if ((await physicalJson(policyFile, 1048576, limit)).digest !== rawPolicy.digest ||
-            (await physicalJson(join(payload, 'metadata.json'), 1048576, limit)).digest !== identity.metadataDigest ||
-            (await physicalJson(join(layout.bundle, 'Contents/Resources/native-compatibility.json'), 1048576, limit)).digest !== compatibility.digest)
-          throw unavailable('browser');
-        if (observeReady) noteHostStartup(custody, 'ready-trust-metadata-after');
-        assertBudget(limit);
-        if (observeReady) noteHostStartup(custody, 'ready-trust-isolation-before');
-        await assertIsolation(layout, policy.stateRoot, limit);
-        if (observeReady) noteHostStartup(custody, 'ready-trust-isolation-after');
-        if (observeReady) noteHostStartup(custody, 'ready-trust-guard-before');
-        await assertGuard(limit);
-        if (observeReady) noteHostStartup(custody, 'ready-trust-guard-after');
-        if (observeReady) noteHostStartup(custody, 'ready-trust-directories-before');
-        for (const path of [layout.buildRoot, layout.bundle, layout.payload]) { assertBudget(limit); await directory(path, false); }
-        if (observeReady) noteHostStartup(custody, 'ready-trust-directories-after');
-        if (custody) {
-          assertHostCustody(custody);
-          if (observeReady) noteHostStartup(custody, 'ready-trust-snapshot-before');
-          const proof = await manifests.compareSignedSnapshot(signed, limit);
-          if (observeReady) noteHostStartup(custody, 'ready-trust-snapshot-after');
-          assertHostCustody(custody);
-          if (observeReady) noteHostStartup(custody, 'ready-trust-consume-before');
-          manifests.consumeSignedSnapshot(proof, signed, limit);
-          if (observeReady) noteHostStartup(custody, 'ready-trust-consume-after');
-          assertHostCustody(custody);
-        } else signed.assertIdentity(limit);
-        assertBudget(limit);
-      } catch (error) {
-        try {
-          const phase = manifests.readSignedVerificationPhase(error);
-          if (observation && verificationStages.has(observation) && phase && !verificationFailurePhases.has(observation))
-            verificationFailurePhases.set(observation, phase);
-          if (custody && phase) noteHostStartup(custody, armedTrustFailureStages[phase]);
-        } catch { /* Observation cannot alter custody or the original failure. */ }
-        // Detected armed package drift closes the real original even if an
-        // upstream caller would otherwise redact or swallow an exception.
-        if (custody) return custody.terminate();
-        throw error;
+    assertTrusted: (limit: number, originalStartupCutoff?: number) => verifyTrusted(limit, originalStartupCutoff),
+  });
+  async function verifyTrusted(limit: number, originalStartupCutoff?: number, preferRetainedStorage = false): Promise<void> {
+    if (!verifiedHosts.has(result)) throw unavailable('browser');
+    const custody = armedHosts.get(result);
+    let observeReady = false;
+    try {
+      // The original registry binds this frozen host to its actual custody
+      // and instance. Only startup uses the already captured Claim cutoff.
+      if (originalStartupCutoff !== undefined) {
+        if (custody && custody.host !== result) throw unavailable('browser');
+        if (!custody || custody.instance.record.phase === 'starting') limit = originalStartupCutoff;
       }
-    } });
+      assertBudget(limit); if (custody) assertHostCustody(custody);
+      try {
+        if (custody && custody.host === result && custody.instance.record.phase === 'ready' && !readyTrustObserved) {
+          readyTrustObserved = true; observeReady = true;
+        }
+      } catch { /* Observation never replaces verification or its failure. */ }
+      if (observeReady) noteHostStartup(custody, 'ready-trust-metadata-before');
+      if ((await physicalJson(policyFile, 1048576, limit)).digest !== rawPolicy.digest ||
+          (await physicalJson(join(payload, 'metadata.json'), 1048576, limit)).digest !== identity.metadataDigest ||
+          (await physicalJson(join(layout.bundle, 'Contents/Resources/native-compatibility.json'), 1048576, limit)).digest !== compatibility.digest)
+        throw unavailable('browser');
+      if (observeReady) noteHostStartup(custody, 'ready-trust-metadata-after');
+      assertBudget(limit);
+      if (observeReady) noteHostStartup(custody, 'ready-trust-isolation-before');
+      await assertIsolation(layout, policy.stateRoot, limit);
+      if (observeReady) noteHostStartup(custody, 'ready-trust-isolation-after');
+      if (observeReady) noteHostStartup(custody, 'ready-trust-guard-before');
+      await assertGuard(limit);
+      if (observeReady) noteHostStartup(custody, 'ready-trust-guard-after');
+      if (observeReady) noteHostStartup(custody, 'ready-trust-directories-before');
+      for (const path of [layout.buildRoot, layout.bundle, layout.payload]) { assertBudget(limit); await directory(path, false); }
+      if (observeReady) noteHostStartup(custody, 'ready-trust-directories-after');
+      if (preferRetainedStorage && (!custody || custody.instance.record.phase === 'starting') &&
+          manifests.assertRetainedReadOnlyStorage(signed, limit)) {
+        if (custody) assertHostCustody(custody);
+      } else if (custody) {
+        assertHostCustody(custody);
+        if (observeReady) noteHostStartup(custody, 'ready-trust-snapshot-before');
+        const proof = await manifests.compareSignedSnapshot(signed, limit);
+        if (observeReady) noteHostStartup(custody, 'ready-trust-snapshot-after');
+        assertHostCustody(custody);
+        if (observeReady) noteHostStartup(custody, 'ready-trust-consume-before');
+        manifests.consumeSignedSnapshot(proof, signed, limit);
+        if (observeReady) noteHostStartup(custody, 'ready-trust-consume-after');
+        assertHostCustody(custody);
+      } else signed.assertIdentity(limit);
+      assertBudget(limit);
+    } catch (error) {
+      try {
+        const phase = manifests.readSignedVerificationPhase(error);
+        if (observation && verificationStages.has(observation) && phase && !verificationFailurePhases.has(observation))
+          verificationFailurePhases.set(observation, phase);
+        if (custody && phase) noteHostStartup(custody, armedTrustFailureStages[phase]);
+      } catch { /* Observation cannot alter custody or the original failure. */ }
+      // Detected armed package drift closes the real original even if an
+      // upstream caller would otherwise redact or swallow an exception.
+      if (custody) return custody.terminate();
+      throw error;
+    }
+  }
+  startupTrustChecks.set(result, (limit, cutoff) => verifyTrusted(limit, cutoff, true));
   noteHostVerification(observation, 'initial-verified-host');
   assertBudget(deadline); verifiedHosts.add(result); await result.assertTrusted(deadline); return result;
 }

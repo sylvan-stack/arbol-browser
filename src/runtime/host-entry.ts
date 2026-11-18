@@ -10,7 +10,7 @@ import { profilePaths } from '../profiles/paths.js';
 import { consumeSelection, type BuildSelection } from './selection.js';
 import { validator } from '../contracts/schema.js';
 import { unavailable } from '../contracts/errors.js';
-import { adoptHostBuildLease, captureHostBuild, terminateCapturedHostBuild, type CapturedHostBuild, type BuildLease } from './build-lease.js';
+import { adoptHostBuildLease, assertAdoptedBuildContinuity, captureHostBuild, terminateCapturedHostBuild, type CapturedHostBuild, type BuildLease } from './build-lease.js';
 import { assertVerifiedHostMetadata, assertHostEngineAuthority, type VerifiedHost } from './authorities.js';
 import { claimedHostAttempt } from './process.js';
 import { noteHostStartup, prepareHostCustody, abortUnadmittedHost, type HostCustody } from './custody.js';
@@ -77,21 +77,24 @@ export async function prepareOwnedHost(actualApp: ProfileApp, request: HostReque
   if (!location) throw unavailable('browser');
   // This adopts, rather than releases/reopens, the original outer description.
   const buildGuard = await adoptHostBuildLease(host, platform, join(location.leaf, `launch-${request.request}.json`), deadline, capture);
-  const assertAdmission = async () => {
+  const assertAdmission = async (mutation = true) => {
     assertTime(deadline); if (actualApp.isReady()) throw unavailable('browser');
     await claimedHostAttempt(request.profile, host, platform, request.request, deadline);
-    await buildGuard.assert(); assertTime(deadline);
+    if (mutation) await buildGuard.assert();
+    else await assertAdoptedBuildContinuity(buildGuard, host, deadline);
+    assertTime(deadline);
   };
+  const assertContinuity = () => assertAdmission(false);
   let instance: InstanceOwner | null = null, custody: HostCustody | undefined;
   try {
     instance = await acquireInstance(request.profile, platform, request.selection.build, previousExit, deadline,
-      { assertAdmission, failed: owner => abortUnadmittedHost(owner, buildGuard, platform) });
+      { assertAdmission, assertContinuity, failed: owner => abortUnadmittedHost(owner, buildGuard, platform) });
     // The losing original still owns the genuine inherited Build, and must
     // publish terminal-only no-use before exact self exit. No invented Owner.
     if (!instance) return abortUnadmittedHost(undefined, buildGuard, platform);
-    await assertAdmission(); await instance.owner.assert();
+    await assertContinuity(); await instance.owner.assert();
     const prior = await previousExit.priorExpectation(request.profile, instance.previous, instance.owner, buildGuard, deadline);
-    await assertAdmission();
+    await assertContinuity();
     custody = await prepareHostCustody(host, instance, buildGuard, platform, request.request, prior, deadline);
     const watchdog = await custody.arm(native, deadline);
     custody.assertRetained(); assertTime(deadline);

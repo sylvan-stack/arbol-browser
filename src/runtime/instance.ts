@@ -107,6 +107,8 @@ export interface InstanceAcquisition {
   /** Production uses the actual native short claim transaction. No engine or
    * marker access is permitted by this callback or by acquisition itself. */
   assertAdmission(): Promise<void>;
+  /** Optional read-only assertion before acquiring or inspecting ownership. */
+  assertContinuity?(): Promise<void>;
   /** Once production ownership is acquired, failed preparation retains the
    * actual guard and enters native unwind instead of the Foundation release. */
   failed(owner: OwnerLease): Promise<never>;
@@ -117,11 +119,12 @@ export async function acquireInstance(profile: ProfileSnapshot, platform: Platfo
   previousExit: PreviousExit, deadline: number, acquisition?: InstanceAcquisition): Promise<InstanceOwner | null> {
   assertTime(deadline);
   if (!validator('browser.Build')(build)) throw profileUnavailable();
-  await acquisition?.assertAdmission(); assertTime(deadline);
+  const inspect = () => acquisition?.assertContinuity ? acquisition.assertContinuity() : acquisition?.assertAdmission();
+  await inspect(); assertTime(deadline);
   const owner = await ownerLock(profile, platform, false, Math.min(deadline, now() + 10000));
   if (!owner) return null;
   try {
-    await acquisition?.assertAdmission(); await owner.assert();
+    await inspect(); await owner.assert();
     const location = await runtimeLocation(profile, true);
     if (!location) throw profileUnavailable();
     const previous = await readRuntime(location);

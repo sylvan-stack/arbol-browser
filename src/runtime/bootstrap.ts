@@ -1,4 +1,5 @@
 import { isHostCustody, noteHostStartup, prepareArmedHostSnapshot, type HostCustody } from './custody.js';
+import { assertAdoptedBuildContinuity } from './build-lease.js';
 import { unavailable } from '../contracts/errors.js';
 import type { CommandPorts } from './ports.js';
 
@@ -277,6 +278,13 @@ export interface TrustedShellIntegration {
   /** Invoke synchronously at ABR-10's actual authorized transport commit boundary. */
   agentTabs(recipient: string): Contract<'browser.TabsResult'>;
 }
+/** Both resource preparations consume a complete signed comparison. This
+ * preceding check verifies continuity of the original adopted Build. */
+function assertPreparationBuild(prepared: HostPreparation, deadline: number): Promise<void> {
+  const { custody, buildGuard } = prepared;
+  return isHostCustody(custody) && custody.build === buildGuard ?
+    assertAdoptedBuildContinuity(buildGuard, custody.host, deadline) : buildGuard.assert();
+}
 /** ABR-29 must supply its actual owned/prepared host and ABR-10/11 services.
  * No default services, EngineAuthority or readiness are invented here. The ordinary
  * entry above continues to refuse; this function is never invoked by this Beat. */
@@ -288,7 +296,7 @@ export async function integrateTrustedShell(port: NativeShellPort, prepared: Hos
   const { boundary, modules } = value;
   const ownership = handovers.get(boundary.watchdog);
   if (!ownership || !installedBoundaries.has(boundary)) throw unavailable('browser');
-  await prepared.instance.owner.assert(); await prepared.buildGuard.assert(); await prepared.engine.assertReady();
+  await prepared.instance.owner.assert(); await assertPreparationBuild(prepared, deadline); await prepared.engine.assertReady();
   await assertHeldPath(prepared.instance.owner.profile.paths.owner, ownership.owner);
   if (!selection.guard || prepared.instance.record.build !== selection.build) throw unavailable('browser');
   await assertHeldPath(selection.guard, ownership.build);
@@ -333,7 +341,7 @@ export async function prepareRendererControl(boundary: NativeFailureBoundary, pr
   selection: BuildSelection, deadline = performance.now() + 5000): Promise<import('../host/recovery.js').RendererControl> {
   const custody = handovers.get(boundary.watchdog);
   if (!installedBoundaries.has(boundary) || !custody) throw unavailable('browser');
-  await prepared.instance.owner.assert(); await prepared.buildGuard.assert(); await prepared.engine.assertReady();
+  await prepared.instance.owner.assert(); await assertPreparationBuild(prepared, deadline); await prepared.engine.assertReady();
   await assertHeldPath(prepared.instance.owner.profile.paths.owner, custody.owner);
   if (!selection.guard || prepared.instance.record.build !== selection.build) throw unavailable('browser');
   await assertHeldPath(selection.guard, custody.build);
