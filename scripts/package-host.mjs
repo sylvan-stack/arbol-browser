@@ -697,8 +697,26 @@ export async function prepareAllocatedHost(environment = process.env) {
     await assertAllocation();
     const volumeRoot = await mkdtemp(join(buildRoot, '.host-volume-')); await privateDirectory(volumeRoot, true);
     const image = join(volumeRoot, 'host.dmg'), deadline = performance.now() + 120000;
+    // A plain source root makes the image contain the signed app's root entries,
+    // rather than hdiutil's additional staging-app wrapper. Copy every entry.
+    const sourceIdentity = await privateDirectory(bundle, true), sourceStamp = fullStamp(source);
+    const sourceEntries = (await readdir(bundle)).sort();
+    if (!sourceEntries.length || canonical(await inventory(bundle)) !== canonical(signed.files)) fail('Sealed source differs before copying');
+    await assertPhysicalCap(bundle);
+    const plain = await mkdtemp(join(buildRoot, '.host-image-source-')), plainIdentity = await privateDirectory(plain, true);
+    if ((await readdir(plain)).length) fail('Image source is not empty');
     await assertAllocation();
-    imageCommand('/usr/bin/hdiutil', ['create', '-fs', 'APFS', '-srcfolder', bundle, '-volname', 'ArbolBrowser',
+    imageCommand('/bin/cp', ['-pR', ...sourceEntries.map(name => join(bundle, name)), plain], deadline);
+    if (canonical(await privateDirectory(plain, true)) !== canonical(plainIdentity) ||
+        canonical((await readdir(plain)).sort()) !== canonical(sourceEntries) ||
+        canonical(await inventory(plain)) !== canonical(signed.files)) fail('Plain image source differs from sealed original');
+    await assertPhysicalCap(plain);
+    if (canonical(await privateDirectory(bundle, true)) !== canonical(sourceIdentity) ||
+        fullStamp(await lstat(bundle, { bigint: true })) !== sourceStamp ||
+        canonical((await readdir(bundle)).sort()) !== canonical(sourceEntries) ||
+        canonical(await inventory(bundle)) !== canonical(signed.files)) fail('Sealed source changed while copying');
+    await assertAllocation();
+    imageCommand('/usr/bin/hdiutil', ['create', '-fs', 'APFS', '-srcfolder', plain, '-volname', 'ArbolBrowser',
       '-uid', String(account.uid), '-gid', String(account.gid), '-mode', '0700', '-format', 'UDRO', '-plist', image], deadline);
     await assertAllocation(); await chmod(image, 0o600);
     const imageFD = await open(image, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
