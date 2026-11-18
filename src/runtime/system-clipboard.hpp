@@ -88,7 +88,7 @@ struct Source {
     struct stat held{},named{};
     return fd>=3&&!fstat(fd,&held)&&!lstat(path.c_str(),&named)&&sameFile(identity,held)&&sameFile(held,named);
   }
-  bool verify(double deadline) {
+  bool verifyStockCode(double deadline) {
     fd=open(path.c_str(),O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
     if(fd<3||fstat(fd,&identity)||!S_ISREG(identity.st_mode)||identity.st_uid!=geteuid()||identity.st_nlink!=1||
        identity.st_size<=signedCodeEnd||identity.st_size>268435456||!unchanged()) return false;
@@ -130,8 +130,11 @@ struct Source {
     }
     unsigned char bytes[CC_SHA256_DIGEST_LENGTH]; if(CC_SHA256_Final(bytes,&digest)!=1) return false;
     char encoded[65]{}; for(unsigned i=0;i<sizeof(bytes);++i) snprintf(encoded+2*i,3,"%02x",bytes[i]);
-    return !strcmp(encoded,stockCodeDigest)&&unchanged()&&arbol_boundary::clockMs()<deadline&&
-      arbol_boundary::signature(path,false)&&unchanged()&&arbol_boundary::clockMs()<deadline;
+    return !strcmp(encoded,stockCodeDigest)&&unchanged()&&arbol_boundary::clockMs()<deadline;
+  }
+  bool verify(double deadline) {
+    return verifyStockCode(deadline)&&arbol_boundary::signature(path,false)&&
+      unchanged()&&arbol_boundary::clockMs()<deadline;
   }
   void start(double deadline) {
     worker=new std::thread([this,deadline] {

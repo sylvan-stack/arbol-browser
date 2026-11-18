@@ -12,6 +12,7 @@
     "arbol-browser": "bin/arbol-browser"
   },
   "scripts": {
+    "demo": "node scripts/demo.mjs",
     "compile": "node scripts/compile.mjs",
     "package:candidate": "node scripts/package-base.mjs",
     "package:host": "node scripts/package-host.mjs --allocated"
