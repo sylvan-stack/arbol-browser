@@ -1,6 +1,6 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import type { Contract, ContractTypes } from '../contracts/generated.js';
-import { BrowserFailure, unavailable, type BrowserError } from '../contracts/errors.js';
+import { BrowserFailure, ForegroundWorkRequired, unavailable, type BrowserError } from '../contracts/errors.js';
 import { validator, bundles } from '../contracts/schema.js';
 import { assertManagementCloseOpportunity, type ManagementCloseOpportunity, type ConnectionContext, type Request } from '../runtime/transport.js';
 import { TabAuthority, type AuthorityStamp, type CompletedTransition, type Invalidation } from './authority.js';
@@ -207,9 +207,12 @@ export class DeliveryAuthority {
       } catch (changed) { current = changed; }
     }
     const publicError = current instanceof BrowserFailure ? current.detail : undefined;
-    const value: BrowserError = { code: publicError?.code ?? 'internal', message: 'The browser request could not complete.', retryable: true,
-      remedy: classified
-        ? 'Use Take control to inspect this page privately.' : 'Inspect fresh browser state before deciding on another action.',
+    const manual = current instanceof ForegroundWorkRequired &&
+      (!known?.dispatchOutcome || known.dispatchOutcome === 'not_dispatched') ? current.detail : undefined;
+    const value: BrowserError = { code: publicError?.code ?? 'internal',
+      message: manual?.message ?? 'The browser request could not complete.', retryable: !manual,
+      remedy: manual?.remedy ?? (classified
+        ? 'Use Take control to inspect this page privately.' : 'Inspect fresh browser state before deciding on another action.'),
       ...(known?.action ? { action: known.action, dispatchOutcome: known.dispatchOutcome! } : {}) };
     if (!validator('browser.BrowserError')(value)) throw unavailable('browser');
     const old = this.pending.get(context)!.get(request.id); old?.bytes.fill(0); this.pending.get(context)!.delete(request.id);

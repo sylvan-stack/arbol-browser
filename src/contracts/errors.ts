@@ -10,6 +10,17 @@ export class BrowserFailure extends Error {
     this.name = 'BrowserFailure';
   }
 }
+/** A host refusal before dispatch. The request already identifies the tab and
+ * operation, so no URL, selector, page content or input is repeated here. */
+export class ForegroundWorkRequired extends BrowserFailure {
+  constructor(readonly scope: 'tab' | 'window', action?: string) {
+    super({ code: 'control_refused', message: 'Complete this step manually in Arbol Browser.', retryable: false,
+      remedy: scope === 'tab'
+        ? 'Bring Arbol Browser forward yourself. Use Take control on the requested tab, perform the step, then explicitly Return control.'
+        : 'Use the Browser’s own window and tab controls to perform this step yourself.',
+      ...(action ? { action, dispatchOutcome: 'not_dispatched' as const } : {}) });
+  }
+}
 export function unavailable(stage: 'profile' | 'browser'): BrowserFailure {
   return new BrowserFailure({ code: stage === 'profile' ? 'profile_unavailable' : 'browser_unavailable',
     message: 'This candidate does not provide the required browser stage.', retryable: false,
