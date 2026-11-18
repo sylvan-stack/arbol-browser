@@ -1259,8 +1259,15 @@ static napi_value watchdogAssert(napi_env env,napi_callback_info info) {
   if(!c->retainedReader.valid()||!c->retainedWriter.valid()) return fail(env);
   if(c->hostRequired) {
     auto* state=c->finalization.shared(); uint64_t reasons=state->fatal.load(std::memory_order_acquire),cutoff=state->fatalCutoffUs.load(std::memory_order_acquire);
-    if((reasons&~arbol_exit::admissionLoss)||(reasons&&(!cutoff||arbol_boundary::clockMs()*1000>=cutoff))||
-       !c->finalization.held(c->context)||!(c->mutation?c->mutation->current():c->sessionUse?c->sessionUse->current():c->finalization.controls(c->context,arbol_boundary::clockMs()+100))) return fail(env);
+    if(reasons&~arbol_exit::admissionLoss) return fail(env);
+    if(reasons&&!cutoff) return fail(env);
+    if(reasons&&arbol_boundary::clockMs()*1000>=cutoff) return fail(env);
+    if(!c->finalization.held(c->context)) return fail(env);
+    if(c->mutation) {
+      if(!c->mutation->current()) return fail(env);
+    } else if(c->sessionUse) {
+      if(!c->sessionUse->current()) return fail(env);
+    } else if(!c->finalization.controls(c->context,arbol_boundary::clockMs()+100)) return fail(env);
   }
   napi_value out; napi_get_undefined(env,&out); return out;
 }
@@ -1342,7 +1349,7 @@ static napi_value publishHostReady(napi_env env,napi_callback_info info) {
      !integer(env,args[2],&agent)||!integer(env,args[3],&management)) return fail(env);
   auto* c=custodyArgument(env,args[0]);
   if(!c||!c->hostRequired||!c->bound||getpid()!=c->context.main.pid||!c->finalization.present()) return fail(env);
-  auto reject=[&]() { c->finalization.shared()->declareFatal(); return fail(env); };
+  auto reject=[&](unsigned line = __builtin_LINE()) { c->finalization.shared()->declareFatal(); return fail(env,line); };
   if(c->readyAttempted) return reject(); c->readyAttempted=true;
   @autoreleasepool { @try { try {
     auto* state=c->finalization.shared(); NSDictionary* runtime=arbol_attempt::json(encoded);
