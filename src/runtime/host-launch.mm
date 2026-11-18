@@ -6,17 +6,21 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <cstdio>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 
 namespace {
 enum class Outcome { pending, refused, accepted, timedOut };
+enum class ErrorDomain { noneOrUnknown, cocoa, posix, osStatus, other };
 struct Reply {
   std::mutex mutex;
   Outcome outcome = Outcome::pending;
   bool callback = false;
   int callbackPid = 0;
   bool error = false, app = false;
+  ErrorDomain errorDomain = ErrorDomain::noneOrUnknown;
+  int64_t errorCode = 0;
 };
 
 enum class Observation { refused, waiting, proved };
@@ -156,8 +160,9 @@ Observation inspect(arbol_attempt::Claim& claim, NSString* application, const st
 
 void diagnostic(const Reply& reply, unsigned branch, unsigned phase) {
   os_log_with_type(OS_LOG_DEFAULT,OS_LOG_TYPE_DEFAULT,
-    "host-launch reply callback=%{public}d error=%{public}d app=%{public}d branch=%{public}u phase=%{public}u outcome=%{public}u",
-    reply.callback,reply.error,reply.app,branch,phase,(unsigned)reply.outcome);
+    "host-launch reply callback=%{public}d error=%{public}d app=%{public}d branch=%{public}u phase=%{public}u outcome=%{public}u errorDomain=%{public}u errorCode=%{public}lld",
+    reply.callback,reply.error,reply.app,branch,phase,(unsigned)reply.outcome,
+    (unsigned)reply.errorDomain,(long long)reply.errorCode);
 }
 }
 
@@ -206,7 +211,25 @@ int main(int argc, const char* argv[]) {
           if (reply->callback || reply->outcome != Outcome::pending) return;
           reply->callback = true; reply->error = error != nil; reply->app = app != nil;
         }
-        if (error) return;
+        if (error) {
+          // The authoritative error flag is already visible. Optional getters
+          // cannot hold its mutex or delay the main loop's original cutoff.
+          ErrorDomain domain = ErrorDomain::noneOrUnknown; int64_t code = 0;
+          try { @try {
+            NSString* value = error.domain;
+            static_assert(sizeof(NSInteger) == sizeof(int64_t));
+            const int64_t number = error.code;
+            const ErrorDomain category = [value isEqual:NSCocoaErrorDomain] ? ErrorDomain::cocoa :
+              [value isEqual:NSPOSIXErrorDomain] ? ErrorDomain::posix :
+              [value isEqual:NSOSStatusErrorDomain] ? ErrorDomain::osStatus :
+              value ? ErrorDomain::other : ErrorDomain::noneOrUnknown;
+            domain = category; code = number;
+          } @catch (NSException*) {} } catch (...) {}
+          { std::lock_guard<std::mutex> held(reply->mutex);
+            reply->errorDomain = domain; reply->errorCode = code;
+          }
+          return;
+        }
         // Optional metadata can veto a contrary positive PID, never authorize
         // this launch. Its getter cannot hold main past the original cutoff.
         int callbackPid = 0;
