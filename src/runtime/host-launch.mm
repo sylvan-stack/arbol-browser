@@ -196,7 +196,7 @@ int main(int argc, const char* argv[]) {
     if(arbol_boundary::clockMs()>=deadline) return 4;
     NSWorkspaceOpenConfiguration* configuration = [NSWorkspaceOpenConfiguration configuration];
     configuration.createsNewApplicationInstance = YES;
-    configuration.activates = YES;
+    configuration.activates = NO;
     configuration.addsToRecentItems = NO;
     configuration.arguments = @[ @"--arbol-host-request", request ];
     // A closed environment is supplied; bootstrap also replaces the complete

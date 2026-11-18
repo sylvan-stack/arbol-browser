@@ -159,7 +159,7 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
     },
     show() {
       registration.assertLoaded(); authority.assertOperational();
-      host.window.show();
+      if (!host.window.isVisible()) host.window.showInactive();
     },
     publish() {
       if (!host.presentationStable()) return; // a real placement co-commit will notify the consistent state
