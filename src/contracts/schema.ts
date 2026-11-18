@@ -33,7 +33,10 @@ export function validator<K extends keyof ContractTypes>(name: K): ValidateFunct
   const [bundle, definition] = name.split('.');
   const schema = bundles[bundle as Bundle];
   if (!schema || !(definition! in schema.$defs)) throw new Error('Unknown contract type');
-  return ajv.compile<ContractTypes[K]>({ $ref: `${schema.$id}#/$defs/${definition}` });
+  // A new $ref wrapper recompiles on each lookup and grows Ajv's cache.
+  const validate = ajv.getSchema<ContractTypes[K]>(`${schema.$id}#/$defs/${definition}`);
+  if (!validate) throw new Error('Unknown contract type');
+  return validate;
 }
 
 /** Compile all named roots. This is a schema/reference check, not a behavior suite. */
