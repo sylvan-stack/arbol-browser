@@ -674,7 +674,11 @@ export async function compareSignedSnapshot(signed: SignedBundle, deadline: numb
   try {
     budget(deadline); storageAssert(snapshot.storage, deadline);
     await Promise.race([compareCompleteSnapshot(signed, snapshot, deadline), new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(() => reject(new Error('native_snapshot_timeout')), Math.max(1, deadline - performance.now()));
+      timer = setTimeout(() => {
+        const error = new Error('native_snapshot_timeout');
+        noteVerificationFailure(error, 'verification-cutoff');
+        reject(error);
+      }, Math.max(1, deadline - performance.now()));
     })]);
     budget(deadline); if (snapshot.poisoned) refuse();
     storageAssert(snapshot.storage, deadline);
