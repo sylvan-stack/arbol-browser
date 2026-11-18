@@ -304,12 +304,18 @@ export async function assertProductionCloseReady(profile: ProfileSnapshot, recor
     const address = new URL('./authorities.js', import.meta.url).href;
     const authority = await import(address) as typeof import('./authorities.js');
     const layout = selectedLayout(selection, resolve(fileURLToPath(new URL('../../', import.meta.url))));
-    const host = verifiedHost ?? await authority.verifyPackagedHost(selection, layout.payload, deadline);
-    assertVerifiedHostMetadata(host, deadline);
-    if (host.identity.layout.build !== layout.build || host.identity.layout.buildRoot !== layout.buildRoot ||
-        host.identity.layout.bundle !== layout.bundle || host.identity.layout.payload !== layout.payload ||
-        selection.guard !== join(layout.buildRoot, '../.uses', layout.build)) throw unavailable('browser');
-    await createLaunchTransactions(host, platform, exits, Boolean(verifiedHost)).admitted(profile, record, deadline);
+    let retained: VerifiedHost | undefined;
+    if (verifiedHost) {
+      assertVerifiedHostMetadata(verifiedHost, deadline);
+      if (verifiedHost.identity.layout.build !== layout.build || verifiedHost.identity.layout.buildRoot !== layout.buildRoot ||
+          verifiedHost.identity.layout.bundle !== layout.bundle || verifiedHost.identity.layout.payload !== layout.payload ||
+          selection.guard !== join(layout.buildRoot, '../.uses', layout.build)) throw unavailable('browser');
+      const manifestURL = new URL('../native/manifest.js', import.meta.url).href;
+      const manifest = await import(manifestURL) as typeof import('../native/manifest.js');
+      if (manifest.assertRetainedReadOnlyStorage(verifiedHost.signed, deadline)) retained = verifiedHost;
+    }
+    const host = retained ?? await authority.verifyPackagedHost(selection, layout.payload, deadline);
+    await createLaunchTransactions(host, platform, exits, Boolean(retained)).admitted(profile, record, deadline);
     await lease.assert(); assertTime(deadline);
   } finally { lease.release(); }
 }

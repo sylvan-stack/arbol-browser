@@ -324,8 +324,10 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
   async function verifyTrusted(limit: number, originalStartupCutoff?: number, retainedFor?: 'startup' | 'close'): Promise<void> {
     if (!verifiedHosts.has(result)) throw unavailable('browser');
     const custody = armedHosts.get(result);
+    const closing = retainedFor === 'close' ? custody?.instance.record : undefined;
     let observeReady = false;
     try {
+      if (closing && closing.phase !== 'closing') throw unavailable('browser');
       // The original registry binds this frozen host to its actual custody
       // and instance. Only startup uses the already captured Claim cutoff.
       if (originalStartupCutoff !== undefined) {
@@ -369,6 +371,7 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
         if (observeReady) noteHostStartup(custody, 'ready-trust-consume-after');
         assertHostCustody(custody);
       } else signed.assertIdentity(limit);
+      if (closing && custody?.instance.record !== closing) throw unavailable('browser');
       assertBudget(limit);
     } catch (error) {
       try {

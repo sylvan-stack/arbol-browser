@@ -1,5 +1,5 @@
 import { isHostCustody, noteHostStartup, prepareArmedHostSnapshot, type HostCustody } from './custody.js';
-import { assertAdoptedBuildContinuity } from './build-lease.js';
+import { assertAdoptedBuildClosing, assertAdoptedBuildContinuity } from './build-lease.js';
 import { unavailable } from '../contracts/errors.js';
 import type { CommandPorts } from './ports.js';
 
@@ -173,7 +173,7 @@ export function createNativeLifetime(boundary: NativeFailureBoundary, host: Host
   const ownership = handovers.get(boundary.watchdog);
   if (!ownership) return boundary.fatal.fail('native_integrity_unavailable');
   let attached = false, exiting = false;
-  const assertCustody = async (startup?: HostLifetimeStartup) => {
+  const assertCustody = async (startup?: HostLifetimeStartup, closeGrace?: number) => {
     boundary.fatal.assertHealthy(); boundary.watchdog.assertArmed(boundary.native.trust);
     if (!selection.guard || host.instance.record.build !== selection.build) throw unavailable('browser');
     await host.instance.owner.assert();
@@ -184,6 +184,10 @@ export function createNativeLifetime(boundary: NativeFailureBoundary, host: Host
       custody.assertRetained();
       await assertAdoptedBuildContinuity(host.buildGuard, custody.host, startupBuild.deadline);
       custody.assertRetained();
+    } else if (closeGrace !== undefined) {
+      if (!isHostCustody(custody) || custody.instance !== host.instance || custody.build !== host.buildGuard ||
+          host.instance.record.phase !== 'closing') return boundary.fatal.fail('native_integrity_unavailable');
+      custody.assertRetained(); await assertAdoptedBuildClosing(host.buildGuard, custody.host, closeGrace); custody.assertRetained();
     } else await host.buildGuard.assert();
     await assertHeldPath(host.instance.owner.profile.paths.owner, ownership.owner);
     await assertHeldPath(selection.guard, ownership.build);
@@ -204,10 +208,14 @@ export function createNativeLifetime(boundary: NativeFailureBoundary, host: Host
       catch { return boundary.fatal.fail('native_integrity_unavailable'); }
     },
     quarantine(): never { return boundary.fatal.fail('native_boundary_unavailable'); },
-    async exit(deadline: number): Promise<never> {
+    async exit(deadline: number, closeGrace?: number): Promise<never> {
       try {
         if (!attached || exiting || !Number.isFinite(deadline) || performance.now() >= deadline) return boundary.fatal.fail('native_boundary_unavailable');
-        exiting = true; await assertCustody(); boundary.native.seal();
+        const closing = host.instance.record;
+        exiting = true; await assertCustody(undefined, closeGrace);
+        if (closeGrace !== undefined && (host.instance.record !== closing || performance.now() >= closeGrace))
+          return boundary.fatal.fail('native_boundary_unavailable');
+        boundary.native.seal();
         // Healthy H/A continues through ordinary shutdown. The timer escalates
         // failure; no finally stops either monitor or releases original guards.
         const timer = setTimeout(() => boundary.fatal.fail('native_boundary_unavailable'), Math.max(1, deadline - performance.now()));

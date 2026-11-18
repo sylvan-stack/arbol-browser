@@ -3,6 +3,7 @@ import { setTimeout } from 'node:timers/promises';
 import type { Contract } from '../contracts/generated.js';
 import { unavailable, BrowserFailure } from '../contracts/errors.js';
 import { nativeLifetimeReadiness, preflightPageAdmission } from './bootstrap.js';
+import { assertAdoptedBuildClosing } from './build-lease.js';
 import { noteHostStartup, isHostCustody } from './custody.js';
 import { isProductionExitAuthority, type ProductionExitAuthority } from './exit.js';
 import { archiveRemovedRuntime, assertProductionCloseReady } from './process.js';
@@ -382,7 +383,7 @@ export interface HostNativeLifetime {
   quarantine(): void;
   /** Exit is owned by the independently armed native path, retaining guards.
    * A bare Electron quit event is neither flush nor complete-exit evidence. */
-  exit(deadline: number): Promise<void>;
+  exit(deadline: number, closeGrace?: number): Promise<void>;
 }
 /** One authoritative host; no automatic restart and no saved action/lease state. */
 export function createHostLifecycle(prepared: HostPreparation, sessions: ProfileSessions, transport: TransportServer,
@@ -418,6 +419,7 @@ export function createHostLifecycle(prepared: HostPreparation, sessions: Profile
   const shutdown = (opportunity?: ManagementCloseOpportunity, acknowledgement?: Promise<void>) => {
     if (closing) return closing;
     if (phase === 'fatal') return Promise.reject(unavailable('browser'));
+    const retainedClose = production && phase === 'ready' && admitted;
     let deadline = now() + 8000, grace = deadline - 3000;
     if (production) {
       try {
@@ -447,9 +449,12 @@ export function createHostLifecycle(prepared: HostPreparation, sessions: Profile
         await Promise.all([control.retireAll(grace), ...pending]);
         witness?.pagesRetired();
         await sessions.flushStorage(); // necessary; explicitly insufficient to mark clean
-        await prepared.instance.owner.assert(); await prepared.buildGuard.assert();
+        await prepared.instance.owner.assert();
+        if (retainedClose) await assertAdoptedBuildClosing(prepared.buildGuard, prepared.custody.host, grace);
+        else await prepared.buildGuard.assert();
         await transport.close();
-        await native.exit(deadline);
+        if (retainedClose) await native.exit(deadline, grace);
+        else await native.exit(deadline);
         // A returning exit port is not verified engine/helper disappearance.
         throw unavailable('browser');
         // Never release owner/Build or call completeExit from a window/quit event.

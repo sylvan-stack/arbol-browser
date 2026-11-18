@@ -5,7 +5,7 @@ import { directory, assertDirectory, privateFile, sameIdentity, identity, profil
 import type { PlatformPort, HeldLock } from './platform.js';
 import { selectedLayout, type BuildSelection } from './selection.js';
 import type { BuildGuard } from './start.js';
-import { assertHostStartupContinuity, assertTrustedHost, type VerifiedHost } from './authorities.js';
+import { assertHostCloseContinuity, assertHostStartupContinuity, assertTrustedHost, type VerifiedHost } from './authorities.js';
 import { assertPlatform } from './platform.js';
 import { withOwnerLockForCustody, type OwnerLease } from '../profiles/locking.js';
 
@@ -13,15 +13,21 @@ export interface BuildLease extends BuildGuard {
   readonly selection: BuildSelection;
 }
 const buildDescriptions = new WeakMap<BuildLease, { platform: PlatformPort; held: HeldLock }>();
-const adoptedStartupChecks = new WeakMap<BuildLease, { host: VerifiedHost; assert(deadline: number): Promise<void> }>();
+const adoptedBuildChecks = new WeakMap<BuildLease, { host: VerifiedHost;
+  assertStartup(deadline: number): Promise<void>; assertClosing(deadline: number): Promise<void> }>();
 
 /** Limited to the exact original adopted Build. Other leases keep their full
  * assertion, and matching an image description grants no content receipt. */
 export async function assertAdoptedBuildContinuity(lease: BuildLease, host: VerifiedHost, deadline: number): Promise<void> {
-  const original = adoptedStartupChecks.get(lease);
+  const original = adoptedBuildChecks.get(lease);
   if (!original) return lease.assert();
   if (original.host !== host) throw profileUnavailable();
-  await original.assert(deadline);
+  await original.assertStartup(deadline);
+}
+export async function assertAdoptedBuildClosing(lease: BuildLease, host: VerifiedHost, deadline: number): Promise<void> {
+  const original = adoptedBuildChecks.get(lease);
+  if (!original || original.host !== host) throw profileUnavailable();
+  await original.assertClosing(deadline);
 }
 /** Only the original real description behind this module's lease is handed to
  * the exact native platform. There is no descriptor export by guard pathname.
@@ -97,11 +103,16 @@ export async function adoptHostBuildLease(host: VerifiedHost, platform: Platform
       release(): never { throw profileUnavailable(); },
     });
     buildDescriptions.set(lease, { platform, held });
-    adoptedStartupChecks.set(lease, { host, async assert(limit) {
-      assertOriginal();
-      await assertHostStartupContinuity(host, performance.now() + 5000, Math.min(deadline, limit));
-      assertOriginal();
-    } });
+    adoptedBuildChecks.set(lease, { host,
+      async assertStartup(limit) {
+        assertOriginal();
+        await assertHostStartupContinuity(host, performance.now() + 5000, Math.min(deadline, limit));
+        assertOriginal();
+      },
+      async assertClosing(limit) {
+        assertOriginal(); await assertHostCloseContinuity(host, limit); assertOriginal();
+      },
+    });
     assertOriginal(); return lease;
   } catch { return terminateCapturedHostBuild(token); }
 }
