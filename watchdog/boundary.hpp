@@ -389,9 +389,9 @@ struct Context {
       observe(main.pid,leader,&leaderDetail)==1&&same(leader,main)&&leader.group==main.group&&
       !(leaderDetail.bsd.pbi_flags&PROC_FLAG_INEXIT)&&getsid(main.pid)==session;
   }
-  double observeDirectChildExec(Identity& child,ChildExecReadback& readback) const {
+  double observeDirectChildExec(Identity& child,ChildExecReadback& readback,double sampledAt) const {
     const Identity forked=child;
-    if(!readback.expires) readback.expires=clockMs()+12;
+    if(!readback.expires) readback.expires=sampledAt+12;
     for(;;) {
       const double limit=std::min(readback.expires,readback.liveCutoff());
       if(clockMs()>=limit) return 0;
@@ -442,6 +442,7 @@ struct Context {
     groupPending=false; std::set<int> currentGaps;
     auto inspect=[&](int pid,bool groupMember) {
       if(pid<=0) return;
+      const double sampledAt=readback?clockMs():0;
       Identity id; Info info{}; int state=observe(pid,id,&info);
       if(!state) {
         if(groupMember) {
@@ -493,7 +494,7 @@ struct Context {
       // original child executes. Capture only its verified post-exec identity.
       if(readback&&!forceFull&&valid&&!originalGroupRetired&&!captured&&id.pid!=main.pid&&direct&&
          !(info.bsd.pbi_flags&PROC_FLAG_EXEC)&&(path.empty()||path==engine())&&readback->active()&&liveDirectChild(id,info)) {
-        execObservedAt=observeDirectChildExec(id,*readback);
+        execObservedAt=observeDirectChildExec(id,*readback,sampledAt);
         if(!execObservedAt||!engineMonitorNumberEligible(id)) { uncertainFamily(); valid=false; return; }
         path.clear(); image=executable(id,path);
       }
@@ -520,8 +521,8 @@ struct Context {
         if(seen.size()>=4096||!signature(path,true)) { uncertainFamily(); valid=false; return; }
         if(execObservedAt) {
           Identity confirmed; Info detail{}; std::string currentPath;
-          if(observe(id.pid,confirmed,&detail)!=1||!same(confirmed,id)||!(detail.bsd.pbi_flags&PROC_FLAG_EXEC)||
-             !liveDirectChild(confirmed,detail)||!executable(confirmed,currentPath)||currentPath!=path||
+          if(!executable(id,currentPath)||currentPath!=path||observe(id.pid,confirmed,&detail)!=1||
+             !same(confirmed,id)||!(detail.bsd.pbi_flags&PROC_FLAG_EXEC)||!liveDirectChild(confirmed,detail)||
              execObservedAt>=readback->expires) {
             uncertainFamily(); valid=false; return;
           }

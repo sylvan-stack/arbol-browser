@@ -306,8 +306,8 @@ struct Deadline {
     if(cap) {
       if(!cap->present()) return 0.0;
       auto* state=cap->shared();
-      if(state->fatal.load(std::memory_order_acquire)) return 0.0;
       const auto grace=state->closeGraceUs.load(std::memory_order_acquire);
+      if(state->fatal.load(std::memory_order_acquire)) return 0.0;
       if(grace) limit=std::min(limit,(double)grace/1000);
     }
     return limit;
