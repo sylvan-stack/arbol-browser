@@ -52,9 +52,12 @@ inspect #done
 
 The gesture goes to the loaded page and leaves the macOS pointer and
 foreground app alone. Each selector must match one rendered element in the
-main document. The preview can scroll that page to find the endpoints. The
-gesture uses only in-page data. Verify the site's resulting state after a
-`dispatched` reply, or before retrying if the outcome is uncertain.
+main document. The preview can scroll the page to find the endpoints.
+HTML-draggable elements receive HTML drag events with page-provided data.
+Other elements receive pointer and mouse events. Sites that require trusted
+native events or native pointer capture need a visible handoff. Verify the
+site's resulting state after a `dispatched` reply, or before retrying if the
+outcome is uncertain.
 
 ### Sign in to two accounts on one site
 
