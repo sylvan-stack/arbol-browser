@@ -1,11 +1,21 @@
-const { app, BaseWindow, WebContentsView, session } = require('electron');
+const { app, BaseWindow, WebContentsView, ipcMain, protocol, session } = require('electron');
 const { createHash } = require('node:crypto');
+const { readFile } = require('node:fs/promises');
 const { join } = require('node:path');
 const { createInterface } = require('node:readline');
-const { privateDirectory } = require('./profile-storage.cjs');
+const { privateDirectory, validAccount, profileId, readProfiles, writeProfiles } = require('./profile-storage.cjs');
 
-const maximumTabs = 8;
+const maximumTabs = 40;
+const maximumProfileTabs = 8;
 const actionTimeout = 15000;
+const chromeOrigin = 'arbol-preview://chrome';
+const chromeEntry = chromeOrigin + '/index.html';
+const chromeFiles = new Map([
+  ['/index.html', 'text/html; charset=utf-8'],
+  ['/chrome.mjs', 'text/javascript; charset=utf-8'],
+  ['/navigation.mjs', 'text/javascript; charset=utf-8'],
+  ['/navigation.css', 'text/css; charset=utf-8'],
+]);
 const preferences = Object.freeze({
   sandbox: true, contextIsolation: true, nodeIntegration: false,
   backgroundThrottling: false, devTools: false, webSecurity: true,
@@ -92,15 +102,36 @@ async function main(config, clipboard) {
   await app.whenReady();
   clipboard.install(localPaths.framework);
   clipboard.check();
+  const { browserProfileWidth, browserToolbarHeight } = await import('./chrome/navigation.mjs');
   const website = session.fromPartition('arbol-browser-preview');
   sessionPolicy(website);
-  const defaultProfile = { name: 'default', website };
-  const loginProfiles = new Map();
   const profilesRoot = privateDirectory(localPaths.profiles);
+  const defaultProfile = { id: 'default', name: 'Default', website, tabs: new Map(), selected: null };
+  const loginProfiles = new Map(readProfiles(profilesRoot).map(record => {
+    const id = profileId(record);
+    return [id, { ...record, id, website: null, tabs: new Map(), selected: null }];
+  }));
+  const chromeSession = session.fromPartition('arbol-browser-preview-chrome', { cache: false });
+  sessionPolicy(chromeSession);
+  chromeSession.protocol.handle('arbol-preview', async request => {
+    const url = new URL(request.url);
+    const type = url.host === 'chrome' && !url.search && !url.hash && chromeFiles.get(url.pathname);
+    if (!type || request.method !== 'GET') return new Response(null, { status: 404 });
+    return new Response(await readFile(join(__dirname, 'chrome', url.pathname.slice(1))), {
+      headers: { 'Content-Type': type, 'X-Content-Type-Options': 'nosniff' },
+    });
+  });
   const window = new BaseWindow({ width: 1100, height: 780, minWidth: 360, minHeight: 260,
     title: 'Arbol Browser Preview', show: false });
+  const chrome = new WebContentsView({ webPreferences: { ...preferences, session: chromeSession,
+    preload: join(__dirname, 'chrome/preload.cjs') } });
+  chrome.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  chrome.webContents.on('will-frame-navigate', event => event.preventDefault());
+  chrome.webContents.on('will-attach-webview', event => event.preventDefault());
+  window.contentView.addChildView(chrome);
   const tabs = new Map();
-  let selected, nextTab = 0, closing = false, quitting = false;
+  let activeProfile = defaultProfile, selected = null, nextTab = 0, revision = 0;
+  let closing = false, quitting = false;
   let pageWork = Promise.resolve(), presentationWork = Promise.resolve();
   let fixture, input;
   const cadence = setInterval(clipboard.check, 1000);
@@ -108,40 +139,83 @@ async function main(config, clipboard) {
 
   function layout() {
     const { width, height } = window.getContentBounds();
-    for (const { view } of tabs.values()) view.setBounds({ x: 0, y: 0, width, height });
+    const x = browserProfileWidth(width), y = browserToolbarHeight;
+    chrome.setBounds({ x: 0, y: 0, width, height });
+    for (const { view } of tabs.values())
+      view.setBounds({ x, y, width: Math.max(0, width - x), height: Math.max(0, height - y) });
   }
-  function select(tab) {
-    if (!tab) throw new Error('That preview tab does not exist.');
+  function profileState() {
+    return {
+      revision, profile: activeProfile.id, tab: selected?.id ?? null,
+      profiles: [defaultProfile, ...loginProfiles.values()].map(profile => ({
+        id: profile.id, name: profile.name,
+        tabs: [...profile.tabs.values()].map(tab => {
+          const url = tab.view.webContents.getURL();
+          return { id: tab.id, site: url.startsWith('http') ? new URL(url).hostname : tab.site };
+        }),
+      })),
+    };
+  }
+  function publish() {
+    revision++;
+    if (!closing && !chrome.webContents.isDestroyed()) chrome.webContents.send('arbol-preview:changed', profileState());
+  }
+  function selectProfile(profile, tab = profile.selected, focus = true) {
+    activeProfile = profile;
+    profile.selected = tab;
     if (selected !== tab) {
       selected?.view.setVisible(false);
       selected = tab;
-      tab.view.setVisible(true);
-      if (window.isVisible()) tab.view.webContents.focus();
+      selected?.view.setVisible(true);
     }
+    if (focus && window.isVisible()) selected?.view.webContents.focus();
+    publish();
   }
-  function loginProfile(url, account) {
-    if (!/^[a-z](?:[a-z0-9-]{0,30}[a-z0-9])?$/.test(account))
+  function select(tab, focus = true) {
+    if (!tab) throw new Error('That preview tab does not exist.');
+    selectProfile(tab.profile, tab, focus);
+  }
+  function findProfile(id) {
+    const profile = id === defaultProfile.id ? defaultProfile : loginProfiles.get(id);
+    if (!profile) throw new Error('That preview profile does not exist. Use profiles to find its ID.');
+    return profile;
+  }
+  function registerProfile(url, account, name) {
+    if (!validAccount(account))
       throw new Error('Choose an account label of 1–32 lowercase letters, digits or hyphens.');
     const site = new URL(url).hostname.replace(/\.$/, '');
-    const key = createHash('sha256').update(site).update('\0').update(account).digest('hex');
-    let profile = loginProfiles.get(key);
-    if (!profile) {
+    const id = profileId({ site, account });
+    const current = loginProfiles.get(id);
+    if (current && (!name || current.name === name)) return current;
+    const record = { site, account, name: name ?? id };
+    const records = new Map(loginProfiles);
+    records.set(id, record);
+    writeProfiles(privateDirectory(profilesRoot), [...records.values()]);
+    if (current) current.name = record.name;
+    else loginProfiles.set(id, { ...record, id, website: null, tabs: new Map(), selected: null });
+    publish();
+    return loginProfiles.get(id);
+  }
+  function websiteSession(profile) {
+    if (!profile.website) {
       privateDirectory(profilesRoot);
+      const key = createHash('sha256').update(profile.site).update('\0').update(profile.account).digest('hex');
       const path = privateDirectory(join(profilesRoot, 'site-' + key));
       const website = session.fromPath(path);
       if (website.getStoragePath() !== path) throw new Error('Could not open the selected site profile.');
       sessionPolicy(website);
-      profile = { name: site + '/' + account, website };
-      loginProfiles.set(key, profile);
+      profile.website = website;
     }
-    return profile;
+    return profile.website;
   }
-  function newTab(profile = defaultProfile) {
+  function newTab(profile = defaultProfile, focus = true) {
     clipboard.check();
-    if (tabs.size >= maximumTabs) throw new Error('The preview allows eight open tabs.');
-    const view = new WebContentsView({ webPreferences: { ...preferences, session: profile.website } });
+    if (tabs.size >= maximumTabs || profile.tabs.size >= maximumProfileTabs)
+      throw new Error('Close a tab before opening another.');
+    const view = new WebContentsView({ webPreferences: { ...preferences, session: websiteSession(profile) } });
+    view.setVisible(false);
     const contents = view.webContents;
-    const tab = { id: ++nextTab, view, profile };
+    const tab = { id: ++nextTab, view, profile, site: '' };
     const checkNavigation = event => {
       if (!event.isMainFrame && /^(about:|data:|blob:)/.test(event.url)) return;
       try { address(event.url); }
@@ -152,21 +226,35 @@ async function main(config, clipboard) {
     contents.on('will-redirect', checkNavigation);
     contents.on('will-attach-webview', event => event.preventDefault());
     contents.on('will-prevent-unload', event => event.preventDefault());
+    contents.on('did-navigate', publish);
+    contents.on('did-navigate-in-page', publish);
     window.contentView.addChildView(view);
     tabs.set(tab.id, tab);
+    profile.tabs.set(tab.id, tab);
     layout();
-    select(tab);
+    select(tab, focus);
     return tab;
+  }
+  function closeTab(tab) {
+    const { profile, view, id } = tab;
+    const next = profile.selected === tab ?
+      [...profile.tabs.values()].find(candidate => candidate !== tab) ?? null : profile.selected;
+    tabs.delete(id);
+    profile.tabs.delete(id);
+    selectProfile(profile, next, false);
+    window.contentView.removeChildView(view);
+    view.webContents.close();
   }
   function describe(tab) {
     const contents = tab.view.webContents;
     const url = contents.getURL();
     const reportedUrl = tab.profile === defaultProfile ? url : url.split(/[?#]/, 1)[0];
-    return { tab: tab.id, profile: tab.profile.name, url: reportedUrl.slice(0, 8192), contents: contents.id,
+    return { tab: tab.id, profile: tab.profile.id, url: reportedUrl.slice(0, 8192), contents: contents.id,
       renderer: contents.getOSProcessId(), history: contents.navigationHistory.getAllEntries().length };
   }
   function status() {
-    return { visible: window.isVisible(), dock: app.dock.isVisible(), current: describe(selected) };
+    return { visible: window.isVisible(), dock: app.dock.isVisible(), profile: activeProfile.id,
+      current: selected ? describe(selected) : null };
   }
   async function show(visible) {
     if (visible) {
@@ -174,7 +262,7 @@ async function main(config, clipboard) {
       await app.dock.show();
       if (closing) return;
       window.show();
-      selected.view.webContents.focus();
+      selected?.view.webContents.focus();
     } else {
       window.hide();
       app.dock.hide();
@@ -187,9 +275,12 @@ async function main(config, clipboard) {
     closing = true;
     clearInterval(cadence);
     input?.close();
+    ipcMain.removeHandler('arbol-preview:state');
+    ipcMain.removeHandler('arbol-preview:action');
+    chrome.webContents.close();
     for (const { view } of tabs.values()) view.webContents.close();
     try {
-      await within(Promise.all([...loginProfiles.values()].map(({ website }) => {
+      await within(Promise.all([...loginProfiles.values()].filter(profile => profile.website).map(({ website }) => {
         website.flushStorageData();
         return website.cookies.flushStore();
       })));
@@ -206,6 +297,8 @@ async function main(config, clipboard) {
   }
   async function navigate(tab, url) {
     const contents = tab.view.webContents;
+    tab.site = new URL(url).hostname;
+    publish();
     try { await within(contents.loadURL(url), () => { if (!contents.isDestroyed()) contents.stop(); }); }
     catch { throw new Error('The page could not be loaded. Check the address, network and certificate.'); }
     return describe(tab);
@@ -213,19 +306,30 @@ async function main(config, clipboard) {
   async function action(command, argumentsText) {
     clipboard.check();
     switch (command) {
-      case 'go': return navigate(selected, address(argumentsText));
+      case 'go': {
+        const url = address(argumentsText);
+        return navigate(selected ?? newTab(activeProfile), url);
+      }
       case 'open': {
         const url = address(argumentsText);
         return navigate(newTab(), url);
+      }
+      case 'profile-create': {
+        const [match, target, account, name] = /^(\S+)\s+(\S+)\s+(.+)$/.exec(argumentsText.trim()) ?? [];
+        if (!match) throw new Error('Use profile-create URL account Display name.');
+        const profile = registerProfile(address(target), account, name);
+        return { id: profile.id, name: profile.name };
       }
       case 'login': {
         const [target, account = 'primary', extra] = argumentsText.trim().split(/\s+/, 3);
         if (extra) throw new Error('Use login URL [account].');
         const url = address(target);
-        if (tabs.size >= maximumTabs) throw new Error('The preview allows eight open tabs.');
-        return navigate(newTab(loginProfile(url, account)), url);
+        if (tabs.size >= maximumTabs) throw new Error('Close a tab before opening another.');
+        return navigate(newTab(registerProfile(url, account)), url);
       }
-      case 'tabs': return { selected: selected.id, tabs: [...tabs.values()].map(describe) };
+      case 'profiles': return profileState();
+      case 'profile': selectProfile(findProfile(argumentsText.trim())); return status();
+      case 'tabs': return { selected: selected?.id ?? null, tabs: [...tabs.values()].map(describe) };
       case 'tab': select(tabs.get(Number(argumentsText))); return status();
       case 'inspect':
       case 'fill':
@@ -235,8 +339,8 @@ async function main(config, clipboard) {
         if (command === 'fill') [selector, value] = /^([^ ]+) (.*)$/.exec(argumentsText)?.slice(1) ?? [];
         if ((command !== 'inspect' && !selector) || selector?.length > 512 || value?.length > 1600)
           throw new Error('Use inspect [selector], fill selector text, or click selector.');
-        const contents = selected.view.webContents;
-        if (contents.isLoadingMainFrame() || !contents.getURL()) throw new Error('Navigate to a loaded page first.');
+        const contents = selected?.view.webContents;
+        if (!contents || contents.isLoadingMainFrame() || !contents.getURL()) throw new Error('Navigate to a loaded page first.');
         const args = JSON.stringify([command, selector, value]);
         let result;
         try {
@@ -246,7 +350,7 @@ async function main(config, clipboard) {
         if (result.error) throw new Error(result.error);
         return result;
       }
-      default: throw new Error('Commands: status, show, hide, go URL, open URL, login URL [account], tabs, tab ID, inspect [selector], fill selector text, click selector, quit.');
+      default: throw new Error('Commands: status, show, hide, go URL, open URL, login URL [account], profiles, profile ID, profile-create URL account Display name, tabs, tab ID, inspect, fill, click, quit.');
     }
   }
   function line(text) {
@@ -269,6 +373,44 @@ async function main(config, clipboard) {
     else pageWork = work;
   }
 
+  let resolveChrome;
+  const readyChrome = new Promise(resolve => { resolveChrome = resolve; });
+  function requireChrome(event) {
+    if (closing || event.sender !== chrome.webContents || !event.senderFrame ||
+        event.senderFrame !== chrome.webContents.mainFrame || event.senderFrame.url !== chromeEntry)
+      throw new Error('The Browser control request was refused.');
+  }
+  ipcMain.handle('arbol-preview:state', event => {
+    requireChrome(event);
+    resolveChrome();
+    return profileState();
+  });
+  ipcMain.handle('arbol-preview:action', async (event, request) => {
+    requireChrome(event);
+    try {
+      if (!request || request.profile !== activeProfile.id || request.tab !== (selected?.id ?? null))
+        return { error: 'The active profile or tab changed. Try again.' };
+      clipboard.check();
+      switch (request.type) {
+        case 'select-profile': selectProfile(findProfile(request.value), undefined, false); break;
+        case 'select-tab': select(activeProfile.tabs.get(request.value), false); break;
+        case 'new-tab': newTab(activeProfile, false); break;
+        case 'close-tab': {
+          const tab = activeProfile.tabs.get(request.value);
+          if (!tab) throw new Error('That preview tab does not exist.');
+          closeTab(tab);
+          break;
+        }
+        case 'navigate': {
+          const url = address(typeof request.value === 'string' ? request.value : '');
+          await navigate(selected ?? newTab(activeProfile, false), url);
+          break;
+        }
+        default: return { error: 'The Browser control request was refused.' };
+      }
+      return { ok: true };
+    } catch (error) { return { error: String(error.message).slice(0, 290) }; }
+  });
   window.on('resize', layout);
   window.on('close', event => { event.preventDefault(); void quit(); });
   app.on('before-quit', event => {
@@ -276,6 +418,10 @@ async function main(config, clipboard) {
     event.preventDefault();
     void quit();
   });
+  layout();
+  await within(chrome.webContents.loadURL(chromeEntry));
+  await within(readyChrome);
+  if (closing) return;
   newTab();
   app.dock.hide();
   if (config.visible) await show(true);
@@ -300,6 +446,8 @@ try {
   app.setPath('sessionData', localPaths.sessionData);
   app.setActivationPolicy('accessory');
   if (!app.requestSingleInstanceLock()) throw new Error('The Browser preview is already running with this data store.');
+  protocol.registerSchemesAsPrivileged([{ scheme: 'arbol-preview',
+    privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true } }]);
   void main(config, require(localPaths.clipboard)).catch(error => {
     write({ event: 'failed', error: String(error.message).slice(0, 290) });
     app.exit(1);

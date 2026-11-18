@@ -59,6 +59,16 @@ keeps the selected tab's profile, and redirects stay with the login tab.
 Named logins are saved under `~/.arbol/browser-preview/`. Default website
 data and fixture runs are disposable.
 
+In the window, select a profile on the left. Its open tabs appear across
+the top. Each profile row shows its tab count and, in a roomy window, its
+open website hostnames. Use the address field or the plus button to open
+a page in the selected profile. Switching profiles restores that profile's
+selected tab and leaves its pages running.
+
+To save a display name before signing in, use
+`profile-create URL account Display name`. Use `profiles` to list IDs and
+`profile ID` to switch profiles from the terminal.
+
 | | |
 |---|---|
 | Package | `@sylvan-stack/arbol-browser` 1.0.0 |
