@@ -10,6 +10,7 @@
 #include <thread>
 #include <memory>
 #include <dirent.h>
+#include <os/log.h>
 namespace arbol_exit {
 using arbol_boundary::Identity;
 // Purpose-specific private exit evidence only. Launch/cancel/capsule/marker
@@ -252,12 +253,22 @@ struct SharedState {
   // dirty marker; it never predicts or grants its replacement inode.
   char expectedMarkerDigest[65]{};
   MarkerBinding marker{};
-  void poison(uint64_t reason) {
+  void poison(uint64_t reason,unsigned callerLine=__builtin_LINE()) {
     uint32_t value=activation.load(std::memory_order_acquire);
     while((value==0||value==1)&&!activation.compare_exchange_weak(value,value==0?4:3,std::memory_order_acq_rel)) {}
     // A post-commit reason remains recorded, but cannot retroactively erase
     // the genuine acknowledged cut which won before this fatal publication.
-    fatal.fetch_or(reason,std::memory_order_acq_rel);
+    uint64_t previous=fatal.fetch_or(reason,std::memory_order_acq_rel);
+    if(previous==0) {
+      int savedErrno=errno;
+      try {
+        @try {
+          os_log_error(OS_LOG_DEFAULT,"arbol-browser-first-fatal reason=%{public}llu line=%{public}u",
+            (unsigned long long)reason,callerLine);
+        } @catch(NSException*) {}
+      } catch(...) {}
+      errno=savedErrno;
+    }
   }
   static void minimum(std::atomic<uint64_t>& field,uint64_t value) {
     uint64_t old=field.load(std::memory_order_acquire);
@@ -268,12 +279,12 @@ struct SharedState {
     // already admitted budget. Grace is published last for first admission.
     minimum(closeReceivedUs,received); minimum(closeOverallUs,overall); minimum(closeGraceUs,grace);
   }
-  void declareFatal() {
+  void declareFatal(unsigned callerLine=__builtin_LINE()) {
     uint64_t cutoff=(uint64_t)((arbol_boundary::clockMs()+1000)*1000),old=fatalCutoffUs.load(std::memory_order_acquire);
     while((!old||cutoff<old)&&!fatalCutoffUs.compare_exchange_weak(old,cutoff,std::memory_order_acq_rel)) {}
     // Publish the bound before the admission loss. This preserves F's existing
     // one-second forwarding/receipt window; a genuine hard loss remains sooner.
-    poison(admissionLoss);
+    poison(admissionLoss,callerLine);
   }
 };
 static_assert(std::atomic<uint64_t>::is_always_lock_free && std::atomic<uint32_t>::is_always_lock_free);

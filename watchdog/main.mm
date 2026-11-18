@@ -55,8 +55,8 @@ static Context record(const std::string& raw,bool primary,Identity& producer) {
 }
 // Refusal never advertises R or gives up the only retained descriptions. An
 // already identified family can be enforced; unknown input cannot select PIDs.
-static void poison(arbol_exit::HostCapability* cap,uint64_t reason) {
-  if(cap&&cap->present()) cap->shared()->poison(reason);
+static void poison(arbol_exit::HostCapability* cap,uint64_t reason,unsigned callerLine=__builtin_LINE()) {
+  if(cap&&cap->present()) cap->shared()->poison(reason,callerLine);
 }
 // The sole controlled final-release route for original monitors. Host-private
 // failed enrollment never downgrades to the Native-only legacy exit path.
@@ -129,8 +129,15 @@ static bool frame(const std::string& line,Frame& result,const std::string& allow
 }
 struct Deadline {
   double expires; bool fatal=false,received=false,elapsed=false,sealed=false,hardLoss=false; uint64_t sequence=0;
+  unsigned firstHardLossLine=0; // Observation only; never read by a deadline or authority predicate.
   explicit Deadline(double start):expires(start+2500) {}
-  bool expired(double now) { if((!sealed||fatal)&&now>=expires) fatal=elapsed=hardLoss=true; return elapsed; }
+  bool expired(double now,unsigned callerLine=__builtin_LINE()) {
+    if((!sealed||fatal)&&now>=expires) {
+      fatal=elapsed=hardLoss=true;
+      if(!firstHardLossLine) firstHardLossLine=callerLine;
+    }
+    return elapsed;
+  }
   bool accept(const Frame& value,double now) {
     if(expired(now)) return false;
     if(received&&value.sequence<=sequence) return false;
@@ -140,7 +147,10 @@ struct Deadline {
     return true;
   }
   void seal() { sealed=elapsed=true; } // closes renewal only, never a completion proof
-  void lost(double now) { fatal=elapsed=sealed=hardLoss=true; expires=std::min(expires,now); }
+  void lost(double now,unsigned callerLine=__builtin_LINE()) {
+    fatal=elapsed=sealed=hardLoss=true; expires=std::min(expires,now);
+    if(!firstHardLossLine) firstHardLossLine=callerLine;
+  }
 };
 [[noreturn]] static void retirePair(Context& c,Channel& pair,bool primary,arbol_exit::HostCapability* cap=nullptr,
   arbol_exit::ExitWatch* mainWatch=nullptr,double mainLimit=0,std::vector<std::string> first={}) {
@@ -358,7 +368,7 @@ struct Deadline {
     }
     // This handoff is itself a cleanup boundary; never leave attribution until
     // the loop tail when a complete census may make this call nonreturning.
-    if(deadline.hardLoss) poison(cap,arbol_exit::protocolLoss|arbol_exit::forced);
+    if(deadline.hardLoss) poison(cap,arbol_exit::protocolLoss|arbol_exit::forced,deadline.firstHardLossLine);
     else if(deadline.fatal&&cap) cap->shared()->declareFatal();
     if(c.engineGone()&&(!cap||watch.observed()||deadline.hardLoss)) {
       // The census itself may have been delayed. Its first complete result
@@ -454,7 +464,7 @@ struct Deadline {
     Identity peerNow; const Identity& peer=primary?c.custody:c.primary;
     if(pair.failed||observe(peer.pid,peerNow)!=1||!same(peer,peerNow)||peerNow.group!=(primary?c.main.group:(uint32_t)c.primary.pid)||
        !c.census(observed)||!lockIdentity(c.owner)||!lockIdentity(c.build)) deadline.lost(clockMs());
-    if(deadline.hardLoss) { poison(cap,arbol_exit::protocolLoss|arbol_exit::forced); c.enforce(); }
+    if(deadline.hardLoss) { poison(cap,arbol_exit::protocolLoss|arbol_exit::forced,deadline.firstHardLossLine); c.enforce(); }
     reap(c.custody); maybeRetire(pendingRetirement); usleep(5000);
   }
 }
