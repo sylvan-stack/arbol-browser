@@ -34,10 +34,25 @@ terminal can still act on the page. At the second `show`, the original ID
 and draft are still present and the timer and count have advanced.
 
 Use `--url https://example.com/` to start with your own address or
-`--visible` to show the window immediately. `go URL` navigates the selected
-tab. `open URL` creates another live tab. Use `tabs` to find tab IDs and
-`tab ID` to select one. `status` shows the current window and Dock state.
+`--visible` to show the window without activating it. `show` does the same
+after startup. Bring the window forward yourself when you want to interact.
+`go URL` navigates the selected tab and `open URL` creates another live tab.
+Use `tabs` to find tab IDs and `tab ID` to select one. `status` reports
+window visibility, Dock visibility, focus and any pending handoff.
 Page actions accept ordinary CSS selectors. Each command responds with JSON.
+
+### Complete a foreground step manually
+
+The controller hands off native pickers and other steps that would interfere
+with the owner’s focus. Use `handoff ACTION` to pause for a known manual step,
+such as sign-in. Use `status` to find `manual.id`, the tab, and the action.
+`show` can reveal the window while leaving focus where it is. Bring the
+window forward when ready and perform the step. After confirming completion,
+send `resume HANDOFF_ID` with the reported ID. Subsequent commands act on the
+current page. The original operation is never replayed.
+
+The preview blocks website popups and script dialogs. Websites can use HTML
+fullscreen inside their view without making the native window fullscreen.
 
 ### Drag an item within a webpage
 
