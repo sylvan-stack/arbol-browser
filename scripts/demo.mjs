@@ -31,7 +31,7 @@ async function run() {
     const storage = options.includes('--fixture') ? scratch :
       privateDirectory(join(privateDirectory(join(await realpath(homedir()), '.arbol')), 'browser-preview'));
     const userData = privateDirectory(join(storage, 'instance'));
-    const sessionData = privateDirectory(join(scratch, 'session'));
+    const sessionData = storage;
     const profiles = privateDirectory(join(storage, 'site-profiles'));
     const addon = join(scratch, 'clipboard.node');
     const env = { PATH: '/usr/bin:/bin', HOME: process.env.HOME, LANG: 'en_US.UTF-8', TMPDIR: scratch };
