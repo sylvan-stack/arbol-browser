@@ -28,7 +28,7 @@ export type SignedVerificationPhase = 'bundle-selection' | 'initial-snapshot' |
   'nested-signature-verification' | 'nested-signature-details' | 'nested-signature-entitlements' |
   'publisher' | 'compatibility' | 'inventory' | 'final-snapshot' | 'final-physical-comparison' |
   'repeated-snapshot' | 'repeated-physical' | 'repeated-manifest' | 'repeated-cutoff' | 'snapshot-receipt' | 'verification-cutoff' |
-  'snapshot-root-identity' | 'snapshot-entry-identity' | 'snapshot-file-description' | 'snapshot-file-read' |
+  'snapshot-root-identity' | 'snapshot-root-change-time' | 'snapshot-entry-identity' | 'snapshot-file-description' | 'snapshot-file-read' |
   'snapshot-symlink' | 'snapshot-directory-membership' | 'snapshot-encoded-mismatch' | 'snapshot-filesystem';
 const verificationFailures = new WeakMap<Error, SignedVerificationPhase>();
 function noteVerificationFailure(error: unknown, phase: SignedVerificationPhase): void {
@@ -180,6 +180,21 @@ const comparisons = new WeakMap<SignedSnapshotComparison, { signed: SignedBundle
 function physicalStamp(stat: import('node:fs').BigIntStats): string {
   return stable([stat.dev, stat.ino, stat.mode, stat.uid, stat.gid, stat.nlink, stat.size, stat.mtimeNs, stat.ctimeNs, stat.birthtimeNs].map(String));
 }
+/** Observe only the two stamps used by an existing failed comparison. Never
+ * restat, retry or replace the original full-stamp verification predicate. */
+function stampFailurePhase(identity: SnapshotIdentityPhase, before: string | undefined,
+  after: string | undefined): SnapshotIdentityPhase | 'snapshot-root-change-time' {
+  try {
+    if (identity === 'snapshot-root-identity' && before !== undefined && after !== undefined && before !== after) {
+      const a: unknown = JSON.parse(before), b: unknown = JSON.parse(after);
+      if (Array.isArray(a) && Array.isArray(b) && a.length === 10 && b.length === 10 &&
+          a.every(value => typeof value === 'string') && b.every(value => typeof value === 'string') &&
+          a[8] !== b[8] && a.every((value, index) => index === 8 || value === b[index]))
+        return 'snapshot-root-change-time';
+    }
+  } catch { /* Observation failure retains the original fixed phase. */ }
+  return identity;
+}
 // Capture the actual unpatched implementation once, in this canonical module.
 // These callbacks perform filesystem work off the browser heartbeat thread.
 const originalAsyncFS = physicalFS;
@@ -236,7 +251,8 @@ function synchronousNames(path: string, deadline: number, maximum: number, obser
     for (let index = 0; index <= maximum; ++index) {
       budget(deadline); const entry = snapshotFilesystem(() => directory!.readSync(), observed); budget(deadline);
       if (!entry) {
-        if (physicalStamp(snapshotFilesystem(() => lstatSync(path, { bigint: true }), observed)) !== stamp || snapshotFilesystem(() => realpathSync(path), observed) !== path) refuseSnapshot(identity, observed);
+        const afterStamp = physicalStamp(snapshotFilesystem(() => lstatSync(path, { bigint: true }), observed));
+        if (afterStamp !== stamp || snapshotFilesystem(() => realpathSync(path), observed) !== path) refuseSnapshot(stampFailurePhase(identity, stamp, afterStamp), observed);
         return names.sort();
       }
       if (names.length === maximum) refuseSnapshot('snapshot-directory-membership', observed);
@@ -261,7 +277,8 @@ async function asynchronousNames(path: string, expected: PhysicalEntry, active: 
   const maximum = expected.children?.length;
   if (expected.kind !== 'directory' || maximum === undefined || maximum > completeEntryLimit) refuseSnapshot('snapshot-directory-membership', observed);
   const before = await asyncLstat(path, observed);
-  if (!before.isDirectory() || physicalStamp(before) !== expected.stamp || await asyncRealpath(path, observed) !== path) refuseSnapshot(identity, observed);
+  let beforeStamp: string | undefined;
+  if (!before.isDirectory() || (beforeStamp = physicalStamp(before)) !== expected.stamp || await asyncRealpath(path, observed) !== path) refuseSnapshot(stampFailurePhase(identity, expected.stamp, beforeStamp), observed);
   const names: string[] = [], seen = new Set<string>(); let directory: import('node:fs').Dir | undefined;
   try {
     active(); directory = await asyncDirectory(path, observed); active();
@@ -270,7 +287,8 @@ async function asynchronousNames(path: string, expected: PhysicalEntry, active: 
       active(); const entry = await asyncDirectoryRead(directory, observed); active();
       if (!entry) {
         const after = await asyncLstat(path, observed);
-        if (!after.isDirectory() || physicalStamp(after) !== expected.stamp || await asyncRealpath(path, observed) !== path) refuseSnapshot(identity, observed);
+        let afterStamp: string | undefined;
+        if (!after.isDirectory() || (afterStamp = physicalStamp(after)) !== expected.stamp || await asyncRealpath(path, observed) !== path) refuseSnapshot(stampFailurePhase(identity, expected.stamp, afterStamp), observed);
         active(); return names.sort();
       }
       if (names.length === maximum) refuseSnapshot('snapshot-directory-membership', observed);
@@ -330,8 +348,9 @@ async function compareCompleteSnapshot(signed: SignedBundle, snapshot: FrozenSna
       const expected = snapshot.physical[key]; if (!expected) refuseSnapshot('snapshot-entry-identity', observed);
       const path = key ? join(root, key) : root, stat = await asyncLstat(path, observed);
       active();
-      if (physicalStamp(stat) !== expected.stamp ||
-          (expected.kind === 'directory' ? !stat.isDirectory() : expected.kind === 'file' ? !stat.isFile() : !stat.isSymbolicLink())) refuseSnapshot(key ? 'snapshot-entry-identity' : 'snapshot-root-identity', observed);
+      const stamp = physicalStamp(stat);
+      if (stamp !== expected.stamp ||
+          (expected.kind === 'directory' ? !stat.isDirectory() : expected.kind === 'file' ? !stat.isFile() : !stat.isSymbolicLink())) refuseSnapshot(stampFailurePhase(key ? 'snapshot-entry-identity' : 'snapshot-root-identity', expected.stamp, stamp), observed);
       if (expected.kind === 'symlink') {
         const link = await asyncLink(path, observed), target = await asyncRealpath(path, observed); active();
         if (link !== expected.link || target !== expected.target || !target.startsWith(root + sep) ||
@@ -440,7 +459,8 @@ function completeSnapshot(root: string, deadline = Infinity, physical?: Record<s
       const after = snapshotFilesystem(() => lstatSync(path), observed);
       if (after.dev !== before.dev || after.ino !== before.ino || after.mode !== before.mode || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs || physicalStamp(snapshotFilesystem(() => lstatSync(path, { bigint: true }), observed)) !== beforeStamp) refuseSnapshot('snapshot-entry-identity', observed);
     }
-    if (physicalStamp(snapshotFilesystem(() => lstatSync(directory, { bigint: true }), observed)) !== originalStamp) refuseSnapshot(directory === root ? 'snapshot-root-identity' : 'snapshot-entry-identity', observed);
+    const afterStamp = physicalStamp(snapshotFilesystem(() => lstatSync(directory, { bigint: true }), observed));
+    if (afterStamp !== originalStamp) refuseSnapshot(stampFailurePhase(directory === root ? 'snapshot-root-identity' : 'snapshot-entry-identity', originalStamp, afterStamp), observed);
     if (stable(synchronousNames(directory, deadline, names.length, observed, directory === root ? 'snapshot-root-identity' : 'snapshot-entry-identity')) !== stable(names)) refuseSnapshot('snapshot-directory-membership', observed);
   }
   walk(root); budget(deadline); return stable(entries);
@@ -498,7 +518,7 @@ export function verifySignedBundle(bundle: string, deadline = Infinity): SignedB
     phase = 'final-physical-comparison';
     if (before !== after) refuseSnapshot('snapshot-encoded-mismatch', observed);
     if (stable(physical) !== stable(afterPhysical))
-      refuseSnapshot(physical['']?.stamp !== afterPhysical['']?.stamp ? 'snapshot-root-identity' : 'snapshot-entry-identity', observed);
+      refuseSnapshot(stampFailurePhase(physical['']?.stamp !== afterPhysical['']?.stamp ? 'snapshot-root-identity' : 'snapshot-entry-identity', physical['']?.stamp, afterPhysical['']?.stamp), observed);
     // Snapshot validation cannot be bypassed by mutation through a caller-held object.
     function frozen<T>(value: T): T { if (value && typeof value === 'object') { for (const entry of Object.values(value)) frozen(entry); Object.freeze(value); } return value; }
     const manifest = frozen(initial);
@@ -516,7 +536,7 @@ export function verifySignedBundle(bundle: string, deadline = Infinity): SignedB
           if (completeSnapshot(root, limit, currentPhysical, observed) !== before) refuseSnapshot('snapshot-encoded-mismatch', observed);
           repeatedPhase = 'repeated-physical';
           if (stable(currentPhysical) !== stable(snapshot.physical))
-            refuseSnapshot(currentPhysical['']?.stamp !== snapshot.physical['']?.stamp ? 'snapshot-root-identity' : 'snapshot-entry-identity', observed);
+            refuseSnapshot(stampFailurePhase(currentPhysical['']?.stamp !== snapshot.physical['']?.stamp ? 'snapshot-root-identity' : 'snapshot-entry-identity', snapshot.physical['']?.stamp, currentPhysical['']?.stamp), observed);
           repeatedPhase = 'repeated-manifest';
           if (stable(boundedJson(join(root, 'Contents/Resources/native-compatibility.json'), limit)) !== encoded) refuse();
           repeatedPhase = 'repeated-cutoff';
