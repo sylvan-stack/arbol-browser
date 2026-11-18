@@ -445,9 +445,11 @@ export async function prepareAllocatedHost(environment = process.env) {
     await assertAllocation();
     const source = await lstat(bundle, { bigint: true }), parent = await lstat(buildRoot, { bigint: true });
     if (!source.isDirectory() || source.dev !== parent.dev) fail('Sealed app is not on actual Building device');
-    // The existing genuine Native primitive is same-parent RENAME_EXCL.
-    // Its hidden source and fixed installed destination share this exact parent.
-    const installed = join(buildRoot, 'ArbolBrowser.app'); support.publishDirectory(bundle, installed);
+    // Protect the exact original root after signing/metadata mutation and the
+    // same-parent RENAME_EXCL, before CLI publication or any trust snapshot.
+    // ABR-24 must clear/read back this owned flag under exclusive Build-use
+    // protection in production pruning before release/distribution.
+    const installed = join(buildRoot, 'ArbolBrowser.app'); support.publishDirectory(bundle, installed, held);
     await syncDirectory(buildRoot);
     const actual = await lstat(installed, { bigint: true });
     if (actual.dev !== source.dev || actual.ino !== source.ino || actual.uid !== source.uid ||

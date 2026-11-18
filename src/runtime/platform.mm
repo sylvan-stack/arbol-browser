@@ -208,13 +208,32 @@ static napi_value groupCensus(napi_env env, napi_callback_info info) {
 // The caller holds registry.lock and syncs all staging contents before this call,
 // then syncs this parent after return. Ancestor validation remains with the caller.
 static napi_value publishDirectory(napi_env env, napi_callback_info info) {
-  napi_value args[2]; size_t count = 2; std::string source, destination;
-  if (napi_get_cb_info(env, info, &count, args, nullptr, nullptr) != napi_ok || count != 2 ||
+  napi_value args[4]; size_t count = 4; std::string source, destination;
+  if (napi_get_cb_info(env, info, &count, args, nullptr, nullptr) != napi_ok || (count != 2 && count != 3) ||
       !string(env, args[0], source) || !string(env, args[1], destination)) return fail(env);
   size_t a = source.rfind('/'), b = destination.rfind('/');
   if (a == 0 || b == 0 || source.substr(0, a) != destination.substr(0, b)) return fail(env);
   std::string parent = source.substr(0, a), from = source.substr(a + 1), to = destination.substr(b + 1);
   if (from.empty() || to.empty() || from == "." || from == ".." || to == "." || to == ".." || from == to) return fail(env);
+  HeldLock* building = nullptr;
+  if (count == 3) {
+    void* raw = nullptr;
+    if (napi_get_value_external(env, args[2], &raw) != napi_ok || !raw) return fail(env);
+    building = static_cast<HeldLock*>(raw);
+    size_t slash = parent.rfind('/');
+    if (!liveLocks.count(building) || building->mode != LOCK_SH || slash == 0 || slash == std::string::npos) return fail(env);
+    std::string registry = parent.substr(0, slash), build = parent.substr(slash + 1);
+    struct stat lock{}; char lockPath[PATH_MAX]{};
+    if (registry.substr(registry.rfind('/') + 1) != "arbol-browser" || build.empty() || build.size() > 16 ||
+        build[0] == '0' || build.find_first_not_of("0123456789abcdef") != std::string::npos ||
+        to != "ArbolBrowser.app" || from.size() != 44 || from.substr(0, 18) != ".host-preparation-" ||
+        from.substr(40) != ".app" || from.substr(18, 22).find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_") != std::string::npos ||
+        building->path != registry + "/.uses/" + build || !matches(building, &lock) ||
+        fcntl(building->fd, F_GETPATH, lockPath) || building->path != lockPath ||
+        !arbol_boundary::canonical(building->path) || !arbol_boundary::canonical(source) ||
+        !arbol_boundary::canonical(parent) || !arbol_boundary::privateAncestors(source) ||
+        !arbol_boundary::privateAncestors(building->path)) return fail(env);
+  }
   int fd = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (fd < 0) return fail(env);
   struct stat st{}, path{}, staged{}, published{};
@@ -223,12 +242,52 @@ static napi_value publishDirectory(napi_env env, napi_callback_info info) {
     (st.st_mode & 07777) == 0700 && st.st_dev == path.st_dev && st.st_ino == path.st_ino &&
     fstatat(fd, from.c_str(), &staged, AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(staged.st_mode) &&
     staged.st_uid == geteuid() && (staged.st_mode & 07777) == 0700;
+  int root = -1;
+  auto sameRoot = [&](const struct stat& actual) {
+    return S_ISDIR(actual.st_mode) && actual.st_dev == staged.st_dev && actual.st_ino == staged.st_ino &&
+      actual.st_uid == staged.st_uid && (actual.st_mode & 07777) == 0700;
+  };
+  if (valid && building) {
+    // Retain the original staged description across RENAME_EXCL. Never reopen
+    // the destination to choose the inode whose flag will be changed.
+    root = openat(fd, from.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    struct stat original{}, named{}, lock{};
+    valid = root >= 0 && fstat(root, &original) == 0 && sameRoot(original) &&
+      original.st_flags == staged.st_flags && !(original.st_flags & UF_IMMUTABLE) &&
+      fstatat(fd, from.c_str(), &named, AT_SYMLINK_NOFOLLOW) == 0 && sameRoot(named) &&
+      named.st_flags == staged.st_flags && matches(building, &lock);
+  }
   if (!valid || renameatx_np(fd, from.c_str(), fd, to.c_str(), RENAME_EXCL) != 0) {
+    if (root >= 0) close(root);
     close(fd); return fail(env);
   }
   valid = fstatat(fd, to.c_str(), &published, AT_SYMLINK_NOFOLLOW) == 0 &&
     S_ISDIR(published.st_mode) && published.st_dev == staged.st_dev && published.st_ino == staged.st_ino &&
     lstat(parent.c_str(), &path) == 0 && path.st_dev == st.st_dev && path.st_ino == st.st_ino;
+  if (building) {
+    struct stat original{}, lock{};
+    char rootPath[PATH_MAX]{};
+    valid = valid && sameRoot(published) && published.st_flags == staged.st_flags &&
+      fstat(root, &original) == 0 && sameRoot(original) && original.st_flags == staged.st_flags &&
+      fcntl(root, F_GETPATH, rootPath) == 0 && destination == rootPath && matches(building, &lock);
+    // Only the new exact published root is protected, after signing/metadata
+    // mutations and rename. All other flags and all diagnostic artifacts stay.
+    const auto flags = staged.st_flags | UF_IMMUTABLE;
+    valid = valid && fchflags(root, flags) == 0;
+    auto protectedRoot = [&]() {
+      struct stat current{}, named{}, parentNow{}, parentName{}, heldNow{};
+      return fstat(root, &current) == 0 && sameRoot(current) && current.st_flags == flags &&
+        fstatat(fd, to.c_str(), &named, AT_SYMLINK_NOFOLLOW) == 0 && sameRoot(named) && named.st_flags == flags &&
+        fstat(fd, &parentNow) == 0 && lstat(parent.c_str(), &parentName) == 0 &&
+        S_ISDIR(parentNow.st_mode) && S_ISDIR(parentName.st_mode) && parentNow.st_uid == geteuid() &&
+        (parentNow.st_mode & 07777) == 0700 && parentNow.st_dev == st.st_dev && parentNow.st_ino == st.st_ino &&
+        parentName.st_dev == st.st_dev && parentName.st_ino == st.st_ino &&
+        fcntl(root, F_GETPATH, rootPath) == 0 && destination == rootPath && matches(building, &heldNow);
+    };
+    valid = valid && protectedRoot() && fsync(root) == 0 && fsync(fd) == 0 && protectedRoot();
+    int rootResult = close(root);
+    valid = valid && rootResult == 0;
+  }
   int result = close(fd);
   if (!valid || result != 0) return fail(env);
   napi_value out; napi_get_undefined(env, &out); return out;
