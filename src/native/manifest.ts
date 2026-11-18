@@ -186,11 +186,92 @@ function physicalStamp(stat: import('node:fs').BigIntStats): string {
  * interpreter participates in pretrust identity. Later boundaries use only
  * captured original filesystem functions and never learn another baseline. */
 const helperPath = '/System/Library/PrivateFrameworks/DiskImages.framework/Versions/A/Resources/diskimages-helper';
-const kernelIdentityScript = "ObjC.import('Foundation');\nObjC.bindFunction('getpid',['int',[]]);\nObjC.bindFunction('getuid',['unsigned int',[]]);\nObjC.bindFunction('geteuid',['unsigned int',[]]);\nObjC.bindFunction('sysctl', ['int', ['pointer', 'unsigned int', 'pointer', 'pointer', 'pointer', 'unsigned long']]);\nfunction enc(a) {\n const c='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'; let s='';\n for(let i=0;i<a.length;i+=3){let n=(a[i]<<16)|((a[i+1]||0)<<8)|(a[i+2]||0);s+=c[(n>>>18)&63]+c[(n>>>12)&63]+(i+1<a.length?c[(n>>>6)&63]:'=')+(i+2<a.length?c[n&63]:'=');}return s;\n}\nfunction dec(s) {\n const c='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';let a=[],n=0,b=0;\n for(let i=0;i<s.length;i++){if(s[i]==='=')break;let v=c.indexOf(s[i]);if(v<0)throw Error('non-base64 output');n=(n<<6)|v;b+=6;if(b>=8){b-=8;a.push((n>>>b)&255);}}return a;\n}\nfunction le(a,o,n) {let v=0;for(let i=0;i<n;i++)v+=a[o+i]*Math.pow(256,i);return v;}\nfunction i32(a,o){let v=le(a,o,4);return v>2147483647?v-4294967296:v;}\nfunction bytes(a,mutable){let d=$.NSData.alloc.initWithBase64EncodedStringOptions($(enc(a)),0);return mutable?d.mutableCopy:d;}\nfunction run(argv) {\n const cutoff=Date.now()+30000, ownPid=Number($.getpid()), uid=Number($.getuid()), euid=Number($.geteuid());\n if(argv.length!==1 || !/^[1-9][0-9]*$/.test(argv[0]))throw Error('one canonical PID input required');\n const pid=Number(argv[0]);if(!Number.isSafeInteger(pid)||pid>2147483647)throw Error('PID range');\n let a=[];for(const v of [1,14,1,pid])for(let j=0;j<4;j++)a.push((v>>>8*j)&255);\n const mib=bytes(a,false), size=bytes([136,2,0,0,0,0,0,0],true), out=$.NSMutableData.dataWithLength(648);\n if(Number(mib.length)!==16||Number(size.length)!==8||Number(out.length)!==648)throw Error('bounded buffer length mismatch');\n const rc=$.sysctl(mib.bytes,4,out.mutableBytes,size.mutableBytes,null,0);\n const n=le(dec(ObjC.unwrap(size.base64EncodedStringWithOptions(0))),0,8);\n const raw=ObjC.unwrap(out.base64EncodedStringWithOptions(0)), b=dec(raw);\n if(rc!==0||n!==648||b.length!==648)throw Error('own PID sysctl refused rc='+rc+' length='+n);\n const parsed={pid:i32(b,40),effectiveUid:le(b,420,4),realUid:le(b,392,4),startSeconds:le(b,0,8),startMicroseconds:i32(b,8),padding12through15:b.slice(12,16)};\n if(parsed.pid!==pid||parsed.effectiveUid!==euid||parsed.realUid!==uid||parsed.startSeconds<=0||parsed.startSeconds>Date.now()/1000||parsed.startMicroseconds<0||parsed.startMicroseconds>=1000000)throw Error('own kernel identity/parse mismatch');\n if(Date.now()>cutoff)throw Error('original local cutoff exceeded');\n return JSON.stringify({format:1,complete:true,route:'stock Apple osascript JXA linked libc numeric-MIB sysctl',ownPid:ownPid,targetPid:pid,ownUid:uid,ownEffectiveUid:euid,mib:[1,14,1,pid],returnCode:rc,capacityBytes:648,returnedBytes:n,rawBase64:raw,parsed:parsed,paddingIsNotMicroseconds:true,localCutoff:cutoff,finishedAt:Date.now(),queries:1,attachments:0,productionAddonLoaded:false,qualificationCredit:false});\n}\n";
+const kernelIdentityScript = String.raw`ObjC.import('Foundation');
+ObjC.bindFunction('getpid', ['int', []]);
+ObjC.bindFunction('getuid', ['unsigned int', []]);
+ObjC.bindFunction('geteuid', ['unsigned int', []]);
+ObjC.bindFunction('sysctl', ['int', ['pointer', 'unsigned int', 'pointer', 'pointer', 'pointer', 'unsigned long']]);
+function enc(a) {
+  const c = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  let s = '';
+  for (let i = 0; i < a.length; i += 3) {
+    const n = (a[i] << 16) | ((a[i + 1] || 0) << 8) | (a[i + 2] || 0);
+    s += c[(n >>> 18) & 63] + c[(n >>> 12) & 63] +
+      (i + 1 < a.length ? c[(n >>> 6) & 63] : '=') + (i + 2 < a.length ? c[n & 63] : '=');
+  }
+  return s;
+}
+function dec(s) {
+  const c = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  let a = [], n = 0, b = 0;
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '=') break;
+    const v = c.indexOf(s[i]);
+    if (v < 0) throw Error('non-base64 output');
+    n = (n << 6) | v;
+    b += 6;
+    if (b >= 8) {
+      b -= 8;
+      a.push((n >>> b) & 255);
+    }
+  }
+  return a;
+}
+function le(a, o, n) {
+  let v = 0;
+  for (let i = 0; i < n; i++) v += a[o + i] * Math.pow(256, i);
+  return v;
+}
+function i32(a, o) {
+  const v = le(a, o, 4);
+  return v > 2147483647 ? v - 4294967296 : v;
+}
+function bytes(a, mutable) {
+  const d = $.NSData.alloc.initWithBase64EncodedStringOptions($(enc(a)), 0);
+  return mutable ? d.mutableCopy : d;
+}
+function run(argv) {
+  const cutoff = Date.now() + 30000;
+  const ownPid = Number($.getpid()), uid = Number($.getuid()), euid = Number($.geteuid());
+  if (argv.length !== 1 || !/^[1-9][0-9]*$/.test(argv[0])) throw Error('one canonical PID input required');
+  const pid = Number(argv[0]);
+  if (!Number.isSafeInteger(pid) || pid > 2147483647) throw Error('PID range');
+  const a = [];
+  for (const v of [1, 14, 1, pid]) {
+    for (let j = 0; j < 4; j++) a.push((v >>> 8 * j) & 255);
+  }
+  const mib = bytes(a, false), size = bytes([136, 2, 0, 0, 0, 0, 0, 0], true);
+  const out = $.NSMutableData.dataWithLength(648);
+  if (Number(mib.length) !== 16 || Number(size.length) !== 8 || Number(out.length) !== 648)
+    throw Error('bounded buffer length mismatch');
+  const rc = $.sysctl(mib.bytes, 4, out.mutableBytes, size.mutableBytes, null, 0);
+  const n = le(dec(ObjC.unwrap(size.base64EncodedStringWithOptions(0))), 0, 8);
+  const raw = ObjC.unwrap(out.base64EncodedStringWithOptions(0)), b = dec(raw);
+  if (rc !== 0 || n !== 648 || b.length !== 648) throw Error('own PID sysctl refused rc=' + rc + ' length=' + n);
+  const parsed = {
+    pid: i32(b, 40), effectiveUid: le(b, 420, 4), realUid: le(b, 392, 4),
+    startSeconds: le(b, 0, 8), startMicroseconds: i32(b, 8), padding12through15: b.slice(12, 16)
+  };
+  if (parsed.pid !== pid || parsed.effectiveUid !== euid || parsed.realUid !== uid ||
+      parsed.startSeconds <= 0 || parsed.startSeconds > Date.now() / 1000 ||
+      parsed.startMicroseconds < 0 || parsed.startMicroseconds >= 1000000) throw Error('own kernel identity/parse mismatch');
+  if (Date.now() > cutoff) throw Error('original local cutoff exceeded');
+  return JSON.stringify({
+    format: 1, complete: true, route: 'stock Apple osascript JXA linked libc numeric-MIB sysctl',
+    ownPid: ownPid, targetPid: pid, ownUid: uid, ownEffectiveUid: euid, mib: [1, 14, 1, pid],
+    returnCode: rc, capacityBytes: 648, returnedBytes: n, rawBase64: raw, parsed: parsed,
+    paddingIsNotMicroseconds: true, localCutoff: cutoff, finishedAt: Date.now(), queries: 1,
+    attachments: 0, productionAddonLoaded: false, qualificationCredit: false
+  });
+}
+`;
 interface StorageDescription { readonly fd: number; readonly path: string; readonly stamp: string; readonly directory: boolean }
 interface StorageContext { readonly descriptions: readonly StorageDescription[]; readonly mapping: string }
 const storageFinalizer = new FinalizationRegistry<readonly StorageDescription[]>(descriptions => {
-  for (const description of descriptions) { try { closeSync(description.fd); } catch { /* Resource disposal only. */ } }
+  for (const description of descriptions) {
+    try { closeSync(description.fd); }
+    catch { /* Resource disposal only. */ }
+  }
 });
 function appleQuery(program: string, args: string[], deadline: number, input?: string): string {
   const result = spawnSync(program, args, { input, timeout: budget(deadline), maxBuffer: nativeLimit,
@@ -244,7 +325,8 @@ function storageMapping(root: string, deadline: number): { volume: Record<string
       }
     }
   }
-  const device = lstatSync(volume.DeviceNode, { bigint: true }), mounted = lstatSync(volume.MountPoint, { bigint: true });
+  const device = lstatSync(volume.DeviceNode, { bigint: true });
+  const mounted = lstatSync(volume.MountPoint, { bigint: true });
   if (!device.isBlockDevice() || !mounted.isDirectory() || device.rdev !== mounted.dev ||
       mounted.dev !== lstatSync(root, { bigint: true }).dev || realpathSync(volume.MountPoint) !== volume.MountPoint) refuse();
   if (!matches.length) {
@@ -276,18 +358,25 @@ function helperKernel(pid: number, deadline: number): string {
   return stable([pid, String(seconds), micros, uid]);
 }
 function helperBacking(image: Record<string, unknown>, backing: StorageDescription, deadline: number): void {
-  const pid = Number(image['hdid-pid']), before = helperKernel(pid, deadline);
+  const pid = Number(image['hdid-pid']);
+  const before = helperKernel(pid, deadline);
   const text = lstatSync(helperPath, { bigint: true });
-  if (!text.isFile() || text.uid !== 0n || (text.mode & 0o7777n) !== 0o555n || realpathSync(helperPath) !== helperPath) refuse();
+  if (!text.isFile() || text.uid !== 0n || (text.mode & 0o022n) !== 0n || (text.mode & 0o111n) === 0n || realpathSync(helperPath) !== helperPath) refuse();
   appleQuery('/usr/bin/codesign', ['--verify', '--strict', '-R=anchor apple', helperPath], deadline);
   const raw = appleQuery('/usr/sbin/lsof', ['-nP', '-a', '-p', String(pid), '-F0pucfatDin'], deadline);
   const processFields: Record<string, string> = {}, files: Record<string, string>[] = [];
   let current = processFields;
   for (let field of raw.split('\0')) {
-    field = field.replace(/^\n/, ''); if (!field) continue;
+    field = field.replace(/^\n/, '');
+    if (!field) continue;
     const tag = field[0], value = field.slice(1);
-    if (tag === 'f') { current = { f: value }; files.push(current); }
-    else { if (!'pucfatDin'.includes(tag) || Object.hasOwn(current, tag)) refuse(); current[tag] = value; }
+    if (tag === 'f') {
+      current = { f: value };
+      files.push(current);
+    } else {
+      if (!'pucfatDin'.includes(tag) || Object.hasOwn(current, tag)) refuse();
+      current[tag] = value;
+    }
   }
   if (processFields.p !== String(pid) || processFields.u !== String(process.getuid?.()) || !processFields.c) refuse();
   const vnode = (row: Record<string, string>, st: import('node:fs').BigIntStats): boolean => {
@@ -315,9 +404,13 @@ function discoverStorage(root: string, deadline: number): StorageContext | undef
     const context = Object.freeze({ descriptions: Object.freeze(descriptions), mapping: mapping.key });
     helperBacking(mapping.image, descriptions[1], deadline);
     if (storageMapping(root, deadline).key !== context.mapping) refuse();
-    storageAssert(context, deadline); return context;
+    storageAssert(context, deadline);
+    return context;
   } catch (error) {
-    for (const d of descriptions) { try { closeSync(d.fd); } catch { /* Preserve refusal. */ } }
+    for (const d of descriptions) {
+      try { closeSync(d.fd); }
+      catch { /* Preserve refusal. */ }
+    }
     return refuseVerification('storage-context', error);
   }
 }
