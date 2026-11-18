@@ -374,6 +374,186 @@ export const preservedStockArchive = '/Users/msix/Builds/sylvan-stack/arbol-brow
 /** Ordinary authentic Arbol Building adapter. Only its two actual injected
  * inputs are accepted; source comes from original build.json, never invented
  * environment metadata. Does not select, activate or mark a Build working. */
+
+// This isolated adapter creates no production installation policy. ABR-24 owns
+// installation/remount after reboot, final image protection/notarization and
+// exclusive guarded unmount/pruning before release. Successful volumes remain
+// mounted for the real host lifetime; no process or candidate starts here.
+const imageKernelScript = String.raw`ObjC.import('Foundation');
+ObjC.bindFunction('getpid', ['int', []]);
+ObjC.bindFunction('getuid', ['unsigned int', []]);
+ObjC.bindFunction('geteuid', ['unsigned int', []]);
+ObjC.bindFunction('sysctl', ['int', ['pointer', 'unsigned int', 'pointer', 'pointer', 'pointer', 'unsigned long']]);
+function enc(a) {
+  const c = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  let s = '';
+  for (let i = 0; i < a.length; i += 3) {
+    const n = (a[i] << 16) | ((a[i + 1] || 0) << 8) | (a[i + 2] || 0);
+    s += c[(n >>> 18) & 63] + c[(n >>> 12) & 63] +
+      (i + 1 < a.length ? c[(n >>> 6) & 63] : '=') + (i + 2 < a.length ? c[n & 63] : '=');
+  }
+  return s;
+}
+function dec(s) {
+  const c = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  let a = [], n = 0, b = 0;
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '=') break;
+    const v = c.indexOf(s[i]);
+    if (v < 0) throw Error('non-base64 output');
+    n = (n << 6) | v;
+    b += 6;
+    if (b >= 8) {
+      b -= 8;
+      a.push((n >>> b) & 255);
+    }
+  }
+  return a;
+}
+function le(a, o, n) {
+  let v = 0;
+  for (let i = 0; i < n; i++) v += a[o + i] * Math.pow(256, i);
+  return v;
+}
+function i32(a, o) {
+  const v = le(a, o, 4);
+  return v > 2147483647 ? v - 4294967296 : v;
+}
+function bytes(a, mutable) {
+  const d = $.NSData.alloc.initWithBase64EncodedStringOptions($(enc(a)), 0);
+  return mutable ? d.mutableCopy : d;
+}
+function run(argv) {
+  const cutoff = Date.now() + 30000;
+  const ownPid = Number($.getpid()), uid = Number($.getuid()), euid = Number($.geteuid());
+  if (argv.length !== 1 || !/^[1-9][0-9]*$/.test(argv[0])) throw Error('one canonical PID input required');
+  const pid = Number(argv[0]);
+  if (!Number.isSafeInteger(pid) || pid > 2147483647) throw Error('PID range');
+  const a = [];
+  for (const v of [1, 14, 1, pid]) {
+    for (let j = 0; j < 4; j++) a.push((v >>> 8 * j) & 255);
+  }
+  const mib = bytes(a, false), size = bytes([136, 2, 0, 0, 0, 0, 0, 0], true);
+  const out = $.NSMutableData.dataWithLength(648);
+  if (Number(mib.length) !== 16 || Number(size.length) !== 8 || Number(out.length) !== 648)
+    throw Error('bounded buffer length mismatch');
+  const rc = $.sysctl(mib.bytes, 4, out.mutableBytes, size.mutableBytes, null, 0);
+  const n = le(dec(ObjC.unwrap(size.base64EncodedStringWithOptions(0))), 0, 8);
+  const raw = ObjC.unwrap(out.base64EncodedStringWithOptions(0)), b = dec(raw);
+  if (rc !== 0 || n !== 648 || b.length !== 648) throw Error('own PID sysctl refused rc=' + rc + ' length=' + n);
+  const parsed = {
+    pid: i32(b, 40), effectiveUid: le(b, 420, 4), realUid: le(b, 392, 4),
+    startSeconds: le(b, 0, 8), startMicroseconds: i32(b, 8), padding12through15: b.slice(12, 16)
+  };
+  if (parsed.pid !== pid || parsed.effectiveUid !== euid || parsed.realUid !== uid ||
+      parsed.startSeconds <= 0 || parsed.startSeconds > Date.now() / 1000 ||
+      parsed.startMicroseconds < 0 || parsed.startMicroseconds >= 1000000) throw Error('own kernel identity/parse mismatch');
+  if (Date.now() > cutoff) throw Error('original local cutoff exceeded');
+  return JSON.stringify({
+    format: 1, complete: true, route: 'stock Apple osascript JXA linked libc numeric-MIB sysctl',
+    ownPid: ownPid, targetPid: pid, ownUid: uid, ownEffectiveUid: euid, mib: [1, 14, 1, pid],
+    returnCode: rc, capacityBytes: 648, returnedBytes: n, rawBase64: raw, parsed: parsed,
+    paddingIsNotMicroseconds: true, localCutoff: cutoff, finishedAt: Date.now(), queries: 1,
+    attachments: 0, productionAddonLoaded: false, qualificationCredit: false
+  });
+}
+`;
+const imageHelper = '/System/Library/PrivateFrameworks/DiskImages.framework/Versions/A/Resources/diskimages-helper';
+const fullStamp = st => canonical([st.dev, st.ino, st.mode, st.uid, st.gid, st.nlink, st.size, st.mtimeNs, st.ctimeNs, st.birthtimeNs].map(String));
+function imageCommand(program, args, deadline, input) {
+  const remaining = deadline - performance.now();
+  if (remaining <= 0) fail('Read-only volume operation cutoff');
+  const result = spawnSync(program, args, { input, encoding: 'utf8', timeout: Math.max(1, Math.floor(remaining)),
+    maxBuffer: 1048576, env: { PATH: '/usr/bin:/bin' } });
+  if (result.error || result.status !== 0 || performance.now() >= deadline) fail('Read-only volume command refused');
+  return result.stdout;
+}
+function imagePlist(program, args, deadline) {
+  return JSON.parse(imageCommand('/usr/bin/plutil', ['-convert', 'json', '-o', '-', '--', '-'], deadline,
+    imageCommand(program, args, deadline)));
+}
+function imageKernel(pid, deadline) {
+  if (!Number.isSafeInteger(pid) || pid < 1 || pid > 2147483647) fail('Invalid image helper locator');
+  const value = JSON.parse(imageCommand('/usr/bin/osascript', ['-l', 'JavaScript', '-e', imageKernelScript, String(pid)], deadline));
+  if (value.complete !== true || value.targetPid !== pid || value.capacityBytes !== 648 || value.returnedBytes !== 648 ||
+      value.returnCode !== 0 || typeof value.rawBase64 !== 'string') fail('Image helper kernel receipt refused');
+  const raw = Buffer.from(value.rawBase64, 'base64'), account = userInfo();
+  if (raw.length !== 648 || raw.toString('base64') !== value.rawBase64 || raw.readInt32LE(40) !== pid ||
+      raw.readUInt32LE(420) !== account.uid || raw.readUInt32LE(392) !== account.uid || raw.readBigInt64LE(0) <= 0n ||
+      raw.readBigInt64LE(0) > BigInt(Math.floor(Date.now() / 1000)) || raw.readInt32LE(8) < 0 || raw.readInt32LE(8) >= 1000000)
+    fail('Image helper kernel identity refused');
+  return canonical([pid, String(raw.readBigInt64LE(0)), raw.readInt32LE(8), account.uid]);
+}
+async function imageHash(fd, deadline) {
+  const before = await fd.stat({ bigint: true }), h = createHash('sha256'), buffer = Buffer.alloc(65536);
+  if (!before.isFile() || before.nlink !== 1n || before.size < 1n || before.size > 1073741824n) fail('Unsafe owned image');
+  let at = 0;
+  for (;;) {
+    if (performance.now() >= deadline) fail('Image hashing cutoff');
+    const { bytesRead } = await fd.read(buffer, 0, buffer.length, at);
+    if (!bytesRead) break;
+    h.update(buffer.subarray(0, bytesRead)); at += bytesRead;
+    if (BigInt(at) > before.size) fail('Owned image grew');
+  }
+  if (BigInt(at) !== before.size || fullStamp(await fd.stat({ bigint: true })) !== fullStamp(before)) fail('Owned image changed');
+  return h.digest('hex');
+}
+async function readOnlyImageProof(owned, deadline) {
+  const { image, installed, imageFD, rootFD, imageStamp, rootStamp, imageDigest, parentIdentity, buildRoot } = owned;
+  const account = userInfo(), actualImage = await imageFD.stat({ bigint: true }), actualRoot = await rootFD.stat({ bigint: true });
+  if (await realpath(image) !== image || await realpath(installed) !== installed || fullStamp(actualImage) !== imageStamp ||
+      fullStamp(await lstat(image, { bigint: true })) !== imageStamp || actualImage.uid !== BigInt(account.uid) ||
+      (actualImage.mode & 0o7777n) !== 0o600n || fullStamp(actualRoot) !== rootStamp ||
+      fullStamp(await lstat(installed, { bigint: true })) !== rootStamp || !actualRoot.isDirectory() ||
+      actualRoot.uid !== BigInt(account.uid) || actualRoot.gid !== BigInt(account.gid) || (actualRoot.mode & 0o7777n) !== 0o700n ||
+      canonical(await privateDirectory(buildRoot, true)) !== canonical(parentIdentity) || await imageHash(imageFD, deadline) !== imageDigest)
+    fail('Owned image/root identity changed');
+  const select = () => {
+    const info = imagePlist('/usr/bin/hdiutil', ['info', '-plist'], deadline);
+    if (!Array.isArray(info.images)) fail('Missing image records');
+    const matches = info.images.filter(row => row['image-path'] === image);
+    if (matches.length !== 1) fail('Ambiguous owned image');
+    const row = matches[0];
+    if (row.diskimages2 !== false || row['image-type'] !== 'UDIF read-only' || row.writeable !== false ||
+        row['image-encrypted'] !== false || row['owner-uid'] !== account.uid || !Array.isArray(row['system-entities']) ||
+        Object.keys(row).some(key => /shadow|overlay/i.test(key))) fail('Unsupported owned image');
+    const mounted = row['system-entities'].filter(entity => entity['mount-point'] === installed);
+    if (mounted.length !== 1 || !/^\/dev\/disk[0-9]+s[0-9]+$/.test(mounted[0]['dev-entry'])) fail('Owned mount mapping refused');
+    return { pid: row['hdid-pid'], device: mounted[0]['dev-entry'], image, installed, owner: row['owner-uid'],
+      entities: row['system-entities'], diskimages2: row.diskimages2, type: row['image-type'], writable: row.writeable };
+  };
+  const selected = select();
+  if (owned.mapping && canonical(selected) !== canonical(owned.mapping)) fail('Original owned mount mapping changed');
+  const volume = imagePlist('/usr/sbin/diskutil', ['info', '-plist', selected.device], deadline);
+  const device = await lstat(selected.device, { bigint: true });
+  if (!device.isBlockDevice() || device.rdev !== actualRoot.dev || volume.DeviceNode !== selected.device ||
+      volume.MountPoint !== installed || volume.FilesystemType !== 'apfs' || volume.BusProtocol !== 'Disk Image' ||
+      volume.Writable !== false || volume.WritableMedia !== false || volume.WritableVolume !== false) fail('Volume is not the owned read-only APFS root');
+  const before = imageKernel(selected.pid, deadline), text = await lstat(imageHelper, { bigint: true });
+  if (!text.isFile() || text.uid !== 0n || (text.mode & 0o022n) !== 0n || (text.mode & 0o111n) === 0n || await realpath(imageHelper) !== imageHelper) fail('Unsafe Apple helper');
+  imageCommand('/usr/bin/codesign', ['--verify', '--strict', '-R=anchor apple', imageHelper], deadline);
+  const raw = imageCommand('/usr/sbin/lsof', ['-nP', '-a', '-p', String(selected.pid), '-F0pucfatDin'], deadline);
+  const processFields = {}, files = []; let current = processFields;
+  for (let field of raw.split('\0')) {
+    field = field.replace(/^\n/, ''); if (!field) continue;
+    const tag = field[0], value = field.slice(1);
+    if (tag === 'f') { current = { f: value }; files.push(current); }
+    else { if (!'pucfatDin'.includes(tag) || Object.hasOwn(current, tag)) fail('Malformed helper vnode records'); current[tag] = value; }
+  }
+  const vnode = (row, st) => /^0x[0-9a-f]+$/i.test(row.D ?? '') && /^(0|[1-9][0-9]*)$/.test(row.i ?? '') &&
+    BigInt(row.D) === st.dev && BigInt(row.i) === st.ino;
+  const numeric = files.filter(row => /^[0-9]+$/.test(row.f)), regular = numeric.filter(row => row.t === 'REG');
+  if (processFields.p !== String(selected.pid) || processFields.u !== String(account.uid) || !processFields.c ||
+      new Set(numeric.map(row => row.f)).size !== numeric.length || numeric.some(row => !row.t || !row.a) ||
+      !regular.length || regular.some(row => row.a !== 'r' || !vnode(row, actualImage)) ||
+      !files.some(row => row.f === 'txt' && row.t === 'REG' && vnode(row, text)) ||
+      fullStamp(await lstat(imageHelper, { bigint: true })) !== fullStamp(text) || imageKernel(selected.pid, deadline) !== before ||
+      canonical(select()) !== canonical(selected) || fullStamp(await imageFD.stat({ bigint: true })) !== imageStamp ||
+      fullStamp(await lstat(image, { bigint: true })) !== imageStamp || fullStamp(await rootFD.stat({ bigint: true })) !== rootStamp ||
+      fullStamp(await lstat(installed, { bigint: true })) !== rootStamp) fail('Owned helper/backing continuity refused');
+  return selected;
+}
+
 export async function prepareAllocatedHost(environment = process.env) {
   const buildRoot = environment.ARBOL_BUILD_DIR, build = environment.ARBOL_BUILD_NUMBER;
   if (typeof buildRoot !== 'string' || typeof build !== 'string' || resolve(buildRoot) !== buildRoot ||
@@ -408,7 +588,7 @@ export async function prepareAllocatedHost(environment = process.env) {
   try { await mkdir(uses, { mode: 0o700 }); } catch (error) { if (error.code !== 'EEXIST') throw error; }
   const usesIdentity = await privateDirectory(uses), guardPath = join(uses, build);
   const creator = await open(guardPath, constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
-  let log, held, guardIdentity, logIdentity, ownEntry, published = false, failure, signed, staged;
+  let log, held, guardIdentity, logIdentity, ownEntry, ownedVolume, published = false, failure, signed, staged;
   const same = (a, b) => a.dev === b.dev && a.ino === b.ino && a.uid === b.uid && a.mode === b.mode && a.nlink === b.nlink;
   async function assertAllocation() {
     await assertHostIsolation(buildRoot, stateRoot);
@@ -445,15 +625,34 @@ export async function prepareAllocatedHost(environment = process.env) {
     await assertAllocation();
     const source = await lstat(bundle, { bigint: true }), parent = await lstat(buildRoot, { bigint: true });
     if (!source.isDirectory() || source.dev !== parent.dev) fail('Sealed app is not on actual Building device');
-    // Protect the exact original root after signing/metadata mutation and the
-    // same-parent RENAME_EXCL, before CLI publication or any trust snapshot.
-    // ABR-24 must clear/read back this owned flag under exclusive Build-use
-    // protection in production pruning before release/distribution.
-    const installed = join(buildRoot, 'ArbolBrowser.app'); support.publishDirectory(bundle, installed, held);
-    await syncDirectory(buildRoot);
-    const actual = await lstat(installed, { bigint: true });
-    if (actual.dev !== source.dev || actual.ino !== source.ino || actual.uid !== source.uid ||
-        canonical(await inventory(installed)) !== canonical(signed.files)) fail('Installed outer differs from sealed original');
+    const installed = join(buildRoot, 'ArbolBrowser.app'), parentIdentity = await privateDirectory(buildRoot, true);
+    await assertAllocation();
+    const volumeRoot = await mkdtemp(join(buildRoot, '.host-volume-')); await privateDirectory(volumeRoot, true);
+    const image = join(volumeRoot, 'host.dmg'), deadline = performance.now() + 120000;
+    await assertAllocation();
+    imageCommand('/usr/bin/hdiutil', ['create', '-fs', 'APFS', '-srcfolder', bundle, '-volname', 'ArbolBrowser',
+      '-uid', String(account.uid), '-gid', String(account.gid), '-mode', '0700', '-format', 'UDRO', '-plist', image], deadline);
+    await assertAllocation(); await chmod(image, 0o600);
+    const imageFD = await open(image, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    ownedVolume = { image, installed, imageFD, buildRoot, parentIdentity, deadline };
+    ownedVolume.imageStamp = fullStamp(await imageFD.stat({ bigint: true }));
+    ownedVolume.imageDigest = await imageHash(imageFD, deadline);
+    const imageHost = imagePlist('/usr/sbin/diskutil', ['info', '-plist', image], deadline);
+    if (imageHost.Internal !== true || !['Apple Fabric', 'PCI-Express', 'SATA', 'NVMe'].includes(imageHost.BusProtocol))
+      fail('Image backing is not an ordinary internal filesystem');
+    if (canonical(await inventory(bundle)) !== canonical(signed.files) ||
+        (await lstat(bundle, { bigint: true })).ino !== source.ino) fail('Sealed source changed before attachment');
+    const mountpoint = await mkdtemp(join(buildRoot, '.host-mount-'));
+    if ((await readdir(mountpoint)).length) fail('Mountpoint is not empty');
+    await assertAllocation(); support.publishDirectory(mountpoint, installed); await syncDirectory(buildRoot); await assertAllocation();
+    // Non-kernel mode provides the actual userspace helper/backing-vnode proof.
+    ownedVolume.attachmentAttempted = true;
+    imagePlist('/usr/bin/hdiutil', ['attach', image, '-readonly', '-nokernel', '-mountpoint', installed, '-noautoopen', '-plist'], deadline);
+    await assertAllocation();
+    ownedVolume.rootFD = await open(installed, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    ownedVolume.rootStamp = fullStamp(await ownedVolume.rootFD.stat({ bigint: true }));
+    ownedVolume.mapping = await readOnlyImageProof(ownedVolume, deadline);
+    if (canonical(await inventory(installed)) !== canonical(signed.files)) fail('Mounted outer differs from sealed original');
     command('/usr/bin/codesign', ['--verify', '--strict', '--deep', '-R', `=anchor apple generic and certificate leaf[subject.OU] = "7V372XL59S" and identifier "com.sylvan-stack.arbol-browser.native-candidate"`, installed]);
     const payload = join(installed, 'Contents/Resources/browser');
     const metadata = await json(join(payload, 'metadata.json')), policy = await json(join(installed, 'Contents/Resources/host-policy.json'));
@@ -461,6 +660,12 @@ export async function prepareAllocatedHost(environment = process.env) {
         policy.value.buildRoot !== buildRoot || policy.value.stateRoot !== stateRoot || policy.value.reviewDigest !== signed.reviewDigest ||
         policy.value.productDigest !== compiled.record.productDigest) fail('Installed Build metadata differs');
     await assertPhysicalCap(installed); await assertPhysicalCap(payload); await assertAllocation();
+    await readOnlyImageProof(ownedVolume, ownedVolume.deadline);
+    await writeExclusive(join(dirname(ownedVolume.image), 'mount-provenance.json'), canonical({ format: 1,
+      image: ownedVolume.image, imageStamp: ownedVolume.imageStamp, imageSha256: ownedVolume.imageDigest,
+      rootStamp: ownedVolume.rootStamp, mapping: ownedVolume.mapping, parentIdentity: ownedVolume.parentIdentity,
+      productionLifecycle: 'ABR-24 installation/remount/protection/notarization/exclusive-unmount-prune required' }) + '\n');
+    await syncDirectory(dirname(ownedVolume.image)); await assertAllocation();
     const bin = join(buildRoot, 'bin'); await mkdir(bin, { mode: 0o700 });
     const temporary = join(bin, `.entry-${randomBytes(16).toString('hex')}`), entry = join(bin, 'arbol-browser');
     await writeExclusive(temporary, hostLauncher(), 0o755); ownEntry = await lstat(temporary, { bigint: true });
@@ -471,9 +676,28 @@ export async function prepareAllocatedHost(environment = process.env) {
     const final = await lstat(entry, { bigint: true });
     if (final.dev !== ownEntry.dev || final.ino !== ownEntry.ino || final.nlink !== 1n || (final.mode & 0o7777n) !== 0o755n ||
         (await exactFile(entry)).sha256 !== hash(hostLauncher())) fail('Final own entry identity differs');
-    await assertAllocation();
+    await assertAllocation(); await readOnlyImageProof(ownedVolume, ownedVolume.deadline);
   } catch (error) { failure = error; }
-  // No finally error may leave this writer's entry visible on a failed Build.
+  // Withdraw our own entry while the original shared guard still holds.
+  // Never force detach, delete an image, or claim success for uncertain cleanup.
+  if (failure) {
+    try {
+      await assertAllocation(); await withdrawOwnEntry();
+      if (ownedVolume?.mapping && ownedVolume.rootFD) {
+        const deadline = performance.now() + 120000;
+        await readOnlyImageProof(ownedVolume, deadline); await assertAllocation();
+        await ownedVolume.rootFD.close(); ownedVolume.rootFD = undefined;
+        // No product child has been launched by this adapter, the CLI entry is
+        // withdrawn and the original allocation/guard remains held. Busy mounts
+        // refuse ordinary detach and remain as diagnostic artifacts.
+        imageCommand('/usr/bin/hdiutil', ['detach', ownedVolume.mapping.device], deadline);
+      } else if (ownedVolume?.attachmentAttempted) fail('Attachment cleanup identity uncertain; artifacts retained');
+    } catch (cleanup) { failure = new Error('Owned read-only volume cleanup uncertain; artifacts retained', { cause: failure }); }
+  }
+  try { await ownedVolume?.rootFD?.close(); } catch (error) { failure ??= error; }
+  try { await ownedVolume?.imageFD?.close(); } catch (error) { failure ??= error; }
+  // A failure closing a description also withdraws only this writer's entry.
+  try { if (failure) { await assertAllocation(); await withdrawOwnEntry(); } } catch (error) { failure ??= error; }
   try { if (held) support.releaseLock(held); } catch (error) { failure ??= error; }
   try { await creator.close(); } catch (error) { failure ??= error; }
   try { await log?.close(); } catch (error) { failure ??= error; }
