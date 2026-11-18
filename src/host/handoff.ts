@@ -698,7 +698,7 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
             value = projectAgentTabs(tabs(), recipient, id => authority.connected(id)); proof = { kind: 'tabs', recipient };
           } else if (params.name === 'browser_tab_open') {
             const host = windowForOpen();
-            if (host.window.isFocused()) throw new ForegroundWorkRequired('window');
+            if (host.window.isFocused() && !tabs().selected(host)) throw new ForegroundWorkRequired('window');
             const record: PendingOpen = { action: authority.opaque('act'), recipient, request: request.id, targets: new Map(),
               cancelled: false, committed: false, failedRoots: new Set() };
             opens.get(context)!.set(request.id, record); delivery.noteOutcome(context, request, { action: record.action, dispatchOutcome: 'not_dispatched' });

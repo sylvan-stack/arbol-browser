@@ -6,7 +6,7 @@ import { assertManagementCloseOpportunity, type ManagementCloseOpportunity, type
 import { TabAuthority, type AuthorityStamp, type CompletedTransition, type Invalidation } from './authority.js';
 import { assertTabRegistry, type TabRegistry } from './tabs.js';
 import { projectAgentTabs } from './projections.js';
-import { ClassifiedReadRefusal } from './actions.js';
+import { ClassifiedForegroundRefusal, ClassifiedReadRefusal } from './actions.js';
 
 export type DeliveryProof =
   | { readonly kind: 'snapshot' | 'screenshot'; readonly stamp: AuthorityStamp; readonly identity: string }
@@ -18,6 +18,7 @@ export type DeliveryProof =
   | { readonly kind: 'release' | 'close'; readonly receipt: CompletedTransition };
 interface Pending { bytes: Buffer; proof: DeliveryProof; body: unknown }
 interface KnownOutcome { action?: string; dispatchOutcome?: Contract<'browser.Outcome'> }
+interface ClassifiedFailureProof { stamp: AuthorityStamp; mutation: boolean }
 /** Complete framing occurs before any final guard. The transport must write
  * these exact bytes without serialization or callbacks after commit(). */
 export function responseBytes(id: string, success: boolean, value: unknown): Buffer {
@@ -35,7 +36,7 @@ export class DeliveryAuthority {
   private readonly failures = new Map<ConnectionContext, Map<string, Buffer>>();
   private readonly outcomes = new Map<ConnectionContext, Map<string, KnownOutcome>>();
   private readonly malformed = new Map<ConnectionContext, Set<string>>();
-  private readonly classifiedFailures = new Map<ConnectionContext, Map<string, AuthorityStamp>>();
+  private readonly classifiedFailures = new Map<ConnectionContext, Map<string, ClassifiedFailureProof>>();
   constructor(readonly authority: TabAuthority, readonly registry: () => TabRegistry) {
     authority.onInvalidate(event => this.invalidate(event));
   }
@@ -197,21 +198,29 @@ export class DeliveryAuthority {
     this.assertContext(context);
     if (this.malformed.get(context)?.has(request.id)) throw unavailable('browser');
     const known = this.outcomes.get(context)!.get(request.id);
-    let current = error, classified: AuthorityStamp | undefined;
+    let current = error, classified: ClassifiedFailureProof | undefined;
     this.classifiedFailures.get(context)!.delete(request.id);
     if (error instanceof ClassifiedReadRefusal) {
       try {
         if (context.attachment !== error.stamp.attachment || request.method !== 'tool' ||
             !['browser_snapshot', 'browser_screenshot'].includes(request.params.name)) throw unavailable('browser');
-        this.authority.check(error.stamp); classified = error.stamp;
+        this.authority.check(error.stamp); classified = { stamp: error.stamp, mutation: false };
+      } catch (changed) { current = changed; }
+    } else if (error instanceof ClassifiedForegroundRefusal) {
+      try {
+        if (context.attachment !== error.stamp.attachment || request.method !== 'tool' ||
+            !('tab' in request.params.arguments) || request.params.arguments.tab !== error.stamp.target.id ||
+            !('controlGeneration' in request.params.arguments) || request.params.arguments.controlGeneration !== error.stamp.generation ||
+            known?.dispatchOutcome !== 'not_dispatched' || known.action !== error.detail.action) throw unavailable('browser');
+        this.authority.check(error.stamp, true); classified = { stamp: error.stamp, mutation: true };
       } catch (changed) { current = changed; }
     }
     const publicError = current instanceof BrowserFailure ? current.detail : undefined;
     const manual = current instanceof ForegroundWorkRequired &&
-      (!known?.dispatchOutcome || known.dispatchOutcome === 'not_dispatched') ? current.detail : undefined;
+      (current.scope === 'window' ? !known : classified?.mutation === true) ? current.detail : undefined;
     const value: BrowserError = { code: publicError?.code ?? 'internal',
       message: manual?.message ?? 'The browser request could not complete.', retryable: !manual,
-      remedy: manual?.remedy ?? (classified
+      remedy: manual?.remedy ?? (classified?.mutation === false
         ? 'Use Take control to inspect this page privately.' : 'Inspect fresh browser state before deciding on another action.'),
       ...(known?.action ? { action: known.action, dispatchOutcome: known.dispatchOutcome! } : {}) };
     if (!validator('browser.BrowserError')(value)) throw unavailable('browser');
@@ -226,7 +235,7 @@ export class DeliveryAuthority {
     this.assertContext(context); const failures = this.failures.get(context)!, expected = failures.get(request.id);
     if (!expected || !timingSafeEqual(digest(bytes), digest(expected))) throw unavailable('browser');
     const classified = this.classifiedFailures.get(context)!.get(request.id);
-    if (classified) this.authority.check(classified);
+    if (classified) this.authority.check(classified.stamp, classified.mutation);
     // No previous content/grant proof is reused to authorize this new redacted frame.
     this.assertContext(context); expected.fill(0); failures.delete(request.id); this.outcomes.get(context)!.delete(request.id);
     this.classifiedFailures.get(context)!.delete(request.id);

@@ -54,6 +54,9 @@ export interface CaptureReservation {
 export class ClassifiedReadRefusal extends ClassifiedGeometryRefusal {
   constructor(readonly stamp: AuthorityStamp) { super(); }
 }
+export class ClassifiedForegroundRefusal extends ForegroundWorkRequired {
+  constructor(readonly stamp: AuthorityStamp, action: string) { super('tab', action); }
+}
 interface Slot { active?: Task; waiting: Task[] }
 interface Preparation {
   target: TabTarget; generation: number; controller: AbortController; completion: Promise<void>; retired: boolean;
@@ -102,8 +105,11 @@ export class ActionQueue implements HandoffOperations {
     if (task.mutation) this.authority.requireSnapshot(task.snapshot!, task.stamp);
   }
   private assertBackgroundInput(task: Task): void {
+    // Already-issued sequences must retain their original authority to settle.
+    if (!task.mutation || task.dispatched) return;
     const { target, generation, document } = task.stamp;
-    if (task.mutation && (this.awaitingManualWork.get(target) === generation || document.page.window.window.isFocused()))
+    const host = document.page.window;
+    if (this.awaitingManualWork.get(target) === generation || (host.window.isFocused() && host.selected() === document.page))
       throw new ForegroundWorkRequired('tab');
   }
   private safe(task: Task): void {
@@ -221,7 +227,7 @@ export class ActionQueue implements HandoffOperations {
           try {
             this.check(task);
             this.awaitingManualWork.set(stamp.target, stamp.generation);
-            reject(new ForegroundWorkRequired('tab', task.action));
+            reject(new ClassifiedForegroundRefusal(stamp, task.action!));
             return;
           } catch (changed) { current = changed; }
         }
