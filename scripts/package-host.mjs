@@ -464,13 +464,34 @@ function imageCommand(program, args, deadline, input) {
   const remaining = deadline - performance.now();
   if (remaining <= 0) fail('Read-only volume operation cutoff');
   const result = spawnSync(program, args, { input, encoding: 'utf8', timeout: Math.max(1, Math.floor(remaining)),
-    maxBuffer: 1048576, env: { PATH: '/usr/bin:/bin' } });
+    maxBuffer: 1048576, env: { PATH: '/usr/bin:/bin', LC_ALL: 'C' } });
   if (result.error || result.status !== 0 || performance.now() >= deadline) fail('Read-only volume command refused');
   return result.stdout;
 }
 function imagePlist(program, args, deadline) {
   return JSON.parse(imageCommand('/usr/bin/plutil', ['-convert', 'json', '-o', '-', '--', '-'], deadline,
     imageCommand(program, args, deadline)));
+}
+async function imageContainingVolume(path, fd, deadline) {
+  const original = await fd.stat({ bigint: true });
+  if (await realpath(path) !== path || fullStamp(await lstat(path, { bigint: true })) !== fullStamp(original))
+    fail('Original image path changed before volume discovery');
+  const rows = imageCommand('/bin/df', ['-P', path], deadline).trim().split('\n');
+  if (rows.length !== 2 || !rows[0].startsWith('Filesystem')) fail('Ambiguous containing volume');
+  const fields = rows[1].trim().split(/\s+/), devicePath = fields[0];
+  if (fields.length < 6 || !/^\/dev\/disk[0-9]+(?:s[0-9]+)*$/.test(devicePath) ||
+      fields.slice(1, 4).some(value => !/^[0-9]+$/.test(value)) || !/^[0-9]+%$/.test(fields[4]))
+    fail('Malformed containing volume device');
+  const device = await lstat(devicePath, { bigint: true });
+  const volume = imagePlist('/usr/sbin/diskutil', ['info', '-plist', devicePath], deadline);
+  if (!device.isBlockDevice() || device.rdev !== original.dev || volume.DeviceNode !== devicePath ||
+      typeof volume.MountPoint !== 'string' || await realpath(volume.MountPoint) !== volume.MountPoint)
+    fail('Containing volume physical device differs');
+  const mounted = await lstat(volume.MountPoint, { bigint: true });
+  if (!mounted.isDirectory() || mounted.dev !== original.dev || fullStamp(await fd.stat({ bigint: true })) !== fullStamp(original) ||
+      fullStamp(await lstat(path, { bigint: true })) !== fullStamp(original) || await realpath(path) !== path)
+    fail('Original image containing volume changed');
+  return volume;
 }
 function imageKernel(pid, deadline) {
   if (!Number.isSafeInteger(pid) || pid < 1 || pid > 2147483647) fail('Invalid image helper locator');
@@ -637,7 +658,7 @@ export async function prepareAllocatedHost(environment = process.env) {
     ownedVolume = { image, installed, imageFD, buildRoot, parentIdentity, deadline };
     ownedVolume.imageStamp = fullStamp(await imageFD.stat({ bigint: true }));
     ownedVolume.imageDigest = await imageHash(imageFD, deadline);
-    const imageHost = imagePlist('/usr/sbin/diskutil', ['info', '-plist', image], deadline);
+    const imageHost = await imageContainingVolume(image, imageFD, deadline);
     if (imageHost.Internal !== true || !['Apple Fabric', 'PCI-Express', 'SATA', 'NVMe'].includes(imageHost.BusProtocol))
       fail('Image backing is not an ordinary internal filesystem');
     if (canonical(await inventory(bundle)) !== canonical(signed.files) ||
