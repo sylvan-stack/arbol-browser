@@ -29,7 +29,7 @@ export type SignedVerificationPhase = 'bundle-selection' | 'initial-snapshot' |
   'publisher' | 'compatibility' | 'inventory' | 'final-snapshot' | 'final-physical-comparison' |
   'repeated-snapshot' | 'repeated-physical' | 'repeated-manifest' | 'repeated-cutoff' | 'snapshot-receipt' | 'verification-cutoff' |
   'snapshot-root-identity' | 'snapshot-root-change-time' | 'snapshot-entry-identity' | 'snapshot-file-description' | 'snapshot-file-read' |
-  'snapshot-symlink' | 'snapshot-directory-membership' | 'snapshot-encoded-mismatch' | 'snapshot-filesystem';
+  'storage-context' | 'snapshot-symlink' | 'snapshot-directory-membership' | 'snapshot-encoded-mismatch' | 'snapshot-filesystem';
 const verificationFailures = new WeakMap<Error, SignedVerificationPhase>();
 function noteVerificationFailure(error: unknown, phase: SignedVerificationPhase): void {
   try { if (error instanceof Error && !verificationFailures.has(error)) verificationFailures.set(error, phase); }
@@ -170,6 +170,7 @@ interface PhysicalEntry {
   readonly target?: string;
 }
 interface FrozenSnapshot {
+  readonly storage?: StorageContext;
   readonly encoded: string;
   readonly physical: Readonly<Record<string, PhysicalEntry>>;
   poisoned: boolean;
@@ -180,6 +181,161 @@ const comparisons = new WeakMap<SignedSnapshotComparison, { signed: SignedBundle
 function physicalStamp(stat: import('node:fs').BigIntStats): string {
   return stable([stat.dev, stat.ino, stat.mode, stat.uid, stat.gid, stat.nlink, stat.size, stat.mtimeNs, stat.ctimeNs, stat.birthtimeNs].map(String));
 }
+
+/** Construction-only stock Apple metadata. No candidate Native or ambient
+ * interpreter participates in pretrust identity. Later boundaries use only
+ * captured original filesystem functions and never learn another baseline. */
+const helperPath = '/System/Library/PrivateFrameworks/DiskImages.framework/Versions/A/Resources/diskimages-helper';
+const kernelIdentityScript = "ObjC.import('Foundation');\nObjC.bindFunction('getpid',['int',[]]);\nObjC.bindFunction('getuid',['unsigned int',[]]);\nObjC.bindFunction('geteuid',['unsigned int',[]]);\nObjC.bindFunction('sysctl', ['int', ['pointer', 'unsigned int', 'pointer', 'pointer', 'pointer', 'unsigned long']]);\nfunction enc(a) {\n const c='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'; let s='';\n for(let i=0;i<a.length;i+=3){let n=(a[i]<<16)|((a[i+1]||0)<<8)|(a[i+2]||0);s+=c[(n>>>18)&63]+c[(n>>>12)&63]+(i+1<a.length?c[(n>>>6)&63]:'=')+(i+2<a.length?c[n&63]:'=');}return s;\n}\nfunction dec(s) {\n const c='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';let a=[],n=0,b=0;\n for(let i=0;i<s.length;i++){if(s[i]==='=')break;let v=c.indexOf(s[i]);if(v<0)throw Error('non-base64 output');n=(n<<6)|v;b+=6;if(b>=8){b-=8;a.push((n>>>b)&255);}}return a;\n}\nfunction le(a,o,n) {let v=0;for(let i=0;i<n;i++)v+=a[o+i]*Math.pow(256,i);return v;}\nfunction i32(a,o){let v=le(a,o,4);return v>2147483647?v-4294967296:v;}\nfunction bytes(a,mutable){let d=$.NSData.alloc.initWithBase64EncodedStringOptions($(enc(a)),0);return mutable?d.mutableCopy:d;}\nfunction run(argv) {\n const cutoff=Date.now()+30000, ownPid=Number($.getpid()), uid=Number($.getuid()), euid=Number($.geteuid());\n if(argv.length!==1 || !/^[1-9][0-9]*$/.test(argv[0]))throw Error('one canonical PID input required');\n const pid=Number(argv[0]);if(!Number.isSafeInteger(pid)||pid>2147483647)throw Error('PID range');\n let a=[];for(const v of [1,14,1,pid])for(let j=0;j<4;j++)a.push((v>>>8*j)&255);\n const mib=bytes(a,false), size=bytes([136,2,0,0,0,0,0,0],true), out=$.NSMutableData.dataWithLength(648);\n if(Number(mib.length)!==16||Number(size.length)!==8||Number(out.length)!==648)throw Error('bounded buffer length mismatch');\n const rc=$.sysctl(mib.bytes,4,out.mutableBytes,size.mutableBytes,null,0);\n const n=le(dec(ObjC.unwrap(size.base64EncodedStringWithOptions(0))),0,8);\n const raw=ObjC.unwrap(out.base64EncodedStringWithOptions(0)), b=dec(raw);\n if(rc!==0||n!==648||b.length!==648)throw Error('own PID sysctl refused rc='+rc+' length='+n);\n const parsed={pid:i32(b,40),effectiveUid:le(b,420,4),realUid:le(b,392,4),startSeconds:le(b,0,8),startMicroseconds:i32(b,8),padding12through15:b.slice(12,16)};\n if(parsed.pid!==pid||parsed.effectiveUid!==euid||parsed.realUid!==uid||parsed.startSeconds<=0||parsed.startSeconds>Date.now()/1000||parsed.startMicroseconds<0||parsed.startMicroseconds>=1000000)throw Error('own kernel identity/parse mismatch');\n if(Date.now()>cutoff)throw Error('original local cutoff exceeded');\n return JSON.stringify({format:1,complete:true,route:'stock Apple osascript JXA linked libc numeric-MIB sysctl',ownPid:ownPid,targetPid:pid,ownUid:uid,ownEffectiveUid:euid,mib:[1,14,1,pid],returnCode:rc,capacityBytes:648,returnedBytes:n,rawBase64:raw,parsed:parsed,paddingIsNotMicroseconds:true,localCutoff:cutoff,finishedAt:Date.now(),queries:1,attachments:0,productionAddonLoaded:false,qualificationCredit:false});\n}\n";
+interface StorageDescription { readonly fd: number; readonly path: string; readonly stamp: string; readonly directory: boolean }
+interface StorageContext { readonly descriptions: readonly StorageDescription[]; readonly mapping: string }
+const storageFinalizer = new FinalizationRegistry<readonly StorageDescription[]>(descriptions => {
+  for (const description of descriptions) { try { closeSync(description.fd); } catch { /* Resource disposal only. */ } }
+});
+function appleQuery(program: string, args: string[], deadline: number, input?: string): string {
+  const result = spawnSync(program, args, { input, timeout: budget(deadline), maxBuffer: nativeLimit,
+    encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
+  budget(deadline);
+  if (result.error || result.status !== 0 || Buffer.byteLength(result.stdout) > nativeLimit) refuseVerification('storage-context');
+  return result.stdout;
+}
+function applePlist(program: string, args: string[], deadline: number): Record<string, unknown> {
+  const raw = appleQuery(program, args, deadline);
+  const value: unknown = JSON.parse(appleQuery('/usr/bin/plutil', ['-convert', 'json', '-o', '-', '--', '-'], deadline, raw));
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return refuseVerification('storage-context');
+  return value as Record<string, unknown>;
+}
+function storageAssert(context: StorageContext | undefined, deadline: number): void {
+  if (!context) return;
+  try {
+    budget(deadline);
+    for (const d of context.descriptions) {
+      const held = fstatSync(d.fd, { bigint: true }), named = lstatSync(d.path, { bigint: true });
+      if ((d.directory ? !held.isDirectory() || !named.isDirectory() : !held.isFile() || !named.isFile() || held.nlink !== 1n) ||
+          physicalStamp(held) !== d.stamp || physicalStamp(named) !== d.stamp || realpathSync(d.path) !== d.path) refuse();
+    }
+    budget(deadline);
+  } catch (error) { return refuseVerification('storage-context', error); }
+}
+function retainedDescription(path: string, directory: boolean): StorageDescription {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK | (directory ? constants.O_DIRECTORY : 0));
+  try {
+    const held = fstatSync(fd, { bigint: true }), named = lstatSync(path, { bigint: true });
+    if ((directory ? !held.isDirectory() : !held.isFile() || held.nlink !== 1n) ||
+        physicalStamp(held) !== physicalStamp(named) || realpathSync(path) !== path) refuse();
+    return Object.freeze({ fd, path, directory, stamp: physicalStamp(held) });
+  } catch (error) { closeSync(fd); throw error; }
+}
+function storageMapping(root: string, deadline: number): { volume: Record<string, unknown>; image?: Record<string, unknown>; key: string } {
+  const volume = applePlist('/usr/sbin/diskutil', ['info', '-plist', root], deadline);
+  const info = applePlist('/usr/bin/hdiutil', ['info', '-plist'], deadline);
+  if (!Array.isArray(info.images) || typeof volume.MountPoint !== 'string' ||
+      !(root === volume.MountPoint || root.startsWith(volume.MountPoint.endsWith('/') ? volume.MountPoint : volume.MountPoint + sep)) ||
+      typeof volume.DeviceNode !== 'string' || !/^\/dev\/disk[0-9]+s[0-9]+$/.test(volume.DeviceNode) ||
+      !['apfs', 'hfs'].includes(String(volume.FilesystemType))) refuse();
+  const matches: Record<string, unknown>[] = [];
+  for (const item of info.images) {
+    if (!item || typeof item !== 'object' || !Array.isArray(item['system-entities'])) refuse();
+    for (const entity of item['system-entities']) {
+      if (!entity || typeof entity !== 'object') refuse();
+      if (entity['dev-entry'] === volume.DeviceNode || entity['mount-point'] === volume.MountPoint) {
+        if (entity['dev-entry'] !== volume.DeviceNode || entity['mount-point'] !== volume.MountPoint || matches.includes(item)) refuse();
+        matches.push(item);
+      }
+    }
+  }
+  const device = lstatSync(volume.DeviceNode, { bigint: true }), mounted = lstatSync(volume.MountPoint, { bigint: true });
+  if (!device.isBlockDevice() || !mounted.isDirectory() || device.rdev !== mounted.dev ||
+      mounted.dev !== lstatSync(root, { bigint: true }).dev || realpathSync(volume.MountPoint) !== volume.MountPoint) refuse();
+  if (!matches.length) {
+    // Absence of an hdiutil row alone never establishes ordinary storage.
+    if (volume.Internal !== true || !['Apple Fabric', 'PCI-Express', 'SATA', 'NVMe'].includes(String(volume.BusProtocol))) refuse();
+    return { volume, key: stable([volume.DeviceNode, volume.MountPoint, String(mounted.dev), volume.BusProtocol]) };
+  }
+  if (matches.length !== 1) return refuse();
+  const image = matches[0], pid = image['hdid-pid'];
+  if (volume.BusProtocol !== 'Disk Image' || volume.FilesystemType !== 'apfs' || volume.Writable !== false ||
+      volume.WritableMedia !== false || volume.WritableVolume !== false || image.diskimages2 !== false ||
+      image['image-type'] !== 'UDIF read-only' || image.writeable !== false || image['image-encrypted'] !== false ||
+      image['owner-uid'] !== process.getuid?.() || !Number.isSafeInteger(pid) || Number(pid) <= 0 || Number(pid) > 2147483647 ||
+      typeof image['image-path'] !== 'string' || !image['image-path'].startsWith('/') ||
+      realpathSync(image['image-path']) !== image['image-path'] ||
+      Object.keys(image).some(key => /shadow|overlay/i.test(key))) refuse();
+  return { volume, image, key: stable([volume.DeviceNode, volume.MountPoint, String(mounted.dev), image['image-path'],
+    pid, image['owner-uid'], image.diskimages2, image['image-type'], image.writeable, image['system-entities']]) };
+}
+function helperKernel(pid: number, deadline: number): string {
+  const value = JSON.parse(appleQuery('/usr/bin/osascript', ['-l', 'JavaScript', '-e', kernelIdentityScript, String(pid)], deadline));
+  if (value.complete !== true || value.targetPid !== pid || value.capacityBytes !== 648 || value.returnedBytes !== 648 ||
+      value.returnCode !== 0 || typeof value.rawBase64 !== 'string') refuse();
+  const raw = Buffer.from(value.rawBase64, 'base64');
+  if (raw.length !== 648 || raw.toString('base64') !== value.rawBase64) refuse();
+  const seconds = raw.readBigInt64LE(0), micros = raw.readInt32LE(8), uid = process.getuid?.();
+  if (raw.readInt32LE(40) !== pid || raw.readUInt32LE(420) !== uid || raw.readUInt32LE(392) !== uid ||
+      seconds <= 0n || seconds > BigInt(Math.floor(Date.now() / 1000)) || micros < 0 || micros >= 1000000) refuse();
+  return stable([pid, String(seconds), micros, uid]);
+}
+function helperBacking(image: Record<string, unknown>, backing: StorageDescription, deadline: number): void {
+  const pid = Number(image['hdid-pid']), before = helperKernel(pid, deadline);
+  const text = lstatSync(helperPath, { bigint: true });
+  if (!text.isFile() || text.uid !== 0n || (text.mode & 0o7777n) !== 0o555n || realpathSync(helperPath) !== helperPath) refuse();
+  appleQuery('/usr/bin/codesign', ['--verify', '--strict', '-R=anchor apple', helperPath], deadline);
+  const raw = appleQuery('/usr/sbin/lsof', ['-nP', '-a', '-p', String(pid), '-F0pucfatDin'], deadline);
+  const processFields: Record<string, string> = {}, files: Record<string, string>[] = [];
+  let current = processFields;
+  for (let field of raw.split('\0')) {
+    field = field.replace(/^\n/, ''); if (!field) continue;
+    const tag = field[0], value = field.slice(1);
+    if (tag === 'f') { current = { f: value }; files.push(current); }
+    else { if (!'pucfatDin'.includes(tag) || Object.hasOwn(current, tag)) refuse(); current[tag] = value; }
+  }
+  if (processFields.p !== String(pid) || processFields.u !== String(process.getuid?.()) || !processFields.c) refuse();
+  const vnode = (row: Record<string, string>, st: import('node:fs').BigIntStats): boolean => {
+    if (!/^0x[0-9a-f]+$/i.test(row.D ?? '') || !/^(0|[1-9][0-9]*)$/.test(row.i ?? '')) return false;
+    return BigInt(row.D) === st.dev && BigInt(row.i) === st.ino;
+  };
+  const numeric = files.filter(row => /^[0-9]+$/.test(row.f));
+  if (new Set(numeric.map(row => row.f)).size !== numeric.length || numeric.some(row => !row.t || !row.a)) refuse();
+  const regular = numeric.filter(row => row.t === 'REG');
+  const held = fstatSync(backing.fd, { bigint: true });
+  if (!regular.length || regular.some(row => row.a !== 'r' || !vnode(row, held)) ||
+      !files.some(row => row.f === 'txt' && row.t === 'REG' && vnode(row, text)) ||
+      physicalStamp(lstatSync(helperPath, { bigint: true })) !== physicalStamp(text) || helperKernel(pid, deadline) !== before) refuse();
+}
+function discoverStorage(root: string, deadline: number): StorageContext | undefined {
+  const descriptions: StorageDescription[] = [];
+  try {
+    const mapping = storageMapping(root, deadline);
+    if (!mapping.image) return undefined;
+    descriptions.push(retainedDescription(root, true));
+    descriptions.push(retainedDescription(String(mapping.image['image-path']), false));
+    if (storageMapping(descriptions[1].path, deadline).image) refuse();
+    const backing = fstatSync(descriptions[1].fd, { bigint: true });
+    if (backing.uid !== BigInt(process.getuid?.() ?? -1) || (backing.mode & 0o022n)) refuse();
+    const context = Object.freeze({ descriptions: Object.freeze(descriptions), mapping: mapping.key });
+    helperBacking(mapping.image, descriptions[1], deadline);
+    if (storageMapping(root, deadline).key !== context.mapping) refuse();
+    storageAssert(context, deadline); return context;
+  } catch (error) {
+    for (const d of descriptions) { try { closeSync(d.fd); } catch { /* Preserve refusal. */ } }
+    return refuseVerification('storage-context', error);
+  }
+}
+function revalidateStorage(root: string, context: StorageContext | undefined, deadline: number): void {
+  if (!context) {
+    if (storageMapping(root, deadline).image) refuseVerification('storage-context');
+    return;
+  }
+  try {
+    storageAssert(context, deadline);
+    const mapping = storageMapping(root, deadline);
+    if (!mapping.image || mapping.key !== context.mapping) refuse();
+    helperBacking(mapping.image, context.descriptions[1], deadline);
+    if (storageMapping(root, deadline).key !== context.mapping) refuse();
+    storageAssert(context, deadline);
+  } catch (error) { return refuseVerification('storage-context', error); }
+}
+
 /** Observe only the two stamps used by an existing failed comparison. Never
  * restat, retry or replace the original full-stamp verification predicate. */
 function stampFailurePhase(identity: SnapshotIdentityPhase, before: string | undefined,
@@ -400,11 +556,12 @@ export async function compareSignedSnapshot(signed: SignedBundle, deadline: numb
   if (!snapshot || snapshot.poisoned || (signed === trustedCandidate && poisonedTrust)) refuseVerification('repeated-snapshot');
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    budget(deadline);
+    budget(deadline); storageAssert(snapshot.storage, deadline);
     await Promise.race([compareCompleteSnapshot(signed, snapshot, deadline), new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => reject(new Error('native_snapshot_timeout')), Math.max(1, deadline - performance.now()));
     })]);
     budget(deadline); if (snapshot.poisoned) refuse();
+    storageAssert(snapshot.storage, deadline);
     const receipt: SignedSnapshotComparison = Object.freeze({ deadline });
     const expiry = setTimeout(() => {
       const actual = comparisons.get(receipt);
@@ -422,7 +579,7 @@ export function consumeSignedSnapshot(receipt: SignedSnapshotComparison, signed:
   try {
     if (!actual || actual.used || actual.signed !== signed || actual.snapshot !== snapshot || !snapshot || snapshot.poisoned ||
         receipt.deadline !== deadline || (signed === trustedCandidate && poisonedTrust)) refuse();
-    actual.used = true; clearTimeout(actual.expiry); budget(deadline);
+    actual.used = true; clearTimeout(actual.expiry); budget(deadline); storageAssert(snapshot.storage, deadline);
   } catch (error) {
     if (actual) actual.snapshot.poisoned = true;
     if (snapshot) snapshot.poisoned = true;
@@ -472,10 +629,12 @@ export function assertCandidateTrust(value: CandidateTrust): void {
 export function verifySignedBundle(bundle: string, deadline = Infinity): SignedBundle {
   const observed: SnapshotFailure = {};
   let phase: SignedVerificationPhase = 'bundle-selection';
+  let storage: StorageContext | undefined, retained = false;
   try {
     budget(deadline);
     if (!bundle.endsWith('.app') || realpathSync(bundle) !== resolve(bundle)) refuse();
     const root = resolve(bundle);
+    storage = discoverStorage(root, deadline);
     const check = (): Compatibility => {
       signature(root, true, false, deadline);
       phase = 'publisher';
@@ -519,17 +678,18 @@ export function verifySignedBundle(bundle: string, deadline = Infinity): SignedB
     if (before !== after) refuseSnapshot('snapshot-encoded-mismatch', observed);
     if (stable(physical) !== stable(afterPhysical))
       refuseSnapshot(stampFailurePhase(physical['']?.stamp !== afterPhysical['']?.stamp ? 'snapshot-root-identity' : 'snapshot-entry-identity', physical['']?.stamp, afterPhysical['']?.stamp), observed);
+    revalidateStorage(root, storage, deadline);
     // Snapshot validation cannot be bypassed by mutation through a caller-held object.
     function frozen<T>(value: T): T { if (value && typeof value === 'object') { for (const entry of Object.values(value)) frozen(entry); Object.freeze(value); } return value; }
     const manifest = frozen(initial);
-    const snapshot: FrozenSnapshot = { encoded: before, physical: Object.freeze(physical), poisoned: false };
+    const snapshot: FrozenSnapshot = { storage, encoded: before, physical: Object.freeze(physical), poisoned: false };
     const result: SignedBundle = Object.freeze({ bundle: root, manifest,
       snapshotDigest: createHash('sha256').update(before).digest('hex'),
       assertIdentity(limit = Infinity) {
         const observed: SnapshotFailure = {};
         let repeatedPhase: SignedVerificationPhase = 'repeated-snapshot';
         try {
-          budget(limit);
+          budget(limit); storageAssert(storage, limit);
           const currentPhysical: Record<string, PhysicalEntry> = Object.create(null);
           if (snapshot.poisoned) refuse();
           if (snapshotFilesystem(() => realpathSync(root), observed) !== root) refuseSnapshot('snapshot-root-identity', observed);
@@ -540,11 +700,14 @@ export function verifySignedBundle(bundle: string, deadline = Infinity): SignedB
           repeatedPhase = 'repeated-manifest';
           if (stable(boundedJson(join(root, 'Contents/Resources/native-compatibility.json'), limit)) !== encoded) refuse();
           repeatedPhase = 'repeated-cutoff';
-          budget(limit);
+          budget(limit); storageAssert(storage, limit);
         } catch (error) { snapshot.poisoned = true; return refuseVerification(observed.first ?? repeatedPhase, observed.first ? undefined : error); }
       } });
-    signedSnapshots.set(result, snapshot); return result;
+    signedSnapshots.set(result, snapshot);
+    if (storage) storageFinalizer.register(result, storage.descriptions);
+    retained = true; return result;
   } catch (error) { noteSnapshotFailure(observed, error, phase); throw error; }
+  finally { if (!retained && storage) for (const d of storage.descriptions) { try { closeSync(d.fd); } catch { /* Preserve construction refusal. */ } } }
 }
 export function verifyNativeCandidate(bundle: string, deadline = Infinity): CandidateTrust {
   if (poisonedTrust) refuse();
