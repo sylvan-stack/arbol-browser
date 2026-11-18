@@ -2,9 +2,8 @@
 
 Arbol Browser is an independent component of Arbol 2. ABR-1 implements its
 package foundation: typed contracts, command dispatch, private macOS process
-support and test-free candidate compilation. Profile services, the browser host,
-native input enforcement, watchdog and MCP transport are subsequent work.
-Every page-admitting route currently refuses with structured unavailability.
+support and test-free candidate compilation. The local preview below is
+available for User Demos. The ordinary signed release requires qualification.
 
 ## First User Demo
 
@@ -39,6 +38,26 @@ Use `--url https://example.com/` to start with your own address or
 tab. `open URL` creates another live tab. Use `tabs` to find tab IDs and
 `tab ID` to select one. `status` shows the current window and Dock state.
 Page actions accept ordinary CSS selectors. Each command responds with JSON.
+
+### Sign in to two accounts on one site
+
+Start the preview with `npm run demo -- --visible`. Open the first login
+profile and sign in directly in the window. Then open the second profile and
+sign in to the other account.
+
+```text
+login https://www.kimi.ai/code/console first
+login https://www.kimi.ai/code/console second
+tabs
+```
+
+`tabs` includes the profile name and tab ID. Use `tab ID` to choose an
+account and `hide` to keep working headlessly. Use the same hostname and
+label to reopen a saved login, or omit the label to select `primary`.
+Use `open URL` for ordinary tabs in the shared `default` profile. `go URL`
+keeps the selected tab's profile, and redirects stay with the login tab.
+Named logins are saved under `~/.arbol/browser-preview/`. Default website
+data and fixture runs are disposable.
 
 | | |
 |---|---|

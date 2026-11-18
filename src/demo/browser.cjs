@@ -1,5 +1,8 @@
 const { app, BaseWindow, WebContentsView, session } = require('electron');
+const { createHash } = require('node:crypto');
+const { join } = require('node:path');
 const { createInterface } = require('node:readline');
+const { privateDirectory } = require('./profile-storage.cjs');
 
 const maximumTabs = 8;
 const actionTimeout = 15000;
@@ -10,6 +13,7 @@ const preferences = Object.freeze({
 const localPaths = {
   userData: process.env.ARBOL_DEMO_USER_DATA, sessionData: process.env.ARBOL_DEMO_SESSION_DATA,
   clipboard: process.env.ARBOL_DEMO_CLIPBOARD, framework: process.env.ARBOL_DEMO_FRAMEWORK,
+  profiles: process.env.ARBOL_DEMO_PROFILES,
 };
 
 function write(result) {
@@ -90,10 +94,13 @@ async function main(config, clipboard) {
   clipboard.check();
   const website = session.fromPartition('arbol-browser-preview');
   sessionPolicy(website);
+  const defaultProfile = { name: 'default', website };
+  const loginProfiles = new Map();
+  const profilesRoot = privateDirectory(localPaths.profiles);
   const window = new BaseWindow({ width: 1100, height: 780, minWidth: 360, minHeight: 260,
     title: 'Arbol Browser Preview', show: false });
   const tabs = new Map();
-  let selected, nextTab = 0, closing = false;
+  let selected, nextTab = 0, closing = false, quitting = false;
   let pageWork = Promise.resolve(), presentationWork = Promise.resolve();
   let fixture, input;
   const cadence = setInterval(clipboard.check, 1000);
@@ -112,12 +119,29 @@ async function main(config, clipboard) {
       if (window.isVisible()) tab.view.webContents.focus();
     }
   }
-  function newTab() {
+  function loginProfile(url, account) {
+    if (!/^[a-z](?:[a-z0-9-]{0,30}[a-z0-9])?$/.test(account))
+      throw new Error('Choose an account label of 1–32 lowercase letters, digits or hyphens.');
+    const site = new URL(url).hostname.replace(/\.$/, '');
+    const key = createHash('sha256').update(site).update('\0').update(account).digest('hex');
+    let profile = loginProfiles.get(key);
+    if (!profile) {
+      privateDirectory(profilesRoot);
+      const path = privateDirectory(join(profilesRoot, 'site-' + key));
+      const website = session.fromPath(path);
+      if (website.getStoragePath() !== path) throw new Error('Could not open the selected site profile.');
+      sessionPolicy(website);
+      profile = { name: site + '/' + account, website };
+      loginProfiles.set(key, profile);
+    }
+    return profile;
+  }
+  function newTab(profile = defaultProfile) {
     clipboard.check();
     if (tabs.size >= maximumTabs) throw new Error('The preview allows eight open tabs.');
-    const view = new WebContentsView({ webPreferences: { ...preferences, session: website } });
+    const view = new WebContentsView({ webPreferences: { ...preferences, session: profile.website } });
     const contents = view.webContents;
-    const tab = { id: ++nextTab, view };
+    const tab = { id: ++nextTab, view, profile };
     const checkNavigation = event => {
       if (!event.isMainFrame && /^(about:|data:|blob:)/.test(event.url)) return;
       try { address(event.url); }
@@ -136,7 +160,9 @@ async function main(config, clipboard) {
   }
   function describe(tab) {
     const contents = tab.view.webContents;
-    return { tab: tab.id, url: contents.getURL().slice(0, 8192), contents: contents.id,
+    const url = contents.getURL();
+    const reportedUrl = tab.profile === defaultProfile ? url : url.split(/[?#]/, 1)[0];
+    return { tab: tab.id, profile: tab.profile.name, url: reportedUrl.slice(0, 8192), contents: contents.id,
       renderer: contents.getOSProcessId(), history: contents.navigationHistory.getAllEntries().length };
   }
   function status() {
@@ -156,12 +182,23 @@ async function main(config, clipboard) {
     }
     return status();
   }
-  function quit() {
+  async function quit() {
     if (closing) return;
     closing = true;
     clearInterval(cadence);
     input?.close();
     for (const { view } of tabs.values()) view.webContents.close();
+    try {
+      await within(Promise.all([...loginProfiles.values()].map(({ website }) => {
+        website.flushStorageData();
+        return website.cookies.flushStore();
+      })));
+    } catch {
+      write({ event: 'failed', error: 'The preview could not confirm that its login data was saved.' });
+      app.exit(1);
+      return;
+    }
+    quitting = true;
     window.destroy();
     fixture?.close();
     write({ event: 'closed' });
@@ -180,6 +217,13 @@ async function main(config, clipboard) {
       case 'open': {
         const url = address(argumentsText);
         return navigate(newTab(), url);
+      }
+      case 'login': {
+        const [target, account = 'primary', extra] = argumentsText.trim().split(/\s+/, 3);
+        if (extra) throw new Error('Use login URL [account].');
+        const url = address(target);
+        if (tabs.size >= maximumTabs) throw new Error('The preview allows eight open tabs.');
+        return navigate(newTab(loginProfile(url, account)), url);
       }
       case 'tabs': return { selected: selected.id, tabs: [...tabs.values()].map(describe) };
       case 'tab': select(tabs.get(Number(argumentsText))); return status();
@@ -202,14 +246,14 @@ async function main(config, clipboard) {
         if (result.error) throw new Error(result.error);
         return result;
       }
-      default: throw new Error('Commands: status, show, hide, go URL, open URL, tabs, tab ID, inspect [selector], fill selector text, click selector, quit.');
+      default: throw new Error('Commands: status, show, hide, go URL, open URL, login URL [account], tabs, tab ID, inspect [selector], fill selector text, click selector, quit.');
     }
   }
   function line(text) {
     if (closing || !text.trim()) return;
     if (Buffer.byteLength(text) > 10000) { write({ ok: false, error: 'Command is too long.' }); return; }
     const [command] = text.trimStart().split(/ +/, 1);
-    if (command === 'quit') { quit(); return; }
+    if (command === 'quit') { void quit(); return; }
     const args = text.trimStart().slice(command.length).trimStart();
     const presentation = ['show', 'hide', 'status'].includes(command);
     const pending = presentation ? presentationWork : pageWork;
@@ -226,7 +270,12 @@ async function main(config, clipboard) {
   }
 
   window.on('resize', layout);
-  window.on('close', event => { event.preventDefault(); quit(); });
+  window.on('close', event => { event.preventDefault(); void quit(); });
+  app.on('before-quit', event => {
+    if (quitting) return;
+    event.preventDefault();
+    void quit();
+  });
   newTab();
   app.dock.hide();
   if (config.visible) await show(true);
@@ -250,6 +299,7 @@ try {
   app.setPath('userData', localPaths.userData);
   app.setPath('sessionData', localPaths.sessionData);
   app.setActivationPolicy('accessory');
+  if (!app.requestSingleInstanceLock()) throw new Error('The Browser preview is already running with this data store.');
   void main(config, require(localPaths.clipboard)).catch(error => {
     write({ event: 'failed', error: String(error.message).slice(0, 290) });
     app.exit(1);

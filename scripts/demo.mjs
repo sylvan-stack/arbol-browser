@@ -1,11 +1,12 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { access, mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { access, mkdtemp, realpath, rm } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
+const { privateDirectory } = require('../src/demo/profile-storage.cjs');
 const root = fileURLToPath(new URL('../', import.meta.url));
 const options = process.argv.slice(2);
 
@@ -27,9 +28,11 @@ async function run() {
 
   const scratch = await mkdtemp(join(await realpath(tmpdir()), 'arbol-browser-demo-'));
   try {
-    const userData = join(scratch, 'user');
-    const sessionData = join(scratch, 'session');
-    await Promise.all([mkdir(userData, { mode: 0o700 }), mkdir(sessionData, { mode: 0o700 })]);
+    const storage = options.includes('--fixture') ? scratch :
+      privateDirectory(join(privateDirectory(join(await realpath(homedir()), '.arbol')), 'browser-preview'));
+    const userData = privateDirectory(join(storage, 'instance'));
+    const sessionData = privateDirectory(join(scratch, 'session'));
+    const profiles = privateDirectory(join(storage, 'site-profiles'));
     const addon = join(scratch, 'clipboard.node');
     const env = { PATH: '/usr/bin:/bin', HOME: process.env.HOME, LANG: 'en_US.UTF-8', TMPDIR: scratch };
     const compiled = spawnSync('/usr/bin/xcrun', ['clang++', '-std=c++17', '-fobjc-arc', '-fblocks',
@@ -41,7 +44,8 @@ async function run() {
     return await new Promise((resolve, reject) => {
       const child = spawn(executable, [join(root, 'src/demo/browser.cjs'), ...options], {
         cwd: scratch, env: { ...env, ARBOL_DEMO_USER_DATA: userData, ARBOL_DEMO_SESSION_DATA: sessionData,
-          ARBOL_DEMO_CLIPBOARD: addon, ARBOL_DEMO_FRAMEWORK: framework }, stdio: 'inherit',
+          ARBOL_DEMO_CLIPBOARD: addon, ARBOL_DEMO_FRAMEWORK: framework, ARBOL_DEMO_PROFILES: profiles },
+        stdio: 'inherit',
       });
       child.once('error', reject);
       child.once('exit', (code, signal) => resolve(code ?? (signal === 'SIGINT' ? 130 : 1)));
