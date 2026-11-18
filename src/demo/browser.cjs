@@ -162,7 +162,7 @@ async function main(config, clipboard) {
     revision++;
     if (!closing && !chrome.webContents.isDestroyed()) chrome.webContents.send('arbol-preview:changed', profileState());
   }
-  function selectProfile(profile, tab = profile.selected, focus = true) {
+  function selectProfile(profile, tab = profile.selected) {
     activeProfile = profile;
     profile.selected = tab;
     if (selected !== tab) {
@@ -171,12 +171,11 @@ async function main(config, clipboard) {
       selected = tab;
       selected?.view.setVisible(true);
     }
-    if (focus && window.isVisible()) selected?.view.webContents.focus();
     publish();
   }
-  function select(tab, focus = true) {
+  function select(tab) {
     if (!tab) throw new Error('That preview tab does not exist.');
-    selectProfile(tab.profile, tab, focus);
+    selectProfile(tab.profile, tab);
   }
   function findProfile(id) {
     const profile = id === defaultProfile.id ? defaultProfile : loginProfiles.get(id);
@@ -211,7 +210,7 @@ async function main(config, clipboard) {
     }
     return profile.website;
   }
-  function newTab(profile = defaultProfile, focus = true) {
+  function newTab(profile = defaultProfile) {
     clipboard.check();
     if (tabs.size >= maximumTabs || profile.tabs.size >= maximumProfileTabs)
       throw new Error('Close a tab before opening another.');
@@ -238,7 +237,7 @@ async function main(config, clipboard) {
     tabs.set(tab.id, tab);
     profile.tabs.set(tab.id, tab);
     layout();
-    select(tab, focus);
+    select(tab);
     return tab;
   }
   function closeTab(tab) {
@@ -247,7 +246,7 @@ async function main(config, clipboard) {
       [...profile.tabs.values()].find(candidate => candidate !== tab) ?? null : profile.selected;
     tabs.delete(id);
     profile.tabs.delete(id);
-    selectProfile(profile, next, false);
+    selectProfile(profile, next);
     window.contentView.removeChildView(view);
     view.webContents.close();
   }
@@ -259,20 +258,17 @@ async function main(config, clipboard) {
       renderer: contents.getOSProcessId(), history: contents.navigationHistory.getAllEntries().length };
   }
   function status() {
-    return { visible: window.isVisible(), dock: app.dock.isVisible(), profile: activeProfile.id,
+    return { visible: window.isVisible(), dock: app.dock.isVisible(), focused: window.isFocused(), profile: activeProfile.id,
       current: selected ? describe(selected) : null };
   }
-  async function show(visible) {
+  function show(visible) {
     if (visible) {
-      app.setActivationPolicy('regular');
-      await app.dock.show();
-      if (closing) return;
-      window.show();
-      selected?.view.webContents.focus();
+      // Electron's Dock show can activate applications while changing policy.
+      if (!app.dock.isVisible()) app.setActivationPolicy('regular');
+      if (!window.isVisible()) window.showInactive();
     } else {
-      window.hide();
-      app.dock.hide();
-      app.setActivationPolicy('accessory');
+      if (window.isVisible()) window.hide();
+      if (app.dock.isVisible()) app.setActivationPolicy('accessory');
     }
     return status();
   }
@@ -382,7 +378,7 @@ async function main(config, clipboard) {
     const work = pending.then(async () => {
       if (closing) return;
       try {
-        const result = presentation ? command === 'status' ? status() : await show(command === 'show') :
+        const result = presentation ? command === 'status' ? status() : show(command === 'show') :
           await action(command, args);
         if (!closing) write({ command, ok: true, result });
       } catch (error) { if (!closing) write({ command, ok: false, error: String(error.message).slice(0, 290) }); }
@@ -410,9 +406,9 @@ async function main(config, clipboard) {
         return { error: 'The active profile or tab changed. Try again.' };
       clipboard.check();
       switch (request.type) {
-        case 'select-profile': selectProfile(findProfile(request.value), undefined, false); break;
-        case 'select-tab': select(activeProfile.tabs.get(request.value), false); break;
-        case 'new-tab': newTab(activeProfile, false); break;
+        case 'select-profile': selectProfile(findProfile(request.value)); break;
+        case 'select-tab': select(activeProfile.tabs.get(request.value)); break;
+        case 'new-tab': newTab(activeProfile); break;
         case 'close-tab': {
           const tab = activeProfile.tabs.get(request.value);
           if (!tab) throw new Error('That preview tab does not exist.');
@@ -421,7 +417,7 @@ async function main(config, clipboard) {
         }
         case 'navigate': {
           const url = address(typeof request.value === 'string' ? request.value : '');
-          await navigate(selected ?? newTab(activeProfile, false), url);
+          await navigate(selected ?? newTab(activeProfile), url);
           break;
         }
         default: return { error: 'The Browser control request was refused.' };
@@ -441,8 +437,7 @@ async function main(config, clipboard) {
   await within(readyChrome);
   if (closing) return;
   newTab();
-  app.dock.hide();
-  if (config.visible) await show(true);
+  if (config.visible) show(true);
   if (config.fixture) {
     fixture = await require('./fixture.cjs').startFixture();
     config.url = fixture.url;
