@@ -266,7 +266,7 @@ export async function runHostEntry(): Promise<void> {
     });
     boundary = await owned.installNative(effects, deadline);
     noteHostStartup(owned.custody, 'engine-authority');
-    const engine = authorities.createHostEngineAuthority(host, owned.custody, previous);
+    const engine = authorities.createHostEngineAuthority(host, owned.custody, previous, deadline);
     const prepared = await prepareHost(app, owned, engine);
     prepared.custody.assertRetained(); assertTime(deadline);
     if (app.isReady() || state.closed) return prepared.custody.terminate();

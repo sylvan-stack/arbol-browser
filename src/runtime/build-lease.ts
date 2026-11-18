@@ -82,7 +82,7 @@ export async function adoptHostBuildLease(host: VerifiedHost, platform: Platform
       async assert() {
         const current = held.assertIdentity(), expected = host.guardIdentity;
         if (current.device !== expected.device || current.inode !== expected.inode || current.uid !== expected.uid) throw profileUnavailable();
-        await host.assertTrusted(performance.now() + 5000); held.assertIdentity();
+        await host.assertTrusted(performance.now() + 5000, deadline); held.assertIdentity();
       },
       release(): never { throw profileUnavailable(); },
     });

@@ -91,7 +91,7 @@ export interface VerifiedHost {
   readonly signed: SignedBundle;
   readonly policyDigest: string;
   readonly guardIdentity: Readonly<{ device: string; inode: string; uid: number }>;
-  assertTrusted(deadline: number): Promise<void>;
+  assertTrusted(deadline: number, originalStartupCutoff?: number): Promise<void>;
 }
 const verifiedHosts = new WeakSet<object>();
 const armedHosts = new WeakMap<VerifiedHost, import('./custody.js').HostCustody>();
@@ -308,11 +308,17 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
   // Observation only: earlier armed scans cannot consume final ready labels.
   let readyTrustObserved = false;
   const result: VerifiedHost = Object.freeze({ identity, policy, signed, policyDigest: rawPolicy.digest, guardIdentity,
-    async assertTrusted(limit: number) {
+    async assertTrusted(limit: number, originalStartupCutoff?: number) {
       if (!verifiedHosts.has(result)) throw unavailable('browser');
       const custody = armedHosts.get(result);
       let observeReady = false;
       try {
+        // The original registry binds this frozen host to its actual custody
+        // and instance. Only startup uses the already captured Claim cutoff.
+        if (originalStartupCutoff !== undefined) {
+          if (custody && custody.host !== result) throw unavailable('browser');
+          if (!custody || custody.instance.record.phase === 'starting') limit = originalStartupCutoff;
+        }
         assertBudget(limit); if (custody) assertHostCustody(custody);
         try {
           if (custody && custody.host === result && custody.instance.record.phase === 'ready' && !readyTrustObserved) {
@@ -396,13 +402,13 @@ export function assertHostEngineAuthority(value: import('../profiles/compatibili
   if (!engineAuthorities.has(value)) throw unavailable('browser');
 }
 export function createHostEngineAuthority(host: VerifiedHost, custody: import('./custody.js').HostCustody,
-  previousExit: import('./host-entry.js').HostPreviousExit): import('../profiles/compatibility.js').EngineAuthority {
+  previousExit: import('./host-entry.js').HostPreviousExit, originalStartupCutoff: number): import('../profiles/compatibility.js').EngineAuthority {
   if (!verifiedHosts.has(host) || custody.host !== host) throw unavailable('browser');
   custody.assertRetained();
   const authority: import('../profiles/compatibility.js').EngineAuthority = Object.freeze({
     build: host.identity.layout.build, manifest: host.signed.manifest,
     async assertTrusted() {
-      custody.assertRetained(); await host.assertTrusted(performance.now() + 5000); custody.assertRetained();
+      custody.assertRetained(); await host.assertTrusted(performance.now() + 5000, originalStartupCutoff); custody.assertRetained();
     },
     async assertPreviousEngineExited(profile: import('../profiles/records.js').ProfileSnapshot) {
       if (profile !== custody.instance.owner.profile) return custody.terminate();
