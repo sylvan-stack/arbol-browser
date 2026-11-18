@@ -1418,11 +1418,11 @@ public:
   bool publishDirtyMonitor(arbol_boundary::Context& c) { return publishDirtyTerminal(c,false); }
   bool publishDirtyMain(arbol_boundary::Context& c) { return publishDirtyTerminal(c,true); }
   bool terminalUnresolved() const { return terminalUnresolved_; }
-  bool held(arbol_boundary::Context& c) const {
+  bool held(arbol_boundary::Context& c,const arbol_boundary::ReadOnlyMonitorImage* retained=nullptr) const {
     return present()&&exclusiveWriter()&&state_->enrolled.load(std::memory_order_acquire)==7&&
       state_->main.is(c.main)&&state_->primary.is(c.primary)&&state_->custody.is(c.custody)&&
       arbol_boundary::current(c.main)==1&&arbol_boundary::current(c.primary)==1&&arbol_boundary::current(c.custody)==1&&
-      getpgid(c.main.pid)==(int)c.main.group&&getsid(c.main.pid)==c.session&&c.primaryMonitor()&&c.monitor(c.custody,true)&&
+      getpgid(c.main.pid)==(int)c.main.group&&getsid(c.main.pid)==c.session&&c.primaryMonitor(retained)&&c.monitor(c.custody,true,retained)&&
       arbol_boundary::lockIdentity(c.owner)&&arbol_boundary::lockIdentity(c.build)&&metadata();
   }
   bool ready(arbol_boundary::Context& c) const { return held(c)&&state_->fatal.load(std::memory_order_acquire)==0; }

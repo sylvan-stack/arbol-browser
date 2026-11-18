@@ -588,6 +588,7 @@ struct SessionUseNative;
 struct WebsiteSessionNative;
 struct Custody {
   arbol_boundary::Context context; int capsule=-1; bool bound=false,continuousBuild=false,hostRequired=false,spawned=false;
+  arbol_boundary::ReadOnlyMonitorImage monitorImage;
   arbol_exit::HostCapability finalization;
   int reader=-1,writer=-1; bool endpointsPublished=false;
   RetainedPipe retainedReader,retainedWriter;
@@ -984,7 +985,7 @@ static napi_value watchdogBind(napi_env env,napi_callback_info info) {
   std::vector<arbol_boundary::Identity> engines;
   if(found!=1 || !c->context.census(engines) || !arbol_boundary::lockIdentity(c->context.owner) || !arbol_boundary::lockIdentity(c->context.build)) return fail(env);
   if(c->hostRequired) {
-    if(!c->finalization.ready(c->context)) return fail(env);
+    if(!c->finalization.ready(c->context)||!c->monitorImage.capture(c->context.helper())) return fail(env);
     arbol_attempt::Claim claim; std::string raw; NSDictionary* current=nil;
     if(!c->finalization.currentAttempt(c->context,claim,raw,current,arbol_boundary::clockMs()+1000)||
        ![current[@"phase"] isEqual:@"claimed"]||![current[@"stage"] isEqual:@"transferring"]||
@@ -1346,7 +1347,8 @@ static napi_value watchdogAssert(napi_env env,napi_callback_info info) {
     if(reasons&~arbol_exit::admissionLoss) return fail(env);
     if(reasons&&!cutoff) return fail(env);
     if(reasons&&arbol_boundary::clockMs()*1000>=cutoff) return fail(env);
-    if(!c->finalization.held(c->context)) return fail(env);
+    const auto* retained=state->closeGraceUs.load(std::memory_order_acquire)?nullptr:c->monitorImage.retained();
+    if(!c->finalization.held(c->context,retained)) return fail(env);
     if(c->mutation) {
       if(!c->mutation->current()) return fail(env);
     } else if(c->sessionUse) {

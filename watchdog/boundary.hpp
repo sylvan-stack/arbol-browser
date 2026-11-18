@@ -6,6 +6,7 @@
 #include <libproc.h>
 #include <bsm/libbsm.h>
 #include <sys/file.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/proc.h>
 #include <sys/wait.h>
@@ -18,6 +19,7 @@
 #include <climits>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <set>
 #include <string>
@@ -187,6 +189,53 @@ inline bool signature(const std::string& path, bool jit) {
   }
   if (info) CFRelease(info); if (req) CFRelease(req); if (code) CFRelease(code); if (url) CFRelease(url); if (s) CFRelease(s); return valid;
 }
+// Constructed for the signed main's bound watchdogs only. Writable storage
+// keeps live publisher verification. A lost retained proof cannot be renewed.
+class ReadOnlyMonitorImage final {
+  int fd_ = -1;
+  bool accepted_ = false;
+  std::string path_;
+  struct stat file_{};
+  struct statfs mount_{};
+
+  bool sameFile(const struct stat& value) const {
+    return S_ISREG(value.st_mode) && value.st_dev == file_.st_dev && value.st_ino == file_.st_ino &&
+      value.st_gen == file_.st_gen && value.st_mode == file_.st_mode && value.st_flags == file_.st_flags &&
+      value.st_uid == file_.st_uid && value.st_gid == file_.st_gid && value.st_nlink == 1 && file_.st_nlink == 1 &&
+      value.st_size == file_.st_size && value.st_mtimespec.tv_sec == file_.st_mtimespec.tv_sec &&
+      value.st_mtimespec.tv_nsec == file_.st_mtimespec.tv_nsec && value.st_ctimespec.tv_sec == file_.st_ctimespec.tv_sec &&
+      value.st_ctimespec.tv_nsec == file_.st_ctimespec.tv_nsec;
+  }
+  bool sameMount(const struct statfs& value) const {
+    return (value.f_flags & MNT_RDONLY) && (mount_.f_flags & MNT_RDONLY) &&
+      !std::memcmp(&value.f_fsid, &mount_.f_fsid, sizeof(value.f_fsid)) &&
+      !std::strcmp(value.f_mntonname, mount_.f_mntonname) && !std::strcmp(value.f_mntfromname, mount_.f_mntfromname);
+  }
+  bool current() const {
+    struct stat held{}, named{};
+    struct statfs heldMount{};
+    char openedPath[PATH_MAX]{};
+    return !fstat(fd_, &held) && !lstat(path_.c_str(), &named) && sameFile(held) && sameFile(named) &&
+      !fstatfs(fd_, &heldMount) && sameMount(heldMount) && !fcntl(fd_, F_GETPATH, openedPath) && path_ == openedPath;
+  }
+public:
+  ReadOnlyMonitorImage() = default;
+  ReadOnlyMonitorImage(const ReadOnlyMonitorImage&) = delete;
+  ReadOnlyMonitorImage& operator=(const ReadOnlyMonitorImage&) = delete;
+  ~ReadOnlyMonitorImage() { if (fd_ >= 0) close(fd_); }
+
+  bool capture(const std::string& path) {
+    if (fd_ >= 0 || !canonical(path) || statfs(path.c_str(), &mount_)) return false;
+    if (!(mount_.f_flags & MNT_RDONLY)) return true;
+    path_ = path;
+    fd_ = open(path_.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd_ < 0 || fstat(fd_, &file_) || !current() || !signature(path_, false) || !current()) return false;
+    accepted_ = true;
+    return true;
+  }
+  const ReadOnlyMonitorImage* retained() const { return accepted_ ? this : nullptr; }
+  bool verifies(const std::string& path) const { return accepted_ && path == path_ && current(); }
+};
 inline bool signalExact(const Identity& id, int sig) {
   int n = current(id); if (!n) return true; if (n != 1 || id.uid != geteuid()) return false;
   audit_token_t token{}; token.val[5] = (uint32_t)id.pid; token.val[7] = (uint32_t)id.version;
@@ -332,18 +381,19 @@ struct Context {
     }
     authenticated=true; cleanupOnly=true; seen.emplace(key(main),main); return true;
   }
-  bool monitor(const Identity& id, bool anchor) const {
+  bool monitor(const Identity& id, bool anchor, const ReadOnlyMonitorImage* retained = nullptr) const {
     Identity now; std::string path;
     return id.pid > 1 && observe(id.pid, now) == 1 && same(id, now) && now.uid == main.uid && now.group == (anchor ? main.group : (uint32_t)id.pid) &&
-      getsid(id.pid) == session && executable(now, path) && path == helper() && signature(path, false);
+      getsid(id.pid) == session && executable(now, path) && path == helper() &&
+      (retained ? retained->verifies(path) && current(id) == 1 : signature(path, false));
   }
-  bool primaryMonitor() {
+  bool primaryMonitor(const ReadOnlyMonitorImage* retained = nullptr) {
     Identity now;
     if(observe(primary.pid,now)!=1||!same(primary,now)) return false;
-    if(now.group==main.group) return !primaryOutside&&monitor(primary,true);
+    if(now.group==main.group) return !primaryOutside&&monitor(primary,true,retained);
     // The closed signed primary can leave only after C. Peer liveness is
     // checked separately; a dead anchor must not block post-quiescence retirement.
-    if(now.group!=(uint32_t)primary.pid||!monitor(primary,false)) return false;
+    if(now.group!=(uint32_t)primary.pid||!monitor(primary,false,retained)) return false;
     primaryOutside=true; return true;
   }
   bool discoverPrimary() {
