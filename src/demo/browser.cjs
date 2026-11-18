@@ -214,7 +214,10 @@ async function main(config, clipboard) {
     clipboard.check();
     if (tabs.size >= maximumTabs || profile.tabs.size >= maximumProfileTabs)
       throw new Error('Close a tab before opening another.');
-    const view = new WebContentsView({ webPreferences: { ...preferences, session: websiteSession(profile) } });
+    const view = new WebContentsView({ webPreferences: {
+      ...preferences, session: websiteSession(profile),
+      disableDialogs: true, disableHtmlFullscreenWindowResize: true,
+    } });
     view.setVisible(false);
     const contents = view.webContents;
     const tab = { id: ++nextTab, view, profile, site: '', documentRevision: 0 };
