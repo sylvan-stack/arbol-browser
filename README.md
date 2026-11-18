@@ -39,6 +39,23 @@ tab. `open URL` creates another live tab. Use `tabs` to find tab IDs and
 `tab ID` to select one. `status` shows the current window and Dock state.
 Page actions accept ordinary CSS selectors. Each command responds with JSON.
 
+### Drag an item within a webpage
+
+In the selected tab, pass two CSS selectors as a JSON array. For example, on
+a board with `id="card"` and `id="done"`:
+
+```text
+hide
+drag ["#card", "#done"]
+inspect #done
+```
+
+The gesture goes to the loaded page and leaves the macOS pointer and
+foreground app alone. Each selector must match one rendered element in the
+main document. The preview can scroll that page to find the endpoints. The
+gesture uses only in-page data. Verify the site's resulting state after a
+`dispatched` reply, or before retrying if the outcome is uncertain.
+
 ### Sign in to two accounts on one site
 
 Start the preview with `npm run demo -- --visible`. Open the first login
