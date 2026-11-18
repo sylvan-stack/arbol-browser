@@ -4,6 +4,7 @@ const { readFile } = require('node:fs/promises');
 const { join } = require('node:path');
 const { createInterface } = require('node:readline');
 const { privateDirectory, validAccount, profileId, readProfiles, writeProfiles } = require('./profile-storage.cjs');
+const { dragInPage } = require('./drag.cjs');
 
 const maximumTabs = 40;
 const maximumProfileTabs = 8;
@@ -133,6 +134,7 @@ async function main(config, clipboard) {
   let activeProfile = defaultProfile, selected = null, nextTab = 0, revision = 0;
   let closing = false, quitting = false;
   let pageWork = Promise.resolve(), presentationWork = Promise.resolve();
+  let selectionRevision = 0;
   let fixture, input;
   const cadence = setInterval(clipboard.check, 1000);
   cadence.unref();
@@ -164,6 +166,7 @@ async function main(config, clipboard) {
     activeProfile = profile;
     profile.selected = tab;
     if (selected !== tab) {
+      selectionRevision++;
       selected?.view.setVisible(false);
       selected = tab;
       selected?.view.setVisible(true);
@@ -215,7 +218,7 @@ async function main(config, clipboard) {
     const view = new WebContentsView({ webPreferences: { ...preferences, session: websiteSession(profile) } });
     view.setVisible(false);
     const contents = view.webContents;
-    const tab = { id: ++nextTab, view, profile, site: '' };
+    const tab = { id: ++nextTab, view, profile, site: '', documentRevision: 0 };
     const checkNavigation = event => {
       if (!event.isMainFrame && /^(about:|data:|blob:)/.test(event.url)) return;
       try { address(event.url); }
@@ -226,6 +229,9 @@ async function main(config, clipboard) {
     contents.on('will-redirect', checkNavigation);
     contents.on('will-attach-webview', event => event.preventDefault());
     contents.on('will-prevent-unload', event => event.preventDefault());
+    contents.on('did-start-navigation', ({ isMainFrame, isSameDocument }) => {
+      if (isMainFrame && !isSameDocument) tab.documentRevision++;
+    });
     contents.on('did-navigate', publish);
     contents.on('did-navigate-in-page', publish);
     window.contentView.addChildView(view);
@@ -331,6 +337,18 @@ async function main(config, clipboard) {
       case 'profile': selectProfile(findProfile(argumentsText.trim())); return status();
       case 'tabs': return { selected: selected?.id ?? null, tabs: [...tabs.values()].map(describe) };
       case 'tab': select(tabs.get(Number(argumentsText))); return status();
+      case 'drag': {
+        const tab = selected;
+        const contents = tab?.view.webContents;
+        if (!contents || contents.isLoadingMainFrame() || !contents.getURL()) throw new Error('Navigate to a loaded page first.');
+        const revision = selectionRevision;
+        const document = tab.documentRevision;
+        const frame = contents.mainFrame;
+        const isCurrent = () => !closing && selected === tab && selectionRevision === revision &&
+          !contents.isDestroyed() && tab.documentRevision === document && contents.mainFrame === frame &&
+          !contents.isLoadingMainFrame();
+        return dragInPage(contents, argumentsText, isCurrent, within);
+      }
       case 'inspect':
       case 'fill':
       case 'click': {
@@ -350,7 +368,7 @@ async function main(config, clipboard) {
         if (result.error) throw new Error(result.error);
         return result;
       }
-      default: throw new Error('Commands: status, show, hide, go URL, open URL, login URL [account], profiles, profile ID, profile-create URL account Display name, tabs, tab ID, inspect, fill, click, quit.');
+      default: throw new Error('Commands: status, show, hide, go URL, open URL, login URL [account], profiles, profile ID, profile-create URL account Display name, tabs, tab ID, inspect, fill, click, drag, quit.');
     }
   }
   function line(text) {
