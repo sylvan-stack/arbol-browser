@@ -96,10 +96,16 @@ export interface VerifiedHost {
 const verifiedHosts = new WeakSet<object>();
 const armedHosts = new WeakMap<VerifiedHost, import('./custody.js').HostCustody>();
 const startupTrustChecks = new WeakMap<VerifiedHost, (deadline: number, originalStartupCutoff: number) => Promise<void>>();
+const closeTrustChecks = new WeakMap<VerifiedHost, (deadline: number) => Promise<void>>();
 export async function assertHostStartupContinuity(host: VerifiedHost, deadline: number, originalStartupCutoff: number): Promise<void> {
   const check = startupTrustChecks.get(host);
   if (!check) throw unavailable('browser');
   await check(deadline, originalStartupCutoff);
+}
+export async function assertHostCloseContinuity(host: VerifiedHost, deadline: number): Promise<void> {
+  const check = closeTrustChecks.get(host);
+  if (!check) throw unavailable('browser');
+  await check(deadline);
 }
 export function bindArmedHost(host: VerifiedHost, custody: import('./custody.js').HostCustody): void {
   if (!verifiedHosts.has(host) || custody.host !== host || armedHosts.has(host)) throw unavailable('browser');
@@ -315,7 +321,7 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
   const result: VerifiedHost = Object.freeze({ identity, policy, signed, policyDigest: rawPolicy.digest, guardIdentity,
     assertTrusted: (limit: number, originalStartupCutoff?: number) => verifyTrusted(limit, originalStartupCutoff),
   });
-  async function verifyTrusted(limit: number, originalStartupCutoff?: number, preferRetainedStorage = false): Promise<void> {
+  async function verifyTrusted(limit: number, originalStartupCutoff?: number, retainedFor?: 'startup' | 'close'): Promise<void> {
     if (!verifiedHosts.has(result)) throw unavailable('browser');
     const custody = armedHosts.get(result);
     let observeReady = false;
@@ -348,7 +354,8 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
       if (observeReady) noteHostStartup(custody, 'ready-trust-directories-before');
       for (const path of [layout.buildRoot, layout.bundle, layout.payload]) { assertBudget(limit); await directory(path, false); }
       if (observeReady) noteHostStartup(custody, 'ready-trust-directories-after');
-      if (preferRetainedStorage && (!custody || custody.instance.record.phase === 'starting') &&
+      const retainedPhase = retainedFor === 'close' ? 'closing' : 'starting';
+      if (retainedFor && (!custody || custody.instance.record.phase === retainedPhase) &&
           manifests.assertRetainedReadOnlyStorage(signed, limit)) {
         if (custody) assertHostCustody(custody);
       } else if (custody) {
@@ -376,7 +383,8 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
       throw error;
     }
   }
-  startupTrustChecks.set(result, (limit, cutoff) => verifyTrusted(limit, cutoff, true));
+  startupTrustChecks.set(result, (limit, cutoff) => verifyTrusted(limit, cutoff, 'startup'));
+  closeTrustChecks.set(result, limit => verifyTrusted(limit, undefined, 'close'));
   noteHostVerification(observation, 'initial-verified-host');
   assertBudget(deadline); verifiedHosts.add(result); await result.assertTrusted(deadline); return result;
 }

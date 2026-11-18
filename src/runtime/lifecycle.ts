@@ -1,4 +1,4 @@
-import { noteOpenCommand, type OpenCommandObservation } from './authorities.js';
+import { noteOpenCommand, type OpenCommandObservation, type VerifiedHost } from './authorities.js';
 import { setTimeout } from 'node:timers/promises';
 import type { Contract } from '../contracts/generated.js';
 import { unavailable, BrowserFailure } from '../contracts/errors.js';
@@ -143,7 +143,7 @@ function receiveClose(platform: PlatformPort): CommandClose {
     grace: sampled + Math.max(0, native.grace - clock) });
 }
 async function closeProductionProfile(profile: ProfileSnapshot, selection: BuildSelection, platform: PlatformPort,
-  exits: ProductionExitAuthority, command: CommandClose): Promise<Contract<'wire.CloseResult'>> {
+  exits: ProductionExitAuthority, command: CommandClose, closeHost?: VerifiedHost): Promise<Contract<'wire.CloseResult'>> {
   const { deadline, grace } = command;
   const location = await within(deadline, () => runtimeLocation(profile));
   let original = location ? await within(deadline, () => readRuntime(location)) : undefined;
@@ -177,7 +177,7 @@ async function closeProductionProfile(profile: ProfileSnapshot, selection: Build
   if (await exits.tryClosed(profile, original, deadline)) return { profile: profile.record.id, closed: false, dataRemoved: false };
   let requested = false;
   if (originalAlive(original, platform) && original.phase === 'ready' && location && now() < grace) {
-    await within(grace, () => assertProductionCloseReady(profile, original, selection, platform, exits, grace));
+    await within(grace, () => assertProductionCloseReady(profile, original, selection, platform, exits, grace, closeHost));
     const client = await acquireWithin(grace,
       () => connectRuntime(location, original, 'management', selection, platform, grace, 'Explicit close'), value => value.close());
     try {
@@ -260,7 +260,8 @@ export interface ProcessIntegration {
   mcp(connect: (label: string) => Promise<RuntimeClient>, io: Stdio): Promise<void>;
 }
 export function createProcessService(options: { selection: BuildSelection; platform: () => PlatformPort;
-  state?: string; integration?: ProcessIntegration; exits?: ExitAuthority; observation?: OpenCommandObservation; openCutoff?: number }): ProcessPort {
+  state?: string; integration?: ProcessIntegration; exits?: ExitAuthority; closeHost?: VerifiedHost;
+  observation?: OpenCommandObservation; openCutoff?: number }): ProcessPort {
   const state = options.state ?? stateDirectory();
   return Object.freeze<ProcessPort>({
     async open(input) {
@@ -299,7 +300,7 @@ export function createProcessService(options: { selection: BuildSelection; platf
           throw error;
         }
         if (command && isProductionExitAuthority(options.exits))
-          return await closeProductionProfile(profile, options.selection, platform, options.exits, command);
+          return await closeProductionProfile(profile, options.selection, platform, options.exits, command, options.closeHost);
         return await closeProfile(profile, options.selection, platform, options.exits, deadline);
       } finally { if (command) await platform.retireCloseBudget(command.native); }
     },

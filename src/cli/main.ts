@@ -87,7 +87,7 @@ async function productionPorts(selection: BuildSelection, observation?: ColdObse
   const state = host.policy.stateRoot;
   return Object.freeze({
     profiles: createProfileService({ state, platform: () => platform, runtime: createProfileRuntime(platform, selection, exits) }),
-    process: createProcessService({ state, selection, platform: () => platform, integration, exits,
+    process: createProcessService({ state, selection, platform: () => platform, integration, exits, closeHost: host,
       ...(openObservation ? { observation: openObservation } : {}),
       ...(openCutoff === undefined ? {} : { openCutoff }) }),
   });

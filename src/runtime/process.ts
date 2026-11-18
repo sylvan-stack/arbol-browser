@@ -9,7 +9,7 @@ import { unavailable } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
 import { assertProfile, type ProfileSnapshot } from '../profiles/records.js';
 import { assertPlatform, type HeldLock, type PlatformPort, type ProcessProvenance } from './platform.js';
-import { noteOpenCommand, type OpenCommandObservation, assertTrustedHost, assertVerifiedHost, assertVerifiedHostMetadata, type VerifiedHost } from './authorities.js';
+import { noteOpenCommand, type OpenCommandObservation, assertHostCloseContinuity, assertTrustedHost, assertVerifiedHost, assertVerifiedHostMetadata, type VerifiedHost } from './authorities.js';
 import { assertTime, now, runtimeLocation, type RuntimeLocation, type RuntimeRecord } from './instance.js';
 import { createStarter, type LaunchAttemptPort } from './start.js';
 import type { ProcessIntegration } from './lifecycle.js';
@@ -170,7 +170,7 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
   exits: ProductionExitAuthority = createProductionExitAuthority(platform, {
     build: host.identity.layout.build, directory: host.identity.layout.buildRoot,
     guard: join(host.identity.layout.buildRoot, '../.uses', host.identity.layout.build), explicit: true,
-  })): LaunchAttemptPort {
+  }), closeVerification = false): LaunchAttemptPort {
   assertPlatform(platform); assertProductionExitAuthority(exits);
   const pending = new Map<string, LaunchAttempt>();
   return Object.freeze({
@@ -270,7 +270,9 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
             if (originalHost.signed.snapshotDigest !== admitted.candidateDigest || originalHost.identity.sourceDigest !== admitted.sourceDigest ||
                 originalHost.identity.productDigest !== admitted.productDigest || originalHost.policy.stateRoot !== profile.paths.state)
               throw unavailable('browser');
-            await originalHost.assertTrusted(deadline); await lease.assert(); assertTime(deadline);
+            if (sameHost && closeVerification) await assertHostCloseContinuity(originalHost, deadline);
+            else await originalHost.assertTrusted(deadline);
+            await lease.assert(); assertTime(deadline);
             await withLaunchAttempt(profile, platform, deadline, transaction => {
               if (!transaction.current || JSON.stringify(transaction.current) !== JSON.stringify(admitted)) throw unavailable('browser');
               const actual = platform.processProvenance(record.pid);
@@ -296,14 +298,18 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
 /** Close joins an existing exact admitted host only; never reserves or starts. */
 export async function assertProductionCloseReady(profile: ProfileSnapshot, record: RuntimeRecord,
   selection: import('./selection.js').BuildSelection, platform: PlatformPort,
-  exits: ProductionExitAuthority, deadline: number): Promise<void> {
+  exits: ProductionExitAuthority, deadline: number, verifiedHost?: VerifiedHost): Promise<void> {
   const lease = await acquireBuildLease(selection, platform);
   try {
     const address = new URL('./authorities.js', import.meta.url).href;
     const authority = await import(address) as typeof import('./authorities.js');
-    const host = await authority.verifyPackagedHost(selection,
-      selectedLayout(selection, resolve(fileURLToPath(new URL('../../', import.meta.url)))).payload, deadline);
-    await createLaunchTransactions(host, platform, exits).admitted(profile, record, deadline);
+    const layout = selectedLayout(selection, resolve(fileURLToPath(new URL('../../', import.meta.url))));
+    const host = verifiedHost ?? await authority.verifyPackagedHost(selection, layout.payload, deadline);
+    assertVerifiedHostMetadata(host, deadline);
+    if (host.identity.layout.build !== layout.build || host.identity.layout.buildRoot !== layout.buildRoot ||
+        host.identity.layout.bundle !== layout.bundle || host.identity.layout.payload !== layout.payload ||
+        selection.guard !== join(layout.buildRoot, '../.uses', layout.build)) throw unavailable('browser');
+    await createLaunchTransactions(host, platform, exits, Boolean(verifiedHost)).admitted(profile, record, deadline);
     await lease.assert(); assertTime(deadline);
   } finally { lease.release(); }
 }
