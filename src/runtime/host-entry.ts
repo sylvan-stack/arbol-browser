@@ -206,7 +206,8 @@ export async function runHostEntry(): Promise<void> {
     // Only the fixed entry's physical layout and exact outer argument precede
     // native capture. Never read the profile request or learn policy from it.
     const payload = resolve(fileURLToPath(new URL('../../', import.meta.url)));
-    const bundle = dirname(dirname(dirname(payload))), buildRoot = dirname(bundle);
+    const bundle = dirname(dirname(dirname(payload))), parent = dirname(bundle);
+    const buildRoot = basename(parent) === 'app' ? dirname(parent) : parent;
     const selection: BuildSelection = Object.freeze({ build: basename(buildRoot), directory: buildRoot,
       guard: join(dirname(buildRoot), '.uses', basename(buildRoot)), explicit: true });
     const selectionURL = new URL('./selection.js', import.meta.url).href;

@@ -2,7 +2,8 @@
  * simulated host, watchdog, engine-exit certificate or successful tool effect. */
 import { randomBytes } from 'node:crypto';
 import { constants, openSync, closeSync, fstatSync, lstatSync, readSync, realpathSync, mkdirSync, renameSync, fsyncSync, rmdirSync, type BigIntStats } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { setTimeout } from 'node:timers/promises';
 import { unavailable } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
@@ -12,7 +13,7 @@ import { noteOpenCommand, type OpenCommandObservation, assertTrustedHost, assert
 import { assertTime, now, runtimeLocation, type RuntimeLocation, type RuntimeRecord } from './instance.js';
 import { createStarter, type LaunchAttemptPort } from './start.js';
 import type { ProcessIntegration } from './lifecycle.js';
-import type { BuildSelection } from './selection.js';
+import { claimedLayout, selectedLayout, type BuildSelection } from './selection.js';
 import { ownerLock, withOwnerLockForCustody, type OwnerLease, type RegistryLease } from '../profiles/locking.js';
 import { acquireBuildLease, type BuildLease } from './build-lease.js';
 import { createProductionExitAuthority, assertProductionExitAuthority, type ProductionExitAuthority } from './exit.js';
@@ -46,7 +47,7 @@ function parseAttempt(raw: string, location: RuntimeLocation): LaunchAttempt {
   // actual managed profile location before exposing even a read-only snapshot.
   if (!value || value.format !== 1 || value.profile !== location.profile.paths.root || value.profilePathHash !== location.hash)
     throw unavailable('profile');
-  return frozen(value);
+  claimedLayout(value); return frozen(value);
 }
 // Only archiveRemovedRuntime can mint this private post-detach disposition.
 // It cannot be requested through a transaction callback or a structural flag.
@@ -154,9 +155,10 @@ export async function claimedHostAttempt(profile: ProfileSnapshot, host: Verifie
         !self || !current.engine || (['pid', 'uid', 'startId', 'pidVersion', 'group', 'session',
           'parentStartId', 'parentPidVersion', 'executable'] as const).some(key => self[key] !== current.engine![key]) ||
         current.engine.executable !== layout.engine || current.starter.executable !== layout.engine ||
-        current.bootstrap?.executable !== join(layout.bundle, 'Contents/MacOS/arbol-browser-native') ||
+        current.bootstrap?.executable !== layout.bootstrap ||
         current.bootstrap.pid !== self.pid || current.bootstrap.startId !== self.startId ||
         current.bootstrap.pidVersion === self.pidVersion) throw unavailable('browser');
+    if (claimedLayout(current).bundle !== layout.bundle) throw unavailable('browser');
     return current;
   });
 }
@@ -243,26 +245,28 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
               current.runtime.pid !== record.pid || current.runtime.processStartId !== record.processStartId ||
               current.runtime.agentSocket !== record.agentSocket || current.runtime.managementSocket !== record.managementSocket ||
               current.build !== record.build) throw unavailable('browser');
+          const layout = claimedLayout(current);
           const live = platform.processProvenance(record.pid);
           if (!live || (['pid', 'uid', 'startId', 'pidVersion', 'group', 'session', 'parentStartId', 'parentPidVersion', 'executable'] as const)
               .some(key => live[key] !== current.engine![key]) || current.engine.pid !== current.bootstrap.pid ||
               current.engine.startId !== current.bootstrap.startId || current.engine.pidVersion === current.bootstrap.pidVersion ||
-              current.engine.executable !== join(current.buildRoot, 'ArbolBrowser.app/Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron') ||
-              current.bootstrap.executable !== join(current.buildRoot, 'ArbolBrowser.app/Contents/MacOS/arbol-browser-native')) throw unavailable('browser');
+              current.engine.executable !== layout.engine ||
+              current.bootstrap.executable !== layout.bootstrap) throw unavailable('browser');
           return current;
         });
         if (admitted) {
+          const layout = claimedLayout(admitted);
           const selected = Object.freeze({ build: admitted.build, directory: admitted.buildRoot, guard: admitted.buildGuard, explicit: true });
           const lease = await acquireBuildLease(selected, platform);
           try {
             const authorityURL = new URL('./authorities.js', import.meta.url).href;
             const authorities = await import(authorityURL) as typeof import('./authorities.js');
-            const sameHost = host.identity.layout.build === admitted.build && host.identity.layout.buildRoot === admitted.buildRoot &&
+            const sameHost = host.identity.layout.bundle === layout.bundle && host.identity.layout.build === admitted.build && host.identity.layout.buildRoot === admitted.buildRoot &&
               join(host.identity.layout.buildRoot, '../.uses', host.identity.layout.build) === admitted.buildGuard &&
               host.signed.snapshotDigest === admitted.candidateDigest && host.identity.sourceDigest === admitted.sourceDigest &&
               host.identity.productDigest === admitted.productDigest;
             const originalHost = sameHost ? host : await authorities.verifyPackagedHost(selected,
-              join(admitted.buildRoot, 'ArbolBrowser.app/Contents/Resources/browser'), deadline);
+              layout.payload, deadline);
             if (originalHost.signed.snapshotDigest !== admitted.candidateDigest || originalHost.identity.sourceDigest !== admitted.sourceDigest ||
                 originalHost.identity.productDigest !== admitted.productDigest || originalHost.policy.stateRoot !== profile.paths.state)
               throw unavailable('browser');
@@ -298,7 +302,7 @@ export async function assertProductionCloseReady(profile: ProfileSnapshot, recor
     const address = new URL('./authorities.js', import.meta.url).href;
     const authority = await import(address) as typeof import('./authorities.js');
     const host = await authority.verifyPackagedHost(selection,
-      join(selection.directory, 'ArbolBrowser.app/Contents/Resources/browser'), deadline);
+      selectedLayout(selection, resolve(fileURLToPath(new URL('../../', import.meta.url)))).payload, deadline);
     await createLaunchTransactions(host, platform, exits).admitted(profile, record, deadline);
     await lease.assert(); assertTime(deadline);
   } finally { lease.release(); }

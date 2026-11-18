@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 /** Independent production closure. No Electron import, JS clean writer, PID
  * signal, lock-as-exit shortcut or receipt-only force provider lives here. */
 import { join, dirname, basename, resolve } from 'node:path';
@@ -13,7 +14,7 @@ import { assertVerifiedHost, verifyPackagedHost, type VerifiedHost } from './aut
 import { assertPlatform, assertExitInspectionReceipt, type PlatformPort, type ExitInspectionReceipt, type PriorMarkerExpectation } from './platform.js';
 import { withLaunchAttempt, type LaunchAttempt } from './process.js';
 import { now, assertTime, runtimeLocation, type RuntimeRecord } from './instance.js';
-import type { BuildSelection } from './selection.js';
+import { claimedLayout, selectedLayout, type BuildSelection } from './selection.js';
 import type { HostPreviousExit } from './host-entry.js';
 import type { ExitAuthority } from './lifecycle.js';
 import type { EngineExitEvidence } from '../profiles/compatibility.js';
@@ -56,7 +57,7 @@ function closedCandidate(value: unknown, profile: ProfileSnapshot, hash: string)
     throw unavailable('profile');
   const prefix = join(profile.paths.state, 'exit-evidence', hash, attempt.request);
   if (![join(prefix, 'activation.json'), join(prefix, 'terminal.json'), join(prefix, 'unused.json')].includes(attempt.terminal.path)) throw unavailable('profile');
-  return attempt;
+  claimedLayout(attempt); return attempt;
 }
 /** Build selection is the current CLI location only. A previous instance's
  * signed package and original stable Build guard are always proved separately. */
@@ -99,7 +100,7 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
       const oldSelection: BuildSelection = Object.freeze({ build: attempt.build, directory: attempt.buildRoot,
         guard: attempt.buildGuard, explicit: true });
       const build = await acquireBuildLease(oldSelection, platform); release.push(build);
-      const host = await verifyPackagedHost(oldSelection, join(attempt.buildRoot, 'ArbolBrowser.app/Contents/Resources/browser'), deadline);
+      const host = await verifyPackagedHost(oldSelection, claimedLayout(attempt).payload, deadline);
       if (host.policy.stateRoot !== profile.paths.state || host.signed.snapshotDigest !== attempt.candidateDigest ||
           host.identity.sourceDigest !== attempt.sourceDigest || host.identity.productDigest !== attempt.productDigest) throw unavailable('profile');
       await host.assertTrusted(deadline); await build.assert();
@@ -118,7 +119,8 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
         withBuildLockForCustody(build, platform, async heldBuild => {
           const invoke = (data?: import('./platform.js').HeldLock, next?: import('./platform.js').HeldLock) => platform.inspectExit(heldOwner, heldBuild, {
             format: 1, mode: actualMode, profile: profile.paths.root, profileInstance: profile.record.instance,
-            profilePathHash: location.hash, runtimeLeaf: physicalLeaf, bundle: join(build.selection.directory, 'ArbolBrowser.app'),
+            profilePathHash: location.hash, runtimeLeaf: physicalLeaf, bundle: candidate ? claimedLayout(candidate).bundle :
+              pending ? claimedLayout(pending).bundle : selectedLayout(build.selection, resolve(fileURLToPath(new URL('../../', import.meta.url)))).bundle,
             attempt: candidate ?? null, previous: previous ?? null, dataAttempt: dataAttempt ?? null, pending: pending ?? null,
           }, deadline, { ...(data ? { data } : {}), ...(next ? { next } : {}) });
           const withNext = (data?: import('./platform.js').HeldLock) => actualMode === 'reserve' && currentBuild ?

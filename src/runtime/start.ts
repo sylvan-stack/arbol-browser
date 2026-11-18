@@ -1,6 +1,7 @@
 import { noteOpenCommand, type OpenCommandObservation } from './authorities.js';
 import { execFile } from 'node:child_process';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { userInfo } from 'node:os';
 import { setTimeout } from 'node:timers/promises';
 import { statOrAbsent, profileUnavailable } from '../profiles/paths.js';
@@ -35,7 +36,7 @@ export interface LaunchAttemptPort {
 export const launchServices: LaunchPort = Object.freeze({
   launch(selection: BuildSelection, requestPath: string, deadline: number): Promise<number> {
     assertTime(deadline);
-    const layout = selectedLayout(selection, join(selection.directory, 'ArbolBrowser.app/Contents/Resources/browser'));
+    const layout = selectedLayout(selection, resolve(fileURLToPath(new URL('../../', import.meta.url))));
     const account = userInfo(); if (account.uid !== process.geteuid?.()) return Promise.reject(profileUnavailable());
     return new Promise((resolve, reject) => {
       const timeout = Math.floor(deadline - now());

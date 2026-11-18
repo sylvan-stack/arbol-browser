@@ -3,7 +3,7 @@ import { lstat } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
 import { directory, assertDirectory, privateFile, sameIdentity, identity, profileUnavailable } from '../profiles/paths.js';
 import type { PlatformPort, HeldLock } from './platform.js';
-import type { BuildSelection } from './selection.js';
+import { selectedLayout, type BuildSelection } from './selection.js';
 import type { BuildGuard } from './start.js';
 import { assertTrustedHost, type VerifiedHost } from './authorities.js';
 import { assertPlatform } from './platform.js';
@@ -43,8 +43,8 @@ const capturedBuilds = new WeakMap<CapturedHostBuild, { platform: PlatformPort; 
 export function captureHostBuild(platform: PlatformPort, selection: BuildSelection, bundle: string,
   requestPath: string): CapturedHostBuild {
   assertPlatform(platform);
-  if (bundle !== join(selection.directory, 'ArbolBrowser.app') ||
-      selection.guard !== join(dirname(selection.directory), '.uses', selection.build)) throw profileUnavailable();
+  const layout = selectedLayout(selection, join(bundle, 'Contents/Resources/browser'));
+  if (layout.bundle !== bundle) throw profileUnavailable();
   // Native authenticates actual inherited capsule/OFD, signed fixed image,
   // original birth and current Claim. Expired/cancelled is terminal-only there.
   const held = platform.adoptHostBuild(requestPath, selection.guard, bundle);
