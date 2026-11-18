@@ -170,7 +170,7 @@ interface PhysicalEntry {
   readonly target?: string;
 }
 interface FrozenSnapshot {
-  readonly storage?: StorageContext;
+  readonly storage: StorageContext | undefined;
   readonly encoded: string;
   readonly physical: Readonly<Record<string, PhysicalEntry>>;
   poisoned: boolean;
@@ -266,7 +266,7 @@ function run(argv) {
 }
 `;
 interface StorageDescription { readonly fd: number; readonly path: string; readonly stamp: string; readonly directory: boolean }
-interface StorageContext { readonly descriptions: readonly StorageDescription[]; readonly mapping: string }
+interface StorageContext { readonly descriptions: readonly [StorageDescription, StorageDescription]; readonly mapping: string }
 const storageFinalizer = new FinalizationRegistry<readonly StorageDescription[]>(descriptions => {
   for (const description of descriptions) {
     try { closeSync(description.fd); }
@@ -335,7 +335,9 @@ function storageMapping(root: string, deadline: number): { volume: Record<string
     return { volume, key: stable([volume.DeviceNode, volume.MountPoint, String(mounted.dev), volume.BusProtocol]) };
   }
   if (matches.length !== 1) return refuse();
-  const image = matches[0], pid = image['hdid-pid'];
+  const image = matches[0];
+  if (!image) return refuse();
+  const pid = image['hdid-pid'];
   if (volume.BusProtocol !== 'Disk Image' || volume.FilesystemType !== 'apfs' || volume.Writable !== false ||
       volume.WritableMedia !== false || volume.WritableVolume !== false || image.diskimages2 !== false ||
       image['image-type'] !== 'UDIF read-only' || image.writeable !== false || image['image-encrypted'] !== false ||
@@ -369,7 +371,7 @@ function helperBacking(image: Record<string, unknown>, backing: StorageDescripti
   for (let field of raw.split('\0')) {
     field = field.replace(/^\n/, '');
     if (!field) continue;
-    const tag = field[0], value = field.slice(1);
+    const tag = field.charAt(0), value = field.slice(1);
     if (tag === 'f') {
       current = { f: value };
       files.push(current);
@@ -380,10 +382,12 @@ function helperBacking(image: Record<string, unknown>, backing: StorageDescripti
   }
   if (processFields.p !== String(pid) || processFields.u !== String(process.getuid?.()) || !processFields.c) refuse();
   const vnode = (row: Record<string, string>, st: import('node:fs').BigIntStats): boolean => {
-    if (!/^0x[0-9a-f]+$/i.test(row.D ?? '') || !/^(0|[1-9][0-9]*)$/.test(row.i ?? '')) return false;
-    return BigInt(row.D) === st.dev && BigInt(row.i) === st.ino;
+    const device = row.D, inode = row.i;
+    if (typeof device !== 'string' || typeof inode !== 'string' ||
+        !/^0x[0-9a-f]+$/i.test(device) || !/^(0|[1-9][0-9]*)$/.test(inode)) return false;
+    return BigInt(device) === st.dev && BigInt(inode) === st.ino;
   };
-  const numeric = files.filter(row => /^[0-9]+$/.test(row.f));
+  const numeric = files.filter(row => /^[0-9]+$/.test(row.f ?? ''));
   if (new Set(numeric.map(row => row.f)).size !== numeric.length || numeric.some(row => !row.t || !row.a)) refuse();
   const regular = numeric.filter(row => row.t === 'REG');
   const held = fstatSync(backing.fd, { bigint: true });
@@ -396,13 +400,15 @@ function discoverStorage(root: string, deadline: number): StorageContext | undef
   try {
     const mapping = storageMapping(root, deadline);
     if (!mapping.image) return undefined;
-    descriptions.push(retainedDescription(root, true));
-    descriptions.push(retainedDescription(String(mapping.image['image-path']), false));
-    if (storageMapping(descriptions[1].path, deadline).image) refuse();
-    const backing = fstatSync(descriptions[1].fd, { bigint: true });
+    const rootDescription = retainedDescription(root, true);
+    descriptions.push(rootDescription);
+    const backingDescription = retainedDescription(String(mapping.image['image-path']), false);
+    descriptions.push(backingDescription);
+    if (storageMapping(backingDescription.path, deadline).image) refuse();
+    const backing = fstatSync(backingDescription.fd, { bigint: true });
     if (backing.uid !== BigInt(process.getuid?.() ?? -1) || (backing.mode & 0o022n)) refuse();
-    const context = Object.freeze({ descriptions: Object.freeze(descriptions), mapping: mapping.key });
-    helperBacking(mapping.image, descriptions[1], deadline);
+    const context = Object.freeze({ descriptions: Object.freeze([rootDescription, backingDescription] as const), mapping: mapping.key });
+    helperBacking(mapping.image, backingDescription, deadline);
     if (storageMapping(root, deadline).key !== context.mapping) refuse();
     storageAssert(context, deadline);
     return context;
