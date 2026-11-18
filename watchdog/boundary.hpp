@@ -207,16 +207,19 @@ class ReadOnlyMonitorImage final {
       value.st_ctimespec.tv_nsec == file_.st_ctimespec.tv_nsec;
   }
   bool sameMount(const struct statfs& value) const {
-    return (value.f_flags & MNT_RDONLY) && (mount_.f_flags & MNT_RDONLY) &&
+    constexpr auto requiredFlags = MNT_RDONLY | MNT_LOCAL;
+    return (value.f_flags & requiredFlags) == requiredFlags && (mount_.f_flags & requiredFlags) == requiredFlags &&
       !std::memcmp(&value.f_fsid, &mount_.f_fsid, sizeof(value.f_fsid)) &&
+      !std::strcmp(value.f_fstypename, mount_.f_fstypename) &&
       !std::strcmp(value.f_mntonname, mount_.f_mntonname) && !std::strcmp(value.f_mntfromname, mount_.f_mntfromname);
   }
   bool current() const {
     struct stat held{}, named{};
-    struct statfs heldMount{};
+    struct statfs heldMount{}, namedMount{};
     char openedPath[PATH_MAX]{};
     return !fstat(fd_, &held) && !lstat(path_.c_str(), &named) && sameFile(held) && sameFile(named) &&
-      !fstatfs(fd_, &heldMount) && sameMount(heldMount) && !fcntl(fd_, F_GETPATH, openedPath) && path_ == openedPath;
+      !fstatfs(fd_, &heldMount) && sameMount(heldMount) && !statfs(path_.c_str(), &namedMount) && sameMount(namedMount) &&
+      !fcntl(fd_, F_GETPATH, openedPath) && path_ == openedPath;
   }
 public:
   ReadOnlyMonitorImage() = default;
@@ -226,7 +229,7 @@ public:
 
   bool capture(const std::string& path) {
     if (fd_ >= 0 || !canonical(path) || statfs(path.c_str(), &mount_)) return false;
-    if (!(mount_.f_flags & MNT_RDONLY)) return true;
+    if (!sameMount(mount_)) return true;
     path_ = path;
     fd_ = open(path_.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     if (fd_ < 0 || fstat(fd_, &file_) || !current() || !signature(path_, false) || !current()) return false;
