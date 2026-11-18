@@ -98,6 +98,11 @@ function budget(deadline: number): number {
   if (deadline !== Infinity && (!Number.isFinite(deadline) || performance.now() >= deadline)) refuseVerification('verification-cutoff');
   return deadline === Infinity ? 5000 : Math.max(1, Math.min(5000, Math.floor(deadline - performance.now())));
 }
+// Only returned bytes are hashed. Keep tiny entries cheap while avoiding a
+// filesystem request for every 64 KiB of the embedded runtime.
+function fileReadBuffer(size: number): Buffer {
+  return Buffer.allocUnsafe(Math.min(512 * 1024, Math.max(1, size)));
+}
 /** Hash and inspect one verified description, with exactly one overflow byte.
  * Nonblocking no-follow open must precede fstat so a substituted FIFO cannot
  * wait for a writer. Physical symlinks are handled separately by the caller. */
@@ -109,7 +114,7 @@ function physicalFile(path: string, named: import('node:fs').Stats, deadline: nu
     if (!first.isFile() || !named.isFile() || first.dev !== named.dev || first.ino !== named.ino ||
         first.nlink !== 1 || named.nlink !== 1 || first.mode !== named.mode || first.uid !== named.uid ||
         !Number.isSafeInteger(first.size) || first.size < 0 || snapshotFilesystem(() => realpathSync(path), observed) !== path) refuseSnapshot('snapshot-file-description', observed);
-    const hash = createHash('sha256'), buffer = Buffer.alloc(65536), header = Buffer.alloc(4);
+    const hash = createHash('sha256'), buffer = fileReadBuffer(first.size), header = Buffer.alloc(4);
     let offset = 0;
     while (offset < first.size) {
       budget(deadline);
@@ -534,8 +539,13 @@ function synchronousNames(path: string, deadline: number, maximum: number, obser
     return refuseSnapshot('snapshot-directory-membership', observed);
   } catch (error) { noteSnapshotFailure(observed, error); throw error; } finally { if (directory) snapshotFilesystem(() => directory!.closeSync(), observed); budget(deadline); }
 }
-function asyncDirectory(path: string, observed?: SnapshotFailure): Promise<import('node:fs').Dir> {
-  return new Promise((resolve, reject) => snapshotFilesystem(() => rawOpendir(path, { encoding: 'buffer', bufferSize: 1 },
+function asyncDirectory(path: string, maximum: number, observed?: SnapshotFailure): Promise<import('node:fs').Dir> {
+  // Keep each native batch inside the existing entry limit plus the extra
+  // entry checked for overflow, including the last batch of a large directory.
+  const limit = maximum + 1;
+  let bufferSize = Math.min(32, limit);
+  while (limit % bufferSize !== 0) bufferSize--;
+  return new Promise((resolve, reject) => snapshotFilesystem(() => rawOpendir(path, { encoding: 'buffer', bufferSize },
     (error, directory) => error ? reject(rejectSnapshotFilesystem(error, observed)) : resolve(directory)), observed));
 }
 function asyncDirectoryRead(directory: import('node:fs').Dir, observed?: SnapshotFailure): Promise<import('node:fs').Dirent | null> {
@@ -553,7 +563,7 @@ async function asynchronousNames(path: string, expected: PhysicalEntry, active: 
   if (!before.isDirectory() || (beforeStamp = physicalStamp(before)) !== expected.stamp || await asyncRealpath(path, observed) !== path) refuseSnapshot(stampFailurePhase(identity, expected.stamp, beforeStamp), observed);
   const names: string[] = [], seen = new Set<string>(); let directory: import('node:fs').Dir | undefined;
   try {
-    active(); directory = await asyncDirectory(path, observed); active();
+    active(); directory = await asyncDirectory(path, maximum, observed); active();
     if (!sameDirectoryPath(directory, path)) refuseSnapshot(identity, observed);
     for (let index = 0; index <= maximum; ++index) {
       active(); const entry = await asyncDirectoryRead(directory, observed); active();
@@ -647,7 +657,7 @@ async function compareCompleteSnapshot(signed: SignedBundle, snapshot: FrozenSna
         const first = await asyncStat(fd, observed);
         if (!first.isFile() || first.nlink !== 1n || physicalStamp(first) !== expected.stamp || first.size < 0n || first.size > BigInt(Number.MAX_SAFE_INTEGER)) refuseSnapshot('snapshot-file-description', observed);
         const size = Number(first.size);
-        const hash = createHash('sha256'), buffer = Buffer.alloc(65536); let position = 0;
+        const hash = createHash('sha256'), buffer = fileReadBuffer(size); let position = 0;
         while (position < size) {
           active(); const count = await asyncRead(fd, buffer, Math.min(buffer.length, size - position), position, observed);
           active(); if (count < 1) refuseSnapshot('snapshot-file-read', observed); hash.update(buffer.subarray(0, count)); position += count;
