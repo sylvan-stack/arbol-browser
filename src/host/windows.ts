@@ -1,5 +1,6 @@
 import { consumeArmedHostSnapshot, type ArmedHostSnapshot } from '../runtime/custody.js';
 import { BaseWindow, WebContentsView, View, type Session } from 'electron';
+import { EventEmitter } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { realpathSync } from 'node:fs';
 import type { ProfileSessions } from '../profiles/session.js';
@@ -155,7 +156,7 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
     createPage(): PageSurface {
       assertWindowHost(host); boundary.fatal.assertHealthy(); boundary.native.assertIntegrity();
       if (closing) throw unavailable('browser');
-      const view = new WebContentsView({ webPreferences: preferences(sessions.website) });
+      const view = new WebContentsView({ webPreferences: { ...preferences(sessions.website), disableHtmlFullscreenWindowResize: true } });
       let current = boundary.native.ownership.bind(window.getNativeWindowHandle(), view.webContents.id,
         () => { window.contentView.addChildView(view); });
       let retired = false;
@@ -214,6 +215,24 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
           return completion;
         },
       });
+      // Keep Electron's actual modal only for the selected foreground user page.
+      // The capability provider can install stricter document checks around this listener.
+      const contents = view.webContents, emitter = contents as unknown as EventEmitter;
+      const raw = EventEmitter.prototype.rawListeners.call(emitter, '-run-dialog');
+      const listeners = EventEmitter.prototype.listeners.call(emitter, '-run-dialog');
+      const stock = raw[0];
+      if (raw.length !== 1 || listeners.length !== 1 || stock !== listeners[0] || typeof stock !== 'function')
+        return boundary.fatal.fail('native_boundary_unavailable');
+      const dialog = async (info: unknown, reply: (accepted: boolean, value: string) => void) => {
+        if (typeof reply !== 'function') return boundary.fatal.fail('native_boundary_unavailable');
+        if (closing || retired || selected !== page || window.isDestroyed() || !window.isFocused() ||
+            category(page) !== 'presented' || page.binding().blocked) return reply(false, '');
+        return Reflect.apply(stock, contents, [info, reply]);
+      };
+      EventEmitter.prototype.removeListener.call(emitter, '-run-dialog', stock);
+      EventEmitter.prototype.on.call(emitter, '-run-dialog', dialog);
+      const installed = EventEmitter.prototype.rawListeners.call(emitter, '-run-dialog');
+      if (installed.length !== 1 || installed[0] !== dialog) return boundary.fatal.fail('native_boundary_unavailable');
       surfaces.add(page); pages.add(page); page.present(false); categories.set(page, category(page)); return page;
     },
     select(page: PageSurface, commit: () => void = () => {}) {

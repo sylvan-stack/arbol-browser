@@ -39,6 +39,7 @@ const installed = new WeakSet<object>();
 // BRW-D36 denies write consent even to a current user-controlled tab. Read
 // consent remains independent; no policy callback can approve clipboard writes.
 const userPermissions = new Set<string>(['geolocation', 'notifications', 'clipboard-read', 'fullscreen', 'pointerLock']);
+const attentionPermissions = new Set<string>(['notifications', 'fullscreen', 'pointerLock']);
 const chooserKey = (frame: InspectionFrame) => JSON.stringify([frame.session ?? null, frame.frameId]);
 function unavailableBoundary(): BrowserFailure {
   return new BrowserFailure({ code: 'unsupported', message: 'The required agent capability boundary is unavailable.', retryable: false,
@@ -81,7 +82,7 @@ export class HostCapabilities {
         this.identity();
         const scope = this.requestScope(contents, details.isMainFrame, details.requestingUrl);
         if (userPermissions.has(permission) && this.userPolicy?.(scope, permission as UserPermission) === true) {
-          scope.assertCurrent(); allow = true;
+          scope.assertCurrent(); allow = !attentionPermissions.has(permission) || scope.page.window.window.isFocused();
         }
       } catch { /* Agent, unknown frame, stale user consent or closed page: deny. */ }
       callback(allow);
@@ -92,7 +93,7 @@ export class HostCapabilities {
         if (!contents || !userPermissions.has(permission)) return false;
         const scope = this.requestScope(contents, details.isMainFrame, details.requestingUrl);
         if (scope.origin !== origin || this.userPolicy?.(scope, permission as UserPermission) !== true) return false;
-        scope.assertCurrent(); return true;
+        scope.assertCurrent(); return !attentionPermissions.has(permission) || scope.page.window.window.isFocused();
       } catch { return false; }
     });
     this.captureHandler.call(website, (_request, callback) => {
@@ -164,8 +165,8 @@ export class HostCapabilities {
     if (address !== scope.document.frame.handle.url) throw unavailableBoundary(); scope.assertCurrent(); return scope;
   }
   /** Must run on the newly created genuine page, before website load/exposure.
-   * The sealed stock constructor supplies the sole -run-dialog listener. Keep
-   * its actual object identity, verify sole possession, and never clone/eval it. */
+   * Retain the sole window-gated -run-dialog listener which owns the genuine
+   * Electron modal promise. Verify its identity and never clone or evaluate it. */
   bindPage(target: TabTarget): void {
     this.identity(); assertPageSurface(target.page);
     if (this.closed || this.records.has(target) || this.records.size >= 64 || target.page.session !== this.sessions.website || target.page.retirement()) throw unavailableBoundary();
@@ -186,7 +187,7 @@ export class HostCapabilities {
         const current = EventEmitter.prototype.rawListeners.call(emitter, '-run-dialog');
         if (current.length !== 1 || current[0] !== dialog || typeof callback !== 'function') throw unavailableBoundary();
         scope = this.userScope(record);
-        if (info?.frame !== scope.document.frame.handle || modals.size) throw unavailableBoundary();
+        if (info?.frame !== scope.document.frame.handle || modals.size || !page.window.window.isFocused()) throw unavailableBoundary();
         scope.assertCurrent();
       } catch { if (typeof callback === 'function') callback(false, ''); return; }
       const token = Object.freeze({}); modals.add(token);
