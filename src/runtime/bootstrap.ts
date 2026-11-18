@@ -84,7 +84,7 @@ import type { NativeCompatibility } from '../native/preflight.js';
 import type { Binding, BindingKey } from '../native/api.js';
 import type { View, WebContentsView } from 'electron';
 import type { HostPreparation } from './host-entry.js';
-import type { HostNativeLifetime } from './lifecycle.js';
+import type { HostLifetimeStartup, HostNativeLifetime } from './lifecycle.js';
 import type { BuildSelection } from './selection.js';
 import { lstat, realpath } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
@@ -173,19 +173,30 @@ export function createNativeLifetime(boundary: NativeFailureBoundary, host: Host
   const ownership = handovers.get(boundary.watchdog);
   if (!ownership) return boundary.fatal.fail('native_integrity_unavailable');
   let attached = false, exiting = false;
-  const assertCustody = async () => {
+  const assertCustody = async (startup?: HostLifetimeStartup) => {
     boundary.fatal.assertHealthy(); boundary.watchdog.assertArmed(boundary.native.trust);
     if (!selection.guard || host.instance.record.build !== selection.build) throw unavailable('browser');
-    await host.instance.owner.assert(); await host.buildGuard.assert();
+    await host.instance.owner.assert();
+    const { custody } = host;
+    const startupBuild = startup && isHostCustody(custody) && custody.instance === host.instance &&
+      custody.build === host.buildGuard && host.instance.record.phase === 'starting' && startup.stillStarting() ? startup : undefined;
+    if (startupBuild) {
+      custody.assertRetained();
+      await assertAdoptedBuildContinuity(host.buildGuard, custody.host, startupBuild.deadline);
+      custody.assertRetained();
+    } else await host.buildGuard.assert();
     await assertHeldPath(host.instance.owner.profile.paths.owner, ownership.owner);
     await assertHeldPath(selection.guard, ownership.build);
     boundary.fatal.assertHealthy(); boundary.watchdog.assertArmed(boundary.native.trust);
+    return startupBuild;
   };
   const lifetime: HostNativeLifetime = Object.freeze({
-    async armRetainedLifetime(current: HostPreparation): Promise<void> {
+    async armRetainedLifetime(current: HostPreparation, startup?: HostLifetimeStartup): Promise<void> {
       try {
         if (attached || current !== host) return boundary.fatal.fail('native_integrity_unavailable');
-        await assertCustody(); attached = true;
+        const startupBuild = await assertCustody(startup);
+        if (startupBuild && (!startupBuild.stillStarting() || host.instance.record.phase !== 'starting')) await assertCustody();
+        attached = true;
       } catch { return boundary.fatal.fail('native_integrity_unavailable'); }
     },
     async assertReady(): Promise<void> {

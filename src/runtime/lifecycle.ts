@@ -368,10 +368,14 @@ export async function prepareOwnershipControl(boundary: import('./bootstrap.js')
   const proof = await proofs.prepareArmedHostSnapshot(custody, boundary.native.trust, 'ownership', documents, deadline);
   return host.createOwnershipHost(boundary, documents, operations, proof, documents);
 }
+export interface HostLifetimeStartup {
+  readonly deadline: number;
+  stillStarting(): boolean;
+}
 export interface HostNativeLifetime {
   /** Validate the already acknowledged native custody receipt against this exact
    * preparation; ABR-7 provides the primitive, ABR-29 the actual handle assembly. */
-  armRetainedLifetime(prepared: HostPreparation): Promise<void>;
+  armRetainedLifetime(prepared: HostPreparation, startup?: HostLifetimeStartup): Promise<void>;
   assertReady(): Promise<void>;
   /** Stop watchdog renewal synchronously before any possibly blocking cleanup. */
   quarantine(): void;
@@ -395,7 +399,10 @@ export function createHostLifecycle(prepared: HostPreparation, sessions: Profile
   const pending = new Set<Promise<void>>();
   const disconnected = new WeakSet<ConnectionContext>();
   const currentPhase = (): HostLifecycle['phase'] => phase;
-  const arm = () => arming ??= Promise.resolve().then(() => native.armRetainedLifetime(prepared));
+  const arm = (startup = false) => arming ??= Promise.resolve().then(() => {
+    if (!startup || phase !== 'starting' || productionDeadline === undefined) return native.armRetainedLifetime(prepared);
+    return native.armRetainedLifetime(prepared, { deadline: productionDeadline, stillStarting: () => phase === 'starting' });
+  });
   function synchronous(work: () => void): void { const result: unknown = work(); if (result !== undefined) throw unavailable('browser'); }
   function closeAdmission() { admitted = false; synchronous(() => control.closeAdmission()); synchronous(() => transport.closeAdmission()); }
   function fatal(): void {
@@ -462,7 +469,7 @@ export function createHostLifecycle(prepared: HostPreparation, sessions: Profile
       synchronous(() => control.assertPrepared());
       noteHostStartup(production ? prepared.custody : undefined, 'lifecycle-control-proof-after');
       noteHostStartup(production ? prepared.custody : undefined, 'lifecycle-arm-before');
-      await arm();
+      await arm(true);
       noteHostStartup(production ? prepared.custody : undefined, 'lifecycle-arm-after'); if (phase !== 'starting') throw unavailable('browser');
       noteHostStartup(production ? prepared.custody : undefined, 'lifecycle-readiness-prepare-before');
       const readyOnly = await nativeLifetimeReadiness(native, prepared);
