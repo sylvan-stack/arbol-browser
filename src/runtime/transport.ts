@@ -7,6 +7,7 @@ import { ownerUid, profileUnavailable } from '../profiles/paths.js';
 import type { PlatformPort, ProcessIdentity } from './platform.js';
 import { assertSocket, now, token, originalAlive, sameProcess, recordProcess,
   type RuntimeRecord, type RuntimeLocation } from './instance.js';
+import { noteHostStartup } from './custody.js';
 import { expectedBuild, type BuildSelection } from './selection.js';
 
 export type Endpoint = 'agent' | 'management';
@@ -466,6 +467,7 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
   if (protectedPort) protectedReadyServers.set(result, {
     open(custody, ready, guard, control) {
       try {
+        noteHostStartup(custody, 'protected-ready-validate-before');
         if (sealed || admission || servers.length !== 2 || ready.phase !== 'ready' ||
             !sameProcess(recordProcess(ready), recordProcess(record)) || ready.instance !== record.instance || ready.nonce !== record.nonce ||
             ready.profileInstance !== record.profileInstance || ready.profilePathHash !== record.profilePathHash || ready.build !== record.build ||
@@ -473,7 +475,10 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
         const handles = servers.map(server => (server as unknown as { _handle?: { fd?: number } })._handle?.fd);
         if (handles.some(value => !Number.isSafeInteger(value) || value! < 3) || handles[0] === handles[1]) return custody.terminate();
         if (guard() !== undefined) return custody.terminate();
+        noteHostStartup(custody, 'protected-ready-validate-after');
+        noteHostStartup(custody, 'protected-claim-ready-before');
         custody.ready(ready, handles[0]!, handles[1]!);
+        noteHostStartup(custody, 'protected-claim-ready-after');
         // No await, event-loop return or peer dispatch between durable native
         // attestation and this exact generation's actual gate opening.
         if (guard() !== undefined || control() !== undefined || guard() !== undefined || sealed) return custody.terminate();

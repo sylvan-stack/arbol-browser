@@ -3,7 +3,7 @@ import { setTimeout } from 'node:timers/promises';
 import type { Contract } from '../contracts/generated.js';
 import { unavailable, BrowserFailure } from '../contracts/errors.js';
 import { nativeLifetimeReadiness, preflightPageAdmission } from './bootstrap.js';
-import { isHostCustody } from './custody.js';
+import { noteHostStartup, isHostCustody } from './custody.js';
 import { isProductionExitAuthority, type ProductionExitAuthority } from './exit.js';
 import { archiveRemovedRuntime, assertProductionCloseReady } from './process.js';
 import { assertPlatform, type PlatformPort, type GroupProcess } from './platform.js';
@@ -458,25 +458,45 @@ export function createHostLifecycle(prepared: HostPreparation, sessions: Profile
     void (async () => {
       try {
       if (phase !== 'starting' || control.windowCount() < 1) throw unavailable('browser');
+      noteHostStartup(production ? prepared.custody : undefined, 'lifecycle-control-proof-before');
       synchronous(() => control.assertPrepared());
-      await arm(); if (phase !== 'starting') throw unavailable('browser');
+      noteHostStartup(production ? prepared.custody : undefined, 'lifecycle-control-proof-after');
+      noteHostStartup(production ? prepared.custody : undefined, 'lifecycle-arm-before');
+      await arm();
+      noteHostStartup(production ? prepared.custody : undefined, 'lifecycle-arm-after'); if (phase !== 'starting') throw unavailable('browser');
+      noteHostStartup(production ? prepared.custody : undefined, 'lifecycle-readiness-prepare-before');
       const readyOnly = await nativeLifetimeReadiness(native, prepared);
+      noteHostStartup(production ? prepared.custody : undefined, 'lifecycle-readiness-prepare-after');
       if (phase !== 'starting') throw unavailable('browser');
+      noteHostStartup(production ? prepared.custody : undefined, 'lifecycle-native-proof-before');
       if (readyOnly) await readyOnly(); else await native.assertReady();
+      noteHostStartup(production ? prepared.custody : undefined, 'lifecycle-native-proof-after');
       if (phase !== 'starting') throw unavailable('browser');
-      await prepared.engine.assertReady(); if (phase !== 'starting') throw unavailable('browser');
-      if (!readyOnly) await prepared.buildGuard.assert();
+      noteHostStartup(production ? prepared.custody : undefined, 'lifecycle-engine-proof-before');
+      await prepared.engine.assertReady();
+      noteHostStartup(production ? prepared.custody : undefined, 'lifecycle-engine-proof-after'); if (phase !== 'starting') throw unavailable('browser');
+      if (!readyOnly) {
+        noteHostStartup(production ? prepared.custody : undefined, 'lifecycle-build-proof-before');
+        await prepared.buildGuard.assert();
+        noteHostStartup(production ? prepared.custody : undefined, 'lifecycle-build-proof-after');
+      }
       if (phase !== 'starting') throw unavailable('browser');
+      noteHostStartup(production ? prepared.custody : undefined, 'lifecycle-owner-proof-before');
       await prepared.instance.owner.assert();
+      noteHostStartup(production ? prepared.custody : undefined, 'lifecycle-owner-proof-after');
       if (phase !== 'starting') throw unavailable('browser');
       // Real ready proofs have completed. Serialize its publication with any
       // later normal close so phase writes cannot race or resurrect readiness.
+      noteHostStartup(production ? prepared.custody : undefined, 'lifecycle-public-ready-before');
       phase = 'ready'; readyPublication = prepared.instance.phase('ready'); await readyPublication;
+      noteHostStartup(production ? prepared.custody : undefined, 'lifecycle-public-ready-after');
       if (phase !== 'ready') throw unavailable('browser');
       if (production) {
         if (productionDeadline === undefined) return prepared.custody.terminate();
         assertTime(productionDeadline);
+        noteHostStartup(prepared.custody, 'lifecycle-final-trust-before');
         await prepared.custody.host.assertTrusted(productionDeadline);
+        noteHostStartup(prepared.custody, 'lifecycle-final-trust-after');
         const generation = prepared.instance.record;
         const guard = () => {
           assertTime(productionDeadline);

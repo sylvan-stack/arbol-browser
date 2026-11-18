@@ -9,7 +9,7 @@ import { validator } from '../contracts/schema.js';
 import { packagedLayout, selectedLayout, type BuildSelection, type PackagedLayout } from './selection.js';
 import type { Contract } from '../contracts/generated.js';
 import { directory, assertDirectory } from '../profiles/paths.js';
-import { assertHostCustody } from './custody.js';
+import { noteHostStartup, assertHostCustody } from './custody.js';
 import type { SignedBundle, SignedVerificationPhase } from '../native/manifest.js';
 
 const physicalFS = process.getBuiltinModule(typeof process.versions.electron === 'string' ? 'original-fs' : 'fs') as typeof import('node:fs') | undefined;
@@ -99,6 +99,37 @@ export function bindArmedHost(host: VerifiedHost, custody: import('./custody.js'
   if (!verifiedHosts.has(host) || custody.host !== host || armedHosts.has(host)) throw unavailable('browser');
   assertHostCustody(custody); armedHosts.set(host, custody);
 }
+const armedTrustFailureStages = Object.freeze({
+  'bundle-selection': 'armed-trust-failure-bundle-selection',
+  'initial-snapshot': 'armed-trust-failure-initial-snapshot',
+  'outer-signature-verification': 'armed-trust-failure-outer-signature-verification',
+  'outer-signature-details': 'armed-trust-failure-outer-signature-details',
+  'outer-signature-entitlements': 'armed-trust-failure-outer-signature-entitlements',
+  'nested-signature-verification': 'armed-trust-failure-nested-signature-verification',
+  'nested-signature-details': 'armed-trust-failure-nested-signature-details',
+  'nested-signature-entitlements': 'armed-trust-failure-nested-signature-entitlements',
+  'publisher': 'armed-trust-failure-publisher',
+  'compatibility': 'armed-trust-failure-compatibility',
+  'inventory': 'armed-trust-failure-inventory',
+  'final-snapshot': 'armed-trust-failure-final-snapshot',
+  'final-physical-comparison': 'armed-trust-failure-final-physical-comparison',
+  'repeated-snapshot': 'armed-trust-failure-repeated-snapshot',
+  'repeated-physical': 'armed-trust-failure-repeated-physical',
+  'repeated-manifest': 'armed-trust-failure-repeated-manifest',
+  'repeated-cutoff': 'armed-trust-failure-repeated-cutoff',
+  'snapshot-receipt': 'armed-trust-failure-snapshot-receipt',
+  'verification-cutoff': 'armed-trust-failure-verification-cutoff',
+  'snapshot-root-identity': 'armed-trust-failure-snapshot-root-identity',
+  'snapshot-root-change-time': 'armed-trust-failure-snapshot-root-change-time',
+  'snapshot-entry-identity': 'armed-trust-failure-snapshot-entry-identity',
+  'snapshot-file-description': 'armed-trust-failure-snapshot-file-description',
+  'snapshot-file-read': 'armed-trust-failure-snapshot-file-read',
+  'storage-context': 'armed-trust-failure-storage-context',
+  'snapshot-symlink': 'armed-trust-failure-snapshot-symlink',
+  'snapshot-directory-membership': 'armed-trust-failure-snapshot-directory-membership',
+  'snapshot-encoded-mismatch': 'armed-trust-failure-snapshot-encoded-mismatch',
+  'snapshot-filesystem': 'armed-trust-failure-snapshot-filesystem'
+} as const satisfies Record<SignedVerificationPhase, import('./platform.js').HostStartupStage>);
 const hostPolicyKeys = ['format', 'purpose', 'build', 'buildRoot', 'stateRoot', 'sourceDigest', 'productDigest',
   'metadataDigest', 'compatibilityDigest', 'reviewDigest', 'qualificationDigest', 'readerKey',
   'readableReaderKeys', 'readableDataEpochs'].sort().join(',');
@@ -274,24 +305,45 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
         await realpath(selection.guard) !== selection.guard) throw unavailable('browser');
     assertBudget(limit);
   };
+  // Observation only: earlier armed scans cannot consume final ready labels.
+  let readyTrustObserved = false;
   const result: VerifiedHost = Object.freeze({ identity, policy, signed, policyDigest: rawPolicy.digest, guardIdentity,
     async assertTrusted(limit: number) {
       if (!verifiedHosts.has(result)) throw unavailable('browser');
       const custody = armedHosts.get(result);
+      let observeReady = false;
       try {
         assertBudget(limit); if (custody) assertHostCustody(custody);
+        try {
+          if (custody && custody.host === result && custody.instance.record.phase === 'ready' && !readyTrustObserved) {
+            readyTrustObserved = true; observeReady = true;
+          }
+        } catch { /* Observation never replaces verification or its failure. */ }
+        if (observeReady) noteHostStartup(custody, 'ready-trust-metadata-before');
         if ((await physicalJson(policyFile, 1048576, limit)).digest !== rawPolicy.digest ||
             (await physicalJson(join(payload, 'metadata.json'), 1048576, limit)).digest !== identity.metadataDigest ||
             (await physicalJson(join(layout.bundle, 'Contents/Resources/native-compatibility.json'), 1048576, limit)).digest !== compatibility.digest)
           throw unavailable('browser');
+        if (observeReady) noteHostStartup(custody, 'ready-trust-metadata-after');
         assertBudget(limit);
+        if (observeReady) noteHostStartup(custody, 'ready-trust-isolation-before');
         await assertIsolation(layout, policy.stateRoot, limit);
+        if (observeReady) noteHostStartup(custody, 'ready-trust-isolation-after');
+        if (observeReady) noteHostStartup(custody, 'ready-trust-guard-before');
         await assertGuard(limit);
+        if (observeReady) noteHostStartup(custody, 'ready-trust-guard-after');
+        if (observeReady) noteHostStartup(custody, 'ready-trust-directories-before');
         for (const path of [layout.buildRoot, layout.bundle, layout.payload]) { assertBudget(limit); await directory(path, false); }
+        if (observeReady) noteHostStartup(custody, 'ready-trust-directories-after');
         if (custody) {
           assertHostCustody(custody);
+          if (observeReady) noteHostStartup(custody, 'ready-trust-snapshot-before');
           const proof = await manifests.compareSignedSnapshot(signed, limit);
-          assertHostCustody(custody); manifests.consumeSignedSnapshot(proof, signed, limit);
+          if (observeReady) noteHostStartup(custody, 'ready-trust-snapshot-after');
+          assertHostCustody(custody);
+          if (observeReady) noteHostStartup(custody, 'ready-trust-consume-before');
+          manifests.consumeSignedSnapshot(proof, signed, limit);
+          if (observeReady) noteHostStartup(custody, 'ready-trust-consume-after');
           assertHostCustody(custody);
         } else signed.assertIdentity(limit);
         assertBudget(limit);
@@ -300,6 +352,7 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
           const phase = manifests.readSignedVerificationPhase(error);
           if (observation && verificationStages.has(observation) && phase && !verificationFailurePhases.has(observation))
             verificationFailurePhases.set(observation, phase);
+          if (custody && phase) noteHostStartup(custody, armedTrustFailureStages[phase]);
         } catch { /* Observation cannot alter custody or the original failure. */ }
         // Detected armed package drift closes the real original even if an
         // upstream caller would otherwise redact or swallow an exception.

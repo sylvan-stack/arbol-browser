@@ -642,7 +642,90 @@ static void observeNativeRefusal(Custody* c) noexcept {
 static const char* const hostStartupStages[]={"arm-readback","native-install-snapshot","native-feature-addon-preflight",
   "engine-authority","owned-lease-policy","engine-owner-policy","marker-read","existing-marker-compatibility",
   "fresh-marker-compatibility","verified-prior-exit","native-marker-permit",
-  "watchdog-spawn-loss","watchdog-readiness-loss","watchdog-pipe-error","watchdog-pipe-end","watchdog-ack-malformed","watchdog-ack-order","watchdog-ack-expiry","watchdog-custody-refusal","watchdog-termination","watchdog-transport-loss","native_integrity_unavailable","native_retirement_unavailable","native_watchdog_unavailable","native_boundary_unavailable"};
+  "watchdog-spawn-loss","watchdog-readiness-loss","watchdog-pipe-error","watchdog-pipe-end","watchdog-ack-malformed","watchdog-ack-order","watchdog-ack-expiry","watchdog-custody-refusal","watchdog-termination","watchdog-transport-loss","native_integrity_unavailable","native_retirement_unavailable","native_watchdog_unavailable","native_boundary_unavailable",
+  "host-session-configure-before",
+  "host-session-configure-after",
+  "host-session-bind-before",
+  "host-session-bind-after",
+  "host-control-prepare-before",
+  "host-control-prepare-after",
+  "host-shell-port-before",
+  "host-shell-port-after",
+  "host-shell-integrate-before",
+  "host-shell-integrate-after",
+  "host-control-bind-before",
+  "host-control-bind-after",
+  "host-listeners-before",
+  "host-listeners-after",
+  "host-lifecycle-bind-before",
+  "host-lifecycle-bind-after",
+  "host-shell-load-before",
+  "host-shell-load-after",
+  "host-lifecycle-ready-before",
+  "host-lifecycle-ready-after",
+  "lifecycle-control-proof-before",
+  "lifecycle-control-proof-after",
+  "lifecycle-arm-before",
+  "lifecycle-arm-after",
+  "lifecycle-readiness-prepare-before",
+  "lifecycle-readiness-prepare-after",
+  "lifecycle-native-proof-before",
+  "lifecycle-native-proof-after",
+  "lifecycle-engine-proof-before",
+  "lifecycle-engine-proof-after",
+  "lifecycle-build-proof-before",
+  "lifecycle-build-proof-after",
+  "lifecycle-owner-proof-before",
+  "lifecycle-owner-proof-after",
+  "lifecycle-public-ready-before",
+  "lifecycle-public-ready-after",
+  "lifecycle-final-trust-before",
+  "lifecycle-final-trust-after",
+  "protected-ready-validate-before",
+  "protected-ready-validate-after",
+  "protected-claim-ready-before",
+  "protected-claim-ready-after",
+  "ready-trust-metadata-before",
+  "ready-trust-metadata-after",
+  "ready-trust-isolation-before",
+  "ready-trust-isolation-after",
+  "ready-trust-guard-before",
+  "ready-trust-guard-after",
+  "ready-trust-directories-before",
+  "ready-trust-directories-after",
+  "ready-trust-snapshot-before",
+  "ready-trust-snapshot-after",
+  "ready-trust-consume-before",
+  "ready-trust-consume-after",
+  "armed-trust-failure-bundle-selection",
+  "armed-trust-failure-initial-snapshot",
+  "armed-trust-failure-outer-signature-verification",
+  "armed-trust-failure-outer-signature-details",
+  "armed-trust-failure-outer-signature-entitlements",
+  "armed-trust-failure-nested-signature-verification",
+  "armed-trust-failure-nested-signature-details",
+  "armed-trust-failure-nested-signature-entitlements",
+  "armed-trust-failure-publisher",
+  "armed-trust-failure-compatibility",
+  "armed-trust-failure-inventory",
+  "armed-trust-failure-final-snapshot",
+  "armed-trust-failure-final-physical-comparison",
+  "armed-trust-failure-repeated-snapshot",
+  "armed-trust-failure-repeated-physical",
+  "armed-trust-failure-repeated-manifest",
+  "armed-trust-failure-repeated-cutoff",
+  "armed-trust-failure-snapshot-receipt",
+  "armed-trust-failure-verification-cutoff",
+  "armed-trust-failure-snapshot-root-identity",
+  "armed-trust-failure-snapshot-root-change-time",
+  "armed-trust-failure-snapshot-entry-identity",
+  "armed-trust-failure-snapshot-file-description",
+  "armed-trust-failure-snapshot-file-read",
+  "armed-trust-failure-storage-context",
+  "armed-trust-failure-snapshot-symlink",
+  "armed-trust-failure-snapshot-directory-membership",
+  "armed-trust-failure-snapshot-encoded-mismatch",
+  "armed-trust-failure-snapshot-filesystem"};
 // New failure labels alone may observe a genuine pre-bind fatal context.
 // Ordinary milestone guards below, including bound, remain unchanged.
 static constexpr int hostLossStart=11;
@@ -650,7 +733,7 @@ static std::atomic<bool> hostLossEmitted{false};
 static void observeHostLoss(Custody* c,int stage) noexcept {
   int saved=errno;
   @autoreleasepool { @try { try {
-    if(stage>=hostLossStart&&stage<(int)(sizeof(hostStartupStages)/sizeof(hostStartupStages[0]))&&
+    if(stage>=hostLossStart&&stage<=24&&
        c&&nativeCustodies.count(c)&&c->continuousBuild&&c->hostRequired&&c->finalization.present()&&
        c->finalization.shared()->fatal.load(std::memory_order_acquire)&&
        getpid()==c->context.main.pid&&arbol_boundary::current(c->context.main)==1&&
@@ -661,7 +744,7 @@ static void observeHostLoss(Custody* c,int stage) noexcept {
   errno=saved;
 }
 static void observeHostStartup(Custody* c,int stage) noexcept {
-  if(stage>=hostLossStart) { observeHostLoss(c,stage); return; }
+  if(stage>=hostLossStart&&stage<=24) { observeHostLoss(c,stage); return; }
   int saved=errno;
   @autoreleasepool { @try { try {
     if(c&&nativeCustodies.count(c)&&stage>=0&&stage<(int)(sizeof(hostStartupStages)/sizeof(hostStartupStages[0]))&&
@@ -1350,7 +1433,10 @@ static napi_value publishHostReady(napi_env env,napi_callback_info info) {
      !integer(env,args[2],&agent)||!integer(env,args[3],&management)) return fail(env);
   auto* c=custodyArgument(env,args[0]);
   if(!c||!c->hostRequired||!c->bound||getpid()!=c->context.main.pid||!c->finalization.present()) return fail(env);
-  auto reject=[&](unsigned line = __builtin_LINE()) { c->finalization.shared()->declareFatal(); return fail(env,line); };
+  auto reject=[&](unsigned line = __builtin_LINE()) {
+    c->finalization.shared()->declareFatal(); auto failure=fail(env,line);
+    observeNativeRefusal(c); return failure;
+  };
   if(c->readyAttempted) return reject(); c->readyAttempted=true;
   @autoreleasepool { @try { try {
     auto* state=c->finalization.shared(); NSDictionary* runtime=arbol_attempt::json(encoded);

@@ -126,7 +126,9 @@ export async function prepareHost(actualApp: ProfileApp, owned: OwnedHost, autho
     if (authority.build !== instance.record.build) return custody.terminate();
     const engine = await prepareEngine(instance.owner, authority, stage => noteHostStartup(custody, stage));
     custody.assertRetained(); custody.assertMarker();
+    noteHostStartup(custody, 'host-session-configure-before');
     const binding = await configureProfileSession(actualApp, engine, custody);
+    noteHostStartup(custody, 'host-session-configure-after');
     if (actualApp.isReady()) return custody.terminate();
     const prepared: HostPreparation = Object.freeze({ ...owned, engine, binding });
     ownedHosts.add(prepared); return prepared;
@@ -164,29 +166,45 @@ async function assembleAfterReady(prepared: HostPreparation, sessions: ProfileSe
   };
   try {
     current(); sessionModule.assertProductionSessions(sessions, prepared.custody);
+    noteHostStartup(prepared.custody, 'host-control-prepare-before');
     const control = await bootstrap.prepareRendererControl(boundary, prepared, request.selection, deadline);
+    noteHostStartup(prepared.custody, 'host-control-prepare-after');
     state.control = control; current();
-    const port = await bootstrap.prepareNativeShellPort(boundary); current();
+    noteHostStartup(prepared.custody, 'host-shell-port-before');
+    const port = await bootstrap.prepareNativeShellPort(boundary);
+    noteHostStartup(prepared.custody, 'host-shell-port-after'); current();
+    noteHostStartup(prepared.custody, 'host-shell-integrate-before');
     const shell = await bootstrap.integrateTrustedShell(port, prepared, request.selection, sessions,
       control.ownership.lifecycle, control.ownership.shell, deadline);
+    noteHostStartup(prepared.custody, 'host-shell-integrate-after');
     state.shell = shell; current();
     // Genuine physical shell is still hidden and empty. No load/show precedes
     // real controller/window/registration binding in the accepted graph.
+    noteHostStartup(prepared.custody, 'host-control-bind-before');
     control.bind(shell.tabs, shell.host, shell.registration);
+    noteHostStartup(prepared.custody, 'host-control-bind-after');
+    noteHostStartup(prepared.custody, 'host-listeners-before');
     const transport = await transports.listenProtectedTransport(prepared.instance.location, prepared.instance.record, platform,
       control.ownership.dispatch);
+    noteHostStartup(prepared.custody, 'host-listeners-after');
     state.transport = transport; current();
     const shutdown = sessionModule.productionSessionShutdown(sessions, prepared.custody);
     const native = bootstrap.createNativeLifetime(boundary, prepared, request.selection, () => shutdown.quit());
+    noteHostStartup(prepared.custody, 'host-lifecycle-bind-before');
     const runtime = lifecycle.createHostLifecycle(prepared, sessions, transport, control.ownership.control, native, deadline, platform);
     state.runtime = runtime; control.ownership.bindRuntime(runtime);
+    noteHostStartup(prepared.custody, 'host-lifecycle-bind-after');
     app.on('before-quit', event => {
       if (shutdown.isQuitting()) return;
       event.preventDefault(); void runtime.close().catch(() => {});
     });
     app.on('window-all-closed', () => runtime.lastWindowClosed());
-    await shell.registration.load(); current(); shell.registration.assertLoaded();
-    await runtime.ready(); current();
+    noteHostStartup(prepared.custody, 'host-shell-load-before');
+    await shell.registration.load();
+    noteHostStartup(prepared.custody, 'host-shell-load-after'); current(); shell.registration.assertLoaded();
+    noteHostStartup(prepared.custody, 'host-lifecycle-ready-before');
+    await runtime.ready();
+    noteHostStartup(prepared.custody, 'host-lifecycle-ready-after'); current();
   } catch {
     if (state.runtime?.phase === 'closing') return; // actual bounded native shutdown already owns abandonment
     state.closed = true; return boundary.fatal.fail('native_boundary_unavailable');
@@ -259,7 +277,9 @@ export async function runHostEntry(): Promise<void> {
       try {
         assertTime(deadline); prepared.custody.assertRetained();
         if (!app.isReady() || state.closed) return prepared.custody.terminate();
+        noteHostStartup(prepared.custody, 'host-session-bind-before');
         const sessions = await bindHostSessions(prepared);
+        noteHostStartup(prepared.custody, 'host-session-bind-after');
         assertTime(deadline); prepared.custody.assertRetained();
         if (state.closed) return prepared.custody.terminate();
         await assembleAfterReady(prepared, sessions, installed, request, state, deadline, native.platform);
