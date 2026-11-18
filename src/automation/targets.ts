@@ -1,9 +1,10 @@
 import type { ActionTarget } from './admission.js';
 import { staleSnapshot } from '../host/authority.js';
-import { BrowserFailure } from '../contracts/errors.js';
+import { BrowserFailure, ForegroundWorkRequired } from '../contracts/errors.js';
 
 export type TargetUse = 'click' | 'key' | 'type' | 'scroll' | 'drag';
 export interface TargetPoint { readonly x: number; readonly y: number }
+const nativePickerTypes = new Set(['file', 'color', 'date', 'datetime-local', 'month', 'time', 'week']);
 function unsuitable(): never {
   throw new BrowserFailure({ code: 'control_refused', message: 'The original target cannot accept this operation.', retryable: true,
     remedy: 'Inspect current page state or use Take control.' });
@@ -15,21 +16,25 @@ export async function suitable(target: ActionTarget, use: TargetUse): Promise<vo
   const { readiness, fields } = target.inspection;
   const classified = await fields.classify(target.frame, target.guard); target.guard();
   const field = classified.nodes.get(target.backend);
-  if (!field || field.sensitive || field.unavailable || field.signature.length !== 64) unsuitable();
+  if (field?.sensitive) throw new ForegroundWorkRequired('tab');
+  if (!field || field.unavailable || field.signature.length !== 64) unsuitable();
   if (use === 'type' && !field.editable) unsuitable();
-  // Native file chooser is a separate engine surface; never initiate it with a
-  // click/key and hope a general permission callback will see it.
+  // Native pickers use separate engine surfaces outside the permission callback.
   const described = await readiness.inspect(target.frame, target.guard, 'DOM.describeNode', { backendNodeId: target.backend, depth: 0 }) as {
-    node?: { backendNodeId?: number; nodeType?: number; attributes?: string[] } };
+    node?: { backendNodeId?: number; nodeType?: number; localName?: string; attributes?: string[] } };
   target.guard();
   if (described.node?.backendNodeId !== target.backend || ![1, 9].includes(described.node.nodeType ?? 0)) throw staleSnapshot();
   const attributes = described.node.attributes ?? [];
   if (attributes.length > 4096 || attributes.length % 2) throw staleSnapshot();
+  let opensNativePicker = false;
   for (let i = 0; i < attributes.length; i += 2) {
     const name = attributes[i]!.toLowerCase(), value = attributes[i + 1]!.toLowerCase();
     if (name === 'disabled' || name === 'inert' || (name === 'aria-disabled' && value === 'true') ||
-        (name === 'type' && value === 'file') || (use === 'type' && name === 'readonly')) unsuitable();
+        (use === 'type' && name === 'readonly')) unsuitable();
+    if (name === 'type' && described.node.localName === 'input' && nativePickerTypes.has(value) &&
+        (value === 'file' || use === 'click' || use === 'key')) opensNativePicker = true;
   }
+  if (opensNativePicker) throw new ForegroundWorkRequired('tab');
   const ax = await readiness.inspect(target.frame, target.guard, 'Accessibility.getPartialAXTree',
     { backendNodeId: target.backend, fetchRelatives: false }) as { nodes?: { backendDOMNodeId?: number; ignored?: boolean;
       role?: { value?: string }; properties?: { name: string; value: { value?: unknown } }[] }[] };

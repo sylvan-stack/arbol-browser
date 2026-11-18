@@ -1,6 +1,6 @@
 import { performance } from 'node:perf_hooks';
 import type { Contract } from '../contracts/generated.js';
-import { BrowserFailure, type ErrorCode } from '../contracts/errors.js';
+import { BrowserFailure, ForegroundWorkRequired, type ErrorCode } from '../contracts/errors.js';
 import { TabAuthority, type AuthorityStamp, type DocumentReceipt, type Invalidation, type NavigationContinuation } from './authority.js';
 import type { HandoffOperations } from './handoff.js';
 import { refused, type TabTarget } from './tabs.js';
@@ -81,6 +81,7 @@ export class ActionQueue implements HandoffOperations {
   private readonly slots = new Map<TabTarget, Slot>();
   private readonly tasks = new Set<Task>();
   private readonly interrupted = new WeakMap<TabTarget, Task | undefined>();
+  private readonly awaitingManualWork = new WeakMap<TabTarget, number>();
   private readonly preparations = new Set<Preparation>();
   private readonly executions = new WeakMap<ActionExecution, Task>();
   private readonly captures = new Map<TabTarget, Task>();
@@ -99,6 +100,11 @@ export class ActionQueue implements HandoffOperations {
     this.authority.check(task.stamp, task.mutation);
     if (task.terminal || task.retired || task.controller.signal.aborted || performance.now() >= task.deadline) throw this.failure(task, 'control_refused');
     if (task.mutation) this.authority.requireSnapshot(task.snapshot!, task.stamp);
+  }
+  private assertBackgroundInput(task: Task): void {
+    const { target, generation, document } = task.stamp;
+    if (task.mutation && (this.awaitingManualWork.get(target) === generation || document.page.window.window.isFocused()))
+      throw new ForegroundWorkRequired('tab');
   }
   private safe(task: Task): void {
     if (task.retired || (task.workDone && !task.captureHeld && task.issued.size === 0 && task.sequences.size === 0 && (!task.dispatched || !task.mutation || task.settled))) {
@@ -146,6 +152,7 @@ export class ActionQueue implements HandoffOperations {
       get command() { return task.command; }, get navigation() { return task.navigation; },
       dispatch: <U>(command: () => Promise<U>): Promise<U> => {
         this.check(task);
+        this.assertBackgroundInput(task);
         if (task.command >= Number.MAX_SAFE_INTEGER) return this.authority.exhausted();
         ++task.command;
         if (task.mutation && !task.navigation) task.navigation = this.authority.beginContinuation(stamp, task.action!, operation);
@@ -198,6 +205,7 @@ export class ActionQueue implements HandoffOperations {
       task.started = true;
       try {
         this.check(task);
+        this.assertBackgroundInput(task);
         if (!task.mutation) { task.countedRead = true; ++this.reads; if (task.screenshot) ++this.screenshots; }
         const value = await work(execution);
         if (task.mutation && (!task.settled || task.issued.size || task.sequences.size)) throw this.failure(task, 'control_refused');
@@ -209,6 +217,14 @@ export class ActionQueue implements HandoffOperations {
         // classified refusal. Only this recognized read condition keeps the
         // fixed remedy; arbitrary provider strings never cross the queue.
         let current = error;
+        if (task.mutation && !task.dispatched && current instanceof ForegroundWorkRequired) {
+          try {
+            this.check(task);
+            this.awaitingManualWork.set(stamp.target, stamp.generation);
+            reject(new ForegroundWorkRequired('tab', task.action));
+            return;
+          } catch (changed) { current = changed; }
+        }
         if (!task.mutation && current instanceof ClassifiedGeometryRefusal)
           try { this.authority.check(task.stamp); } catch (changed) { current = changed; }
         if (!task.mutation && !task.controller.signal.aborted && !task.retired && performance.now() < task.deadline &&
