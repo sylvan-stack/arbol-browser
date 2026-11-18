@@ -1,4 +1,4 @@
-import { constants, type Stats } from 'node:fs';
+import { constants, lstatSync, realpathSync, type Stats } from 'node:fs';
 import { lstat, mkdir, open, realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
@@ -46,6 +46,23 @@ export async function directory(path: string, privateMode = true): Promise<Ident
   const stat = await lstat(path);
   if (privateMode && (stat.uid !== uid || (stat.mode & 0o7777) !== 0o700)) throw profileUnavailable();
   if (await realpath(path) !== path) throw profileUnavailable();
+  return identity(stat);
+}
+/** Same checks without yielding while a genuine short Claim is held. */
+export function directorySync(path: string, privateMode = true): Identity {
+  if (!isAbsolute(path) || resolve(path) !== path || path.includes('\0')) throw profileUnavailable();
+  const root = parse(path).root;
+  let cursor = root;
+  const uid = ownerUid();
+  for (const part of path.slice(root.length).split('/').filter(Boolean)) {
+    cursor = join(cursor, part);
+    const st = lstatSync(cursor);
+    if (!st.isDirectory() || st.isSymbolicLink() || (st.mode & 0o022) !== 0 ||
+        (st.uid !== uid && st.uid !== 0)) throw profileUnavailable();
+  }
+  const stat = lstatSync(path);
+  if (privateMode && (stat.uid !== uid || (stat.mode & 0o7777) !== 0o700)) throw profileUnavailable();
+  if (realpathSync(path) !== path) throw profileUnavailable();
   return identity(stat);
 }
 export async function assertDirectory(path: string, expected: Identity): Promise<void> {

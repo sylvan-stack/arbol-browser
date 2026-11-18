@@ -70,7 +70,7 @@ export async function withLaunchAttempt<T>(profile: ProfileSnapshot, platform: P
       held = platform.tryLock(join(location.leaf, 'claim.lock')) ?? undefined;
       if (!held) await setTimeout(Math.min(25, Math.max(1, contention - now())));
     }
-    assertTime(deadline); await location.assert(); held.assertIdentity();
+    assertTime(deadline); location.assertSync(); held.assertIdentity();
     let raw = platform.readLaunchAttempt(held);
     let current = raw === null ? undefined : parseAttempt(raw, location);
     active = true;
@@ -95,7 +95,7 @@ export async function withLaunchAttempt<T>(profile: ProfileSnapshot, platform: P
       catch { detachResults.set(result, 'uncertain'); }
       return result;
     }
-    await location.assert(); held.assertIdentity(); assertTime(deadline); return result;
+    location.assertSync(); held.assertIdentity(); assertTime(deadline); return result;
   } finally { active = false; held?.release(); }
 }
 

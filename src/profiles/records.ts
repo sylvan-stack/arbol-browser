@@ -1,9 +1,9 @@
-import { constants } from 'node:fs';
+import { constants, openSync, closeSync, fstatSync, lstatSync, readSync } from 'node:fs';
 import { lstat, open } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { validator } from '../contracts/schema.js';
 import type { Contract } from '../contracts/generated.js';
-import { directory, identity, sameIdentity, privateFile, profileId, profileMissing, profileUnavailable,
+import { directory, directorySync, identity, sameIdentity, privateFile, profileId, profileMissing, profileUnavailable,
   missing, type Identity, type ProfilePaths, assertDirectory } from './paths.js';
 
 export type ProfileRecord = Contract<'profile.ProfileRecord'>;
@@ -27,6 +27,22 @@ export async function readJson(path: string, maxBytes = 65536): Promise<{ value:
     const value: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, bytesRead)));
     return { value, identity: identity(before) };
   } finally { await handle.close(); }
+}
+function readJsonSync(path: string, maxBytes = 65536): { value: unknown; identity: Identity } {
+  const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const before = fstatSync(descriptor); privateFile(before);
+    if (before.size > maxBytes) throw profileUnavailable();
+    const bytes = Buffer.alloc(maxBytes + 1);
+    const bytesRead = readSync(descriptor, bytes, 0, bytes.length, 0);
+    const after = fstatSync(descriptor); privateFile(after);
+    const published = lstatSync(path); privateFile(published);
+    if (!sameIdentity(identity(published), identity(before))) throw profileUnavailable();
+    if (bytesRead !== before.size || bytesRead > maxBytes || after.size !== before.size ||
+        after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) throw profileUnavailable();
+    const value: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, bytesRead)));
+    return { value, identity: identity(before) };
+  } finally { closeSync(descriptor); }
 }
 export function validatedRecord(value: unknown, id: string): Readonly<ProfileRecord> {
   if (!validator('profile.ProfileRecord')(value) || value.id !== id || !value.createdAt.endsWith('Z')) throw profileUnavailable();
@@ -59,6 +75,31 @@ export async function readProfile(paths: ProfilePaths): Promise<ProfileSnapshot>
 }
 export async function assertProfile(snapshot: ProfileSnapshot): Promise<void> {
   const current = await readProfile(snapshot.paths);
+  if (!sameIdentity(current.rootIdentity, snapshot.rootIdentity) ||
+      !sameIdentity(current.dataIdentity, snapshot.dataIdentity) ||
+      !sameIdentity(current.recordIdentity, snapshot.recordIdentity) ||
+      JSON.stringify(current.record) !== JSON.stringify(snapshot.record)) throw profileUnavailable();
+}
+/** Retain the complete readProfile/assertProfile proof inside the short Claim. */
+export function assertProfileSync(snapshot: ProfileSnapshot): void {
+  const paths = snapshot.paths;
+  let current: ProfileSnapshot;
+  try {
+    directorySync(paths.state); directorySync(paths.profiles);
+    const rootIdentity = directorySync(paths.root);
+    const raw = readJsonSync(paths.record);
+    const record = validatedRecord(raw.value, paths.id);
+    const dataIdentity = directorySync(paths.data);
+    directorySync(paths.logs);
+    if (!sameIdentity(directorySync(paths.root), rootIdentity)) throw profileUnavailable();
+    current = Object.freeze({ paths, record, rootIdentity, recordIdentity: raw.identity, dataIdentity });
+  } catch (error) {
+    if (missing(error)) {
+      try { lstatSync(paths.root); }
+      catch (rootError) { if (missing(rootError)) throw profileMissing(); throw profileUnavailable(); }
+    }
+    throw profileUnavailable();
+  }
   if (!sameIdentity(current.rootIdentity, snapshot.rootIdentity) ||
       !sameIdentity(current.dataIdentity, snapshot.dataIdentity) ||
       !sameIdentity(current.recordIdentity, snapshot.recordIdentity) ||

@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
+import { lstatSync, realpathSync } from 'node:fs';
 import { lstat, mkdir, realpath, rename, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -7,7 +8,7 @@ import type { Contract } from '../contracts/generated.js';
 import { validator } from '../contracts/schema.js';
 import { unavailable } from '../contracts/errors.js';
 import { ownerUid, privateFile, identity, sameIdentity, statOrAbsent, profileUnavailable, type Identity } from '../profiles/paths.js';
-import { assertProfile, readJson, writeNewFile, type ProfileSnapshot } from '../profiles/records.js';
+import { assertProfile, assertProfileSync, readJson, writeNewFile, type ProfileSnapshot } from '../profiles/records.js';
 import { ownerLock, type OwnerLease } from '../profiles/locking.js';
 import type { HeldLock, PlatformPort, ProcessIdentity } from './platform.js';
 
@@ -30,9 +31,15 @@ export interface RuntimeLocation {
   readonly profile: ProfileSnapshot; readonly parent: string; readonly leaf: string; readonly hash: string;
   readonly agent: string; readonly management: string; readonly record: string;
   assert(): Promise<void>;
+  assertSync(): void;
 }
 async function privateDirectory(path: string): Promise<Identity> {
   const st = await lstat(path);
+  if (!st.isDirectory() || st.uid !== ownerUid() || (st.mode & 0o7777) !== 0o700) throw profileUnavailable();
+  return identity(st);
+}
+function privateDirectorySync(path: string): Identity {
+  const st = lstatSync(path);
   if (!st.isDirectory() || st.uid !== ownerUid() || (st.mode & 0o7777) !== 0o700) throw profileUnavailable();
   return identity(st);
 }
@@ -62,6 +69,12 @@ export async function runtimeLocation(profile: ProfileSnapshot, create = false):
           !sameIdentity(leafIdentity, await privateDirectory(leaf)) || await realpath('/tmp') !== tmp)
         throw profileUnavailable();
       await assertProfile(profile);
+    },
+    assertSync() {
+      if (!sameIdentity(parentIdentity, privateDirectorySync(parent)) ||
+          !sameIdentity(leafIdentity, privateDirectorySync(leaf)) || realpathSync('/tmp') !== tmp)
+        throw profileUnavailable();
+      assertProfileSync(profile);
     },
   });
   await location.assert(); return location;
