@@ -81,7 +81,7 @@ if (args.length === 6) {
   assert.equal(args[4], '--native-consumer');
   assert.equal(args[5], nativeConsumer.manifest, 'Only the pinned ABR-46 manifest can qualify this gate');
 }
-const buildRoot = await realpath(args[1]), candidate = join(buildRoot, 'ArbolBrowser.app/Contents/Resources/browser'), output = resolve(args[3]);
+const buildRoot = await realpath(args[1]), candidate = join(buildRoot, 'app/ArbolBrowser.app/Contents/Resources/browser'), output = resolve(args[3]);
 assert.equal(await realpath(candidate), candidate, 'The ordinary sealed host payload must be canonical');
 const protectedRoots = [resolve(repository), buildRoot, dirname(nativeConsumer.manifest), '/Users/msix/Artifacts'];
 assert.ok(!protectedRoots.some(path => output === path || output.startsWith(path + sep)),
@@ -108,9 +108,9 @@ if (!embedded && !controlWorker) {
     const foundationSource = inventoryDigest(await sourceInventory());
     execFileSync('/usr/bin/codesign', ['--verify', '--strict', '--deep', '-R',
       '=anchor apple generic and certificate leaf[subject.OU] = "7V372XL59S" and identifier "com.sylvan-stack.arbol-browser.native-candidate"',
-      join(buildRoot, 'ArbolBrowser.app')], { stdio: 'pipe' });
-    gate.signedBundle = { path: join(buildRoot, 'ArbolBrowser.app'), publisherVerified: true,
-      inventory: inventoryDigest(await (await import('./package-base.mjs')).inventory(join(buildRoot, 'ArbolBrowser.app'))) };
+      join(buildRoot, 'app/ArbolBrowser.app')], { stdio: 'pipe' });
+    gate.signedBundle = { path: join(buildRoot, 'app/ArbolBrowser.app'), publisherVerified: true,
+      inventory: inventoryDigest(await (await import('./package-base.mjs')).inventory(join(buildRoot, 'app/ArbolBrowser.app'))) };
     const foundationOutput = join(output, 'foundation'), home = join(foundationOutput, 'runtime-home');
     await mkdir(foundationOutput, { mode: 0o700 });
     await mkdir(home, { mode: 0o700 });
@@ -250,7 +250,7 @@ if (!embedded && !controlWorker) {
     assert.deepEqual(await snapshot(sources), gate.harness, 'Qualification harness changed during the gate');
     assert.equal(inventoryDigest(await sourceInventory()), foundationSource, 'Foundation source changed during the gate');
     assert.deepEqual(gate.cases.map(item => item.id), gate.selection);
-    assert.equal(inventoryDigest(await (await import('./package-base.mjs')).inventory(join(buildRoot, 'ArbolBrowser.app'))), gate.signedBundle.inventory,
+    assert.equal(inventoryDigest(await (await import('./package-base.mjs')).inventory(join(buildRoot, 'app/ArbolBrowser.app'))), gate.signedBundle.inventory,
       'Signed ordinary assembly changed during qualification');
     gate.passed = foundation.passed === true && gate.control.passed === true && gate.cases.every(item => item.status === 'passed');
   } catch (error) {

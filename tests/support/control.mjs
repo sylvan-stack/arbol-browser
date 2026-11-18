@@ -93,7 +93,7 @@ export function processSnapshot() {
 export async function family(c, label) {
   // Inspect the OS census in memory. Persist only this exact package's rows,
   // never unrelated owner process arguments or the Node-mode gate worker.
-  const rows = processSnapshot().split('\n').filter(line => line.includes(c.buildRoot + '/ArbolBrowser.app/') &&
+  const rows = processSnapshot().split('\n').filter(line => line.includes(c.buildRoot + '/app/ArbolBrowser.app/') &&
     Number(line.trim().split(/\s+/)[0]) !== process.pid);
   await save(join(c.output, label + '-processes.json'), rows); return rows;
 }
