@@ -300,6 +300,18 @@ struct Deadline {
     if(blockedWrite) limit=std::min(limit,blockedWrite+1000);
     return limit;
   };
+  ChildExecReadback childExecReadback{[&] {
+    if(terminal||deadline.elapsed||deadline.fatal||deadline.hardLoss) return 0.0;
+    double limit=liveLimit();
+    if(cap) {
+      if(!cap->present()) return 0.0;
+      auto* state=cap->shared();
+      if(state->fatal.load(std::memory_order_acquire)) return 0.0;
+      const auto grace=state->closeGraceUs.load(std::memory_order_acquire);
+      if(grace) limit=std::min(limit,(double)grace/1000);
+    }
+    return limit;
+  }};
   auto sealTerminal=[&] {
     if(!terminal) { terminalExpires=liveLimit(); terminal=true; }
     deadline.seal(); // never renew H/A or manufacture a receipt
@@ -370,7 +382,7 @@ struct Deadline {
     // the loop tail when a complete census may make this call nonreturning.
     if(deadline.hardLoss) poison(cap,arbol_exit::protocolLoss|arbol_exit::forced,deadline.firstHardLossLine);
     else if(deadline.fatal&&cap) cap->shared()->declareFatal();
-    if(c.engineGone()&&(!cap||watch.observed()||deadline.hardLoss)) {
+    if(c.engineGone(false,&childExecReadback)&&(!cap||watch.observed()||deadline.hardLoss)) {
       // The census itself may have been delayed. Its first complete result
       // cannot be backdated from a late poll into the frozen live window.
       if(cap&&terminal&&clockMs()>=terminalExpires) { deadline.lost(clockMs()); poison(cap,arbol_exit::identityLoss); }
@@ -381,6 +393,7 @@ struct Deadline {
     }
   };
   for(;;) {
+    childExecReadback.expires=0;
     double now=clockMs();
     if(!watch.poll()) { deadline.lost(now); poison(cap,arbol_exit::watchLoss); }
     if(cap) {
@@ -463,7 +476,7 @@ struct Deadline {
     std::vector<Identity> observed;
     Identity peerNow; const Identity& peer=primary?c.custody:c.primary;
     if(pair.failed||observe(peer.pid,peerNow)!=1||!same(peer,peerNow)||peerNow.group!=(primary?c.main.group:(uint32_t)c.primary.pid)||
-       !c.census(observed)||!lockIdentity(c.owner)||!lockIdentity(c.build)) deadline.lost(clockMs());
+       !c.census(observed,false,&childExecReadback)||!lockIdentity(c.owner)||!lockIdentity(c.build)) deadline.lost(clockMs());
     if(deadline.hardLoss) { poison(cap,arbol_exit::protocolLoss|arbol_exit::forced,deadline.firstHardLossLine); c.enforce(); }
     reap(c.custody); maybeRetire(pendingRetirement); usleep(5000);
   }

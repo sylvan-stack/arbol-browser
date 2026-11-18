@@ -28,6 +28,7 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <functional>
 #include <deque>
 #include <dlfcn.h>
 #include <mach-o/loader.h>
@@ -238,6 +239,11 @@ public:
   virtual bool complete()=0;
   virtual bool seal()=0;
 };
+struct ChildExecReadback {
+  std::function<double()> liveCutoff;
+  double expires=0;
+  bool active() const { const double limit=liveCutoff(); return clockMs()<limit; }
+};
 struct Context {
   Identity main, primary, custody; bool authenticated=false, cleanupOnly=false, primaryOutside=false,familyUncertain=false; std::string bundle, digest; int session = 0; Lock owner, build;
   std::map<OriginalKey,Identity> seen;
@@ -375,7 +381,35 @@ struct Context {
     }
     if(count>1) return false; if(count==1) custody=found; return true;
   }
-  bool census(std::vector<Identity>& targets,bool forceFull=false) {
+  bool liveDirectChild(const Identity& child,const Info& detail) const {
+    Identity leader; Info leaderDetail{};
+    return child.uid==main.uid&&child.group==main.group&&detail.bsd.pbi_ppid==(uint32_t)main.pid&&
+      detail.unique.parent==main.start&&detail.unique.originalParentVersion==main.version&&
+      !(detail.bsd.pbi_flags&PROC_FLAG_INEXIT)&&getsid(child.pid)==session&&
+      observe(main.pid,leader,&leaderDetail)==1&&same(leader,main)&&leader.group==main.group&&
+      !(leaderDetail.bsd.pbi_flags&PROC_FLAG_INEXIT)&&getsid(main.pid)==session;
+  }
+  double observeDirectChildExec(Identity& child,ChildExecReadback& readback) const {
+    const Identity forked=child;
+    if(!readback.expires) readback.expires=clockMs()+12;
+    for(;;) {
+      const double limit=std::min(readback.expires,readback.liveCutoff());
+      if(clockMs()>=limit) return 0;
+      Identity observed; Info detail{};
+      if(observe(forked.pid,observed,&detail)!=1||observed.start!=forked.start||!liveDirectChild(observed,detail)) return 0;
+      const bool executed=(detail.bsd.pbi_flags&PROC_FLAG_EXEC)!=0;
+      if(executed&&observed.version!=forked.version) {
+        const double confirmedLimit=std::min(limit,readback.liveCutoff());
+        const double at=clockMs();
+        if(at>=confirmedLimit) return 0;
+        child=observed;
+        return at;
+      }
+      if(executed||observed.version!=forked.version) return 0;
+      usleep(500);
+    }
+  }
+  bool census(std::vector<Identity>& targets,bool forceFull=false,ChildExecReadback* readback=nullptr) {
     targets.clear();
     if(!authenticated||!foundation()||!monitorBirthsCurrent()) return false;
     bool valid=!familyUncertain;
@@ -454,6 +488,15 @@ struct Context {
       if(id.uid!=main.uid) { uncertainFamily(); valid=false; return; }
       bool original=captured&&same(old->second,id);
       std::string path; bool image=executable(id,path);
+      double execObservedAt=0;
+      // Darwin can briefly report the main's inherited image before the
+      // original child executes. Capture only its verified post-exec identity.
+      if(readback&&!forceFull&&valid&&!originalGroupRetired&&!captured&&id.pid!=main.pid&&direct&&
+         !(info.bsd.pbi_flags&PROC_FLAG_EXEC)&&(path.empty()||path==engine())&&readback->active()&&liveDirectChild(id,info)) {
+        execObservedAt=observeDirectChildExec(id,*readback);
+        if(!execObservedAt||!engineMonitorNumberEligible(id)) { uncertainFamily(); valid=false; return; }
+        path.clear(); image=executable(id,path);
+      }
       if(!image&&original) {
         Identity after; Info latest{}; int again=observe(pid,after,&latest);
         // Preserve the accepted ABR-46 race tree. Neither live-list ESRCH nor
@@ -475,6 +518,15 @@ struct Context {
       }
       if(!captured) {
         if(seen.size()>=4096||!signature(path,true)) { uncertainFamily(); valid=false; return; }
+        if(execObservedAt) {
+          Identity confirmed; Info detail{}; std::string currentPath;
+          if(observe(id.pid,confirmed,&detail)!=1||!same(confirmed,id)||!(detail.bsd.pbi_flags&PROC_FLAG_EXEC)||
+             !liveDirectChild(confirmed,detail)||!executable(confirmed,currentPath)||currentPath!=path||
+             execObservedAt>=readback->expires) {
+            uncertainFamily(); valid=false; return;
+          }
+          if(!readback->active()) { uncertainFamily(); valid=false; return; }
+        }
         if(family&&!same(id,main)) {
           FamilyObservation observation{id,info.unique.parent,(uint64_t)(clockMs()*1000),info.unique.originalParentVersion,(uint32_t)session,engineRole(path)};
           if(!family->capture(observation)) { uncertainFamily(); valid=false; return; }
@@ -510,10 +562,10 @@ struct Context {
     if(!originalGone(main)&&std::none_of(targets.begin(),targets.end(),[&](const Identity& id){return same(id,main);})) targets.push_back(main);
     return valid&&fullCensusValid;
   }
-  bool engineGone(bool executingMain = false) {
+  bool engineGone(bool executingMain = false,ChildExecReadback* readback=nullptr) {
     std::vector<Identity> targets;
     auto empty=[&] { return std::none_of(targets.begin(),targets.end(),[&](const Identity& id){return !executingMain||!same(id,main);}); };
-    if(!census(targets)||groupPending||familyUncertain||!empty()) return false;
+    if(!census(targets,false,readback)||groupPending||familyUncertain||!empty()) return false;
     // Final eligibility always performs a newly completed full UID pass after
     // the candidate quiescence, plus current actual group and durable union.
     if(!census(targets,true)||groupPending||familyUncertain||!empty()||(family&&!family->complete())) return false;
