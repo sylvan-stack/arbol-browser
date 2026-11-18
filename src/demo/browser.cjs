@@ -9,6 +9,8 @@ const { dragInPage } = require('./drag.cjs');
 const maximumTabs = 40;
 const maximumProfileTabs = 8;
 const actionTimeout = 15000;
+const foregroundActions = new Set(['go', 'open', 'login', 'profile', 'tab', 'fill', 'click', 'drag']);
+const handoffCommands = new Set(['profiles', 'tabs', 'resume']);
 const chromeOrigin = 'arbol-preview://chrome';
 const chromeEntry = chromeOrigin + '/index.html';
 const chromeFiles = new Map([
@@ -74,6 +76,13 @@ function operate(operation, selector, value) {
     return { title: document.title.slice(0, 200), text: (text || '').slice(0, 1600),
       ...(textField ? { value: target.value.slice(0, 1600) } : {}) };
   }
+  const control = target instanceof HTMLLabelElement ? target.control : target;
+  if (control instanceof HTMLInputElement && !control.disabled) {
+    if (operation === 'fill' && control.type === 'password')
+      return { manual: 'Enter the password directly on the page.' };
+    if (operation === 'click' && ['file', 'color', 'date', 'datetime-local', 'month', 'time', 'week'].includes(control.type))
+      return { manual: control.type === 'file' ? 'Use the file picker on this page.' : 'Use the picker on this page.' };
+  }
   if (operation === 'fill') {
     if (!textField || target.disabled || target.readOnly) return { error: 'Choose an editable ordinary text field.' };
     const prototype = target instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
@@ -132,6 +141,7 @@ async function main(config, clipboard) {
   window.contentView.addChildView(chrome);
   const tabs = new Map();
   let activeProfile = defaultProfile, selected = null, nextTab = 0, revision = 0;
+  let handoff = null, nextHandoff = 0;
   let closing = false, quitting = false;
   let pageWork = Promise.resolve(), presentationWork = Promise.resolve();
   let selectionRevision = 0;
@@ -262,7 +272,20 @@ async function main(config, clipboard) {
   }
   function status() {
     return { visible: window.isVisible(), dock: app.dock.isVisible(), focused: window.isFocused(), profile: activeProfile.id,
-      current: selected ? describe(selected) : null };
+      current: selected ? describe(selected) : null,
+      ...(handoff ? { manual: { ...handoff, closed: !tabs.has(handoff.tab) } } : {}) };
+  }
+  function requestManual(tab, action) {
+    if (!tab) throw new Error('Select the page that needs manual work.');
+    if (!action || action.length > 290) throw new Error('Use handoff followed by a short description of the manual action.');
+    const contents = tab.view.webContents;
+    const url = contents.isDestroyed() ? '' : contents.getURL();
+    handoff = { id: ++nextHandoff, tab: tab.id, profile: tab.profile.id,
+      site: url.startsWith('http') ? new URL(url).hostname : tab.site, action };
+    return status();
+  }
+  function awaitingManual() {
+    return new Error('Waiting for manual work. Use status and resume the matching handoff after the owner confirms.');
   }
   function show(visible) {
     if (visible) {
@@ -310,7 +333,17 @@ async function main(config, clipboard) {
   }
   async function action(command, argumentsText) {
     clipboard.check();
+    if (handoff && !handoffCommands.has(command)) throw awaitingManual();
+    if (selected && window.isFocused() && foregroundActions.has(command))
+      return requestManual(selected, 'Complete the requested ' + command + ' step directly in the visible Browser.');
     switch (command) {
+      case 'handoff': return requestManual(selected, argumentsText);
+      case 'resume': {
+        if (!handoff || argumentsText.trim() !== String(handoff.id))
+          throw new Error('Use resume HANDOFF_ID after the owner confirms the matching handoff.');
+        handoff = null;
+        return status();
+      }
       case 'go': {
         const url = address(argumentsText);
         return navigate(selected ?? newTab(activeProfile), url);
@@ -356,7 +389,8 @@ async function main(config, clipboard) {
         if (command === 'fill') [selector, value] = /^([^ ]+) (.*)$/.exec(argumentsText)?.slice(1) ?? [];
         if ((command !== 'inspect' && !selector) || selector?.length > 512 || value?.length > 1600)
           throw new Error('Use inspect [selector], fill selector text, or click selector.');
-        const contents = selected?.view.webContents;
+        const tab = selected;
+        const contents = tab?.view.webContents;
         if (!contents || contents.isLoadingMainFrame() || !contents.getURL()) throw new Error('Navigate to a loaded page first.');
         const args = JSON.stringify([command, selector, value]);
         let result;
@@ -365,9 +399,10 @@ async function main(config, clipboard) {
             [{ code: '(' + operate.toString() + ')(...' + args + ')' }]));
         } catch { throw new Error('The page could not complete the action.'); }
         if (result.error) throw new Error(result.error);
+        if (result.manual) return requestManual(tab, result.manual);
         return result;
       }
-      default: throw new Error('Commands: status, show, hide, go URL, open URL, login URL [account], profiles, profile ID, profile-create URL account Display name, tabs, tab ID, inspect, fill, click, drag, quit.');
+      default: throw new Error('Commands: status, show, hide, go URL, open URL, login URL [account], profiles, profile ID, profile-create URL account Display name, tabs, tab ID, inspect, fill, click, drag, handoff ACTION, resume HANDOFF_ID, quit.');
     }
   }
   function line(text) {
@@ -381,6 +416,7 @@ async function main(config, clipboard) {
     const work = pending.then(async () => {
       if (closing) return;
       try {
+        if (command === 'hide' && handoff) throw awaitingManual();
         const result = presentation ? command === 'status' ? status() : show(command === 'show') :
           await action(command, args);
         if (!closing) write({ command, ok: true, result });
