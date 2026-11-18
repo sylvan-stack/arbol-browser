@@ -9,7 +9,7 @@ import { unavailable } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
 import { assertProfile, type ProfileSnapshot } from '../profiles/records.js';
 import { assertPlatform, type HeldLock, type PlatformPort, type ProcessProvenance } from './platform.js';
-import { noteOpenCommand, type OpenCommandObservation, assertHostCloseContinuity, assertTrustedHost, assertVerifiedHost, assertVerifiedHostMetadata, type VerifiedHost } from './authorities.js';
+import { noteOpenCommand, type OpenCommandObservation, assertHostCloseContinuity, assertHostStartupContinuity, assertVerifiedHost, assertVerifiedHostMetadata, type VerifiedHost } from './authorities.js';
 import { assertTime, now, runtimeLocation, type RuntimeLocation, type RuntimeRecord } from './instance.js';
 import { createStarter, type LaunchAttemptPort } from './start.js';
 import type { ProcessIntegration } from './lifecycle.js';
@@ -175,7 +175,8 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
   const pending = new Map<string, LaunchAttempt>();
   return Object.freeze({
     async reserve(profile: ProfileSnapshot, request: string, deadline: number, heldBuild?: import('./start.js').BuildGuard) {
-      await assertTrustedHost(host, deadline);
+      // The native reservation below still requires a complete current proof.
+      await assertHostStartupContinuity(host, deadline, deadline);
       const next = await pendingLaunchAttempt(profile, host, platform, request, deadline);
       if (pending.has(request)) throw unavailable('browser'); pending.set(request, next);
       // Every production reservation, including the first and an expired
@@ -334,7 +335,8 @@ export function createProductionProcessIntegration(host: VerifiedHost, selection
     async start(profile: ProfileSnapshot, endpoint: import('./transport.js').Endpoint, deadline: number,
       contentionDeadline: number, label?: string) {
       noteOpenCommand(observation, 'open-current-signed-start');
-      assertTime(deadline); assertVerifiedHost(host, deadline);
+      assertTime(deadline);
+      await assertHostStartupContinuity(host, deadline, deadline);
       if (profile.paths.state !== host.policy.stateRoot) throw unavailable('profile');
       const attempts = createLaunchTransactions(host, platform, exits);
       const starter = createStarter({ selection, platform, attempts, ...(observation ? { observation } : {}),
