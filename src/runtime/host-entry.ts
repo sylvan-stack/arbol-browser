@@ -53,6 +53,10 @@ export interface OwnedHost {
   installNative(effects: import('../native/fatal.js').FatalEffects, deadline: number): Promise<import('./bootstrap.js').NativeFailureBoundary>;
 }
 const ownedHosts = new WeakSet<object>();
+/** Membership only: callers must still validate the exact preparation tuple. */
+export function isOwnedHost(host: unknown): host is OwnedHost {
+  return typeof host === 'object' && host !== null && ownedHosts.has(host);
+}
 export function assertOwnedHost(host: OwnedHost): void {
   if (!ownedHosts.has(host)) throw unavailable('browser'); host.custody.assertRetained();
 }

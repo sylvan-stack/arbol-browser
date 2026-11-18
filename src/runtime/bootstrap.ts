@@ -1,4 +1,4 @@
-import { noteHostStartup, prepareArmedHostSnapshot, type HostCustody } from './custody.js';
+import { isHostCustody, noteHostStartup, prepareArmedHostSnapshot, type HostCustody } from './custody.js';
 import { unavailable } from '../contracts/errors.js';
 import type { CommandPorts } from './ports.js';
 
@@ -153,6 +153,17 @@ async function assertHeldPath(path: string, held: HeldLock): Promise<void> {
       String(actual.dev) !== expected.device || String(actual.ino) !== expected.inode || actual.uid !== BigInt(expected.uid)) throw unavailable('browser');
   held.assertIdentity();
 }
+const lifetimeReadiness = new WeakMap<HostNativeLifetime, {
+  host: HostPreparation; obtain(): Promise<(() => Promise<void>) | undefined>;
+}>();
+/** Only a canonical factory result bound to this exact preparation can obtain
+ * the private ready operation. Injected/standalone inputs never import host. */
+export async function nativeLifetimeReadiness(native: HostNativeLifetime,
+  host: HostPreparation): Promise<(() => Promise<void>) | undefined> {
+  const actual = lifetimeReadiness.get(native);
+  if (!actual || actual.host !== host || !isHostCustody(host.custody)) return undefined;
+  return actual.obtain();
+}
 /** Native lifetime contribution, not EngineAuthority or complete host admission.
  * ABR-29 supplies its actual preparation/selection and real app-exit request. */
 export function createNativeLifetime(boundary: NativeFailureBoundary, host: HostPreparation, selection: BuildSelection,
@@ -169,7 +180,7 @@ export function createNativeLifetime(boundary: NativeFailureBoundary, host: Host
     await assertHeldPath(selection.guard, ownership.build);
     boundary.fatal.assertHealthy(); boundary.watchdog.assertArmed(boundary.native.trust);
   };
-  return Object.freeze({
+  const lifetime: HostNativeLifetime = Object.freeze({
     async armRetainedLifetime(current: HostPreparation): Promise<void> {
       try {
         if (attached || current !== host) return boundary.fatal.fail('native_integrity_unavailable');
@@ -195,6 +206,37 @@ export function createNativeLifetime(boundary: NativeFailureBoundary, host: Host
       } catch { return boundary.fatal.fail('native_boundary_unavailable'); }
     },
   });
+  if (!isHostCustody(host.custody)) return lifetime;
+  const { instance, buildGuard, custody, watchdog } = host;
+  const exactPreparation = () => isHostCustody(custody) && host.instance === instance && host.buildGuard === buildGuard &&
+    host.custody === custody && custody.instance === instance && custody.build === buildGuard &&
+    host.watchdog === watchdog && watchdog === boundary.watchdog && ownership.prepared.trust === boundary.native.trust &&
+    custody.host.signed.bundle === boundary.native.trust.bundle &&
+    custody.host.signed.snapshotDigest === boundary.native.trust.snapshotDigest &&
+    instance.record.build === selection.build && selection.build === custody.host.identity.layout.build &&
+    selection.directory === custody.host.identity.layout.buildRoot &&
+    selection.guard !== '' && selection.guard === buildGuard.selection.guard &&
+    selection.build === buildGuard.selection.build && selection.directory === buildGuard.selection.directory;
+  lifetimeReadiness.set(lifetime, { host, async obtain() {
+    if (!exactPreparation()) return undefined;
+    const hostURL = new URL('./host-entry.js', import.meta.url).href;
+    const hosts = await import(hostURL) as typeof import('./host-entry.js');
+    if (!hosts.isOwnedHost(host) || !exactPreparation()) return undefined;
+    return async () => {
+      try {
+        const current = () => {
+          if (!attached || exiting || !hosts.isOwnedHost(host) || !exactPreparation())
+            return boundary.fatal.fail('native_integrity_unavailable');
+          boundary.fatal.assertHealthy(); boundary.watchdog.assertArmed(boundary.native.trust); custody.assertRetained();
+        };
+        current(); await instance.owner.assert(); current();
+        await assertHeldPath(instance.owner.profile.paths.owner, ownership.owner); current();
+        await assertHeldPath(selection.guard, ownership.build); current();
+        boundary.native.assertIntegrity();
+      } catch { return boundary.fatal.fail('native_integrity_unavailable'); }
+    };
+  } });
+  return lifetime;
 }
 
 import type { ProfileSessions } from '../profiles/session.js';
