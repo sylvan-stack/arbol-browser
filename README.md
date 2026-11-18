@@ -6,6 +6,40 @@ support and test-free candidate compilation. Profile services, the browser host,
 native input enforcement, watchdog and MCP transport are subsequent work.
 Every page-admitting route currently refuses with structured unavailability.
 
+## First User Demo
+
+The local preview runs on the pinned Electron runtime on macOS arm64. It
+starts with disposable state and stays in the terminal until you close it.
+Run the dependency installation below once, then start the demo.
+
+```sh
+npm run demo -- --fixture
+```
+
+Enter these commands one at a time in the preview terminal.
+
+```text
+fill #message My unsaved draft
+click #increment
+show
+hide
+click #increment
+inspect #count
+show
+quit
+```
+
+At the first `show`, read the document ID, timer and field in the window.
+You can click **Increase count** in the window too. After `hide`, the
+terminal can still act on the page. At the second `show`, the original ID
+and draft are still present and the timer and count have advanced.
+
+Use `--url https://example.com/` to start with your own address or
+`--visible` to show the window immediately. `go URL` navigates the selected
+tab. `open URL` creates another live tab. Use `tabs` to find tab IDs and
+`tab ID` to select one. `status` shows the current window and Dock state.
+Page actions accept ordinary CSS selectors. Each command responds with JSON.
+
 | | |
 |---|---|
 | Package | `@sylvan-stack/arbol-browser` 1.0.0 |
