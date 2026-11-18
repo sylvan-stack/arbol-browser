@@ -1420,9 +1420,15 @@ static napi_value latchWatchdogFatal(napi_env env,napi_callback_info info) {
 // the JS admission gate is closed. This sole private producer durably writes
 // the existing native engine-ready Claim; it accepts no caller-selected role.
 static bool readyListener(int fd,NSString* expected,struct stat& named) {
-  int type=0,listening=0; socklen_t size=sizeof(type); struct stat held{};
-  return fd>=3&&!getsockopt(fd,SOL_SOCKET,SO_TYPE,&type,&size)&&size==sizeof(type)&&type==SOCK_STREAM&&
-    (size=sizeof(listening),!getsockopt(fd,SOL_SOCKET,SO_ACCEPTCONN,&listening,&size))&&size==sizeof(listening)&&listening==1&&
+  if(fd<3) return false;
+  // Darwin exposes the listening bit in descriptor info. getsockopt with
+  // SO_ACCEPTCONN can refuse a genuine listener with ENOPROTOOPT.
+  socket_fdinfo descriptor{};
+  if(proc_pidfdinfo(getpid(),fd,PROC_PIDFDSOCKETINFO,&descriptor,sizeof(descriptor))!=sizeof(descriptor)) return false;
+  const auto& socket=descriptor.psi;
+  struct stat held{};
+  return socket.soi_kind==SOCKINFO_UN&&socket.soi_family==AF_UNIX&&socket.soi_type==SOCK_STREAM&&
+    (socket.soi_options&SO_ACCEPTCONN)&&
     !fstat(fd,&held)&&S_ISSOCK(held.st_mode)&&managementSocketPath(fd,false,expected)&&
     !lstat(expected.fileSystemRepresentation,&named)&&S_ISSOCK(named.st_mode)&&named.st_uid==geteuid()&&
     named.st_nlink==1&&(named.st_mode&07777)==0600;
