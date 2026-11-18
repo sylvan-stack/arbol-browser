@@ -460,6 +460,44 @@ function run(argv) {
 `;
 const imageHelper = '/System/Library/PrivateFrameworks/DiskImages.framework/Versions/A/Resources/diskimages-helper';
 const fullStamp = st => canonical([st.dev, st.ino, st.mode, st.uid, st.gid, st.nlink, st.size, st.mtimeNs, st.ctimeNs, st.birthtimeNs].map(String));
+const imageStampFields = ['dev', 'ino', 'mode', 'uid', 'gid', 'nlink', 'size', 'mtimeNs', 'ctimeNs', 'birthtimeNs'];
+const stampFields = stamp => Object.fromEntries(imageStampFields.map((name, i) => [name, JSON.parse(stamp)[i]]));
+async function imageReceipt(owned, name, value) {
+  if (owned.image.length > 4096 || owned.installed.length > 4096) fail('Owned evidence path bound');
+  const bytes = canonical({ format: 1, image: owned.image, installed: owned.installed, ...value }) + '\n';
+  if (Buffer.byteLength(bytes) > 16384) fail('Owned evidence record bound');
+  await writeExclusive(join(dirname(owned.image), name), bytes);
+  await syncDirectory(dirname(owned.image));
+}
+async function imageOperand(owned, label, expected, current) {
+  if (canonical(current) === canonical(expected)) return;
+  // Diagnostic failure cannot replace the original fixed-operand refusal.
+  try { await imageReceipt(owned, 'identity-refusal.json', { operand: label, expected, current }); } catch {}
+  fail(`Owned image/root identity changed: ${label}`);
+}
+async function constructionImage(owned, afterAttach) {
+  const { image, imageFD, originalImageStamp, imageDigest, deadline } = owned;
+  const phase = afterAttach ? 'attach-bridge' : 'pre-attach';
+  const actual = fullStamp(await imageFD.stat({ bigint: true }));
+  await imageOperand(owned, `${phase}-canonical-image`, true, await realpath(image) === image);
+  await imageOperand(owned, `${phase}-named-image`, actual, fullStamp(await lstat(image, { bigint: true })));
+  const original = stampFields(originalImageStamp), current = stampFields(actual);
+  // Only this one documented construction operation may change image ctime.
+  for (const field of imageStampFields) {
+    if (afterAttach && field === 'ctimeNs') continue;
+    await imageOperand(owned, `${phase}-image-${field}`, original[field], current[field]);
+  }
+  await imageOperand(owned, `${phase}-image-digest`, imageDigest, await imageHash(imageFD, deadline));
+  await imageOperand(owned, `${phase}-image-fd-final`, actual, fullStamp(await imageFD.stat({ bigint: true })));
+  await imageOperand(owned, `${phase}-image-name-final`, actual, fullStamp(await lstat(image, { bigint: true })));
+  await imageOperand(owned, `${phase}-image-canonical-final`, true, await realpath(image) === image);
+  await imageReceipt(owned, afterAttach ? 'attachment-bridge.json' : 'attachment-preparation.json', {
+    phase, original, current, imageSha256: imageDigest,
+    changedFields: imageStampFields.filter(field => original[field] !== current[field]),
+    historicalAttempt19OperandAndWriter: 'unknown'
+  });
+  return actual;
+}
 function imageCommand(program, args, deadline, input) {
   const remaining = deadline - performance.now();
   if (remaining <= 0) fail('Read-only volume operation cutoff');
@@ -522,13 +560,20 @@ async function imageHash(fd, deadline) {
 async function readOnlyImageProof(owned, deadline) {
   const { image, installed, imageFD, rootFD, imageStamp, rootStamp, imageDigest, parentIdentity, buildRoot } = owned;
   const account = userInfo(), actualImage = await imageFD.stat({ bigint: true }), actualRoot = await rootFD.stat({ bigint: true });
-  if (await realpath(image) !== image || await realpath(installed) !== installed || fullStamp(actualImage) !== imageStamp ||
-      fullStamp(await lstat(image, { bigint: true })) !== imageStamp || actualImage.uid !== BigInt(account.uid) ||
-      (actualImage.mode & 0o7777n) !== 0o600n || fullStamp(actualRoot) !== rootStamp ||
-      fullStamp(await lstat(installed, { bigint: true })) !== rootStamp || !actualRoot.isDirectory() ||
-      actualRoot.uid !== BigInt(account.uid) || actualRoot.gid !== BigInt(account.gid) || (actualRoot.mode & 0o7777n) !== 0o700n ||
-      canonical(await privateDirectory(buildRoot, true)) !== canonical(parentIdentity) || await imageHash(imageFD, deadline) !== imageDigest)
-    fail('Owned image/root identity changed');
+  await imageOperand(owned, 'image-canonical', true, await realpath(image) === image);
+  await imageOperand(owned, 'root-canonical', true, await realpath(installed) === installed);
+  await imageOperand(owned, 'image-fd-full-stamp', imageStamp, fullStamp(actualImage));
+  await imageOperand(owned, 'image-name-full-stamp', imageStamp, fullStamp(await lstat(image, { bigint: true })));
+  await imageOperand(owned, 'image-owner', String(account.uid), String(actualImage.uid));
+  await imageOperand(owned, 'image-mode', '384', String(actualImage.mode & 0o7777n));
+  await imageOperand(owned, 'root-fd-full-stamp', rootStamp, fullStamp(actualRoot));
+  await imageOperand(owned, 'root-name-full-stamp', rootStamp, fullStamp(await lstat(installed, { bigint: true })));
+  await imageOperand(owned, 'root-directory', true, actualRoot.isDirectory());
+  await imageOperand(owned, 'root-owner', String(account.uid), String(actualRoot.uid));
+  await imageOperand(owned, 'root-group', String(account.gid), String(actualRoot.gid));
+  await imageOperand(owned, 'root-mode', '448', String(actualRoot.mode & 0o7777n));
+  await imageOperand(owned, 'build-parent-identity', parentIdentity, await privateDirectory(buildRoot, true));
+  await imageOperand(owned, 'image-byte-digest', imageDigest, await imageHash(imageFD, deadline));
   const select = () => {
     const info = imagePlist('/usr/bin/hdiutil', ['info', '-plist'], deadline);
     if (!Array.isArray(info.images)) fail('Missing image records');
@@ -569,9 +614,11 @@ async function readOnlyImageProof(owned, deadline) {
       !regular.length || regular.some(row => row.a !== 'r' || !vnode(row, actualImage)) ||
       !files.some(row => row.f === 'txt' && row.t === 'REG' && vnode(row, text)) ||
       fullStamp(await lstat(imageHelper, { bigint: true })) !== fullStamp(text) || imageKernel(selected.pid, deadline) !== before ||
-      canonical(select()) !== canonical(selected) || fullStamp(await imageFD.stat({ bigint: true })) !== imageStamp ||
-      fullStamp(await lstat(image, { bigint: true })) !== imageStamp || fullStamp(await rootFD.stat({ bigint: true })) !== rootStamp ||
-      fullStamp(await lstat(installed, { bigint: true })) !== rootStamp) fail('Owned helper/backing continuity refused');
+      canonical(select()) !== canonical(selected)) fail('Owned helper/backing continuity refused');
+  await imageOperand(owned, 'continuity-image-fd-full-stamp', imageStamp, fullStamp(await imageFD.stat({ bigint: true })));
+  await imageOperand(owned, 'continuity-image-name-full-stamp', imageStamp, fullStamp(await lstat(image, { bigint: true })));
+  await imageOperand(owned, 'continuity-root-fd-full-stamp', rootStamp, fullStamp(await rootFD.stat({ bigint: true })));
+  await imageOperand(owned, 'continuity-root-name-full-stamp', rootStamp, fullStamp(await lstat(installed, { bigint: true })));
   return selected;
 }
 
@@ -656,7 +703,7 @@ export async function prepareAllocatedHost(environment = process.env) {
     await assertAllocation(); await chmod(image, 0o600);
     const imageFD = await open(image, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     ownedVolume = { image, installed, imageFD, buildRoot, parentIdentity, deadline };
-    ownedVolume.imageStamp = fullStamp(await imageFD.stat({ bigint: true }));
+    ownedVolume.originalImageStamp = fullStamp(await imageFD.stat({ bigint: true }));
     ownedVolume.imageDigest = await imageHash(imageFD, deadline);
     const imageHost = await imageContainingVolume(image, imageFD, deadline);
     if (imageHost.Internal !== true || !['Apple Fabric', 'PCI-Express', 'SATA', 'NVMe'].includes(imageHost.BusProtocol))
@@ -667,8 +714,11 @@ export async function prepareAllocatedHost(environment = process.env) {
     if ((await readdir(mountpoint)).length) fail('Mountpoint is not empty');
     await assertAllocation(); support.publishDirectory(mountpoint, installed); await syncDirectory(buildRoot); await assertAllocation();
     // Non-kernel mode provides the actual userspace helper/backing-vnode proof.
+    await constructionImage(ownedVolume, false);
     ownedVolume.attachmentAttempted = true;
     imagePlist('/usr/bin/hdiutil', ['attach', image, '-readonly', '-nokernel', '-mountpoint', installed, '-noautoopen', '-plist'], deadline);
+    // Seal once after construction; every subsequent full-stamp check includes ctime.
+    ownedVolume.imageStamp = await constructionImage(ownedVolume, true);
     await assertAllocation();
     ownedVolume.rootFD = await open(installed, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
     ownedVolume.rootStamp = fullStamp(await ownedVolume.rootFD.stat({ bigint: true }));
