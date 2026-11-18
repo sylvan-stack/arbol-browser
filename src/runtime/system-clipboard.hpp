@@ -144,14 +144,24 @@ struct Source {
   }
 };
 
-struct Entry { Class cls=nullptr; SEL selector=nullptr; Method method=nullptr; IMP original=nullptr,replacement=nullptr; std::string encoding; };
+struct Entry {
+  Class cls=nullptr; SEL selector=nullptr; Method method=nullptr; IMP original=nullptr,replacement=nullptr;
+  std::string encoding; bool (*provider)(IMP)=appkitImplementation;
+};
 struct CatalogMethod { Method method; IMP original; std::string encoding; };
 struct Catalog { Class cls; std::vector<CatalogMethod> methods; };
+struct Guard;
+struct SystemCatalogPolicy {
+  unsigned classLimit;
+  bool (*registerEntries)(Guard&);
+};
 struct Guard {
   std::recursive_mutex mutex; bool attempted=false,protected_=false,failed=false;
   Source* source=nullptr; void* owner=nullptr;
   bool (*current)(void*)=nullptr; void (*fatal)(void*)=nullptr;
   Class board=nullptr,inert=nullptr,filter=nullptr,item=nullptr,meta=nullptr;
+  Class additionalItem=nullptr;
+  const SystemCatalogPolicy* systemCatalog=nullptr;
   NSPasteboard* general=nil;
   std::vector<Entry> entries;
   std::vector<Catalog> catalogs;
@@ -163,17 +173,18 @@ struct Guard {
   bool entryIntact(const Entry& e,bool installed) const {
     return class_getInstanceMethod(e.cls,e.selector)==e.method&&
       !strcmp(method_getTypeEncoding(e.method),e.encoding.c_str())&&
-      method_getImplementation(e.method)==(installed&&e.replacement?e.replacement:e.original)&&appkitImplementation(e.original);
+      method_getImplementation(e.method)==(installed&&e.replacement?e.replacement:e.original)&&e.provider(e.original);
   }
   // Every observed loaded subclass must be in the exact accepted family.
   // This is continuous integrity for the pinned producer, not arbitrary new
   // native-code/plugin coverage. Such a provider remains unsupported.
   bool family() const {
-    unsigned count=0; Class* classes=objc_copyClassList(&count); bool ok=classes&&count<=50000;
+    unsigned count=0; Class* classes=objc_copyClassList(&count);
+    bool ok=classes&&count<=(systemCatalog?systemCatalog->classLimit:50000);
     for(unsigned i=0;ok&&i<count;++i) {
       Class c=classes[i],base=c; unsigned depth=0;
       while(base&&base!=board&&base!=item&&++depth<=128) base=class_getSuperclass(base);
-      if(depth>128||(base==board&&c!=board&&c!=inert&&c!=filter)||(base==item&&c!=item)) ok=false;
+      if(depth>128||(base==board&&c!=board&&c!=inert&&c!=filter)||(base==item&&c!=item&&c!=additionalItem)) ok=false;
     }
     free(classes); return ok;
   }
@@ -195,16 +206,26 @@ struct Guard {
     }
     return true;
   }
-  bool captureCatalog(Class cls) {
+  bool captureCatalog(Class cls, int expectedCount=-1) {
     unsigned count=0; Method* methods=class_copyMethodList(cls,&count);
-    if(count>512||(!methods&&count)) { free(methods); return false; }
+    if(count>512||(!methods&&count)||(expectedCount>=0&&count!=(unsigned)expectedCount)) { free(methods); return false; }
     Catalog catalog{cls,{}}; bool ok=true;
     for(unsigned i=0;i<count;++i) {
       IMP imp=method_getImplementation(methods[i]); const char* encoding=method_getTypeEncoding(methods[i]);
-      if(!encoding||!appkitImplementation(imp)) { ok=false; break; }
+      if(!encoding||(!appkitImplementation(imp)&&(!systemCatalog||
+         std::none_of(entries.begin(),entries.end(),[&](const Entry& e) {
+           return e.cls==cls&&e.method==methods[i]&&e.original==imp&&entryIntact(e,false);
+         })))) { ok=false; break; }
       catalog.methods.push_back({methods[i],imp,encoding});
     }
-    free(methods); if(ok) catalogs.push_back(std::move(catalog)); return ok;
+    free(methods);
+    if(ok&&systemCatalog) ok=std::all_of(entries.begin(),entries.end(),[&](const Entry& e) {
+      return e.cls!=cls||e.provider==appkitImplementation||
+        std::any_of(catalog.methods.begin(),catalog.methods.end(),[&](const CatalogMethod& method) {
+          return method.method==e.method&&method.original==e.original;
+        });
+    });
+    if(ok) catalogs.push_back(std::move(catalog)); return ok;
   }
   const Entry* lookup(Class cls,SEL selector) const {
     for(const auto& e:entries) if(e.cls==cls&&e.selector==selector) return &e;
@@ -271,13 +292,15 @@ struct Guard {
     } @catch(NSException*) { fail(); return false; } }
     catch(...) { fail(); return false; }
   }
-  bool add(Class cls,const char* name,const char* encoding,IMP replacement=nullptr) {
+  bool add(Class cls,const char* name,const char* encoding,IMP replacement=nullptr,
+           bool (*provider)(IMP)=appkitImplementation) {
     if(!cls||entries.size()>=96) return false;
     SEL selector=sel_registerName(name); Method method=class_getInstanceMethod(cls,selector);
-    if(!method||strcmp(method_getTypeEncoding(method),encoding)||!appkitImplementation(method_getImplementation(method))) return false;
-    entries.push_back({cls,selector,method,method_getImplementation(method),replacement,encoding}); return true;
+    if(!method||strcmp(method_getTypeEncoding(method),encoding)||!provider(method_getImplementation(method))) return false;
+    entries.push_back({cls,selector,method,method_getImplementation(method),replacement,encoding,provider}); return true;
   }
-  bool install(Source* input,void* actual,bool(*isCurrent)(void*),void(*onFatal)(void*));
+  bool install(Source* input,void* actual,bool(*isCurrent)(void*),void(*onFatal)(void*),
+               const SystemCatalogPolicy* additional=nullptr);
 };
 
 // Validate/capture each exact pair under the guard. The named-board original
@@ -341,9 +364,11 @@ inline void refuseUnshunt(id cls,SEL selector) {
     if(cls!=g.board||!g.healthy()||!e||!g.entryIntact(*e,true)) g.seal(); } @catch(NSException*) { g.seal(); }
   // This provider has denied every start; never invoke a global stop.
 }
-inline bool Guard::install(Source* input,void* actual,bool(*isCurrent)(void*),void(*onFatal)(void*)) {
+inline bool Guard::install(Source* input,void* actual,bool(*isCurrent)(void*),void(*onFatal)(void*),
+                           const SystemCatalogPolicy* additional) {
   std::lock_guard<std::recursive_mutex> lock(mutex);
   if(attempted) return false; attempted=true; source=input; owner=actual; current=isCurrent; fatal=onFatal;
+  systemCatalog=additional;
   @try {
     if(![NSThread isMainThread]||!input||input->result.load(std::memory_order_acquire)!=1||!input->unchanged()||
        !current||!current(owner)||!input->pinLoaded()) { seal(); return false; }
@@ -383,8 +408,10 @@ inline bool Guard::install(Source* input,void* actual,bool(*isCurrent)(void*),vo
         if(m!=e.method) entries.push_back({cls,e.selector,m,method_getImplementation(m),nullptr,e.encoding});
       }
     }
+    if(ok&&systemCatalog) ok=systemCatalog->registerEntries(*this);
     if(ok) for(Class cls:{board,inert,filter,item,meta,object_getClass(inert),object_getClass(filter)})
       if(!captureCatalog(cls)) { ok=false; break; }
+    if(ok&&additionalItem) ok=captureCatalog(additionalItem,4)&&captureCatalog(object_getClass(additionalItem),0);
     if(!ok||!intact(false)||!aliases()) { seal(); return false; }
     const auto* factory=lookup(meta,sel_registerName("generalPasteboard"));
     general=((id(*)(id,SEL))factory->original)(board,factory->selector);
