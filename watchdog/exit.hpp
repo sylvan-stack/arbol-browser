@@ -77,7 +77,8 @@ public:
     if(count<0 || count>1 || (seen_ && count)) { uncertain_=true; return false; }
     if(!count) return true;
     const auto& event=events[0];
-    constexpr uint16_t permitted=EV_ADD|EV_ENABLE|EV_CLEAR|EV_ONESHOT|EV_EOF;
+    // Darwin can keep the registration's EV_RECEIPT on the terminal event.
+    constexpr uint16_t permitted=EV_ADD|EV_ENABLE|EV_CLEAR|EV_RECEIPT|EV_ONESHOT|EV_EOF;
     if(event.ident!=(uintptr_t)original_.pid || event.filter!=EVFILT_PROC || event.udata!=this ||
        (event.flags&~permitted) || !(event.flags&EV_EOF) || !(event.flags&EV_ONESHOT) ||
        // A separate or coalesced NOTE_EXEC is irreversible identity drift,
