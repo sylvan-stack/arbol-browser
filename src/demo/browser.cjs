@@ -11,6 +11,7 @@ const maximumProfileTabs = 8;
 const actionTimeout = 15000;
 const foregroundActions = new Set(['go', 'open', 'login', 'profile', 'tab', 'fill', 'click', 'drag']);
 const handoffCommands = new Set(['profiles', 'tabs', 'resume']);
+const foregroundRefusal = 'The Browser window has focus. Use its own controls for this step, or use handoff ACTION to record the manual task.';
 const chromeOrigin = 'arbol-preview://chrome';
 const chromeEntry = chromeOrigin + '/index.html';
 const chromeFiles = new Map([
@@ -323,6 +324,16 @@ async function main(config, clipboard) {
     write({ event: 'closed' });
     app.quit();
   }
+  function endController() {
+    if (closing) return;
+    if (window.isFocused()) {
+      window.once('blur', endController);
+      return;
+    }
+    // Prevent the window from becoming key while profile storage flushes.
+    show(false);
+    void quit();
+  }
   async function navigate(tab, url) {
     const contents = tab.view.webContents;
     tab.site = new URL(url).hostname;
@@ -334,8 +345,7 @@ async function main(config, clipboard) {
   async function action(command, argumentsText) {
     clipboard.check();
     if (handoff && !handoffCommands.has(command)) throw awaitingManual();
-    if (selected && window.isFocused() && foregroundActions.has(command))
-      return requestManual(selected, 'Complete the requested ' + command + ' step directly in the visible Browser.');
+    if (foregroundActions.has(command) && window.isFocused()) throw new Error(foregroundRefusal);
     switch (command) {
       case 'handoff': return requestManual(selected, argumentsText);
       case 'resume': {
@@ -409,14 +419,21 @@ async function main(config, clipboard) {
     if (closing || !text.trim()) return;
     if (Buffer.byteLength(text) > 10000) { write({ ok: false, error: 'Command is too long.' }); return; }
     const [command] = text.trimStart().split(/ +/, 1);
-    if (command === 'quit') { void quit(); return; }
+    if (command === 'quit') {
+      if (window.isFocused()) write({ command, ok: false, error: foregroundRefusal });
+      else endController();
+      return;
+    }
     const args = text.trimStart().slice(command.length).trimStart();
     const presentation = ['show', 'hide', 'status'].includes(command);
     const pending = presentation ? presentationWork : pageWork;
     const work = pending.then(async () => {
       if (closing) return;
       try {
-        if (command === 'hide' && handoff) throw awaitingManual();
+        if (command === 'hide') {
+          if (window.isFocused()) throw new Error(foregroundRefusal);
+          if (handoff) throw awaitingManual();
+        }
         const result = presentation ? command === 'status' ? status() : show(command === 'show') :
           await action(command, args);
         if (!closing) write({ command, ok: true, result });
@@ -486,7 +503,7 @@ async function main(config, clipboard) {
     error => write({ command: 'go', ok: false, error: error.message }));
   input = createInterface({ input: process.stdin, terminal: false, crlfDelay: Infinity });
   input.on('line', line);
-  input.once('close', () => { void Promise.allSettled([pageWork, presentationWork]).then(quit); });
+  input.once('close', () => { void Promise.allSettled([pageWork, presentationWork]).then(endController); });
 }
 
 try {
