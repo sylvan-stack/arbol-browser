@@ -137,9 +137,21 @@ export async function prepareHost(actualApp: ProfileApp, owned: OwnedHost, autho
     ownedHosts.add(prepared); return prepared;
   } catch { return custody.terminate(); }
 }
-export async function bindHostSessions(prepared: HostPreparation): Promise<ProfileSessions> {
+export async function bindHostSessions(prepared: HostPreparation, deadline: number): Promise<ProfileSessions> {
   assertOwnedHost(prepared);
-  await prepared.instance.owner.assert(); await prepared.buildGuard.assert();
+  const { instance, custody, buildGuard } = prepared;
+  const starting = instance.record;
+  const assertStarting = () => {
+    assertTime(deadline);
+    if (starting.phase !== 'starting' || instance.record !== starting ||
+        custody.instance !== instance || custody.build !== buildGuard) return custody.terminate();
+    custody.assertRetained();
+  };
+  assertStarting();
+  await instance.owner.assert();
+  assertStarting();
+  await assertAdoptedBuildContinuity(buildGuard, custody.host, deadline);
+  assertStarting();
   return prepared.binding.bindActual();
 }
 interface ActualHostAssembly {
@@ -281,7 +293,7 @@ export async function runHostEntry(): Promise<void> {
         assertTime(deadline); prepared.custody.assertRetained();
         if (!app.isReady() || state.closed) return prepared.custody.terminate();
         noteHostStartup(prepared.custody, 'host-session-bind-before');
-        const sessions = await bindHostSessions(prepared);
+        const sessions = await bindHostSessions(prepared, deadline);
         noteHostStartup(prepared.custody, 'host-session-bind-after');
         assertTime(deadline); prepared.custody.assertRetained();
         if (state.closed) return prepared.custody.terminate();
