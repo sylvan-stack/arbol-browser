@@ -1,5 +1,6 @@
 {
   "component": "arbol-browser",
+  "installationLayout": 2,
   "entry": "bin/arbol-browser",
   "contract": 1,
   "dataFormat": 1,
