@@ -77,8 +77,8 @@ export async function preservationBoundary(context) {
 export async function transportBoundary(context) {
   const base = await fixture(context, 'transport');
   const home = await privateDirectory(join(base.home, 'long-data-path-'.repeat(6), 'retained-profile-home-'.repeat(5)));
-  await privateDirectory(join(home, 'Library/Application Support/Arbol'));
-  const f = { ...base, home, state: join(home, 'Library/Application Support/Arbol/browser') };
+  const installation = await privateDirectory(join(home, '.arbol'));
+  const f = { ...base, home, state: join(installation, 'browser') };
   assert.equal((await cli(f, ['profiles', 'create', 'transport'])).status, 0);
   const { loadPlatform } = await load(f, 'runtime/platform'), platform = loadPlatform();
   const { readProfile } = await load(f, 'profiles/records');

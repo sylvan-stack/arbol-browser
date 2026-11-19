@@ -21,8 +21,8 @@ export async function privateDirectory(path) {
 export async function fixture(context, name) {
   const root = await privateDirectory(join(context.output, name));
   const home = await privateDirectory(join(root, 'home'));
-  await privateDirectory(join(home, 'Library/Application Support/Arbol'));
-  return { ...context, root, home, state: join(home, 'Library/Application Support/Arbol/browser') };
+  const installation = await privateDirectory(join(home, '.arbol'));
+  return { ...context, root, home, state: join(installation, 'browser') };
 }
 export function environment(context) {
   // A closed environment excludes owner credentials and launcher/runtime overrides.
