@@ -30,6 +30,7 @@ export interface LaunchPort { launch(selection: BuildSelection, requestPath: str
 export interface LaunchAttemptPort {
   reserve(profile: ProfileSnapshot, request: string, deadline: number, build?: BuildGuard): Promise<void>;
   launched(profile: ProfileSnapshot, request: string, pid: number, deadline: number): Promise<void>;
+  publishedReady(profile: ProfileSnapshot, request: string, pid: number, deadline: number): Promise<RuntimeRecord | undefined>;
   cancel(profile: ProfileSnapshot, request: string, deadline: number): Promise<void>;
   admitted(profile: ProfileSnapshot, record: RuntimeRecord, deadline: number, request?: string, joiningStartup?: boolean): Promise<void>;
 }
@@ -139,16 +140,23 @@ export function createStarter(options: { selection: BuildSelection; platform: Pl
       noteOpenCommand(options.observation, 'open-native-ready-attachment');
       do {
         assertTime(admissionDeadline); await guard.assert(); startup.assertIdentity();
-        const record = await readRuntime(location);
-        if (record && record.phase === 'ready' && originalAlive(record, options.platform)) {
-          await options.attempts?.admitted(profile, record, admissionDeadline, request);
-          const client = await connectRuntime(location, record, endpoint, options.selection, options.platform, deadline, label);
-          try {
-            await options.authority.assertReady(profile, record, options.attempts ? request : undefined);
-            await guard.assert(); assertTime(deadline);
-            assertTime(deadline); release(); assertTime(deadline);
-            return { client, record, alreadyRunning: false };
-          } catch (error) { client.close(); throw error; }
+        // The native READY Claim follows the atomic runtime file replacement.
+        // A strict descriptor/name read during that replacement can fail.
+        const published = await options.attempts?.publishedReady(profile, request, launched, admissionDeadline);
+        if (!options.attempts || published) {
+          const record = await readRuntime(location);
+          if (published && (!record || (Object.keys(published) as (keyof RuntimeRecord)[])
+            .some(key => published[key] !== record[key]))) throw profileUnavailable();
+          if (record && record.phase === 'ready' && originalAlive(record, options.platform)) {
+            await options.attempts?.admitted(profile, record, admissionDeadline, request);
+            const client = await connectRuntime(location, record, endpoint, options.selection, options.platform, deadline, label);
+            try {
+              await options.authority.assertReady(profile, record, options.attempts ? request : undefined);
+              await guard.assert(); assertTime(deadline);
+              assertTime(deadline); release(); assertTime(deadline);
+              return { client, record, alreadyRunning: false };
+            } catch (error) { client.close(); throw error; }
+          }
         }
         await setTimeout(Math.min(25, Math.max(1, admissionDeadline - now())));
       } while (now() < admissionDeadline);

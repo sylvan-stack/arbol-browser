@@ -223,6 +223,21 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
         await setTimeout(Math.min(10, Math.max(1, deadline - now())));
       }
     },
+    async publishedReady(profile: ProfileSnapshot, request: string, pid: number, deadline: number) {
+      const expected = pending.get(request);
+      if (!expected) throw unavailable('browser');
+      return withLaunchAttempt(profile, platform, deadline, ({ current }) => {
+        if (!current || current.request !== request || current.nonce !== expected.nonce ||
+            current.profileInstance !== expected.profileInstance || current.profilePathHash !== expected.profilePathHash ||
+            current.build !== expected.build || current.buildRoot !== expected.buildRoot || current.buildGuard !== expected.buildGuard ||
+            current.sourceDigest !== expected.sourceDigest || current.productDigest !== expected.productDigest ||
+            current.candidateDigest !== expected.candidateDigest || current.bootstrap?.pid !== pid) throw unavailable('browser');
+        if (current.phase === 'claimed' && current.expires > platform.continuousTime()) return undefined;
+        if (current.phase !== 'ready' || current.stage !== 'admitted' || current.engine?.pid !== pid ||
+            !current.runtime || current.runtime.pid !== pid || current.runtime.phase !== 'ready') throw unavailable('browser');
+        return current.runtime;
+      });
+    },
     async admitted(profile: ProfileSnapshot, record: RuntimeRecord, deadline: number, request?: string, joiningStartup = false) {
       const own = request ? pending.get(request) : undefined;
       if (request && !own) throw unavailable('browser');
