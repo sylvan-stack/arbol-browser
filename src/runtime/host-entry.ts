@@ -259,7 +259,7 @@ export async function runHostEntry(): Promise<void> {
     const deadline = Math.min(localBudget, sampled + attempt.expires - nativeNow); assertTime(deadline);
     const exitURL = new URL('./exit.js', import.meta.url).href;
     const exits = await import(exitURL) as typeof import('./exit.js');
-    const previous = exits.createProductionExitAuthority(native.platform, request.selection);
+    const previous = exits.createProductionExitAuthority(native.platform, request.selection, host);
     owned = await prepareOwnedHost(app, request, host, native, previous, deadline, capture);
     if (!owned) return terminateCapturedHostBuild(capture);
     const effects: import('../native/fatal.js').FatalEffects = Object.freeze({

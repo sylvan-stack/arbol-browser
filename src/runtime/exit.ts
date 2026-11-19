@@ -10,7 +10,7 @@ import { assertProfile, readJson, type ProfileSnapshot } from '../profiles/recor
 import { statOrAbsent } from '../profiles/paths.js';
 import { ownerLock, withOwnerLockForCustody, type OwnerLease } from '../profiles/locking.js';
 import { acquireBuildLease, withBuildLockForCustody, type BuildLease } from './build-lease.js';
-import { assertHostCloseContinuity, assertTrustedHost, assertVerifiedHostMetadata, verifyPackagedHost, type VerifiedHost } from './authorities.js';
+import { assertHostCloseContinuity, assertHostStartupContinuity, assertTrustedHost, assertVerifiedHostMetadata, verifyPackagedHost, type VerifiedHost } from './authorities.js';
 import { assertPlatform, assertExitInspectionReceipt, type PlatformPort, type ExitInspectionReceipt, type PriorMarkerExpectation } from './platform.js';
 import { withLaunchAttempt, type LaunchAttempt } from './process.js';
 import { now, assertTime, runtimeLocation, type RuntimeRecord } from './instance.js';
@@ -63,7 +63,7 @@ function closedCandidate(value: unknown, profile: ProfileSnapshot, hash: string)
 }
 /** Build selection is the current CLI location only. A previous instance's
  * signed package and original stable Build guard are always proved separately. */
-export function createProductionExitAuthority(platform: PlatformPort, selection: BuildSelection): ProductionExitAuthority {
+export function createProductionExitAuthority(platform: PlatformPort, selection: BuildSelection, startingHost?: VerifiedHost): ProductionExitAuthority {
   assertPlatform(platform);
   type OldProof = { host: VerifiedHost; build: BuildLease };
   const priorProofs = new WeakMap<OwnerLease, Map<string, OldProof>>();
@@ -123,10 +123,34 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
           return { host: closeHost, build };
         }
       }
-      const host = await verifyPackagedHost(oldSelection, layout.payload, deadline);
-      if (host.policy.stateRoot !== profile.paths.state || host.signed.snapshotDigest !== attempt.candidateDigest ||
-          host.identity.sourceDigest !== attempt.sourceDigest || host.identity.productDigest !== attempt.productDigest) throw unavailable('profile');
-      await host.assertTrusted(deadline); await build.assert();
+      const matchesAttempt = (host: VerifiedHost) => host.policy.stateRoot === profile.paths.state &&
+        host.signed.snapshotDigest === attempt.candidateDigest && host.identity.sourceDigest === attempt.sourceDigest &&
+        host.identity.productDigest === attempt.productDigest;
+      let host: VerifiedHost | undefined;
+      if (startingHost && process.type === 'browser' && actualMode === 'prior') {
+        assertVerifiedHostMetadata(startingHost, deadline);
+        const currentLayout = startingHost.identity.layout;
+        if (currentLayout.build === oldSelection.build && currentLayout.buildRoot === oldSelection.directory &&
+            currentLayout.bundle === layout.bundle && currentLayout.payload === layout.payload &&
+            oldSelection.guard === join(currentLayout.buildRoot, '../.uses', currentLayout.build) && matchesAttempt(startingHost)) {
+          const sameGuard = await withBuildLockForCustody(build, platform, held => {
+            const actual = held.assertIdentity(), expected = startingHost.guardIdentity;
+            return actual.device === expected.device && actual.inode === expected.inode && actual.uid === expected.uid;
+          });
+          if (!sameGuard) throw unavailable('profile');
+          const manifest = await import(new URL('../native/manifest.js', import.meta.url).href) as typeof import('../native/manifest.js');
+          if (manifest.assertRetainedReadOnlyStorage(startingHost.signed, deadline)) {
+            await assertHostStartupContinuity(startingHost, deadline, deadline);
+            host = startingHost;
+          }
+        }
+      }
+      if (!host) {
+        host = await verifyPackagedHost(oldSelection, layout.payload, deadline);
+        if (!matchesAttempt(host)) throw unavailable('profile');
+        await host.assertTrusted(deadline);
+      }
+      await build.assert();
       if (actualMode === 'prior') {
         const proofs = priorProofs.get(owner) ?? new Map<string, OldProof>(); proofs.set(key, { host, build }); priorProofs.set(owner, proofs);
         release.splice(release.indexOf(build), 1);
