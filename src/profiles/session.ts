@@ -1,8 +1,7 @@
 import type { App, Session } from 'electron';
 import { randomBytes } from 'node:crypto';
-import { join } from 'node:path';
-import { directory, assertDirectory, ownerUid, profileUnavailable, statOrAbsent } from './paths.js';
-import { engineRootStorage, type EngineTransaction } from './compatibility.js';
+import { directory, assertDirectory, profileUnavailable } from './paths.js';
+import { assertEngineRootStorage, type EngineTransaction } from './compatibility.js';
 import { assertHostCustody, type HostCustody } from '../runtime/custody.js';
 import type { WebsiteSessionReceipt } from '../runtime/platform.js';
 
@@ -107,16 +106,7 @@ export async function configureProfileSession(app: ProfileApp, transaction: Engi
   const paths = transaction.owner.profile.paths;
   const data = await directory(paths.data), userData = await directory(paths.userData);
   await directory(paths.logs);
-  if (custody) {
-    const root = await directory(paths.root);
-    const uid = ownerUid();
-    for (const [name, type] of Object.entries(engineRootStorage)) {
-      const existing = await statOrAbsent(join(paths.root, name));
-      if (existing && (existing.dev !== root.device || existing.uid !== uid || (existing.mode & 0o022) !== 0 ||
-          (type === 'file' ? !existing.isFile() || existing.nlink !== 1 : !existing.isDirectory()))) throw profileUnavailable();
-    }
-    await assertDirectory(paths.root, root);
-  }
+  if (custody) await assertEngineRootStorage(transaction.owner, await directory(paths.root));
   if (app.isReady() || configuredApps.has(app)) throw profileUnavailable();
   configuredApps.add(app);
   if (custody) { if (custody.instance.owner !== transaction.owner) return custody.terminate(); custody.assertMarker(); }

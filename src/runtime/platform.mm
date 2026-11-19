@@ -1128,13 +1128,13 @@ static bool absentEngineRootStorage(NSDictionary* capability,double deadline) {
   NSString* profile=capability[@"attempt"][@"profile"];
   if(arbol_boundary::clockMs()>=deadline||!arbol_boundary::canonical(profile.fileSystemRepresentation)) return false;
   int fd=open(profile.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC); if(fd<0) return false;
-  struct stat held{},named{},entry{};
-  bool ok=!fstat(fd,&held)&&S_ISDIR(held.st_mode)&&[arbol_exit::fileIdentity(held) isEqual:capability[@"profileDirectory"]];
-  for(const auto& artifact:arbol_exit::engineRootStorage) {
-    if(!ok||arbol_boundary::clockMs()>=deadline) { ok=false; break; }
-    ok=fstatat(fd,artifact.name,&entry,AT_SYMLINK_NOFOLLOW)<0&&errno==ENOENT;
-  }
-  ok=ok&&!lstat(profile.fileSystemRepresentation,&named)&&[arbol_exit::fileIdentity(named) isEqual:capability[@"profileDirectory"]];
+  struct stat held{},after{},named{};
+  std::vector<std::string> names;
+  bool ok=!fstat(fd,&held)&&S_ISDIR(held.st_mode)&&(held.st_mode&07777)==0700&&held.st_uid==geteuid()&&
+    [arbol_exit::fileIdentity(held) isEqual:capability[@"profileDirectory"]]&&arbol_exit::storageNames(fd,deadline,names)&&
+    std::none_of(names.begin(),names.end(),arbol_exit::engineRootStorageName)&&
+    !fstat(fd,&after)&&!lstat(profile.fileSystemRepresentation,&named)&&
+    arbol_exit::sameStorageNode(held,after)&&arbol_exit::sameStorageNode(after,named);
   if(close(fd)) ok=false;
   return ok&&arbol_boundary::clockMs()<deadline;
 }

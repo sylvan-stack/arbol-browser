@@ -1,18 +1,75 @@
-import { opendir, rename } from 'node:fs/promises';
+import { constants, type BigIntStats } from 'node:fs';
+import { lstat, open, opendir, rename } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import type { Contract } from '../contracts/generated.js';
 import { validator } from '../contracts/schema.js';
 import { BrowserFailure } from '../contracts/errors.js';
-import { profileUnavailable, statOrAbsent, sameIdentity, syncDirectory, type Identity } from './paths.js';
+import { profileUnavailable, statOrAbsent, sameIdentity, syncDirectory, ownerUid, type Identity } from './paths.js';
 import { readJson, writeNewFile, type ProfileSnapshot } from './records.js';
 import type { OwnerLease } from './locking.js';
 
 export type EngineMarker = Contract<'profile.EngineMarker'>;
 // Opaque artifacts Electron places beside the explicit website data directory.
-export const engineRootStorage = Object.freeze({
-  'Local State': 'file', GraphiteDawnCache: 'directory', GPUPersistentCache: 'directory',
-} as const);
+const nonEngineRootNames = new Set(['profile.json', 'engine.json', 'owner.lock', 'logs', 'data', 'userData']);
+const knownEngineRootTypes = new Map([['Local State', 'file'], ['GraphiteDawnCache', 'directory'], ['GPUPersistentCache', 'directory']]);
+const storageNodeLimit = 131072;
+
+async function storageNames(path: string): Promise<string[]> {
+  const stream = await opendir(path);
+  const names = new Set<string>();
+  try {
+    for (let entry = await stream.read(); entry; entry = await stream.read()) {
+      const name = entry.name;
+      if (!name || name === '.' || name === '..' || name.includes('/') || name.includes('\uFFFD') ||
+          names.has(name) || names.size >= storageNodeLimit) throw profileUnavailable();
+      names.add(name);
+    }
+  } finally { await stream.close(); }
+  return [...names];
+}
+
+function sameStorageNode(a: BigIntStats, b: BigIntStats): boolean {
+  return a.dev === b.dev && a.ino === b.ino && a.mode === b.mode && a.uid === b.uid && a.gid === b.gid &&
+    a.nlink === b.nlink && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
+}
+
+/** Validate opaque profile-root storage while the actual Engine Owner is held.
+ * Never adopt a symlink or a file that can be written through another name. */
+export async function assertEngineRootStorage(owner: OwnerLease, root: Identity): Promise<void> {
+  await owner.assert();
+  const uid = BigInt(ownerUid()), device = BigInt(root.device);
+  const path = owner.profile.paths.root;
+  let visited = 0;
+  const check = async (parent: string, name: string, depth: number): Promise<void> => {
+    if (depth > 128 || ++visited > storageNodeLimit) throw profileUnavailable();
+    const child = join(parent, name);
+    const first = await lstat(child, { bigint: true });
+    const folder = first.isDirectory(), type = depth === 0 ? knownEngineRootTypes.get(name) : undefined;
+    if (first.dev !== device || first.uid !== uid || (first.mode & 0o022n) !== 0n ||
+        (!folder && (!first.isFile() || first.nlink !== 1n)) ||
+        (type && folder !== (type === 'directory'))) throw profileUnavailable();
+    const handle = await open(child, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK |
+      (folder ? constants.O_DIRECTORY : 0));
+    try {
+      if (!sameStorageNode(first, await handle.stat({ bigint: true })) ||
+          !sameStorageNode(first, await lstat(child, { bigint: true }))) throw profileUnavailable();
+      if (folder) for (const entry of await storageNames(child)) await check(child, entry, depth + 1);
+      if (!sameStorageNode(first, await handle.stat({ bigint: true })) ||
+          !sameStorageNode(first, await lstat(child, { bigint: true }))) throw profileUnavailable();
+    } finally { await handle.close(); }
+  };
+  const held = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY);
+  try {
+    const first = await held.stat({ bigint: true });
+    if (first.dev !== device || first.ino !== BigInt(root.inode) || first.uid !== uid || (first.mode & 0o7777n) !== 0o700n ||
+        !sameStorageNode(first, await lstat(path, { bigint: true }))) throw profileUnavailable();
+    for (const name of await storageNames(path)) if (!nonEngineRootNames.has(name)) await check(path, name, 0);
+    if (!sameStorageNode(first, await held.stat({ bigint: true })) ||
+        !sameStorageNode(first, await lstat(path, { bigint: true }))) throw profileUnavailable();
+  } finally { await held.close(); }
+  await owner.assert();
+}
 /** Supplied by signed package preflight, never by CLI input or PackageMetadata.
  * assertTrusted must verify the exact immutable Build/runtime/manifest payload.
  * ABR-2 provides no permissive production implementation of this authority. */
@@ -111,8 +168,8 @@ export async function prepareEngine(owner: OwnerLease, authority: EngineAuthorit
       note('fresh-marker-compatibility');
       // Missing marker never adopts existing native storage, even after a crash.
       if (manifest.dataEpoch !== 1 || !await emptyDirectory(profile.paths.data) ||
-          !await emptyDirectory(profile.paths.userData) || (await Promise.all(Object.keys(engineRootStorage)
-            .map(name => statOrAbsent(join(profile.paths.root, name))))).some(Boolean)) throw profileUnavailable();
+          !await emptyDirectory(profile.paths.userData) ||
+          (await storageNames(profile.paths.root)).some(name => !nonEngineRootNames.has(name))) throw profileUnavailable();
     }
     note('verified-prior-exit');
     await authority.assertPreviousEngineExited(profile);

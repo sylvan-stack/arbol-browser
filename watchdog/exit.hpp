@@ -564,9 +564,33 @@ public:
 // acknowledgement. The private profile ancestor makes owner-owned 0644/0755
 // children private without rewriting Chromium modes. No symlink, hardlinked
 // regular file, foreign device/owner or group/other write access is admitted.
-inline constexpr struct EngineRootArtifact { const char* name; bool directory; } engineRootStorage[] = {
-  {"Local State",false}, {"GraphiteDawnCache",true}, {"GPUPersistentCache",true}
-};
+inline bool engineRootStorageName(const std::string& name) {
+  return name!="profile.json"&&name!="engine.json"&&name!="owner.lock"&&name!="logs"&&name!="data"&&name!="userData";
+}
+inline bool engineRootStorageType(const std::string& name,const struct stat& st) {
+  if(name=="Local State") return S_ISREG(st.st_mode);
+  if(name=="GraphiteDawnCache"||name=="GPUPersistentCache") return S_ISDIR(st.st_mode);
+  return true;
+}
+inline bool sameStorageNode(const struct stat& a,const struct stat& b) {
+  return a.st_dev==b.st_dev&&a.st_ino==b.st_ino&&a.st_mode==b.st_mode&&a.st_uid==b.st_uid&&a.st_gid==b.st_gid&&
+    a.st_nlink==b.st_nlink&&a.st_size==b.st_size&&a.st_mtimespec.tv_sec==b.st_mtimespec.tv_sec&&
+    a.st_mtimespec.tv_nsec==b.st_mtimespec.tv_nsec&&a.st_ctimespec.tv_sec==b.st_ctimespec.tv_sec&&a.st_ctimespec.tv_nsec==b.st_ctimespec.tv_nsec;
+}
+inline bool storageNames(int fd,double deadline,std::vector<std::string>& names) {
+  int copy=fcntl(fd,F_DUPFD_CLOEXEC,64); DIR* stream=copy>=0?fdopendir(copy):nullptr;
+  if(!stream) { if(copy>=0) close(copy); return false; }
+  bool ok=true; errno=0;
+  while(auto* entry=readdir(stream)) {
+    if(!strcmp(entry->d_name,".")||!strcmp(entry->d_name,"..")) continue;
+    if(arbol_boundary::clockMs()>=deadline||names.size()>=131072) { ok=false; break; }
+    names.emplace_back(entry->d_name);
+  }
+  if(errno) ok=false;
+  if(closedir(stream)) ok=false;
+  std::sort(names.begin(),names.end());
+  return ok&&std::adjacent_find(names.begin(),names.end())==names.end()&&arbol_boundary::clockMs()<deadline;
+}
 struct StorageResult {
   std::atomic<int> state{0}; // pending, 1=actual completed success, -1=refused
   double started=0,completed=0; uint64_t files=0,directories=0; std::string digest;
@@ -577,11 +601,6 @@ class StorageScan {
   bool safe(const struct stat& st) const {
     return st.st_dev==device_&&st.st_uid==geteuid()&&!(st.st_mode&0022)&&
       ((S_ISREG(st.st_mode)&&st.st_nlink==1)||(S_ISDIR(st.st_mode)&&st.st_nlink>0));
-  }
-  static bool sameNode(const struct stat& a,const struct stat& b) {
-    return a.st_dev==b.st_dev&&a.st_ino==b.st_ino&&a.st_mode==b.st_mode&&a.st_uid==b.st_uid&&a.st_gid==b.st_gid&&
-      a.st_nlink==b.st_nlink&&a.st_size==b.st_size&&a.st_mtimespec.tv_sec==b.st_mtimespec.tv_sec&&
-      a.st_mtimespec.tv_nsec==b.st_mtimespec.tv_nsec&&a.st_ctimespec.tv_sec==b.st_ctimespec.tv_sec&&a.st_ctimespec.tv_nsec==b.st_ctimespec.tv_nsec;
   }
   static std::string metadata(const struct stat& st) {
     std::string value;
@@ -596,22 +615,10 @@ class StorageScan {
     if(fstatat(parent,name.c_str(),&named,AT_SYMLINK_NOFOLLOW)||!safe(named)) return false;
     int fd=openat(parent,name.c_str(),O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC|(S_ISDIR(named.st_mode)?O_DIRECTORY:0));
     if(fd<0) return false;
-    bool ok=!fstat(fd,&first)&&safe(first)&&sameNode(first,named)&&within(); std::string summary=metadata(first);
+    bool ok=!fstat(fd,&first)&&safe(first)&&sameStorageNode(first,named)&&within(); std::string summary=metadata(first);
     if(ok&&S_ISDIR(first.st_mode)) {
       ++directories_; std::vector<std::string> names;
-      int copy=fcntl(fd,F_DUPFD_CLOEXEC,64); DIR* stream=copy>=0?fdopendir(copy):nullptr;
-      if(!stream) { if(copy>=0) close(copy); ok=false; }
-      else {
-        errno=0;
-        while(auto* entry=readdir(stream)) {
-          if(!strcmp(entry->d_name,".")||!strcmp(entry->d_name,"..")) continue;
-          names.emplace_back(entry->d_name);
-          if(names.size()>131072||!within()) { ok=false; break; }
-        }
-        if(errno) ok=false; if(closedir(stream)) ok=false;
-      }
-      std::sort(names.begin(),names.end());
-      if(std::adjacent_find(names.begin(),names.end())!=names.end()) ok=false;
+      ok=storageNames(fd,deadline_,names);
       for(const auto& child:names) {
         if(!ok) break; std::string content;
         ok=node(fd,child,depth+1,synchronize,content);
@@ -625,7 +632,7 @@ class StorageScan {
       if(synchronize) ok=within()&&!fsync(fd)&&within()&&!fcntl(fd,F_FULLFSYNC)&&within();
     }
     ok=ok&&!fstat(fd,&last)&&!fstatat(parent,name.c_str(),&after,AT_SYMLINK_NOFOLLOW)&&
-      safe(last)&&sameNode(first,last)&&sameNode(last,after)&&within();
+      safe(last)&&sameStorageNode(first,last)&&sameStorageNode(last,after)&&within();
     if(close(fd)) ok=false;
     if(ok) digest=[arbol_attempt::digest(summary) UTF8String]; return ok;
   }
@@ -635,7 +642,7 @@ class StorageScan {
     int root=open(profile.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC); if(root<0) return false;
     struct stat held{},named{},after{},endName{};
     bool ok=!fstat(root,&held)&&!lstat(profile.fileSystemRepresentation,&named)&&safe(held)&&S_ISDIR(held.st_mode)&&
-      (held.st_mode&07777)==0700&&sameNode(held,named)&&[fileIdentity(held) isEqual:capability_[@"profileDirectory"]];
+      (held.st_mode&07777)==0700&&sameStorageNode(held,named)&&[fileIdentity(held) isEqual:capability_[@"profileDirectory"]];
     std::string result;
     for(NSString* name in @[@"data",@"userData"]) {
       struct stat child{}; std::string digest;
@@ -643,22 +650,21 @@ class StorageScan {
         [fileIdentity(child) isEqual:capability_[@"directories"][name]]&&node(root,name.UTF8String,0,synchronize,digest);
       if(ok) result+=digest;
     }
-    for(const auto& artifact:engineRootStorage) {
+    std::vector<std::string> names;
+    ok=ok&&storageNames(root,deadline_,names);
+    for(const auto& name:names) {
       if(!ok||!within()) { ok=false; break; }
+      if(!engineRootStorageName(name)) continue;
       struct stat child{},current{};
-      const std::string label=[arbol_attempt::digest(artifact.name) UTF8String];
-      if(fstatat(root,artifact.name,&child,AT_SYMLINK_NOFOLLOW)) {
-        ok=errno==ENOENT;
-        if(ok) result+=label+":absent:";
-        continue;
-      }
       std::string digest;
-      ok=(artifact.directory?S_ISDIR(child.st_mode):S_ISREG(child.st_mode))&&
-        node(root,artifact.name,0,synchronize,digest)&&!fstatat(root,artifact.name,&current,AT_SYMLINK_NOFOLLOW)&&sameNode(child,current);
-      if(ok) result+=label+":present:"+digest+":";
+      ok=!name.empty()&&name.find('/')==std::string::npos&&!fstatat(root,name.c_str(),&child,AT_SYMLINK_NOFOLLOW)&&
+        engineRootStorageType(name,child)&&node(root,name,0,synchronize,digest)&&
+        !fstatat(root,name.c_str(),&current,AT_SYMLINK_NOFOLLOW)&&sameStorageNode(child,current);
+      if(ok) result+=std::string([arbol_attempt::digest(name) UTF8String])+":"+digest+":";
     }
     if(ok&&synchronize) ok=within()&&!fsync(root)&&within();
-    ok=ok&&!fstat(root,&after)&&!lstat(profile.fileSystemRepresentation,&endName)&&sameNode(held,after)&&sameNode(after,endName)&&within();
+    ok=ok&&!fstat(root,&after)&&!lstat(profile.fileSystemRepresentation,&endName)&&
+      sameStorageNode(held,after)&&sameStorageNode(after,endName)&&within();
     if(close(root)) ok=false; if(ok) digest=[arbol_attempt::digest(result) UTF8String]; return ok;
   }
 public:
