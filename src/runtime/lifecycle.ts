@@ -192,7 +192,7 @@ async function closeProductionProfile(profile: ProfileSnapshot, selection: Build
   // In-flight native custody, including main-already-dead, is pending until the
   // independent exact complete family/marker inspection passes. No PID signals.
   while (now() < deadline) {
-    if (await exits.tryClosed(profile, original, deadline))
+    if (await exits.tryClosed(profile, original, deadline, requested ? closeHost : undefined))
       return { profile: profile.record.id, closed: requested, dataRemoved: false };
     await setTimeout(Math.min(10, Math.max(1, deadline - now())));
   }

@@ -10,7 +10,7 @@ import { assertProfile, readJson, type ProfileSnapshot } from '../profiles/recor
 import { statOrAbsent } from '../profiles/paths.js';
 import { ownerLock, withOwnerLockForCustody, type OwnerLease } from '../profiles/locking.js';
 import { acquireBuildLease, withBuildLockForCustody, type BuildLease } from './build-lease.js';
-import { assertTrustedHost, verifyPackagedHost, type VerifiedHost } from './authorities.js';
+import { assertHostCloseContinuity, assertTrustedHost, assertVerifiedHostMetadata, verifyPackagedHost, type VerifiedHost } from './authorities.js';
 import { assertPlatform, assertExitInspectionReceipt, type PlatformPort, type ExitInspectionReceipt, type PriorMarkerExpectation } from './platform.js';
 import { withLaunchAttempt, type LaunchAttempt } from './process.js';
 import { now, assertTime, runtimeLocation, type RuntimeRecord } from './instance.js';
@@ -23,7 +23,7 @@ export interface ProductionExitAuthority extends ExitAuthority, HostPreviousExit
   /** Only this poll treats protection contention/in-flight closure as pending.
    * It never certifies closure or invokes an external signal on uncertainty. */
   assertClosedUnderOwner(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease, deadline: number): Promise<void>;
-  tryClosed(profile: ProfileSnapshot, original: RuntimeRecord, deadline: number): Promise<boolean>;
+  tryClosed(profile: ProfileSnapshot, original: RuntimeRecord, deadline: number, closeHost?: VerifiedHost): Promise<boolean>;
   /** Retires only the independently verified exact closed reservation, retaining
    * its native closed-claim history outside profile and transient socket roots. */
   retire(profile: ProfileSnapshot, owner: OwnerLease, deadline: number): Promise<void>;
@@ -36,6 +36,8 @@ export interface ProductionExitAuthority extends ExitAuthority, HostPreviousExit
   withdraw(profile: ProfileSnapshot, owner: OwnerLease, deadline: number): Promise<void>;
 }
 const authorities = new WeakSet<object>();
+const stableCloseRuntimeFields = ['wire', 'profile', 'profileInstance', 'profilePathHash', 'instance', 'nonce', 'pid',
+  'processStartId', 'build', 'contract', 'agentSocket', 'managementSocket'] as const satisfies readonly (keyof RuntimeRecord)[];
 export function isProductionExitAuthority(value: unknown): value is ProductionExitAuthority {
   return typeof value === 'object' && value !== null && authorities.has(value);
 }
@@ -67,7 +69,7 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
   const priorProofs = new WeakMap<OwnerLease, Map<string, OldProof>>();
   const inspect = async (profile: ProfileSnapshot, previous: RuntimeRecord | undefined, owner: OwnerLease,
     mode: 'prior' | 'host' | 'full' | 'retire' | 'reserve' | 'withdraw', deadline: number, currentBuild?: BuildLease,
-    pending?: LaunchAttempt): Promise<ExitInspectionReceipt> => {
+    pending?: LaunchAttempt, closeHost?: VerifiedHost): Promise<ExitInspectionReceipt> => {
     assertTime(deadline); await owner.assert(); await assertProfile(profile);
     if (owner.profile !== profile) throw unavailable('profile');
     const location = await runtimeLocation(profile, true); if (!location) throw unavailable('profile');
@@ -100,7 +102,28 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
       const oldSelection: BuildSelection = Object.freeze({ build: attempt.build, directory: attempt.buildRoot,
         guard: attempt.buildGuard, explicit: true });
       const build = await acquireBuildLease(oldSelection, platform); release.push(build);
-      const host = await verifyPackagedHost(oldSelection, claimedLayout(attempt).payload, deadline);
+      const layout = claimedLayout(attempt), closing = attempt.runtime;
+      if (closeHost && actualMode === 'full' && attempt === current && attempt === candidate &&
+          attempt.stage === 'admitted' && previous?.phase === 'ready' && closing?.phase === 'closing' &&
+          basename(attempt.terminal?.path ?? '') === 'activation.json' &&
+          stableCloseRuntimeFields.every(key => closing[key] === previous[key]) &&
+          closeHost.identity.layout.build === oldSelection.build && closeHost.identity.layout.buildRoot === oldSelection.directory &&
+          closeHost.identity.layout.bundle === layout.bundle && closeHost.identity.layout.payload === layout.payload &&
+          oldSelection.guard === join(closeHost.identity.layout.buildRoot, '../.uses', closeHost.identity.layout.build) &&
+          closeHost.policy.stateRoot === profile.paths.state && closeHost.signed.snapshotDigest === attempt.candidateDigest &&
+          closeHost.identity.sourceDigest === attempt.sourceDigest && closeHost.identity.productDigest === attempt.productDigest) {
+        const sameGuard = await withBuildLockForCustody(build, platform, held => {
+          const actual = held.assertIdentity(), expected = closeHost.guardIdentity;
+          return actual.device === expected.device && actual.inode === expected.inode && actual.uid === expected.uid;
+        });
+        const manifestURL = new URL('../native/manifest.js', import.meta.url).href;
+        const manifest = await import(manifestURL) as typeof import('../native/manifest.js');
+        if (sameGuard && manifest.assertRetainedReadOnlyStorage(closeHost.signed, deadline)) {
+          await assertHostCloseContinuity(closeHost, deadline); await build.assert();
+          return { host: closeHost, build };
+        }
+      }
+      const host = await verifyPackagedHost(oldSelection, layout.payload, deadline);
       if (host.policy.stateRoot !== profile.paths.state || host.signed.snapshotDigest !== attempt.candidateDigest ||
           host.identity.sourceDigest !== attempt.sourceDigest || host.identity.productDigest !== attempt.productDigest) throw unavailable('profile');
       await host.assertTrusted(deadline); await build.assert();
@@ -171,10 +194,11 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
     async assertClosedUnderOwner(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease, deadline: number) {
       await inspect(profile, original, owner, 'full', deadline);
     },
-    async tryClosed(profile: ProfileSnapshot, original: RuntimeRecord, deadline: number) {
+    async tryClosed(profile: ProfileSnapshot, original: RuntimeRecord, deadline: number, closeHost?: VerifiedHost) {
       assertTime(deadline);
+      if (closeHost) assertVerifiedHostMetadata(closeHost, deadline);
       const owner = await ownerLock(profile, platform, false, deadline); if (!owner) return false;
-      try { await inspect(profile, original, owner, 'full', deadline); return true; }
+      try { await inspect(profile, original, owner, 'full', deadline, undefined, undefined, closeHost); return true; }
       catch { assertTime(deadline); return false; }
       finally { owner.release(); }
     },
