@@ -11,6 +11,7 @@ import type { Contract } from '../contracts/generated.js';
 import { directory, assertDirectory } from '../profiles/paths.js';
 import { noteHostStartup, assertHostCustody } from './custody.js';
 import type { SignedBundle, SignedVerificationPhase } from '../native/manifest.js';
+import installation from './installation-paths.json' with { type: 'json' };
 
 const physicalFS = process.getBuiltinModule(typeof process.versions.electron === 'string' ? 'original-fs' : 'fs') as typeof import('node:fs') | undefined;
 if (!physicalFS || !physicalFS.promises || typeof physicalFS.promises.open !== 'function') throw unavailable('browser');
@@ -169,8 +170,7 @@ async function assertIsolation(layout: PackagedLayout, state: string, deadline: 
   if (!process.geteuid || account.uid !== process.geteuid() || !canonicalPath(account.homedir)) throw unavailable('browser');
   assertBudget(deadline);
   const accountHome = await realpath(account.homedir);
-  for (const protectedPath of [join(accountHome, 'Library/Application Support/Arbol/builds'),
-    join(accountHome, 'Library/Application Support/Arbol/browser')]) {
+  for (const protectedPath of [installation.builds, installation.browser].map(name => join(accountHome, installation.root, name))) {
     const physical = await protectedLocation(protectedPath, deadline);
     for (const actual of [layout.buildRoot, state])
       if (below(actual, physical) || below(physical, actual)) throw unavailable('browser');

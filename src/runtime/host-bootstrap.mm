@@ -51,8 +51,9 @@ static bool isolated(NSString* buildRoot,NSString* state) {
   struct passwd record{},*account=nullptr; char buffer[16384];
   if(getuid()!=geteuid() || getpwuid_r(geteuid(),&record,buffer,sizeof(buffer),&account) || !account || account->pw_uid!=geteuid()) return false;
   NSString* home=protectedPath([NSString stringWithUTF8String:account->pw_dir]); if(!home) return false;
-  for(NSString* suffix in @[@"Library/Application Support/Arbol/builds",@"Library/Application Support/Arbol/browser"]) {
-    NSString* protectedRoot=protectedPath([home stringByAppendingPathComponent:suffix]);
+  NSString* installation=[home stringByAppendingPathComponent:@ARBOL_INSTALLATION_ROOT];
+  for(NSString* suffix in @[@ARBOL_INSTALLATION_BUILDS,@ARBOL_INSTALLATION_BROWSER]) {
+    NSString* protectedRoot=protectedPath([installation stringByAppendingPathComponent:suffix]);
     if(!protectedRoot || overlaps(buildRoot,protectedRoot)||overlaps(state,protectedRoot)) return false;
   }
   return inTime();

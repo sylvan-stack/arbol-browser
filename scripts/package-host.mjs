@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { root, inventory, inventoryDigest, sourceInventory, productInventory } from './package-base.mjs';
 import { validateNativeCompilation } from './compile-native.mjs';
 import { validateWatchdogCompilation } from './compile-watchdog.mjs';
+import installation from '../src/runtime/installation-paths.json' with { type: 'json' };
 
 export const hostRuntime = Object.freeze({ electron: '45.3.2', chromium: '156.0.8078.100', node: '24.22.2',
   napi: '10', modules: '150', platform: 'darwin', arch: 'arm64', macOS: '27.0.1' });
@@ -80,7 +81,7 @@ export async function assertHostIsolation(buildRoot, stateRoot) {
       !/^[1-9a-f][0-9a-f]{0,15}$/.test(basename(buildRoot))) fail('Invalid isolated Build layout');
   const account = userInfo(), home = await realpath(account.homedir);
   if (!process.geteuid || process.geteuid() !== account.uid) fail('Qualification OS account differs');
-  for (const path of [join(home, 'Library/Application Support/Arbol/builds'), join(home, 'Library/Application Support/Arbol/browser')]) {
+  for (const path of [installation.builds, installation.browser].map(name => join(home, installation.root, name))) {
     const protectedRoot = await protectedPath(path);
     for (const actual of [buildRoot, stateRoot]) if (inside(actual, protectedRoot) || inside(protectedRoot, actual)) fail('Owner installation/data is not qualification state');
   }
@@ -655,8 +656,8 @@ export async function prepareAllocatedHost(environment = process.env) {
     fail('Allocated Building/source does not match current committed compilation');
   const stateRoot = join(dirname(dirname(dirname(buildRoot))), 'browser-state');
   const account = userInfo(), home = await realpath(account.homedir);
-  for (const name of ['builds', 'browser']) {
-    const protectedRoot = await protectedPath(join(home, 'Library/Application Support/Arbol', name));
+  for (const name of [installation.builds, installation.browser]) {
+    const protectedRoot = await protectedPath(join(home, installation.root, name));
     for (const path of [buildRoot, stateRoot]) if (inside(path, protectedRoot) || inside(protectedRoot, path)) fail('Owner installation is not isolated qualification');
   }
   await checkedDirectory(dirname(stateRoot), false, true);

@@ -14,9 +14,21 @@ export const platformCompilerPolicy = Object.freeze({ compiler: nativeCompilerPo
   architecture: 'arm64', deployment: '27.0', compiledNapi: 8, protocol: 1, headerArchive: nativeCompilerPolicy.headerArchive,
   frozenConsumer: frozenDigest, outputs: ['platform.node', 'host-launch', 'host-bootstrap'], qualification: 'unexecuted' });
 const names = ['src/runtime/platform.mm', 'src/runtime/host-launch.mm', 'src/runtime/host-bootstrap.mm'];
+const installationSource = 'src/runtime/installation-paths.json';
 const closure = [...names, 'src/runtime/platform.ts', 'src/runtime/system-clipboard.hpp', 'src/runtime/attempt.hpp', 'watchdog/boundary.hpp', 'watchdog/exit.hpp',
-  'native/publisher-requirement.json', 'scripts/compile-platform.mjs'];
+  installationSource, 'native/publisher-requirement.json', 'scripts/compile-platform.mjs'];
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+async function installationInput() {
+  const bytes = await readFile(join(root, installationSource));
+  const layout = JSON.parse(bytes);
+  const flags = ['root', 'builds', 'browser'].map(name => {
+    const directory = layout[name];
+    if (typeof directory !== 'string' || !/^\.?[a-z][a-z0-9-]*$/.test(directory))
+      throw new Error('Invalid installation directory component');
+    return `-DARBOL_INSTALLATION_${name.toUpperCase()}=${JSON.stringify(directory)}`;
+  });
+  return { sha256: hash(bytes), flags };
+}
 export function staticCommand(program, args, maximum = 8388608) {
   const result = spawnSync(program, args, { cwd: root, env: { PATH: '/usr/bin:/bin' }, encoding: 'utf8',
     timeout: 120000, maxBuffer: maximum });
@@ -54,10 +66,12 @@ export async function captureCompilerInputs(sourceNames, headers = officialHeade
   if (JSON.parse(settings).CanonicalName !== platformCompilerPolicy.sdk ||
       staticCommand('/usr/bin/xcrun', ['clang++', '--version']).split('\n')[0] !== platformCompilerPolicy.compiler)
     throw new Error('Unsupported pinned compiler or SDK');
+  const installationPaths = sourceNames.includes(names[2]) ? await installationInput() : undefined;
   const paths = new Map();
   for (const name of sourceNames) {
+    const flags = name === names[2] ? installationPaths.flags : [];
     const output = staticCommand('/usr/bin/xcrun', ['clang++', '-std=c++17', '-fobjc-arc', '-fblocks', '-DNAPI_VERSION=8',
-      '-arch', 'arm64', '-mmacosx-version-min=27.0', '-isysroot', sdk, '-I', headers, '-M', '-MT', 'closure', name]);
+      '-arch', 'arm64', '-mmacosx-version-min=27.0', '-isysroot', sdk, '-I', headers, ...flags, '-M', '-MT', 'closure', name]);
     for (const item of dependencies(output)) {
       const full = resolve(root, item), physical = await realpath(full);
       const scopes = [[officialHeaders, 'node'], [sdk, 'sdk'], [compilerRoot, 'clang'], [root, 'source']];
@@ -77,6 +91,7 @@ export async function captureCompilerInputs(sourceNames, headers = officialHeade
     'usr/lib/libbsm.tbd', 'usr/lib/libc++.tbd', 'usr/lib/libSystem.tbd'])
     linkerInputs[path] = hash(await readFile(join(sdk, path)));
   return { policy: platformCompilerPolicy, providers: { sdkAlias, sdk, compilerAlias, compilerPath, linkerAlias, linkerPath },
+    ...(installationPaths ? { installationPaths } : {}),
     compiler: hash(await readFile(compilerPath)), linker: hash(await readFile(linkerPath)), linkerInputs,
     frameworks: { 'platform.node': ['Foundation', 'Security', 'AppKit'], 'host-launch': ['AppKit'], 'host-bootstrap': ['Foundation', 'Security'] },
     sdkSettings: hash(settings), files };
@@ -105,8 +120,10 @@ export async function compilePlatform(headers = officialHeaders) {
   staticCommand('/usr/bin/xcrun', [...common, '-DNAPI_VERSION=8', '-DNODE_GYP_MODULE_NAME=arbol_browser_platform',
     '-bundle', '-undefined', 'dynamic_lookup', '-I', headers, names[0], '-lbsm', '-framework', 'Foundation', '-framework', 'Security', '-framework', 'AppKit',
     '-o', join(root, 'dist/native/platform.node')]);
-  for (const [source, name, frameworks] of [[names[1], 'host-launch', ['AppKit']], [names[2], 'host-bootstrap', ['Foundation', 'Security']]])
-    staticCommand('/usr/bin/xcrun', [...common, source, ...frameworks.flatMap(value => ['-framework', value]), '-o', join(root, 'dist/native', name)]);
+  for (const [source, name, frameworks] of [[names[1], 'host-launch', ['AppKit']], [names[2], 'host-bootstrap', ['Foundation', 'Security']]]) {
+    const flags = source === names[2] ? input.installationPaths.flags : [];
+    staticCommand('/usr/bin/xcrun', [...common, ...flags, source, ...frameworks.flatMap(value => ['-framework', value]), '-o', join(root, 'dist/native', name)]);
+  }
   const outputs = {};
   for (const name of platformCompilerPolicy.outputs) {
     const path = join(root, 'dist/native', name);
