@@ -292,7 +292,8 @@ function assertStartupIdentityRefusal(launch, events) {
   assert.deepEqual(refusal.admission.webContents, []);
   assert.ok(!refusal.admission.nativeImages.some(path => path.endsWith('/ownership.node')));
   assert.ok(!events.some(event => event.stage === 'armed' || event.stage === 'installed'));
-  assert.ok(launch.observations.some(sample => sample.locks.owner?.acquired === false && sample.locks.build?.acquired === false));
+  assert.ok(launch.observations.some(sample => sample.locks?.owner?.acquired === false && sample.locks?.build?.acquired === false),
+    'Refused startup requires a sample showing both original locks held');
   assert.ok(!launch.observations.some(sample => sample.current?.some(row => row.original.executable.endsWith('/native/watchdog'))));
   const witness = launch.startupBirths;
   assert.equal(witness?.forkFence, true, witness?.unavailable);
