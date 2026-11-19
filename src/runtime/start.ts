@@ -145,9 +145,10 @@ export function createStarter(options: { selection: BuildSelection; platform: Pl
         const published = await options.attempts?.publishedReady(profile, request, launched, admissionDeadline);
         if (!options.attempts || published) {
           const record = await readRuntime(location);
-          if (published && (!record || (Object.keys(published) as (keyof RuntimeRecord)[])
+          const ready = record?.phase === 'ready' && originalAlive(record, options.platform);
+          if (published && (!ready || (Object.keys(published) as (keyof RuntimeRecord)[])
             .some(key => published[key] !== record[key]))) throw profileUnavailable();
-          if (record && record.phase === 'ready' && originalAlive(record, options.platform)) {
+          if (ready) {
             await options.attempts?.admitted(profile, record, admissionDeadline, request);
             const client = await connectRuntime(location, record, endpoint, options.selection, options.platform, deadline, label);
             try {
