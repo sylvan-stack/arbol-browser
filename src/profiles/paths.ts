@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
 import { BrowserFailure, invalidInput } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
+import installation from '../runtime/installation-paths.json' with { type: 'json' };
 
 export function profileUnavailable(): BrowserFailure {
   return new BrowserFailure({ code: 'profile_unavailable', message: 'Profile state or ownership cannot be verified.',
@@ -99,7 +100,7 @@ export interface ProfilePaths {
   readonly id: string; readonly root: string; readonly record: string; readonly owner: string;
   readonly data: string; readonly logs: string; readonly userData: string; readonly engine: string;
 }
-export const stateDirectory = (): string => join(homedir(), 'Library/Application Support/Arbol/browser');
+export const stateDirectory = (): string => join(homedir(), installation.root, installation.browser);
 export function profilePaths(id: string, state = stateDirectory()): ProfilePaths {
   profileId(id);
   if (!isAbsolute(state) || state !== resolve(state) || state.includes('\0')) throw profileUnavailable();
@@ -110,8 +111,7 @@ export function profilePaths(id: string, state = stateDirectory()): ProfilePaths
 }
 /** Creation alone may establish browser/profiles. Missing selection never calls this. */
 export async function ensureRegistry(state: string): Promise<void> {
-  // The installation's Application Support ancestors must already exist and be safe.
-  await ensureDirectory(dirname(state), false);
+  await ensureDirectory(dirname(state), state === stateDirectory());
   await ensureDirectory(state);
   await ensureDirectory(join(state, 'profiles'));
   await syncDirectory(state);

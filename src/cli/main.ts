@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { readFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
-import { join, resolve, dirname, basename } from 'node:path';
+import { resolve, dirname, basename } from 'node:path';
+import { stateDirectory } from '../profiles/paths.js';
 import { fileURLToPath } from 'node:url';
 import { parse } from './parse.js';
 import { publicFailure, unavailable, type ExitCode } from '../contracts/errors.js';
@@ -109,7 +109,7 @@ export async function componentInfo(): Promise<Contract<'wire.ComponentInfo'>> {
   }
   const metadata: PackageMetadata = JSON.parse(await readFile(new URL('../../metadata.json', import.meta.url), 'utf8'));
   if (Object.prototype.hasOwnProperty.call(metadata, 'host')) throw unavailable('browser');
-  const info = { ...metadata.component, stateDirectory: join(homedir(), 'Library/Application Support/Arbol/browser') };
+  const info = { ...metadata.component, stateDirectory: stateDirectory() };
   if (!validator('wire.ComponentInfo')(info)) throw new Error('Invalid packaged component metadata');
   return info;
 }

@@ -4,6 +4,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+import installation from '../src/runtime/installation-paths.json' with { type: 'json' };
 
 const require = createRequire(import.meta.url);
 const { privateDirectory } = require('../src/demo/profile-storage.cjs');
@@ -29,7 +30,7 @@ async function run() {
   const scratch = await mkdtemp(join(await realpath(tmpdir()), 'arbol-browser-demo-'));
   try {
     const storage = options.includes('--fixture') ? scratch :
-      privateDirectory(join(privateDirectory(join(await realpath(homedir()), '.arbol')), 'browser-preview'));
+      privateDirectory(join(privateDirectory(join(await realpath(homedir()), installation.root)), 'browser-preview'));
     const userData = privateDirectory(join(storage, 'instance'));
     const sessionData = storage;
     const profiles = privateDirectory(join(storage, 'site-profiles'));
