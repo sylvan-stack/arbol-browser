@@ -18,7 +18,7 @@ export interface StartAuthority {
   assertTrusted(selection: BuildSelection): Promise<void>;
   /** Verify signed native/watchdog readiness and host guard acquisition for the
    * exact record, not just successful socket hello or candidate metadata. */
-  assertReady(profile: ProfileSnapshot, record: RuntimeRecord, request?: string): Promise<void>;
+  assertReady(profile: ProfileSnapshot, record: RuntimeRecord, request?: string, joiningStartup?: boolean): Promise<void>;
   /** Complete main/helper census of this exact attempt. Failure retains guards;
    * callers must resolve retained attempts before ending their process. */
   assertFailed(profile: ProfileSnapshot, request: string, launchedPid: number | undefined, deadline: number): Promise<void>;
@@ -31,7 +31,7 @@ export interface LaunchAttemptPort {
   reserve(profile: ProfileSnapshot, request: string, deadline: number, build?: BuildGuard): Promise<void>;
   launched(profile: ProfileSnapshot, request: string, pid: number, deadline: number): Promise<void>;
   cancel(profile: ProfileSnapshot, request: string, deadline: number): Promise<void>;
-  admitted(profile: ProfileSnapshot, record: RuntimeRecord, deadline: number, request?: string): Promise<void>;
+  admitted(profile: ProfileSnapshot, record: RuntimeRecord, deadline: number, request?: string, joiningStartup?: boolean): Promise<void>;
 }
 export const launchServices: LaunchPort = Object.freeze({
   launch(selection: BuildSelection, requestPath: string, deadline: number): Promise<number> {
@@ -80,43 +80,43 @@ export function createStarter(options: { selection: BuildSelection; platform: Pl
     try {
       await guard.assert();
       let current = await readRuntime(location);
+      let joiningStartup = false;
+      if (!current || !originalAlive(current, options.platform)) {
+        noteOpenCommand(options.observation, 'open-startup-arbitration');
+        const arbitration = options.attempts
+          ? await startupArbitration(location, options.platform, contentionDeadline, deadline)
+          : await startupArbitration(location, options.platform, contentionDeadline);
+        if ('phase' in arbitration) {
+          current = arbitration; joiningStartup = true;
+          await guard.assert(); assertTime(deadline);
+        } else {
+          startup = arbitration;
+          await guard.assert(); assertTime(deadline);
+          current = await readRuntime(location);
+        }
+      }
       if (current && originalAlive(current, options.platform)) {
         noteOpenCommand(options.observation, 'open-native-ready-attachment');
+        const original = current;
+        joiningStartup ||= original.phase === 'starting';
         while (current.phase === 'starting' && now() < deadline) {
           await setTimeout(Math.min(25, Math.max(1, deadline - now())));
           const observed = await readRuntime(location);
-          if (!observed || observed.instance !== current.instance || !originalAlive(observed, options.platform)) throw profileUnavailable();
+          if (!observed || observed.instance !== original.instance || observed.pid !== original.pid ||
+              observed.processStartId !== original.processStartId || observed.nonce !== original.nonce ||
+              observed.build !== original.build || !originalAlive(observed, options.platform)) throw profileUnavailable();
           current = observed;
         }
-        await options.attempts?.admitted(profile, current, deadline);
+        await options.attempts?.admitted(profile, current, deadline, undefined, joiningStartup);
         const client = await connectRuntime(location, current, endpoint, options.selection, options.platform, deadline, label);
         try {
-          await options.authority.assertReady(profile, current); await guard.assert(); assertTime(deadline);
+          await options.authority.assertReady(profile, current, undefined, joiningStartup);
+          await guard.assert(); assertTime(deadline);
           assertTime(deadline); release(); assertTime(deadline);
           return { client, record: current, alreadyRunning: true };
         } catch (error) { client.close(); throw error; }
       }
-      noteOpenCommand(options.observation, 'open-startup-arbitration');
-      startup = await startupArbitration(location, options.platform, contentionDeadline);
-      await guard.assert(); assertTime(deadline);
-      current = await readRuntime(location);
-      if (current && originalAlive(current, options.platform)) {
-        noteOpenCommand(options.observation, 'open-native-ready-attachment');
-        // Another starter won while we waited: attach within the same budget.
-        while (current.phase === 'starting' && now() < deadline) {
-          await setTimeout(Math.min(25, Math.max(1, deadline - now())));
-          const observed = await readRuntime(location);
-          if (!observed || observed.instance !== current.instance || !originalAlive(observed, options.platform)) throw profileUnavailable();
-          current = observed;
-        }
-        await options.attempts?.admitted(profile, current, deadline);
-        const client = await connectRuntime(location, current, endpoint, options.selection, options.platform, deadline, label);
-        try {
-          await options.authority.assertReady(profile, current); await guard.assert(); assertTime(deadline);
-          assertTime(deadline); release(); assertTime(deadline);
-          return { client, record: current, alreadyRunning: true };
-        } catch (error) { client.close(); throw error; }
-      }
+      if (!startup) throw profileUnavailable();
       noteOpenCommand(options.observation, 'open-current-signed-start');
       await options.authority.assertTrusted(options.selection); assertTime(deadline);
       request = token('req');

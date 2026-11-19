@@ -223,7 +223,7 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
         await setTimeout(Math.min(10, Math.max(1, deadline - now())));
       }
     },
-    async admitted(profile: ProfileSnapshot, record: RuntimeRecord, deadline: number, request?: string) {
+    async admitted(profile: ProfileSnapshot, record: RuntimeRecord, deadline: number, request?: string, joiningStartup = false) {
       const own = request ? pending.get(request) : undefined;
       if (request && !own) throw unavailable('browser');
       for (;;) {
@@ -272,10 +272,10 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
                 originalHost.identity.productDigest !== admitted.productDigest || originalHost.policy.stateRoot !== profile.paths.state)
               throw unavailable('browser');
             if (sameHost && closeVerification) await assertHostCloseContinuity(originalHost, deadline);
-            else if (sameHost && own) {
+            else if (sameHost && (own || joiningStartup)) {
               // The host completed its independent full snapshot before the
               // exact Claim could reach ready. Retain the CLI's verified
-              // package only for this same launch and Build lock.
+              // package for this startup and its exact Build lock.
               await withBuildLockForCustody(lease, platform, held => {
                 const actual = held.assertIdentity(), expected = originalHost.guardIdentity;
                 if (actual.device !== expected.device || actual.inode !== expected.inode || actual.uid !== expected.uid)
@@ -358,7 +358,9 @@ export function createProductionProcessIntegration(host: VerifiedHost, selection
             // The intent file is a hint. Native reservation below still verifies the complete package.
             await assertHostStartupContinuity(host, deadline, deadline);
           },
-          async assertReady(actual, record, request) { await attempts.admitted(actual, record, deadline, request); },
+          async assertReady(actual, record, request, joiningStartup) {
+            await attempts.admitted(actual, record, deadline, request, joiningStartup);
+          },
           async assertFailed(actual, request, launchedPid, limit) {
             for (;;) {
               assertTime(limit);

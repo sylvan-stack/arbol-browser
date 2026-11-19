@@ -174,20 +174,35 @@ export interface InstanceOwner {
   readonly previous?: RuntimeRecord | undefined;
   phase(next: 'ready' | 'closing'): Promise<void>;
 }
-/** Separate stable startup inode serializes launch requests only; host never
- * waits for it. Bounded to 10 seconds, inside the original 60-second startup budget. */
+/** The stable startup lock can only be acquired within the contention bound.
+ * Signed callers that already encountered a holder may observe its runtime
+ * through the original command deadline, without gaining launch authority. */
+export function startupArbitration(location: RuntimeLocation, platform: PlatformPort, deadline: number): Promise<HeldLock>;
+export function startupArbitration(location: RuntimeLocation, platform: PlatformPort, deadline: number,
+  observeThrough: number): Promise<HeldLock | RuntimeRecord>;
 export async function startupArbitration(location: RuntimeLocation, platform: PlatformPort,
-  deadline: number): Promise<HeldLock> {
+  deadline: number, observeThrough?: number): Promise<HeldLock | RuntimeRecord> {
   const limit = Math.min(deadline, now() + 10000);
+  let contended = false;
   do {
-    await location.assert(); assertTime(limit);
-    const held = platform.tryLock(join(location.leaf, 'startup.lock'));
-    if (held) {
-      try { held.assertIdentity(); await location.assert(); return held; }
-      catch (error) { held.release(); throw error; }
+    if (observeThrough !== undefined) assertTime(observeThrough);
+    await location.assert();
+    if (now() < limit || !contended || observeThrough === undefined) {
+      assertTime(limit);
+      const held = platform.tryLock(join(location.leaf, 'startup.lock'));
+      if (held) {
+        try { held.assertIdentity(); await location.assert(); return held; }
+        catch (error) { held.release(); throw error; }
+      }
+      contended = true;
     }
-    await setTimeout(Math.min(25, Math.max(1, limit - now())));
-  } while (now() < limit);
+    if (observeThrough !== undefined) {
+      const record = await readRuntime(location);
+      assertTime(observeThrough);
+      if (record && originalAlive(record, platform)) return record;
+    }
+    await setTimeout(Math.min(25, Math.max(1, (observeThrough ?? limit) - now())));
+  } while (now() < (observeThrough ?? limit));
   throw profileUnavailable();
 }
 /** Never infer previous engine closure from an available owner flock. */
