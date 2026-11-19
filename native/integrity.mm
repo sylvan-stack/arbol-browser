@@ -12,11 +12,7 @@ bool integrity() {
       if (method) { poison("native_absence_changed"); return false; }
     } else if (!method || strcmp(method_getTypeEncoding(method), target.encoding)) { poison("native_encoding_changed"); return false; }
   }
-  for (const auto& hook : hooks) {
-    Method method = class_getInstanceMethod(hook.cls, hook.selector);
-    if (!hook.applied || !method || method_getImplementation(method) != hook.guard || strcmp(method_getTypeEncoding(method), hook.encoding.c_str()) ||
-        ![providerOf(hook.before) isEqualToString:@(hook.provider.c_str())]) { poison("native_guard_integrity_changed"); return false; }
-  }
+  if (!installedHooksIntact()) { poison("native_guard_integrity_changed"); return false; }
   if ((!bindingAudit && (liveBindings || policyObjects)) || (bindingAudit && !bindingAudit())) { poison("native_binding_integrity_changed"); return false; }
   return phase.load(std::memory_order_acquire) == Phase::Ready;
 }

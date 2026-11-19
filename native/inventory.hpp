@@ -147,6 +147,7 @@ extern size_t liveBindings, policyObjects;
 void poison(const char* reason);
 bool integrity();
 NSString* providerOf(IMP implementation);
+bool installedHooksIntact();
 NSDictionary* liveInventory();
 NSDictionary* pinnedInventory();
 NSDictionary* statusObject();

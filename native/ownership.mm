@@ -35,9 +35,9 @@ napi_value jsonReply(napi_env env, id value) {
   if (napi_create_string_utf8(env, (const char*)bytes.bytes, bytes.length, &result) != napi_ok) { poison("native_reply_failed"); return nullptr; }
   return result;
 }
-NSString* providerOf(IMP implementation) {
-  Dl_info image{}; Dl_info addon{};
-  if (!dladdr((void*)implementation, &image) || !image.dli_fname || !dladdr((void*)&providerOf, &addon) || !addon.dli_fname) return @"<unknown>";
+static NSString* resolveProvider(const Dl_info& image) {
+  Dl_info addon{};
+  if (!dladdr((void*)&providerOf, &addon) || !addon.dli_fname) return @"<unknown>";
   NSString* actual = [[NSString stringWithUTF8String:image.dli_fname] stringByResolvingSymlinksInPath];
   NSString* expected;
   if ([actual.lastPathComponent isEqualToString:@"AppKit"]) expected = @"/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit";
@@ -47,6 +47,40 @@ NSString* providerOf(IMP implementation) {
   }
   if (![actual isEqualToString:[expected stringByResolvingSymlinksInPath]]) return @"<unexpected-provider>";
   return actual.lastPathComponent;
+}
+NSString* providerOf(IMP implementation) {
+  Dl_info image{};
+  if (!dladdr((void*)implementation, &image) || !image.dli_fname) return @"<unknown>";
+  return resolveProvider(image);
+}
+bool installedHooksIntact() {
+  struct ProviderImage {
+    const void* base = nullptr;
+    std::string loaderPath;
+  };
+  // The positive path proof belongs to this one synchronous integrity pass.
+  ProviderImage appKit, electron;
+  for (const auto& hook : hooks) {
+    Method method = class_getInstanceMethod(hook.cls, hook.selector);
+    if (!hook.applied || !method || method_getImplementation(method) != hook.guard ||
+        strcmp(method_getTypeEncoding(method), hook.encoding.c_str())) return false;
+
+    ProviderImage* verified = nullptr;
+    if (hook.provider == "AppKit") verified = &appKit;
+    else if (hook.provider == "Electron Framework") verified = &electron;
+    if (!verified) {
+      if (![providerOf(hook.before) isEqualToString:@(hook.provider.c_str())]) return false;
+      continue;
+    }
+
+    Dl_info image{};
+    if (!dladdr((void*)hook.before, &image) || !image.dli_fname) return false;
+    if (verified->base && verified->base == image.dli_fbase && verified->loaderPath == image.dli_fname) continue;
+    if (![resolveProvider(image) isEqualToString:@(hook.provider.c_str())]) return false;
+    verified->base = image.dli_fbase;
+    verified->loaderPath = image.dli_fname;
+  }
+  return true;
 }
 static void initializeSelectors() {
   // Chromium installs generated editing selectors in +initialize. Trigger this
