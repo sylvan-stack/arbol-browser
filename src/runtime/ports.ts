@@ -10,11 +10,10 @@ export interface ProcessPort {
   /** Owns only this adapter's stdio lifetime; EOF releases it, never kills the host. */
   mcp(profile: string, io: Stdio): Promise<void>;
 }
-/** ABR-2 supplies this service. Removal performs its own controlling-TTY check. */
 export interface ProfilePort {
   list(): Promise<Contract<'profile.ProfileList'>>;
   create(profile: string, creationRequest?: string): Promise<Contract<'profile.ProfileCreated'>>;
-  remove(profile: string, io: Stdio): Promise<Contract<'profile.ProfileRemoved'>>;
+  remove(profile: string): Promise<Contract<'profile.ProfileRemoved'>>;
 }
 export interface CommandPorts { readonly process: ProcessPort; readonly profiles: ProfilePort }
 

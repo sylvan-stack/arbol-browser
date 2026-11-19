@@ -147,7 +147,7 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
         result = await activePorts.profiles.create(command.profile, command.creationRequest);
         check = validator('profile.ProfileCreated'); break;
       case 'profiles-remove':
-        result = await activePorts.profiles.remove(command.profile, io);
+        result = await activePorts.profiles.remove(command.profile);
         check = validator('profile.ProfileRemoved'); break;
     }
     if (observation) delete observation.open;

@@ -1,11 +1,9 @@
-import { constants } from 'node:fs';
-import { lstat, open, opendir, rm } from 'node:fs/promises';
+import { lstat, opendir, rm } from 'node:fs/promises';
 import { createHash, randomBytes } from 'node:crypto';
 import { join } from 'node:path';
-import { isatty } from 'node:tty';
 import { BrowserFailure } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
-import type { ProfilePort, Stdio } from '../runtime/ports.js';
+import type { ProfilePort } from '../runtime/ports.js';
 import { loadPlatform, type PlatformPort } from '../runtime/platform.js';
 import { createProfile, managedProfiles } from './create.js';
 import { registryLock, ownerLock, lockDeadline, type OwnerLease, type RegistryLease } from './locking.js';
@@ -46,32 +44,6 @@ const unopenedRuntime: ProfileRuntimePort = Object.freeze({
   },
   assertClosed: noRuntimeFootprint,
 });
-function confirmationRefused(): BrowserFailure {
-  return new BrowserFailure({ code: 'control_refused', message: 'Profile removal requires typed terminal confirmation.',
-    retryable: false, remedy: 'Use profiles remove with --delete-data in an interactive terminal.' }, 5);
-}
-async function confirmRemoval(id: string, _io: Stdio): Promise<void> {
-  // /dev/tty requires a controlling terminal. A pipe, injected stdin or MCP body
-  // cannot supply this confirmation. Nothing is ever written to JSON stdout.
-  let tty;
-  try { tty = await open('/dev/tty', constants.O_RDWR | constants.O_NOCTTY); }
-  catch { throw confirmationRefused(); }
-  try {
-    if (!isatty(tty.fd)) throw confirmationRefused();
-    await tty.writeFile(`Permanently delete profile ${id} and all its browser data. Type ${id} to confirm: `);
-    const bytes = Buffer.alloc(67);
-    let length = 0;
-    while (length < bytes.length) {
-      const read = await tty.read(bytes, length, bytes.length - length, null);
-      if (!read.bytesRead) throw confirmationRefused();
-      length += read.bytesRead;
-      if (bytes.subarray(0, length).includes(10)) break;
-    }
-    const value = bytes.subarray(0, length).toString('utf8');
-    if (value !== `${id}\n` && value !== `${id}\r\n`) throw confirmationRefused();
-  } catch { throw confirmationRefused(); }
-  finally { await tty.close(); }
-}
 async function validateRemovalMarker(profile: ProfileSnapshot): Promise<void> {
   if (!await statOrAbsent(profile.paths.engine)) return;
   const read = await readJson(profile.paths.engine);
@@ -119,11 +91,10 @@ export function createProfileService(options: {
         return { profiles };
       } finally { registry.release(); }
     }),
-    remove: (id: string, io: Stdio) => protect(async () => {
+    remove: (id: string) => protect(async () => {
       profileId(id, true);
       const selected = await readProfile(profilePaths(id, state));
       await validateRemovalMarker(selected);
-      await confirmRemoval(id, io);
       const os = platform(), registry = await existingRegistry(state, os, lockDeadline());
       let uncertain = false;
       try {
