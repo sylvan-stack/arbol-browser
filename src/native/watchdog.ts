@@ -60,7 +60,9 @@ export async function startNativeWatchdog(trust: CandidateTrust, custody: Watchd
   const api: NativeWatchdog = Object.freeze({ custody,
     get fatal() { return phase === 'fatal'; },
     assertArmed(value: CandidateTrust): void {
-      if (value !== trust || phase !== 'armed' || expired(custody.now())) lose('watchdog-readiness-loss');
+      if (value !== trust) lose('native_integrity_unavailable');
+      if (phase !== 'armed') lose('watchdog-readiness-loss');
+      if (expired(custody.now())) lose('watchdog-ack-expiry');
       try { custody.assert(); } catch { lose('watchdog-custody-refusal'); }
     },
     quarantine(reason: ProfileFatalCause = 'native_watchdog_unavailable'): void {
