@@ -9,7 +9,7 @@ import { unavailable } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
 import { assertProfile, type ProfileSnapshot } from '../profiles/records.js';
 import { assertPlatform, type HeldLock, type PlatformPort, type ProcessProvenance } from './platform.js';
-import { noteOpenCommand, type OpenCommandObservation, assertHostCloseContinuity, assertHostStartupContinuity, assertVerifiedHost, assertVerifiedHostMetadata, type VerifiedHost } from './authorities.js';
+import { noteOpenCommand, type OpenCommandObservation, assertHostCloseContinuity, assertHostStartupContinuity, assertVerifiedHostMetadata, type VerifiedHost } from './authorities.js';
 import { assertTime, now, runtimeLocation, type RuntimeLocation, type RuntimeRecord } from './instance.js';
 import { createStarter, type LaunchAttemptPort } from './start.js';
 import type { ProcessIntegration } from './lifecycle.js';
@@ -219,7 +219,7 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
             .some(key => current.engine![key] !== live[key]) || live.executable !== host.identity.layout.engine) throw unavailable('browser');
           return true;
         });
-        if (accepted) { assertVerifiedHost(host, deadline); return; }
+        if (accepted) return assertHostStartupContinuity(host, deadline, deadline);
         await setTimeout(Math.min(10, Math.max(1, deadline - now())));
       }
     },
@@ -343,7 +343,9 @@ export function createProductionProcessIntegration(host: VerifiedHost, selection
         acquireBuild: () => acquireBuildLease(selection, platform),
         authority: {
           async assertTrusted(actual) {
-            if (actual !== selection) throw unavailable('browser'); await host.assertTrusted(deadline);
+            if (actual !== selection) throw unavailable('browser');
+            // The intent file is a hint. Native reservation below still verifies the complete package.
+            await assertHostStartupContinuity(host, deadline, deadline);
           },
           async assertReady(actual, record) { await attempts.admitted(actual, record, deadline); },
           async assertFailed(actual, request, launchedPid, limit) {
