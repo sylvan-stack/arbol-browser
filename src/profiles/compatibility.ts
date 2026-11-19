@@ -9,6 +9,10 @@ import { readJson, writeNewFile, type ProfileSnapshot } from './records.js';
 import type { OwnerLease } from './locking.js';
 
 export type EngineMarker = Contract<'profile.EngineMarker'>;
+// Opaque artifacts Electron places beside the explicit website data directory.
+export const engineRootStorage = Object.freeze({
+  'Local State': 'file', GraphiteDawnCache: 'directory', GPUPersistentCache: 'directory',
+} as const);
 /** Supplied by signed package preflight, never by CLI input or PackageMetadata.
  * assertTrusted must verify the exact immutable Build/runtime/manifest payload.
  * ABR-2 provides no permissive production implementation of this authority. */
@@ -107,7 +111,8 @@ export async function prepareEngine(owner: OwnerLease, authority: EngineAuthorit
       note('fresh-marker-compatibility');
       // Missing marker never adopts existing native storage, even after a crash.
       if (manifest.dataEpoch !== 1 || !await emptyDirectory(profile.paths.data) ||
-          !await emptyDirectory(profile.paths.userData)) throw profileUnavailable();
+          !await emptyDirectory(profile.paths.userData) || (await Promise.all(Object.keys(engineRootStorage)
+            .map(name => statOrAbsent(join(profile.paths.root, name))))).some(Boolean)) throw profileUnavailable();
     }
     note('verified-prior-exit');
     await authority.assertPreviousEngineExited(profile);

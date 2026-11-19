@@ -1124,6 +1124,20 @@ static bool emptyNativeDirectory(NSString* path) {
   while(auto* entry=readdir(directory)) if(strcmp(entry->d_name,".")&&strcmp(entry->d_name,"..")) { empty=false; break; }
   if(errno) empty=false; if(closedir(directory)) empty=false; return empty;
 }
+static bool absentEngineRootStorage(NSDictionary* capability,double deadline) {
+  NSString* profile=capability[@"attempt"][@"profile"];
+  if(arbol_boundary::clockMs()>=deadline||!arbol_boundary::canonical(profile.fileSystemRepresentation)) return false;
+  int fd=open(profile.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC); if(fd<0) return false;
+  struct stat held{},named{},entry{};
+  bool ok=!fstat(fd,&held)&&S_ISDIR(held.st_mode)&&[arbol_exit::fileIdentity(held) isEqual:capability[@"profileDirectory"]];
+  for(const auto& artifact:arbol_exit::engineRootStorage) {
+    if(!ok||arbol_boundary::clockMs()>=deadline) { ok=false; break; }
+    ok=fstatat(fd,artifact.name,&entry,AT_SYMLINK_NOFOLLOW)<0&&errno==ENOENT;
+  }
+  ok=ok&&!lstat(profile.fileSystemRepresentation,&named)&&[arbol_exit::fileIdentity(named) isEqual:capability[@"profileDirectory"]];
+  if(close(fd)) ok=false;
+  return ok&&arbol_boundary::clockMs()<deadline;
+}
 static bool priorMarkerMatches(Custody* c,const std::string& raw,const struct stat& st,bool absent) {
   NSDictionary* capability=c->finalization.value(),*prior=capability[@"prior"],*attempt=capability[@"attempt"];
   if([prior[@"kind"] isEqual:@"absent"]) return absent;
@@ -1165,7 +1179,8 @@ static bool signedDirty(Custody* c,const std::string& dirtyRaw,const std::string
      ![dirty[@"requiredReader"] isEqual:policy[@"readerKey"]]||![dirty[@"dataEpoch"] isEqual:compatibility[@"dataEpoch"]]) return false;
   if(absent) return [dirty[@"dataEpoch"] isEqual:@1]&&
     emptyNativeDirectory([attempt[@"profile"] stringByAppendingPathComponent:@"data"])&&
-    emptyNativeDirectory([attempt[@"profile"] stringByAppendingPathComponent:@"userData"]);
+    emptyNativeDirectory([attempt[@"profile"] stringByAppendingPathComponent:@"userData"])&&
+    absentEngineRootStorage(c->finalization.value(),deadline);
   NSDictionary* old=arbol_attempt::json(previous);
   return nativeMarker(old)&&[policy[@"readableReaderKeys"] containsObject:old[@"requiredReader"]]&&
     [policy[@"readableDataEpochs"] containsObject:old[@"dataEpoch"]];

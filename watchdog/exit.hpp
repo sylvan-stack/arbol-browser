@@ -564,6 +564,9 @@ public:
 // acknowledgement. The private profile ancestor makes owner-owned 0644/0755
 // children private without rewriting Chromium modes. No symlink, hardlinked
 // regular file, foreign device/owner or group/other write access is admitted.
+inline constexpr struct EngineRootArtifact { const char* name; bool directory; } engineRootStorage[] = {
+  {"Local State",false}, {"GraphiteDawnCache",true}, {"GPUPersistentCache",true}
+};
 struct StorageResult {
   std::atomic<int> state{0}; // pending, 1=actual completed success, -1=refused
   double started=0,completed=0; uint64_t files=0,directories=0; std::string digest;
@@ -640,6 +643,21 @@ class StorageScan {
         [fileIdentity(child) isEqual:capability_[@"directories"][name]]&&node(root,name.UTF8String,0,synchronize,digest);
       if(ok) result+=digest;
     }
+    for(const auto& artifact:engineRootStorage) {
+      if(!ok||!within()) { ok=false; break; }
+      struct stat child{},current{};
+      const std::string label=[arbol_attempt::digest(artifact.name) UTF8String];
+      if(fstatat(root,artifact.name,&child,AT_SYMLINK_NOFOLLOW)) {
+        ok=errno==ENOENT;
+        if(ok) result+=label+":absent:";
+        continue;
+      }
+      std::string digest;
+      ok=(artifact.directory?S_ISDIR(child.st_mode):S_ISREG(child.st_mode))&&
+        node(root,artifact.name,0,synchronize,digest)&&!fstatat(root,artifact.name,&current,AT_SYMLINK_NOFOLLOW)&&sameNode(child,current);
+      if(ok) result+=label+":present:"+digest+":";
+    }
+    if(ok&&synchronize) ok=within()&&!fsync(root)&&within();
     ok=ok&&!fstat(root,&after)&&!lstat(profile.fileSystemRepresentation,&endName)&&sameNode(held,after)&&sameNode(after,endName)&&within();
     if(close(root)) ok=false; if(ok) digest=[arbol_attempt::digest(result) UTF8String]; return ok;
   }

@@ -1,7 +1,8 @@
 import type { App, Session } from 'electron';
 import { randomBytes } from 'node:crypto';
-import { directory, assertDirectory, profileUnavailable } from './paths.js';
-import type { EngineTransaction } from './compatibility.js';
+import { join } from 'node:path';
+import { directory, assertDirectory, ownerUid, profileUnavailable, statOrAbsent } from './paths.js';
+import { engineRootStorage, type EngineTransaction } from './compatibility.js';
 import { assertHostCustody, type HostCustody } from '../runtime/custody.js';
 import type { WebsiteSessionReceipt } from '../runtime/platform.js';
 
@@ -106,12 +107,24 @@ export async function configureProfileSession(app: ProfileApp, transaction: Engi
   const paths = transaction.owner.profile.paths;
   const data = await directory(paths.data), userData = await directory(paths.userData);
   await directory(paths.logs);
+  if (custody) {
+    const root = await directory(paths.root);
+    const uid = ownerUid();
+    for (const [name, type] of Object.entries(engineRootStorage)) {
+      const existing = await statOrAbsent(join(paths.root, name));
+      if (existing && (existing.dev !== root.device || existing.uid !== uid || (existing.mode & 0o022) !== 0 ||
+          (type === 'file' ? !existing.isFile() || existing.nlink !== 1 : !existing.isDirectory()))) throw profileUnavailable();
+    }
+    await assertDirectory(paths.root, root);
+  }
   if (app.isReady() || configuredApps.has(app)) throw profileUnavailable();
   configuredApps.add(app);
   if (custody) { if (custody.instance.owner !== transaction.owner) return custody.terminate(); custody.assertMarker(); }
   // Synchronous: never allow readiness or another profile between these operations.
   app.setPath('userData', paths.userData);
-  app.setPath('sessionData', paths.userData);
+  // Electron allows the network service to persist only within this parent.
+  // Keep it separate from the exact website context created at data/.
+  app.setPath('sessionData', custody ? paths.root : paths.userData);
   app.setAppLogsPath(paths.logs);
   let used = false;
   const prebind = async () => {
