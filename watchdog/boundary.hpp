@@ -442,7 +442,8 @@ struct Context {
       observe(main.pid,leader,&leaderDetail)==1&&same(leader,main)&&leader.group==main.group&&
       !(leaderDetail.bsd.pbi_flags&PROC_FLAG_INEXIT)&&getsid(main.pid)==session;
   }
-  double observeDirectChildExec(Identity& child,ChildExecReadback& readback,double sampledAt,unsigned& failureLine) const {
+  double observeDirectChildExec(Identity& child,ChildExecReadback& readback,double sampledAt,
+    std::string& completedImage,unsigned& failureLine) const {
     auto refuse=[&failureLine](unsigned callerLine=__builtin_LINE()) {
       failureLine=callerLine;
       return 0.0;
@@ -450,6 +451,7 @@ struct Context {
     const Identity forked=child;
     if(!readback.expires) readback.expires=sampledAt+12;
     int32_t transitionVersion=0;
+    bool sawExec=false;
     for(;;) {
       const double limit=std::min(readback.expires,readback.liveCutoff());
       if(clockMs()>=limit) {
@@ -463,8 +465,21 @@ struct Context {
       if(transitionVersion&&observed.version!=transitionVersion) return refuse();
       const bool executed=(detail.bsd.pbi_flags&PROC_FLAG_EXEC)!=0;
       const bool versionChanged=observed.version!=forked.version;
+      if(sawExec&&!executed) return refuse();
+      sawExec=executed;
       if(executed) {
-        if(!versionChanged) return refuse();
+        std::string image;
+        if(!versionChanged) {
+          // The initial combined kernel sample may already contain this
+          // version. Require its actual executed helper, with the same path
+          // verified again before and after the original publisher check.
+          if(!executable(observed,image)&&!image.empty()) return refuse();
+          if(image.empty()||image==engine()) {
+            usleep(500);
+            continue;
+          }
+          if(!enginePath(image)) return refuse();
+        }
         const double confirmedLimit=std::min(limit,readback.liveCutoff());
         const double at=clockMs();
         if(at>=confirmedLimit) {
@@ -472,6 +487,7 @@ struct Context {
           return refuse();
         }
         child=observed;
+        completedImage=std::move(image);
         return at;
       }
       // Darwin can expose the new PID version before the EXEC flag. Retain
@@ -579,10 +595,12 @@ struct Context {
       if(readback&&!forceFull&&valid&&!originalGroupRetired&&!captured&&id.pid!=main.pid&&direct&&
          !(info.bsd.pbi_flags&PROC_FLAG_EXEC)&&(path.empty()||path==engine())&&readback->active()&&liveDirectChild(id,info)) {
         unsigned execFailureLine=0;
-        execObservedAt=observeDirectChildExec(id,*readback,sampledAt,execFailureLine);
+        std::string completedImage;
+        execObservedAt=observeDirectChildExec(id,*readback,sampledAt,completedImage,execFailureLine);
         if(!execObservedAt) { uncertainFamily(execFailureLine); valid=reject(); return; }
         if(!engineMonitorNumberEligible(id)) { uncertainFamily(); valid=reject(); return; }
         path.clear(); image=executable(id,path);
+        if(!completedImage.empty()&&(!image||path!=completedImage)) { uncertainFamily(); valid=reject(); return; }
       }
       if(!image&&original) {
         Identity after; Info latest{}; int again=observe(pid,after,&latest);
