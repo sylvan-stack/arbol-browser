@@ -1,4 +1,4 @@
-import { isHostCustody, noteHostStartup, prepareArmedHostSnapshot, type HostCustody } from './custody.js';
+import { isHostCustody, noteHostStartup, prepareArmedHostSnapshot, prepareStartupConstructionSnapshot, type HostCustody } from './custody.js';
 import { assertAdoptedBuildClosing, assertAdoptedBuildContinuity } from './build-lease.js';
 import { unavailable } from '../contracts/errors.js';
 import type { CommandPorts } from './ports.js';
@@ -297,8 +297,8 @@ export interface TrustedShellIntegration {
   /** Invoke synchronously at ABR-10's actual authorized transport commit boundary. */
   agentTabs(recipient: string): Contract<'browser.TabsResult'>;
 }
-/** Both resource preparations consume a complete signed comparison. This
- * preceding check verifies continuity of the original adopted Build. */
+/** Both resource preparations verify continuity of the original adopted Build
+ * before consuming their exact one-use construction receipts. */
 function assertPreparationBuild(prepared: HostPreparation, deadline: number): Promise<void> {
   const { custody, buildGuard } = prepared;
   return isHostCustody(custody) && custody.build === buildGuard ?
@@ -342,7 +342,7 @@ export async function integrateTrustedShell(port: NativeShellPort, prepared: Hos
     const onClose = () => {
       void tabs.closeWindow(host).catch(() => boundary.fatal.fail('native_retirement_unavailable'));
     };
-    const proof = await prepareArmedHostSnapshot(prepared.custody, boundary.native.trust, 'window', onClose, deadline);
+    const proof = await prepareStartupConstructionSnapshot(prepared.custody, boundary.native.trust, 'window', onClose, deadline);
     host = modules.windows.createWindowHost(sessions, boundary, onClose, proof);
     const registration = modules.ipc.registerShellIPC(host, tabs, guardedAuthority);
     // Return the actual registered hidden resources before any asynchronous
@@ -370,6 +370,6 @@ export async function prepareRendererControl(boundary: NativeFailureBoundary, pr
   assertNativeFailureBoundary(boundary);
   const identity = Object.freeze({ contract: 1 as const,
     profile: prepared.instance.record.profile, instance: prepared.instance.record.instance, build: prepared.instance.record.build });
-  const proof = await prepareArmedHostSnapshot(prepared.custody, boundary.native.trust, 'ownership', identity, deadline);
+  const proof = await prepareStartupConstructionSnapshot(prepared.custody, boundary.native.trust, 'ownership', identity, deadline);
   return control.createRendererControl(boundary, identity, proof);
 }

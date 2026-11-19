@@ -62,8 +62,16 @@ const armedSnapshots = new WeakMap<ArmedHostSnapshot, {
   consume: () => void; used: boolean;
 }>();
 const preparingSnapshots = new WeakSet<HostCustody>();
-export async function prepareArmedHostSnapshot(custody: HostCustody, trust: import('../native/manifest.js').CandidateTrust,
+export function prepareArmedHostSnapshot(custody: HostCustody, trust: import('../native/manifest.js').CandidateTrust,
   purpose: SnapshotPurpose, operation: object, deadline: number): Promise<ArmedHostSnapshot> {
+  return prepareSnapshot(custody, trust, purpose, operation, deadline, false);
+}
+export function prepareStartupConstructionSnapshot(custody: HostCustody, trust: import('../native/manifest.js').CandidateTrust,
+  purpose: 'ownership' | 'window', operation: object, deadline: number): Promise<ArmedHostSnapshot> {
+  return prepareSnapshot(custody, trust, purpose, operation, deadline, true);
+}
+async function prepareSnapshot(custody: HostCustody, trust: import('../native/manifest.js').CandidateTrust,
+  purpose: SnapshotPurpose, operation: object, deadline: number, startupConstruction: boolean): Promise<ArmedHostSnapshot> {
   assertHostCustody(custody); assertTime(deadline);
   if (preparingSnapshots.has(custody) || !operation || trust.bundle !== custody.host.signed.bundle ||
       trust.snapshotDigest !== custody.host.signed.snapshotDigest) return custody.terminate();
@@ -73,14 +81,22 @@ export async function prepareArmedHostSnapshot(custody: HostCustody, trust: impo
     const manifest = await import(moduleURL) as typeof import('../native/manifest.js');
     assertHostCustody(custody); assertTime(deadline);
     const runtime = custody.instance.record;
-    const proof = await manifest.compareSignedSnapshot(trust, deadline);
+    let consume: () => void;
+    if (startupConstruction && runtime.phase === 'starting' && trust === custody.host.signed &&
+        manifest.assertRetainedReadOnlyStorage(trust, deadline)) {
+      consume = () => {
+        if (!manifest.assertRetainedReadOnlyStorage(trust, deadline)) throw unavailable('browser');
+      };
+    } else {
+      const proof = await manifest.compareSignedSnapshot(trust, deadline);
+      consume = () => manifest.consumeSignedSnapshot(proof, trust, deadline);
+    }
     // No further await after minting: the caller immediately enters its exact
     // synchronous constructor/preflight chain with this private receipt.
     assertHostCustody(custody); assertTime(deadline);
     if (custody.instance.record !== runtime) return custody.terminate();
     const receipt: ArmedHostSnapshot = Object.freeze({ deadline });
-    armedSnapshots.set(receipt, { custody, trust, purpose, operation, runtime,
-      consume: () => manifest.consumeSignedSnapshot(proof, trust, deadline), used: false }); return receipt;
+    armedSnapshots.set(receipt, { custody, trust, purpose, operation, runtime, consume, used: false }); return receipt;
   } catch { preparingSnapshots.delete(custody); return custody.terminate(); }
 }
 export function consumeArmedHostSnapshot(receipt: ArmedHostSnapshot, trust: import('../native/manifest.js').CandidateTrust,
