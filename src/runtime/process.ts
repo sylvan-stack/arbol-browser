@@ -335,14 +335,18 @@ export async function assertProductionCloseReady(profile: ProfileSnapshot, recor
 /** Actual selected, signed package integration. No caller-supplied providers,
  * fake native effects or MCP dependency can open this production boundary. */
 export function createProductionProcessIntegration(host: VerifiedHost, selection: BuildSelection,
-  platform: PlatformPort, exits: ProductionExitAuthority, observation?: OpenCommandObservation): ProcessIntegration {
-  // CLI wiring follows full verification and native provider loading. Actual
-  // command admission and startup still perform their own complete checks.
+  platform: PlatformPort, exits: ProductionExitAuthority, observation?: OpenCommandObservation, openCutoff?: number): ProcessIntegration {
+  // CLI wiring follows full verification and native provider loading. Native
+  // reservation and the host's final readiness proof remain independent.
   assertPlatform(platform); assertProductionExitAuthority(exits); assertVerifiedHostMetadata(host, now() + 5000);
   if (host.identity.layout.build !== selection.build || host.identity.layout.buildRoot !== selection.directory ||
       selection.guard !== join(selection.directory, '../.uses', selection.build)) throw unavailable('browser');
   return Object.freeze({
-    async assertAdmissionAvailable(deadline = now() + 5000) { await host.assertTrusted(deadline); },
+    async assertAdmissionAvailable(deadline = now() + 5000) {
+      if (openCutoff === undefined) return host.assertTrusted(deadline);
+      const cutoff = Math.min(deadline, openCutoff);
+      await assertHostStartupContinuity(host, cutoff, cutoff);
+    },
     async start(profile: ProfileSnapshot, endpoint: import('./transport.js').Endpoint, deadline: number,
       contentionDeadline: number, label?: string) {
       noteOpenCommand(observation, 'open-current-signed-start');

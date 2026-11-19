@@ -76,14 +76,15 @@ async function productionPorts(selection: BuildSelection, observation?: ColdObse
       process.versions.modules !== pinnedRuntime.modules || process.versions.napi !== pinnedRuntime.napi ||
       process.platform !== pinnedRuntime.platform || process.arch !== pinnedRuntime.arch) throw unavailable('browser');
   noteCold(observation, 'repeated-host-trust');
-  await host.assertTrusted(deadline);
+  if (openCutoff === undefined) await host.assertTrusted(deadline);
+  else await authorities.assertHostStartupContinuity(host, deadline, openCutoff);
   noteCold(observation, 'native-platform');
   const platform = loadPlatform();
   noteCold(observation, 'production-adapters');
   const exits = createProductionExitAuthority(platform, selection);
   const openObservation = observation ? authorities.createOpenCommandObservation() : undefined;
   if (observation && openObservation) observation.open = openObservation;
-  const integration = createProductionProcessIntegration(host, selection, platform, exits, openObservation);
+  const integration = createProductionProcessIntegration(host, selection, platform, exits, openObservation, openCutoff);
   const state = host.policy.stateRoot;
   return Object.freeze({
     profiles: createProfileService({ state, platform: () => platform, runtime: createProfileRuntime(platform, selection, exits) }),
