@@ -140,6 +140,8 @@ interface Channel {
   actionObservers: Set<ActionObserver>;
   actionWorld?: ActionWorld;
   surface?: object;
+  viewportWork?: Promise<unknown>;
+  viewportOverride?: true;
 }
 function emptyAck(value: unknown): void {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length) throw staleSnapshot();
@@ -819,6 +821,24 @@ export class PageReadiness implements DocumentPreparation {
     }));
     check();
   }
+  private async readinessViewport(channel: Channel, check: () => void, size?: { width: number; height: number }): Promise<void> {
+    // A superseded readiness job can still have a command on this channel.
+    // Let its real reply settle before applying or clearing the newer viewport.
+    while (channel.viewportWork) {
+      await channel.viewportWork.catch(() => {});
+      check();
+    }
+    if (!size && !channel.viewportOverride) return;
+    if (size) channel.viewportOverride = true; // the engine can apply the command before the reply is checked
+    const work = size
+      ? this.command(channel.page, check, 'Emulation.setDeviceMetricsOverride', { ...size, deviceScaleFactor: 0, mobile: false })
+      : this.command(channel.page, check, 'Emulation.clearDeviceMetricsOverride');
+    channel.viewportWork = work;
+    try {
+      emptyAck(await work); check();
+      if (!size) delete channel.viewportOverride;
+    } finally { delete channel.viewportWork; }
+  }
   private async observe(receipt: HostDocument, check: () => void): Promise<void> {
     const page = receipt.page, channel = this.owned(page), host = page.window;
     const category = presentationCategory(page), selected = host.selected() === page, visible = page.view.getVisible();
@@ -826,14 +846,20 @@ export class PageReadiness implements DocumentPreparation {
     const guard = () => {
       check(); this.documents.target(receipt); this.assertChannel(channel);
       if (channel.identity !== receipt.channel) throw staleSnapshot();
-      if (presentationCategory(page) !== category) throw new PresentationSuperseded();
+      if (presentationCategory(page) !== category || (host.selected() === page) !== selected || page.view.getVisible() !== visible)
+        throw new PresentationSuperseded();
     };
+    guard();
+    if (!selected && visible) throw staleSnapshot(); // Never expose an inactive view to repair it.
+    const { width, height } = page.view.getBounds();
+    if (!presented && (![width, height].every(value => Number.isSafeInteger(value) && value > 0))) throw staleSnapshot();
+    await this.readinessViewport(channel, guard, presented ? undefined : { width, height });
     guard();
     if (presented) {
       const before = page.binding(); page.restorePresentation(); const after = page.binding(); guard();
       if (before.id !== after.id || before.nonce !== after.nonce || before.revision !== after.revision ||
           before.blocked !== after.blocked || after.retired) return this.boundary.fatal.fail('native_boundary_unavailable');
-    } else if (!selected && visible) throw staleSnapshot(); // Never expose an inactive view to repair it.
+    }
     emptyAck(await this.command(page, guard, 'Emulation.setFocusEmulationEnabled', { enabled: true }));
     if (channel.interception === 'unknown')
       await this.command(page, guard, 'Input.setInterceptDrags', { enabled: false });
@@ -844,9 +870,19 @@ export class PageReadiness implements DocumentPreparation {
     const result: unknown = await channel.contents.executeJavaScriptInIsolatedWorld(999, [{ code:
       'new Promise((resolve,reject)=>{if(document.readyState==="loading"){reject(new Error("loading"));return;}requestAnimationFrame(()=>requestAnimationFrame(()=>resolve(0)));})' }], false);
     guard(); if (result !== 0) throw staleSnapshot();
-    const image = await channel.contents.capturePage(undefined, { stayHidden: true, stayAwake: false });
-    guard(); const size = image.getSize();
-    if (image.isEmpty() || size.width <= 0 || size.height <= 0) throw staleSnapshot();
+    if (presented) {
+      const image = await channel.contents.capturePage(undefined, { stayHidden: true, stayAwake: false });
+      guard(); const size = image.getSize();
+      if (image.isEmpty() || size.width <= 0 || size.height <= 0) throw staleSnapshot();
+    } else {
+      type Viewport = { clientWidth?: number; clientHeight?: number };
+      const metrics = await this.command(page, guard, 'Page.getLayoutMetrics') as {
+        cssLayoutViewport?: Viewport; cssVisualViewport?: Viewport & { scale?: number };
+      } | undefined;
+      const layout = metrics?.cssLayoutViewport, visual = metrics?.cssVisualViewport;
+      if (![layout?.clientWidth, layout?.clientHeight, visual?.clientWidth, visual?.clientHeight, visual?.scale]
+        .every(value => typeof value === 'number' && Number.isFinite(value) && value > 0)) throw staleSnapshot();
+    }
     // Native policy/readiness remain separate. This queries the exact owned
     // binding; it neither fabricates quiescence nor unlocks an active gesture.
     const binding = page.binding();
