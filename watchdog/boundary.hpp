@@ -278,8 +278,8 @@ struct FamilyObservation {
   Identity original{}; uint64_t parentStart=0,capturedUs=0;
   int32_t parentVersion=0; uint32_t session=0,image=0;
 };
-// Private diagnostic provenance only. Zero preserves the existing non-family
-// caller-line convention; the two family headers have distinct closed tags.
+// Private diagnostic provenance only. Zero preserves the original caller-line
+// convention; the two reporting headers have distinct closed tags.
 enum class FatalSource : unsigned { existingCaller=0, boundaryHeader=1, exitHeader=2 };
 class FamilyCapture {
 public:
@@ -462,16 +462,25 @@ struct Context {
       usleep(500);
     }
   }
-  bool census(std::vector<Identity>& targets,bool forceFull=false,ChildExecReadback* readback=nullptr) {
+  bool census(std::vector<Identity>& targets,bool forceFull=false,ChildExecReadback* readback=nullptr,unsigned* failureLine=nullptr) {
+    // The live caller can record this pass's first invalid observation. It
+    // has no effect on family custody or the accepted census result.
+    auto reject=[failureLine](unsigned callerLine=__builtin_LINE()) {
+      if(failureLine&&!*failureLine) *failureLine=callerLine;
+      return false;
+    };
     targets.clear();
-    if(!authenticated||!foundation()||!monitorBirthsCurrent()) return false;
+    if(!authenticated) return reject();
+    if(!foundation()) return reject();
+    if(!monitorBirthsCurrent()) return reject();
     bool valid=!familyUncertain;
+    if(!valid) reject();
     if(family) {
       std::vector<FamilyObservation> shared;
-      if(!family->snapshot(shared)) return false;
+      if(!family->snapshot(shared)) return reject();
       for(const auto& value:shared) {
         auto old=seen.find(key(value.original));
-        if(old!=seen.end()&&!same(old->second,value.original)) { uncertainFamily(); return false; }
+        if(old!=seen.end()&&!same(old->second,value.original)) { uncertainFamily(); return reject(); }
         seen.emplace(key(value.original),value.original);
       }
     }
@@ -481,7 +490,7 @@ struct Context {
     parents.emplace(main.start,main.version);
     for(const auto& entry:seen) parents.emplace(entry.second.start,entry.second.version);
     Identity leader; int leaderState=observe(main.pid,leader);
-    if(leaderState<0) return false;
+    if(leaderState<0) return reject();
     if(!originalGroupRetired&&leaderState==1&&leader.start!=main.start&&leader.group==main.group) {
       // Darwin cannot allocate the old leader PID while that original process
       // group exists. A new same-number group is not ours. First reconcile ALL
@@ -489,7 +498,7 @@ struct Context {
       bool retainedSelf=getpid()==primary.pid&&primaryMonitor()&&primaryOutside;
       bool gone=originalGone(main)&&(retainedSelf||originalGone(primary))&&originalGone(custody);
       for(const auto& entry:seen) if(!originalGone(entry.second)) gone=false;
-      if(!gone||(family&&!family->complete())) return false;
+      if(!gone||(family&&!family->complete())) return reject();
       originalGroupRetired=true;
     }
     groupPending=false; std::set<int> currentGaps;
@@ -504,7 +513,7 @@ struct Context {
           else if(pid==primary.pid) known=primary;
           else if(pid==custody.pid) known=custody;
           for(const auto& entry:seen) if(entry.second.pid==pid) known=entry.second;
-          if(!known.pid) { uncertainFamily(); valid=false; }
+          if(!known.pid) { uncertainFamily(); valid=reject(); }
           else {
             // Numeric equality does not prove this group-list occupant is the
             // old original. Keep it unresolved until the actual group no
@@ -519,8 +528,8 @@ struct Context {
                 if(answer->returned==sizeof(Info)&&full.bsd.pbi_pid==(uint32_t)pid&&full.unique.start&&full.unique.version>0) {
                   Identity actual{pid,full.unique.start,full.unique.version,full.bsd.pbi_uid,full.bsd.pbi_pgid};
                   if((actual.start!=known.start&&actual.group==main.group)||
-                     (actual.start==known.start&&!same(actual,known))) { uncertainFamily(); valid=false; }
-                } else if(result==KernelState::uncertain) { uncertainFamily(); valid=false; }
+                     (actual.start==known.start&&!same(actual,known))) { uncertainFamily(); valid=reject(); }
+                } else if(result==KernelState::uncertain) { uncertainFamily(); valid=reject(); }
                 if(clockMs()>=answer->completed+10) answer.reset();
               }
             }
@@ -528,7 +537,11 @@ struct Context {
         }
         return; // known originals remain in the full kernel reconciliation
       }
-      if(state<0) { valid=false; return; }
+      if(state<0) {
+        if(groupMember) valid=reject(); // Original process-group scan.
+        else valid=reject(); // Full scan of the owner's UID.
+        return;
+      }
       bool direct=info.unique.parent==main.start&&info.unique.originalParentVersion==main.version;
       bool descendant=parents.count({info.unique.parent,info.unique.originalParentVersion});
       auto old=seen.find(key(id)); bool captured=old!=seen.end();
@@ -536,10 +549,10 @@ struct Context {
       // Unrelated reuse outside the original group never enrolls or poisons it.
       if((originalGroupRetired||id.group!=main.group)&&!descendant&&!captured&&
          !same(id,main)&&!same(id,primary)&&!same(id,custody)) return;
-      if(same(id,primary)) { if(!primaryMonitor()) valid=false; return; }
-      if(same(id,custody)) { if(!monitor(custody,true)) valid=false; return; }
-      if(!engineMonitorNumberEligible(id)) { valid=false; return; }
-      if(id.uid!=main.uid) { uncertainFamily(); valid=false; return; }
+      if(same(id,primary)) { if(!primaryMonitor()) valid=reject(); return; }
+      if(same(id,custody)) { if(!monitor(custody,true)) valid=reject(); return; }
+      if(!engineMonitorNumberEligible(id)) { valid=reject(); return; }
+      if(id.uid!=main.uid) { uncertainFamily(); valid=reject(); return; }
       bool original=captured&&same(old->second,id);
       std::string path; bool image=executable(id,path);
       double execObservedAt=0;
@@ -548,7 +561,7 @@ struct Context {
       if(readback&&!forceFull&&valid&&!originalGroupRetired&&!captured&&id.pid!=main.pid&&direct&&
          !(info.bsd.pbi_flags&PROC_FLAG_EXEC)&&(path.empty()||path==engine())&&readback->active()&&liveDirectChild(id,info)) {
         execObservedAt=observeDirectChildExec(id,*readback,sampledAt);
-        if(!execObservedAt||!engineMonitorNumberEligible(id)) { uncertainFamily(); valid=false; return; }
+        if(!execObservedAt||!engineMonitorNumberEligible(id)) { uncertainFamily(); valid=reject(); return; }
         path.clear(); image=executable(id,path);
       }
       if(!image&&original) {
@@ -559,35 +572,35 @@ struct Context {
         // A genuinely observed exiting original can lack a task/image; retain
         // its immutable capture until its separate full kernel query completes.
         if(again==1&&same(after,id)&&after.group==main.group&&(latest.bsd.pbi_flags&PROC_FLAG_INEXIT)) return;
-        uncertainFamily(); valid=false; return;
+        uncertainFamily(); valid=reject(); return;
       }
       bool eligible=same(id,main)?image&&path==engine():(direct||original)&&image&&enginePath(path);
-      if(!eligible) { uncertainFamily(); valid=false; return; }
+      if(!eligible) { uncertainFamily(); valid=reject(); return; }
       if(id.group!=main.group||getsid(id.pid)!=session||(!same(id,main)&&!direct&&!original)) {
         // A helper may disappear after successful image lookup too. Keep only
         // the same narrow proven natural-disappearance/reuse explanation.
         Identity after; int again=observe(pid,after);
         if(original&&(!again||(again==1&&after.start!=id.start&&after.group!=main.group))) return;
-        uncertainFamily(); valid=false; return;
+        uncertainFamily(); valid=reject(); return;
       }
       if(!captured) {
-        if(seen.size()>=4096||!signature(path,true)) { uncertainFamily(); valid=false; return; }
+        if(seen.size()>=4096||!signature(path,true)) { uncertainFamily(); valid=reject(); return; }
         if(execObservedAt) {
           Identity confirmed; Info detail{}; std::string currentPath;
           if(!executable(id,currentPath)||currentPath!=path||observe(id.pid,confirmed,&detail)!=1||
              !same(confirmed,id)||!(detail.bsd.pbi_flags&PROC_FLAG_EXEC)||!liveDirectChild(confirmed,detail)||
              execObservedAt>=readback->expires) {
-            uncertainFamily(); valid=false; return;
+            uncertainFamily(); valid=reject(); return;
           }
-          if(!readback->active()) { uncertainFamily(); valid=false; return; }
+          if(!readback->active()) { uncertainFamily(); valid=reject(); return; }
         }
         if(family&&!same(id,main)) {
           FamilyObservation observation{id,info.unique.parent,(uint64_t)(clockMs()*1000),info.unique.originalParentVersion,(uint32_t)session,engineRole(path)};
-          if(!family->capture(observation)) { uncertainFamily(); valid=false; return; }
+          if(!family->capture(observation)) { uncertainFamily(); valid=reject(); return; }
         }
         seen.emplace(key(id),id);
         parents.emplace(id.start,id.version);
-      } else if(!original) { uncertainFamily(); valid=false; }
+      } else if(!original) { uncertainFamily(); valid=reject(); }
     };
     constexpr size_t cap=16385; std::vector<pid_t> pids(cap);
     double began=clockMs();
@@ -596,13 +609,13 @@ struct Context {
     if(forceFull||!lastFullCensus||began>=lastFullCensus+40) {
       lastFullCensus=began; fullCensusValid=false;
       int bytes=proc_listpids(PROC_UID_ONLY,main.uid,pids.data(),(int)(cap*sizeof(pid_t)));
-      if(bytes<0||bytes%sizeof(pid_t)||(size_t)bytes>=cap*sizeof(pid_t)) return false;
+      if(bytes<0||bytes%sizeof(pid_t)||(size_t)bytes>=cap*sizeof(pid_t)) return reject();
       for(int i=0;i<bytes/(int)sizeof(pid_t);++i) inspect(pids[i],false);
       fullCensusValid=valid;
     }
     if(!originalGroupRetired) {
       int bytes=proc_listpids(PROC_PGRP_ONLY,main.group,pids.data(),(int)(cap*sizeof(pid_t)));
-      if(bytes<0||bytes%sizeof(pid_t)||(size_t)bytes>=cap*sizeof(pid_t)) return false;
+      if(bytes<0||bytes%sizeof(pid_t)||(size_t)bytes>=cap*sizeof(pid_t)) return reject();
       for(int i=0;i<bytes/(int)sizeof(pid_t);++i) inspect(pids[i],true);
     }
     for(auto it=groupGaps.begin();it!=groupGaps.end();) {
@@ -614,7 +627,8 @@ struct Context {
       else ++it;
     }
     if(!originalGone(main)&&std::none_of(targets.begin(),targets.end(),[&](const Identity& id){return same(id,main);})) targets.push_back(main);
-    return valid&&fullCensusValid;
+    if(!valid||!fullCensusValid) return reject();
+    return true;
   }
   bool engineGone(bool executingMain = false,ChildExecReadback* readback=nullptr) {
     std::vector<Identity> targets;

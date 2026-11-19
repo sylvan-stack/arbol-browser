@@ -55,8 +55,9 @@ static Context record(const std::string& raw,bool primary,Identity& producer) {
 }
 // Refusal never advertises R or gives up the only retained descriptions. An
 // already identified family can be enforced; unknown input cannot select PIDs.
-static void poison(arbol_exit::HostCapability* cap,uint64_t reason,unsigned callerLine=__builtin_LINE()) {
-  if(cap&&cap->present()) cap->shared()->poison(reason,callerLine);
+static void poison(arbol_exit::HostCapability* cap,uint64_t reason,unsigned callerLine=__builtin_LINE(),
+  FatalSource source=FatalSource::existingCaller) {
+  if(cap&&cap->present()) cap->shared()->poison(reason,callerLine,source);
 }
 // The sole controlled final-release route for original monitors. Host-private
 // failed enrollment never downgrades to the Native-only legacy exit path.
@@ -130,6 +131,7 @@ static bool frame(const std::string& line,Frame& result,const std::string& allow
 struct Deadline {
   double expires; bool fatal=false,received=false,elapsed=false,sealed=false,hardLoss=false; uint64_t sequence=0;
   unsigned firstHardLossLine=0; // Observation only; never read by a deadline or authority predicate.
+  FatalSource firstHardLossSource=FatalSource::existingCaller;
   explicit Deadline(double start):expires(start+2500) {}
   bool expired(double now,unsigned callerLine=__builtin_LINE()) {
     if((!sealed||fatal)&&now>=expires) {
@@ -147,9 +149,9 @@ struct Deadline {
     return true;
   }
   void seal() { sealed=elapsed=true; } // closes renewal only, never a completion proof
-  void lost(double now,unsigned callerLine=__builtin_LINE()) {
+  void lost(double now,unsigned callerLine=__builtin_LINE(),FatalSource source=FatalSource::existingCaller) {
     fatal=elapsed=sealed=hardLoss=true; expires=std::min(expires,now);
-    if(!firstHardLossLine) firstHardLossLine=callerLine;
+    if(!firstHardLossLine) { firstHardLossLine=callerLine; firstHardLossSource=source; }
   }
 };
 [[noreturn]] static void retirePair(Context& c,Channel& pair,bool primary,arbol_exit::HostCapability* cap=nullptr,
@@ -380,7 +382,7 @@ struct Deadline {
     }
     // This handoff is itself a cleanup boundary; never leave attribution until
     // the loop tail when a complete census may make this call nonreturning.
-    if(deadline.hardLoss) poison(cap,arbol_exit::protocolLoss|arbol_exit::forced,deadline.firstHardLossLine);
+    if(deadline.hardLoss) poison(cap,arbol_exit::protocolLoss|arbol_exit::forced,deadline.firstHardLossLine,deadline.firstHardLossSource);
     else if(deadline.fatal&&cap) cap->shared()->declareFatal();
     if(c.engineGone(false,&childExecReadback)&&(!cap||watch.observed()||deadline.hardLoss)) {
       // The census itself may have been delayed. Its first complete result
@@ -475,9 +477,16 @@ struct Deadline {
     else if(!terminal) blockedWrite=0;
     std::vector<Identity> observed;
     Identity peerNow; const Identity& peer=primary?c.custody:c.primary;
-    if(pair.failed||observe(peer.pid,peerNow)!=1||!same(peer,peerNow)||peerNow.group!=(primary?c.main.group:(uint32_t)c.primary.pid)||
-       !c.census(observed,false,&childExecReadback)||!lockIdentity(c.owner)||!lockIdentity(c.build)) deadline.lost(clockMs());
-    if(deadline.hardLoss) { poison(cap,arbol_exit::protocolLoss|arbol_exit::forced,deadline.firstHardLossLine); c.enforce(); }
+    unsigned censusFailureLine=0;
+    if(pair.failed) deadline.lost(clockMs());
+    else if(observe(peer.pid,peerNow)!=1) deadline.lost(clockMs());
+    else if(!same(peer,peerNow)) deadline.lost(clockMs());
+    else if(peerNow.group!=(primary?c.main.group:(uint32_t)c.primary.pid)) deadline.lost(clockMs());
+    else if(!c.census(observed,false,&childExecReadback,&censusFailureLine))
+      deadline.lost(clockMs(),censusFailureLine,FatalSource::boundaryHeader);
+    else if(!lockIdentity(c.owner)) deadline.lost(clockMs());
+    else if(!lockIdentity(c.build)) deadline.lost(clockMs());
+    if(deadline.hardLoss) { poison(cap,arbol_exit::protocolLoss|arbol_exit::forced,deadline.firstHardLossLine,deadline.firstHardLossSource); c.enforce(); }
     reap(c.custody); maybeRetire(pendingRetirement); usleep(5000);
   }
 }
