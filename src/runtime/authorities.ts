@@ -442,7 +442,15 @@ export function createHostEngineAuthority(host: VerifiedHost, custody: import('.
   const authority: import('../profiles/compatibility.js').EngineAuthority = Object.freeze({
     build: host.identity.layout.build, manifest: host.signed.manifest,
     async assertTrusted() {
-      custody.assertRetained(); await host.assertTrusted(performance.now() + 5000, originalStartupCutoff); custody.assertRetained();
+      const starting = custody.instance.record;
+      const assertStarting = () => {
+        assertBudget(originalStartupCutoff);
+        if (starting.phase !== 'starting' || custody.instance.record !== starting) return custody.terminate();
+        custody.assertRetained();
+      };
+      assertStarting();
+      await assertHostStartupContinuity(host, performance.now() + 5000, originalStartupCutoff);
+      assertStarting();
     },
     async assertPreviousEngineExited(profile: import('../profiles/records.js').ProfileSnapshot) {
       if (profile !== custody.instance.owner.profile) return custody.terminate();
