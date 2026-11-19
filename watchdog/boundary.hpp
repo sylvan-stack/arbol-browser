@@ -442,23 +442,41 @@ struct Context {
       observe(main.pid,leader,&leaderDetail)==1&&same(leader,main)&&leader.group==main.group&&
       !(leaderDetail.bsd.pbi_flags&PROC_FLAG_INEXIT)&&getsid(main.pid)==session;
   }
-  double observeDirectChildExec(Identity& child,ChildExecReadback& readback,double sampledAt) const {
+  double observeDirectChildExec(Identity& child,ChildExecReadback& readback,double sampledAt,unsigned& failureLine) const {
+    auto refuse=[&failureLine](unsigned callerLine=__builtin_LINE()) {
+      failureLine=callerLine;
+      return 0.0;
+    };
     const Identity forked=child;
     if(!readback.expires) readback.expires=sampledAt+12;
+    int32_t transitionVersion=0;
     for(;;) {
       const double limit=std::min(readback.expires,readback.liveCutoff());
-      if(clockMs()>=limit) return 0;
+      if(clockMs()>=limit) {
+        if(limit==readback.expires) return refuse(); // Original readback window.
+        return refuse(); // Current live watchdog cutoff.
+      }
       Identity observed; Info detail{};
-      if(observe(forked.pid,observed,&detail)!=1||observed.start!=forked.start||!liveDirectChild(observed,detail)) return 0;
+      if(observe(forked.pid,observed,&detail)!=1) return refuse();
+      if(observed.start!=forked.start) return refuse();
+      if(!liveDirectChild(observed,detail)) return refuse();
+      if(transitionVersion&&observed.version!=transitionVersion) return refuse();
       const bool executed=(detail.bsd.pbi_flags&PROC_FLAG_EXEC)!=0;
-      if(executed&&observed.version!=forked.version) {
+      const bool versionChanged=observed.version!=forked.version;
+      if(executed) {
+        if(!versionChanged) return refuse();
         const double confirmedLimit=std::min(limit,readback.liveCutoff());
         const double at=clockMs();
-        if(at>=confirmedLimit) return 0;
+        if(at>=confirmedLimit) {
+          if(confirmedLimit==readback.expires) return refuse();
+          return refuse();
+        }
         child=observed;
         return at;
       }
-      if(executed||observed.version!=forked.version) return 0;
+      // Darwin can expose the new PID version before the EXEC flag. Retain
+      // that one version for this birth inside the same readback window.
+      if(versionChanged) transitionVersion=observed.version;
       usleep(500);
     }
   }
@@ -560,8 +578,10 @@ struct Context {
       // original child executes. Capture only its verified post-exec identity.
       if(readback&&!forceFull&&valid&&!originalGroupRetired&&!captured&&id.pid!=main.pid&&direct&&
          !(info.bsd.pbi_flags&PROC_FLAG_EXEC)&&(path.empty()||path==engine())&&readback->active()&&liveDirectChild(id,info)) {
-        execObservedAt=observeDirectChildExec(id,*readback,sampledAt);
-        if(!execObservedAt||!engineMonitorNumberEligible(id)) { uncertainFamily(); valid=reject(); return; }
+        unsigned execFailureLine=0;
+        execObservedAt=observeDirectChildExec(id,*readback,sampledAt,execFailureLine);
+        if(!execObservedAt) { uncertainFamily(execFailureLine); valid=reject(); return; }
+        if(!engineMonitorNumberEligible(id)) { uncertainFamily(); valid=reject(); return; }
         path.clear(); image=executable(id,path);
       }
       if(!image&&original) {
