@@ -18,7 +18,7 @@ export interface StartAuthority {
   assertTrusted(selection: BuildSelection): Promise<void>;
   /** Verify signed native/watchdog readiness and host guard acquisition for the
    * exact record, not just successful socket hello or candidate metadata. */
-  assertReady(profile: ProfileSnapshot, record: RuntimeRecord): Promise<void>;
+  assertReady(profile: ProfileSnapshot, record: RuntimeRecord, request?: string): Promise<void>;
   /** Complete main/helper census of this exact attempt. Failure retains guards;
    * callers must resolve retained attempts before ending their process. */
   assertFailed(profile: ProfileSnapshot, request: string, launchedPid: number | undefined, deadline: number): Promise<void>;
@@ -144,7 +144,8 @@ export function createStarter(options: { selection: BuildSelection; platform: Pl
           await options.attempts?.admitted(profile, record, admissionDeadline, request);
           const client = await connectRuntime(location, record, endpoint, options.selection, options.platform, deadline, label);
           try {
-            await options.authority.assertReady(profile, record); await guard.assert(); assertTime(deadline);
+            await options.authority.assertReady(profile, record, options.attempts ? request : undefined);
+            await guard.assert(); assertTime(deadline);
             assertTime(deadline); release(); assertTime(deadline);
             return { client, record, alreadyRunning: false };
           } catch (error) { client.close(); throw error; }

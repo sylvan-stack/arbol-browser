@@ -15,7 +15,7 @@ import { createStarter, type LaunchAttemptPort } from './start.js';
 import type { ProcessIntegration } from './lifecycle.js';
 import { claimedLayout, selectedLayout, type BuildSelection } from './selection.js';
 import { ownerLock, withOwnerLockForCustody, type OwnerLease, type RegistryLease } from '../profiles/locking.js';
-import { acquireBuildLease, type BuildLease } from './build-lease.js';
+import { acquireBuildLease, withBuildLockForCustody, type BuildLease } from './build-lease.js';
 import { createProductionExitAuthority, assertProductionExitAuthority, type ProductionExitAuthority } from './exit.js';
 
 export interface LaunchAttempt {
@@ -272,6 +272,17 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
                 originalHost.identity.productDigest !== admitted.productDigest || originalHost.policy.stateRoot !== profile.paths.state)
               throw unavailable('browser');
             if (sameHost && closeVerification) await assertHostCloseContinuity(originalHost, deadline);
+            else if (sameHost && own) {
+              // The host completed its independent full snapshot before the
+              // exact Claim could reach ready. Retain the CLI's verified
+              // package only for this same launch and Build lock.
+              await withBuildLockForCustody(lease, platform, held => {
+                const actual = held.assertIdentity(), expected = originalHost.guardIdentity;
+                if (actual.device !== expected.device || actual.inode !== expected.inode || actual.uid !== expected.uid)
+                  throw unavailable('browser');
+              });
+              await assertHostStartupContinuity(originalHost, deadline, deadline);
+            }
             else await originalHost.assertTrusted(deadline);
             await lease.assert(); assertTime(deadline);
             await withLaunchAttempt(profile, platform, deadline, transaction => {
@@ -347,7 +358,7 @@ export function createProductionProcessIntegration(host: VerifiedHost, selection
             // The intent file is a hint. Native reservation below still verifies the complete package.
             await assertHostStartupContinuity(host, deadline, deadline);
           },
-          async assertReady(actual, record) { await attempts.admitted(actual, record, deadline); },
+          async assertReady(actual, record, request) { await attempts.admitted(actual, record, deadline, request); },
           async assertFailed(actual, request, launchedPid, limit) {
             for (;;) {
               assertTime(limit);
