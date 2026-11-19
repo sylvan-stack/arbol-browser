@@ -259,8 +259,16 @@ function noteHostVerification(observation: HostVerificationObservation | undefin
  * it changes no Native check and cannot open the owner's production profiles.
  * The full source digest includes later testing-only source; productDigest pins
  * the separately reviewed actual product/compiler/sign inputs, never Git HEAD. */
-export async function verifyPackagedHost(selection: BuildSelection, payload: string, deadline: number,
+export function verifyPackagedHost(selection: BuildSelection, payload: string, deadline: number,
   bootstrapSigned?: SignedBundle, observation?: HostVerificationObservation): Promise<VerifiedHost> {
+  return verifySelectedHost(selection, payload, deadline, bootstrapSigned, observation);
+}
+export function verifyPackagedOpenHost(selection: BuildSelection, payload: string, deadline: number,
+  observation?: HostVerificationObservation): Promise<VerifiedHost> {
+  return verifySelectedHost(selection, payload, deadline, undefined, observation, true);
+}
+async function verifySelectedHost(selection: BuildSelection, payload: string, deadline: number,
+  bootstrapSigned?: SignedBundle, observation?: HostVerificationObservation, ordinaryOpen = false): Promise<VerifiedHost> {
   noteHostVerification(observation, 'signed-bundle');
   assertBudget(deadline);
   const layout = selectedLayout(selection, payload);
@@ -389,7 +397,11 @@ export async function verifyPackagedHost(selection: BuildSelection, payload: str
   startupTrustChecks.set(result, (limit, cutoff) => verifyTrusted(limit, cutoff, 'startup'));
   closeTrustChecks.set(result, limit => verifyTrusted(limit, undefined, 'close'));
   noteHostVerification(observation, 'initial-verified-host');
-  assertBudget(deadline); verifiedHosts.add(result); await result.assertTrusted(deadline); return result;
+  assertBudget(deadline); verifiedHosts.add(result);
+  // Ordinary Open already verified both complete snapshots in this factory.
+  if (ordinaryOpen) await assertHostStartupContinuity(result, deadline, deadline);
+  else await result.assertTrusted(deadline);
+  return result;
 }
 
 /** Metadata-only host-layout correlation. It reads only fixed neighboring

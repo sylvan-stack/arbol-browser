@@ -60,7 +60,10 @@ async function productionPorts(selection: BuildSelection, observation?: ColdObse
   const verification = observation ? authorities.createHostVerificationObservation() : undefined;
   try { if (observation && verification) observation.verification = Object.freeze({ module: authorities, observation: verification }); }
   catch { /* Optional readback cannot alter production provider construction. */ }
-  const host = await authorities.verifyPackagedHost(selection, payload, deadline, undefined, verification).catch(error => {
+  const selectedHost = openCutoff === undefined
+    ? authorities.verifyPackagedHost(selection, payload, deadline, undefined, verification)
+    : authorities.verifyPackagedOpenHost(selection, payload, openCutoff, verification);
+  const host = await selectedHost.catch(error => {
     // Read only this genuine module's observation; no callback enters trust
     // verification, and diagnostic readback cannot replace its actual error.
     try {
