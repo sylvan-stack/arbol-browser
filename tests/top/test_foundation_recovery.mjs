@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import { writeFile, readFile } from 'node:fs/promises';
+import { lstat, readdir, writeFile, readFile } from 'node:fs/promises';
 import { assert, fixture, cli, load, snapshot, dataSentinel, refused, opaque, bounded, rawConnection, delay, privateDirectory } from '../support/foundation.mjs';
 
 export async function preservationBoundary(context) {
@@ -14,10 +14,10 @@ export async function preservationBoundary(context) {
   const profile = join(f.state, 'profiles/retained');
   await dataSentinel(join(profile, 'data/retained'));
   const before = await snapshot(f.state);
-  refused(await cli(f, ['profiles', 'remove', 'retained', '--delete-data'], 'retained\n'), 5, 'control_refused');
-  refused(await cli(f, ['profiles', 'remove', 'default', '--delete-data'], 'default\n'), 2, 'invalid_input');
+  refused(await cli(f, ['profiles', 'remove', 'retained']), 2, 'invalid_input');
+  refused(await cli(f, ['profiles', 'remove', 'default', '--delete-data']), 2, 'invalid_input');
   assert.equal((await cli(f, ['close', '--profile', 'retained'])).value.closed, false);
-  assert.deepEqual(await snapshot(f.state), before, 'Close or piped destructive confirmation changed data');
+  assert.deepEqual(await snapshot(f.state), before, 'Close or refused removal changed data');
 
   const recordPath = join(profile, 'profile.json'), original = await readFile(recordPath, 'utf8');
   await writeFile(recordPath, JSON.stringify({ ...JSON.parse(original), format: 9001 }) + '\n');
@@ -44,7 +44,32 @@ export async function preservationBoundary(context) {
   refused(await cli(f, ['close', '--profile', 'retained']), 4, 'profile_unavailable');
   refused(await cli(f, ['profiles', 'list']), 4, 'profile_unavailable');
   assert.deepEqual(await snapshot(f.state), readerBefore, 'Uncertain exit was marked clean or data was replaced');
-  return { absentDefaultPreserved: true, pipedConfirmationRefused: true, unsupportedBytesPreserved: true,
+
+  const retained = await snapshot(profile);
+  const profiles = join(f.state, 'profiles'), removable = join(profiles, 'removable');
+  assert.equal((await cli(f, ['profiles', 'create', 'removable'])).status, 0);
+  await dataSentinel(join(removable, 'data/disposable'));
+  const removableBefore = await snapshot(removable);
+  const { loadPlatform } = await load(f, 'runtime/platform');
+  const held = loadPlatform().tryLock(join(removable, 'owner.lock'));
+  assert.ok(held, 'Expected the fixture to acquire the original Owner lock');
+  try {
+    refused(await cli(f, ['profiles', 'remove', 'removable', '--delete-data']), 4, 'profile_unavailable');
+    assert.deepEqual(await snapshot(removable), removableBefore, 'Removal changed the profile while Owner was held');
+  } finally { held.release(); }
+
+  const removed = await cli(f, ['profiles', 'remove', 'removable', '--delete-data']);
+  assert.equal(removed.status, 0, removed.stderr);
+  assert.deepEqual(removed.value, { profile: 'removable', dataRemoved: true });
+  await assert.rejects(lstat(removable), { code: 'ENOENT' });
+  const tombstones = (await readdir(profiles)).filter(name => name.startsWith('.deleting-'));
+  assert.equal(tombstones.length, 1);
+  const tombstone = join(profiles, tombstones[0]);
+  assert.deepEqual(await readdir(tombstone), ['owner.lock']);
+  assert.deepEqual((await snapshot(tombstone))['./owner.lock'], removableBefore['./owner.lock']);
+  assert.deepEqual(await snapshot(profile), retained, 'Removal changed the unrelated profile');
+  return { absentDefaultPreserved: true, missingDeleteDataRefused: true, heldOwnerPreserved: true,
+    noninteractiveRemoval: true, unsupportedBytesPreserved: true,
     readerTransaction: 'unavailable: no production signed EngineAuthority',
     completeClose: 'unavailable: no complete original-helper/flush authority', nativeAdmission: 'refused' };
 }

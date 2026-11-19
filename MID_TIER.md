@@ -7,7 +7,7 @@ independently of a top-tier pass.
 Foundation top-tier evidence does not establish successful native host start,
 LaunchServices/helper provenance, lifetime custody, full close/flush/clean marker,
 engine reader/epoch compatibility or actual Electron session persistence. It
-does not establish positive controlling-TTY deletion, all filesystem races,
+does not establish signed removal of an opened-and-closed profile, all filesystem races,
 capacity, cross-UID peers or power-loss durability. Distinct consequential future
 cases need individual admission and tier review; do not generate every hand-over
 obligation as a test or silently turn these gaps into new top-tier cases.
@@ -88,7 +88,7 @@ effects and in-flight drain remain unavailable. Physical input, momentum, OS
 source drag, multilingual IME, dictation and Writing Tools retain separate scope.
 There is no reliable signed post-arm mutation seam, engine reader-transaction
 access oracle, surviving-helper/blocked-main phase trigger, genuine lost-ACK
-observation or confirmed-removal/waiting-starter race oracle in the retained
+observation or profile-removal/waiting-starter race oracle in the retained
 current-host cases. Cross-site/OOPIF replacement and explicit recovery remain
 unqualified. Earlier Native passes do not supply these complete-host claims.
 No low-tier case was invented/restored and no mid-tier suite was added or run.

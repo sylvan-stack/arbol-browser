@@ -37,8 +37,8 @@
       "file": "tests/top/test_foundation_recovery.mjs",
       "tier": "top",
       "status": "retained",
-      "reason": "Refusal may mutate unsupported profile/dirty state, accept piped deletion, fall back/create default or falsely report close/native readiness.",
-      "oracle": "Packaged CLI exit/stdout channels plus complete private state inode/mode/digest inventories before and after each distinct refusal boundary.",
+      "reason": "Refusal may mutate unsupported profile/dirty state, delete a held, default or implicitly selected profile, fall back/create default or falsely report close/native readiness.",
+      "oracle": "Packaged CLI exit and JSON with private state inventories across refusals, plus explicit noninteractive removal of a separate never-opened profile after its Owner lock is released.",
       "origins": [
         "BRW-0.3",
         "BRW-0.7",
@@ -386,8 +386,8 @@
       "reason": "Physical and complementary input routes, complete application/Driver, account/model and signed distribution/install/update journeys require their separate providers and execution scope."
     },
     {
-      "id": "destructive-tty-platform",
-      "reason": "Negative default and absent controlling-TTY protection only; positive confirmed deletion/replacement, cross-UID peers, complete filesystem attack/race and capacity matrix unqualified."
+      "id": "production-profile-removal",
+      "reason": "Signed removal after real Browser exit, the waiting-starter race, cross-UID peers, broader filesystem races and the capacity matrix remain unqualified."
     },
     {
       "id": "native-remaining-input",
@@ -403,7 +403,7 @@
     },
     {
       "id": "control-required-gaps",
-      "reason": "physical native keys/click/wheel/momentum and OS drag; live IME/dictation/Writing Tools/configured text services; actual shell Take/Return/share/revoke/focus/presentation/accessible control oracle; Tools inspection/action drain and in-flight model effects; reliable signed post-arm mutation seam; no synthetic monitor or earlier signature rejection substituted; engine reader transaction fault corpus lacking independently admitted engine-access oracle; main-dead surviving-helper custody and blocked-main dual-watchdog fault routes pending concrete external phase control; genuine lost acknowledgement and authentic failed-launch replay route; cross-site/OOPIF replacement with independent current-view observations; explicit shell recovery action unavailable under present external interface; controlling-TTY removal with a deterministic already-waiting starter: no admitted external phase oracle yet; retain piped/default refusals in unchanged Foundation"
+      "reason": "physical native keys/click/wheel/momentum and OS drag; live IME/dictation/Writing Tools/configured text services; actual shell Take/Return/share/revoke/focus/presentation/accessible control oracle; Tools inspection/action drain and in-flight model effects; reliable signed post-arm mutation seam; no synthetic monitor or earlier signature rejection substituted; engine reader transaction fault corpus lacking independently admitted engine-access oracle; main-dead surviving-helper custody and blocked-main dual-watchdog fault routes pending concrete external phase control; genuine lost acknowledgement and authentic failed-launch replay route; cross-site/OOPIF replacement with independent current-view observations; explicit shell recovery action unavailable under present external interface; signed profile removal with a deterministic already-waiting starter: no admitted external phase oracle yet. Foundation checks the explicit flag, default protection and real Owner contention"
     }
   ],
   "qualificationOwners": {
@@ -412,7 +412,7 @@
     "complete-close": "ABR-29/ABR-12",
     "engine-reader-session": "ABR-29/ABR-12",
     "native-pages-driver-release": "ABR-8/12/16/21/23/25; actual providers and explicit execution scope required",
-    "destructive-tty-platform": "ABR-12 for complete runtime removal; remaining distinct platform evidence requires explicit admission/scope",
+    "production-profile-removal": "ABR-12 for complete runtime removal; remaining distinct platform evidence requires explicit admission/scope",
     "native-remaining-input": "ABR-47 route-review: installed guards and sealed disabled feature are bounded; complementary positive effects and physical/configured-service routes remain unavailable; production agent admission stays false",
     "native-lifetime-edge": "ABR-8 for native edges; ABR-9/29/12 for host transitions and settlement",
     "native-enforcement-limits": "ABR-8 for fault feasibility; ABR-29/12 for continuous production confinement"
