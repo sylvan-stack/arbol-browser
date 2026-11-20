@@ -170,7 +170,12 @@ async function assertIsolation(layout: PackagedLayout, state: string, deadline: 
   if (!process.geteuid || account.uid !== process.geteuid() || !canonicalPath(account.homedir)) throw unavailable('browser');
   assertBudget(deadline);
   const accountHome = await realpath(account.homedir);
-  for (const protectedPath of [installation.builds, installation.browser].map(name => join(accountHome, installation.root, name))) {
+  const protectedPaths = [
+    join(accountHome, ...installation.builds),
+    join(accountHome, ...installation.payloads),
+    join(accountHome, installation.root, installation.browser),
+  ];
+  for (const protectedPath of protectedPaths) {
     const physical = await protectedLocation(protectedPath, deadline);
     for (const actual of [layout.buildRoot, state])
       if (below(actual, physical) || below(physical, actual)) throw unavailable('browser');

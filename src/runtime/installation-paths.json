@@ -1,5 +1,6 @@
 {
   "root": ".arbol",
   "browser": "browser",
-  "builds": "builds"
+  "builds": ["Builds", "registries", "arbol"],
+  "payloads": [".local", "lib", "sylvan-stack", "arbol", "stable"]
 }

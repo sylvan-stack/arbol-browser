@@ -21,11 +21,11 @@ const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 async function installationInput() {
   const bytes = await readFile(join(root, installationSource));
   const layout = JSON.parse(bytes);
-  const flags = ['root', 'builds', 'browser'].map(name => {
-    const directory = layout[name];
-    if (typeof directory !== 'string' || !/^\.?[a-z][a-z0-9-]*$/.test(directory))
+  const flags = ['root', 'builds', 'payloads', 'browser'].map(name => {
+    const parts = Array.isArray(layout[name]) ? layout[name] : [layout[name]];
+    if (!parts.length || parts.some(part => typeof part !== 'string' || !/^\.?[a-z][a-z0-9-]*$/i.test(part)))
       throw new Error('Invalid installation directory component');
-    return `-DARBOL_INSTALLATION_${name.toUpperCase()}=${JSON.stringify(directory)}`;
+    return `-DARBOL_INSTALLATION_${name.toUpperCase()}=${JSON.stringify(parts.join('/'))}`;
   });
   return { sha256: hash(bytes), flags };
 }

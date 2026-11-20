@@ -76,12 +76,16 @@ async function protectedPath(path) {
     return join(await realpath(current), ...tail); // dangling existing aliases refuse
   }
 }
+function protectedLocations(home) {
+  return [join(home, ...installation.builds), join(home, ...installation.payloads),
+    join(home, installation.root, installation.browser)];
+}
 export async function assertHostIsolation(buildRoot, stateRoot) {
   if (resolve(buildRoot) !== buildRoot || resolve(stateRoot) !== stateRoot || basename(dirname(buildRoot)) !== 'arbol-browser' ||
       !/^[1-9a-f][0-9a-f]{0,15}$/.test(basename(buildRoot))) fail('Invalid isolated Build layout');
   const account = userInfo(), home = await realpath(account.homedir);
   if (!process.geteuid || process.geteuid() !== account.uid) fail('Qualification OS account differs');
-  for (const path of [installation.builds, installation.browser].map(name => join(home, installation.root, name))) {
+  for (const path of protectedLocations(home)) {
     const protectedRoot = await protectedPath(path);
     for (const actual of [buildRoot, stateRoot]) if (inside(actual, protectedRoot) || inside(protectedRoot, actual)) fail('Owner installation/data is not qualification state');
   }
@@ -656,8 +660,8 @@ export async function prepareAllocatedHost(environment = process.env) {
     fail('Allocated Building/source does not match current committed compilation');
   const stateRoot = join(dirname(dirname(dirname(buildRoot))), 'browser-state');
   const account = userInfo(), home = await realpath(account.homedir);
-  for (const name of [installation.builds, installation.browser]) {
-    const protectedRoot = await protectedPath(join(home, installation.root, name));
+  for (const path of protectedLocations(home)) {
+    const protectedRoot = await protectedPath(path);
     for (const path of [buildRoot, stateRoot]) if (inside(path, protectedRoot) || inside(protectedRoot, path)) fail('Owner installation is not isolated qualification');
   }
   await checkedDirectory(dirname(stateRoot), false, true);

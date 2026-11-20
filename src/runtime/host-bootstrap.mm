@@ -52,8 +52,10 @@ static bool isolated(NSString* buildRoot,NSString* state) {
   if(getuid()!=geteuid() || getpwuid_r(geteuid(),&record,buffer,sizeof(buffer),&account) || !account || account->pw_uid!=geteuid()) return false;
   NSString* home=protectedPath([NSString stringWithUTF8String:account->pw_dir]); if(!home) return false;
   NSString* installation=[home stringByAppendingPathComponent:@ARBOL_INSTALLATION_ROOT];
-  for(NSString* suffix in @[@ARBOL_INSTALLATION_BUILDS,@ARBOL_INSTALLATION_BROWSER]) {
-    NSString* protectedRoot=protectedPath([installation stringByAppendingPathComponent:suffix]);
+  for(NSString* path in @[[home stringByAppendingPathComponent:@ARBOL_INSTALLATION_BUILDS],
+                          [home stringByAppendingPathComponent:@ARBOL_INSTALLATION_PAYLOADS],
+                          [installation stringByAppendingPathComponent:@ARBOL_INSTALLATION_BROWSER]]) {
+    NSString* protectedRoot=protectedPath(path);
     if(!protectedRoot || overlaps(buildRoot,protectedRoot)||overlaps(state,protectedRoot)) return false;
   }
   return inTime();
