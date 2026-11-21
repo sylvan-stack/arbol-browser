@@ -72,20 +72,12 @@ async function mountedApplication(image, mount, attached) {
   return join(mount, 'ArbolBrowser.app');
 }
 
-/** Check the exact post-staple bytes and the app sealed before submission. This never activates a release. */
-export async function verifyPostStapleRelease({ image, signedReceiptPath, deliveryReceiptPath }) {
+/** Verify the original signed image and its sealed app before local activation. */
+export async function verifySignedRelease({ image, signedReceiptPath }) {
   if (process.platform !== 'darwin' || process.arch !== 'arm64') throw new Error('Release installation requires Darwin arm64');
   const signed = await signedReceipt(signedReceiptPath), expected = signed.value;
-  const delivered = await json(deliveryReceiptPath), receipt = delivered.value;
-  if (receipt.format !== 1 || receipt.kind !== 'notarized-production-release' || receipt.status !== 'Accepted' ||
-      typeof receipt.submission !== 'string' || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(receipt.submission) ||
-      receipt.signedReceiptSha256 !== signed.sha256 || receipt.signedImageSha256 !== expected.imageSha256 ||
-      receipt.build !== expected.build || receipt.source !== expected.source || receipt.productDigest !== expected.productDigest ||
-      receipt.payloadDigest !== expected.payloadDigest || !digest(receipt.imageSha256)) throw new Error('Delivery receipt does not bind the signed release');
-  if ((await exactFile(image, imageLimit)).sha256 !== receipt.imageSha256) throw new Error('Delivered image digest differs');
+  if ((await exactFile(image, imageLimit)).sha256 !== expected.imageSha256) throw new Error('Signed image digest differs');
   checkSignature(image);
-  run('/usr/bin/xcrun', ['stapler', 'validate', image]);
-  run('/usr/sbin/spctl', ['--assess', '--type', 'open', '--context', 'context:primary-signature', image]);
 
   const mount = await mkdtemp(join(await realpath(tmpdir()), 'arbol-browser-release-'));
   await privateDirectory(mount);
@@ -97,13 +89,12 @@ export async function verifyPostStapleRelease({ image, signedReceiptPath, delive
     const data = JSON.parse(run('/usr/bin/plutil', ['-convert', 'json', '-o', '-', '--', '-'], attached).stdout);
     const app = await mountedApplication(image, mount, data);
     checkSignature(app, publisher.bundleIdentifier, true);
-    run('/usr/sbin/spctl', ['--assess', '--type', 'exec', app]);
     await assertPhysicalCap(app);
     const files = await inventory(app);
     const policy = await json(join(app, relativePolicy));
     if (inventoryDigest(files) !== expected.payloadDigest || canonical(files) !== canonical(expected.files) ||
         policy.sha256 !== expected.files[relativePolicy] || canonical(policy.value) !== canonical(expected.policy)) {
-      throw new Error('Notarized application differs from its independently recorded signed inventory');
+      throw new Error('Application differs from its recorded signed inventory');
     }
     const path = join(app, relativeLauncher);
     checkSignature(path, launcherIdentifier);
@@ -113,13 +104,13 @@ export async function verifyPostStapleRelease({ image, signedReceiptPath, delive
     checkSignature(addon);
     platform = await exactFile(addon, launcherLimit);
     if (platform.sha256 !== expected.files[relativePlatform]) throw new Error('Signed installer lock provider differs');
-    if ((await exactFile(image, imageLimit)).sha256 !== receipt.imageSha256 || (await json(signedReceiptPath)).sha256 !== signed.sha256 ||
-        (await json(deliveryReceiptPath)).sha256 !== delivered.sha256) throw new Error('Release inputs changed during verification');
+    if ((await exactFile(image, imageLimit)).sha256 !== expected.imageSha256 ||
+        (await json(signedReceiptPath)).sha256 !== signed.sha256) throw new Error('Release inputs changed during verification');
   } finally {
     if (attached) run('/usr/bin/hdiutil', ['detach', mount]);
     await rmdir(mount);
   }
-  return { build: expected.build, source: expected.source, imageSha256: receipt.imageSha256,
+  return { build: expected.build, source: expected.source, imageSha256: expected.imageSha256,
     payloadDigest: expected.payloadDigest, launcher, platform };
 }
 
@@ -300,7 +291,7 @@ async function recoverInstall(support, executable, alias, provider, uses) {
 
 /** Publish the exact selected binary and image under the same guards used by launch and retirement. */
 export async function installRelease(options) {
-  const release = await verifyPostStapleRelease(options);
+  const release = await verifySignedRelease(options);
   const { homedir: home } = userInfo();
   const supportParts = installation.stableUses.slice(0, -1);
   const privateFrom = supportParts.length - 1;
@@ -372,13 +363,13 @@ export async function installRelease(options) {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const [action, imageFlag, image, signedFlag, signedReceiptPath, deliveryFlag, deliveryReceiptPath, ...extra] = process.argv.slice(2);
+  const [action, imageFlag, image, signedFlag, signedReceiptPath, ...extra] = process.argv.slice(2);
   if (!['verify', 'install'].includes(action) || imageFlag !== '--image' || signedFlag !== '--signed-receipt' ||
-      deliveryFlag !== '--delivery-receipt' || !image || !signedReceiptPath || !deliveryReceiptPath || extra.length) {
-    throw new Error('Usage: install-release.mjs <verify|install> --image <post-staple.dmg> --signed-receipt <signed-release.json> --delivery-receipt <delivery.json>');
+      !image || !signedReceiptPath || extra.length) {
+    throw new Error('Usage: install-release.mjs <verify|install> --image <signed.dmg> --signed-receipt <signed-release.json>');
   }
-  const options = { image: resolve(image), signedReceiptPath: resolve(signedReceiptPath), deliveryReceiptPath: resolve(deliveryReceiptPath) };
-  const result = await (action === 'verify' ? verifyPostStapleRelease(options) : installRelease(options));
+  const options = { image: resolve(image), signedReceiptPath: resolve(signedReceiptPath) };
+  const result = await (action === 'verify' ? verifySignedRelease(options) : installRelease(options));
   delete result.launcher;
   delete result.platform;
   console.log(JSON.stringify(result));
