@@ -26,13 +26,22 @@ There are 50 separately recorded native scenarios.
 Case and scenario selection is fixed. Missing sources, results or required
 observations fail the gate.
 
-Run the normal Build with a fresh isolated registry and bin directory outside
-the checkout.
+Get the user's explicit approval for each test run, including individual cases
+and Builds that run the gate. After approval, set the opt-in for that invocation
+only. Run the normal Build with a fresh isolated registry and bin directory
+outside the checkout.
 
 ```sh
-arbol-builds build arbol-browser --repo /Users/msix/repos/sylvan-stack/arbol-browser \
+ARBOL_BROWSER_MANUAL_FOCUS=1 arbol-builds build arbol-browser --repo /Users/msix/repos/sylvan-stack/arbol-browser \
   --registry-dir /absolute/new-private-run/registry --bin-dir /absolute/new-private-run/bin
 ```
+
+Native scenarios that depend on real keyboard focus show a passive window
+titled `Arbol Browser test · Click title bar · …`. When it appears, click its
+title bar within 20 seconds and leave it selected until it finishes. Click the
+title bar of each new fixture when it appears. If you leave a fixture, it stops
+sending focus-dependent input and reports the missing evidence. Timeout or
+missing focus evidence leaves the scenario unqualified.
 
 The gate writes `result.json`, a Foundation worker result and private native
 case directories under `<isolated-registry>/arbol-browser/.qualification-<build>/`.

@@ -9,6 +9,15 @@ images and the Apple result and log. Cold launch, Open and complete Close
 from Applications require a dedicated Browser profile and separately observed
 filesystem activity from the original host and helpers.
 
+Get explicit approval before each Browser test run, including production
+rehearsals, integration checks and installed launch verification. Use the
+existing macOS account with a dedicated disposable Browser profile for each
+rehearsal and installed launch check. During a focus-preservation observation,
+record the user's foreground app, active window and focused control across
+Browser startup and presentation. Ask the user to select the Browser window
+for any focus-dependent action. Missing foreground or filesystem observations
+leave those requirements unqualified.
+
 No mid-tier cases are retained, implemented or executed. This is an obligation
 list, not a passing suite. `test-tiers.json` records named unavailable routes
 independently of a top-tier pass.

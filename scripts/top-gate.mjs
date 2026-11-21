@@ -82,6 +82,8 @@ assert.ok(args.length === 4 || (!embedded && !controlWorker && args.length === 6
   'Usage: top-gate.mjs --candidate <package> --out <new-private-output> [--native-consumer <pinned-manifest>]');
 assert.equal(args[0], '--candidate'); assert.equal(args[2], '--out');
 assert.ok(args[1] && args[3] && isAbsolute(args[1]) && isAbsolute(args[3]));
+const manualFocusApproval = process.env.ARBOL_BROWSER_MANUAL_FOCUS;
+assert.equal(manualFocusApproval, '1', 'Get the user’s approval for this Browser test run, then set ARBOL_BROWSER_MANUAL_FOCUS=1 for the invocation');
 if (args.length === 6) {
   assert.equal(args[4], '--native-consumer');
   assert.equal(args[5], nativeConsumer.manifest, 'Only the pinned ABR-46 manifest can qualify this gate');
@@ -128,7 +130,8 @@ if (!embedded && !controlWorker) {
     const controlOutput = join(output, 'control'); await mkdir(controlOutput, { mode: 0o700 });
     const controlRun = spawnSync(join(candidate, 'runtime/Electron.app/Contents/MacOS/Electron'),
       [fileURLToPath(import.meta.url), '--candidate', buildRoot, '--out', controlOutput, '--control-worker'], {
-        cwd: repository, env: { HOME: home, PATH: '/usr/bin:/bin', ELECTRON_RUN_AS_NODE: '1', LANG: 'en_US.UTF-8' },
+        cwd: repository, env: { HOME: home, PATH: '/usr/bin:/bin', ELECTRON_RUN_AS_NODE: '1', LANG: 'en_US.UTF-8',
+          ARBOL_BROWSER_MANUAL_FOCUS: manualFocusApproval },
         stdio: 'inherit', timeout: 960000,
       });
     gate.control = { record: join(controlOutput, 'result.json'), passed: false,
@@ -156,7 +159,8 @@ if (!embedded && !controlWorker) {
     await save();
     const result = spawnSync(join(candidate, 'runtime/Electron.app/Contents/MacOS/Electron'),
       [fileURLToPath(import.meta.url), '--candidate', buildRoot, '--out', foundationOutput, '--embedded'], {
-        cwd: repository, env: { HOME: home, PATH: '/usr/bin:/bin', ELECTRON_RUN_AS_NODE: '1', LANG: 'en_US.UTF-8' },
+        cwd: repository, env: { HOME: home, PATH: '/usr/bin:/bin', ELECTRON_RUN_AS_NODE: '1', LANG: 'en_US.UTF-8',
+          ARBOL_BROWSER_MANUAL_FOCUS: manualFocusApproval },
         stdio: 'inherit', timeout: 90000,
       });
     if (result.error) throw result.error;
