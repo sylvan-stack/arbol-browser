@@ -7,9 +7,13 @@ retaining ABR-8's earlier cases and recorded limitations. The exact case and
 scenario selection, admission reasons and unavailable routes are in
 [test-tiers.json](test-tiers.json). No earlier low-tier bodies existed.
 
-The normal Build gate selects all six unchanged Foundation cases, ten unchanged
-native cases (50 scenarios), and five Control cases. ABR-12 owns current-host
-qualification; source selection alone is not an executed result.
+The normal isolated Build gate selects all six Foundation cases, ten Native
+cases with 50 scenarios, and five Control cases. ABR-12 owns current-host
+qualification. A production release Build also runs `releaseArtifactIdentity`
+against the exact signed disk image named by the original Building record.
+The case mounts that image read-only and verifies its Publisher, Build, runtime,
+native executables, and full app inventory. It leaves the selected installation
+and notarization to the separate ABR-25 release operations.
 The Foundation worker calls the ordinary candidate's physical compiled `runCli`
 through explicit no-integration fixture ports, compiled
 libraries, Darwin process addon and embedded Node with disposable state, kernel

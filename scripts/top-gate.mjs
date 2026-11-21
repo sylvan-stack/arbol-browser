@@ -44,11 +44,14 @@ const controlSelection = [
   ['controlProfilePersistence', 'tests/top/test_control_lifecycle.mjs'],
   ['controlCompleteClose', 'tests/top/test_control_lifecycle.mjs'],
 ];
-const allCases = [...foundationSelection, ...selection, ...controlSelection];
+const isolatedCases = [...foundationSelection, ...selection, ...controlSelection];
+const releaseSelection = [['releaseArtifactIdentity', 'tests/top/test_release_concurrency.mjs']];
+const allCases = [...isolatedCases, ...releaseSelection];
 const controlSupport = ['tests/support/control.mjs'];
 const foundationSupport = ['tests/support/foundation.mjs', 'tests/support/foundation-deadlines.mjs', 'tests/support/foundation-startup-deadlines.mjs'];
 const nativeSupport = ['tests/support/native.mjs', 'tests/support/native-entry.mjs', 'tests/support/native-callbacks.mm',
   'tests/support/native-observer.mm', 'tests/support/native-census.mm', 'tests/support/native-launch.mm', 'scripts/compile-native.mjs', 'scripts/package-base.mjs'];
+const releaseSupport = ['tests/support/release.mjs', 'scripts/package-host.mjs'];
 const boundFiles = ['test-tiers.json', 'scripts/top-gate.mjs', 'arbol-build.json'];
 const sourceFiles = (cases, support) => [...new Set([...boundFiles, ...support, ...cases.map(([, file]) => file)])].sort();
 const snapshot = (files) => Promise.all(files.map(async file => [file, hash(await readFile(join(repository, file)))])).then(Object.fromEntries);
@@ -58,6 +61,8 @@ async function readSelection() {
   const inventory = await readJson(join(repository, 'test-tiers.json'));
   assert.deepEqual(inventory.cases.map(item => [item.id, item.file, ...(item.scenarios ? [item.scenarios] : [])]), allCases);
   assert.ok(inventory.cases.every(item => item.tier === 'top' && item.status === 'retained'));
+  assert.deepEqual(inventory.cases.filter(item => item.appliesTo !== undefined).map(item => [item.id, item.appliesTo]),
+    releaseSelection.map(([id]) => [id, 'production-release']));
   return inventory;
 }
 async function verifyExports(cases) {
@@ -90,12 +95,17 @@ if (!embedded && !controlWorker) {
   assert.equal(await realpath(dirname(output)), dirname(output), 'Qualification output must have a canonical parent');
   await mkdir(output, { mode: 0o700 }); // refuse reuse of prior evidence
   const file = join(output, 'result.json');
-  const gate = { format: 3, buildRoot, candidate, output, selection: allCases.map(([id]) => id), cases: [], startedAt: new Date().toISOString(), passed: false };
+  const gate = { format: 3, buildRoot, candidate, output, selection: [], cases: [], startedAt: new Date().toISOString(), passed: false };
   const save = () => writeFile(file, JSON.stringify(gate, null, 2) + '\n', { mode: 0o600 });
   try {
     const inventory = await readSelection();
     gate.unavailableOutsideSelection = inventory.unavailable;
-    const sources = sourceFiles(allCases, [...foundationSupport, ...nativeSupport, ...controlSupport]);
+    const allocation = await readJson(join(buildRoot, 'build.json'));
+    const production = Object.hasOwn(allocation, 'productionRelease');
+    const activeCases = production ? allCases : isolatedCases;
+    gate.selection = activeCases.map(([id]) => id);
+    const sources = sourceFiles(activeCases, [...foundationSupport, ...nativeSupport, ...controlSupport,
+      ...(production ? releaseSupport : [])]);
     gate.harness = await snapshot(sources);
     gate.harnessCommit = execFileSync('/usr/bin/git', ['-C', repository, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
     const nativeModules = await verifyExports(selection);
@@ -247,6 +257,22 @@ if (!embedded && !controlWorker) {
       await save();
     }
     gate.cases.push(...control.cases);
+    if (production) {
+      const modules = await verifyExports(releaseSelection);
+      for (const [id, body] of releaseSelection) {
+        const row = { id, body, bodyDigest: gate.harness[body], status: 'failed' };
+        gate.cases.push(row);
+        try {
+          row.evidence = await modules.get(body)[id]({ buildRoot, repository });
+          row.status = 'passed';
+          console.log('PASS ' + id);
+        } catch (error) {
+          row.error = String(error.stack ?? error);
+          console.error('FAIL ' + id + ': ' + error.message);
+        }
+        await save();
+      }
+    }
     assert.deepEqual(await snapshot(sources), gate.harness, 'Qualification harness changed during the gate');
     assert.equal(inventoryDigest(await sourceInventory()), foundationSource, 'Foundation source changed during the gate');
     assert.deepEqual(gate.cases.map(item => item.id), gate.selection);

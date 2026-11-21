@@ -1,5 +1,14 @@
 # Broader Browser qualification
 
+ABR-25 performs the guarded same-account production rehearsal, notarization,
+independent post-staple verification, and stable installation as explicit
+release operations. The automatic pre-notary gate checks the exact signed
+candidate inventory. The independent verifier in
+`tests/qualification/verify_release.mjs` consumes the submitted and delivered
+images and the Apple result and log. Cold launch, Open and complete Close
+from Applications require a dedicated Browser profile and separately observed
+filesystem activity from the original host and helpers.
+
 No mid-tier cases are retained, implemented or executed. This is an obligation
 list, not a passing suite. `test-tiers.json` records named unavailable routes
 independently of a top-tier pass.

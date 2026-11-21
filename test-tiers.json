@@ -364,6 +364,20 @@
         "BRW-1.5",
         "BRW-1.7"
       ]
+    },
+    {
+      "id": "releaseArtifactIdentity",
+      "file": "tests/top/test_release_concurrency.mjs",
+      "tier": "top",
+      "status": "retained",
+      "appliesTo": "production-release",
+      "reason": "A production Build can associate the latest source with a previously signed or substituted disk image, or qualify a checked-out package that differs from the archived app.",
+      "oracle": "The actual ordinary Building record names one exact signed receipt and physical archive. An independent read-only mount verifies Developer ID, pinned runtime and native code, the compiled direct CLI, the complete file and link inventory, and unchanged allocation and signed receipt.",
+      "origins": [
+        "BRW-0.12",
+        "BRW-4.8",
+        "BRW-4.19"
+      ]
     }
   ],
   "mid": [],
