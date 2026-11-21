@@ -122,6 +122,22 @@ export async function controlProfilePersistence(c) {
   } finally { await page.close(); }
 }
 
+async function closeFamily(c, platform, original, label) {
+  const candidates = (await family(c, label)).map(line => platform.processProvenance(Number(line.trim().split(/\s+/)[0])))
+    .filter(value => value && value.executable.startsWith(c.payload + '/'));
+  const descendants = new Map([[original.startId, original]]);
+  let previousSize;
+  do {
+    previousSize = descendants.size;
+    for (const candidate of candidates) {
+      const parent = descendants.get(candidate.parentStartId);
+      if (candidate.group === original.group || parent?.pidVersion === candidate.parentPidVersion)
+        descendants.set(candidate.startId, candidate);
+    }
+  } while (descendants.size !== previousSize);
+  return candidates.filter(value => descendants.has(value.startId));
+}
+
 export async function controlCompleteClose(c) {
   const profile = 'control-complete-close'; await create(c, profile);
   const page = await loopback(c), samples = [];
@@ -130,12 +146,12 @@ export async function controlCompleteClose(c) {
     await until(() => page.observations.some(o => o.name === 'close-seed'));
     const r = await runtime(c, profile), markerPath = join(c.state, 'profiles', profile, 'engine.json');
     assert.equal(JSON.parse(await readFile(markerPath)).cleanExit, false);
-    const baseline = await family(c, 'before-close');
-    const originals = baseline.map(line => {
-      const pid = Number(line.trim().split(/\s+/)[0]), identity = r.platform.processIdentity(pid);
-      assert.ok(identity, 'Baseline process disappeared before exact identity was captured');
-      const role = pid === r.record.pid ? 'main' : line.includes(c.payload + '/native/watchdog') ? 'monitor' :
-        line.includes(c.payload + '/runtime/Electron.app/') ? 'engine-helper' : 'unknown';
+    const anchor = r.platform.processProvenance(r.record.pid);
+    assert.equal(anchor?.startId, r.record.processStartId, 'Close must observe the current named profile original');
+    const baseline = await closeFamily(c, r.platform, anchor, 'before-close');
+    const originals = baseline.map(identity => {
+      const role = identity.startId === anchor.startId ? 'main' : identity.executable === c.payload + '/native/watchdog' ? 'monitor' :
+        identity.executable.startsWith(c.payload + '/runtime/Electron.app/') ? 'engine-helper' : 'unknown';
       assert.notEqual(role, 'unknown', 'Unclassified original cannot support complete close proof');
       return { ...identity, role };
     });
@@ -155,7 +171,7 @@ export async function controlCompleteClose(c) {
     try { result = await closes(c, profile); } finally { done = true; await observer; }
     assert.equal(observerError, undefined, observerError);
     assert.equal(result.closed, true); assert.equal(JSON.parse(await readFile(markerPath)).cleanExit, true);
-    assert.deepEqual(await family(c, 'after-close'), []);
+    assert.deepEqual(await closeFamily(c, r.platform, anchor, 'after-close'), []);
     for (const original of originals) assert.notEqual(r.platform.processIdentity(original.pid)?.startId, original.startId);
     await open(c, profile, page.url('close-restored'));
     const restored = await until(() => page.observations.find(o => o.name === 'close-restored'));
