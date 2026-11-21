@@ -227,15 +227,17 @@ state. A release Build consumes the published commit with exact production
 source admission and uses the normal isolated Build to retain the existing gate.
 
 ```sh
-forester builds run arbol-browser -- sh -eu -c '
-  arbol-builds build arbol-browser --repo "$1" \
-    --registry-dir "$BUILD_DIR/registry" --bin-dir "$BUILD_DIR/bin" \
-    --browser-release "$2"
-' sh "$reviewed_source_checkout" "$release_review_commit"
+browser_run=$(forester builds run arbol-browser -- sh -eu -c 'printf "%s\n" "$BUILD_DIR"')
+forester builds keep --minutes 60 "$browser_run"
+mkdir -m 700 "$browser_run/registry" "$browser_run/bin"
+"$HOME/Applications/Arbol/bin/arbol-builds" build arbol-browser --repo "$reviewed_source_checkout" \
+  --registry-dir "$browser_run/registry" --bin-dir "$browser_run/bin" \
+  --browser-release "$release_review_commit"
 ```
 
-The Common Build reserves a production number in the canonical registry and
-builds into the private run. The build record gives the path and SHA-256 of
+Forester allocates and tracks the private run. Invoke the Common Build directly
+with those paths so it can reserve the canonical production number and the
+qualification gate can use the native process observers. The build record gives the path and SHA-256 of
 `release-<build>/ArbolBrowser.dmg` and `signed-release.json`. The receipt binds
 the signed app inventory, source, runtime and publisher. Keep the exact signed
 candidate and receipts long enough to finish qualification. Ordinary temporary
