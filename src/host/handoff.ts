@@ -232,7 +232,7 @@ export class HandoffController {
   }
   /** Entire native check/mark/controller commit executes without yielding to an
    * OS input event. Refused busy interaction stays intact and is never queued. */
-  returnControl(target: TabTarget, recipient: string, expected: number): HandoffResult {
+  returnControl(target: TabTarget, recipient: string, expected: number, assertCapability?: () => void): HandoffResult {
     const state = this.authority.expected(target, expected);
     const attachment = this.authority.attachment(recipient);
     if (!this.selected(target) || state.controller.kind !== 'user' || state.handoff !== 'idle' ||
@@ -251,6 +251,7 @@ export class HandoffController {
     this.authority.expected(target, expected);
     if (!this.selected(target) || this.authority.attachment(recipient) !== attachment ||
         !this.authority.state(target).visibleTo.includes(recipient)) throw refused('control_changed');
+    assertCapability?.();
     this.mark(target, true);
     this.authority.publishReturn(target, recipient, expected, document);
     this.authority.changed();
@@ -274,6 +275,8 @@ export interface HostJob {
 export interface OwnershipOperations {
   info(): Readonly<Omit<Contract<'browser.BrowserInfo'>, 'client'>>;
   agent(request: AgentRequest, execution: ActionExecution, inspectionIdentity?: string): Promise<unknown>;
+  preparePage?(target: TabTarget, guard: () => void): Promise<() => void>;
+  prepareReturn?(target: TabTarget, document: DocumentReceipt, guard: () => void): Promise<() => void>;
   user(request: UserRequest, target: TabTarget, job: HostJob): Promise<void>;
   recover(target: TabTarget, expected: number, job: { readonly deadline: number; assertCurrent(): void }): Promise<void>;
   invalidate(target: TabTarget, recipient?: string): void;
@@ -445,6 +448,10 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
           if (before.controller.kind === 'agent') authority.owner(target, before.controller.client, generation);
           else if (authority.state(target).controller.kind !== 'user') throw refused('control_changed');
         };
+        if (operations.preparePage) {
+          const consume = await operations.preparePage(target, guarded);
+          guarded(); consume();
+        }
         await documents.prepare(target, url, { signal, assertCurrent: guarded }); guarded();
         const receipt = authority.refreshDocument(target); markPrepared(target, generation, receipt);
       });
@@ -622,7 +629,24 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
       switch (request.method) {
         case 'share': return Promise.resolve(sharing.share(target, request.params.client, generation));
         case 'stop_sharing': return sharing.stopSharing(target, request.params.client, generation);
-        case 'return': return Promise.resolve(handoff.returnControl(target, request.params.client, generation));
+        case 'return': {
+          const recipient = request.params.client;
+          if (!operations.prepareReturn) return Promise.resolve(handoff.returnControl(target, recipient, generation));
+          const page = target.page, attachment = authority.attachment(recipient), document = authority.document(target);
+          const guard = () => {
+            live();
+            const state = authority.expected(target, generation);
+            if (target.page !== page || tabs().selected(page.window) !== target || page.retirement() ||
+                state.controller.kind !== 'user' || state.handoff !== 'idle' || !state.inputReady ||
+                !state.visibleTo.includes(recipient) || authority.attachment(recipient) !== attachment)
+              throw refused('control_changed');
+            authority.assertDocument(target, document);
+          };
+          guard();
+          return operations.prepareReturn(target, document, guard).then(current => {
+            guard(); return handoff.returnControl(target, recipient, generation, current);
+          });
+        }
         case 'user_navigate': case 'back': case 'forward': case 'reload':
           if (state.controller.kind !== 'user' || state.handoff !== 'idle') throw refused('control_refused');
           return userJob(request, target);

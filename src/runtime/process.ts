@@ -11,7 +11,7 @@ import { assertProfile, type ProfileSnapshot } from '../profiles/records.js';
 import { assertPlatform, type HeldLock, type PlatformPort, type ProcessProvenance } from './platform.js';
 import { noteOpenCommand, type OpenCommandObservation, assertHostCloseContinuity, assertHostStartupContinuity, assertVerifiedHostMetadata, type VerifiedHost } from './authorities.js';
 import { assertTime, now, runtimeLocation, type RuntimeLocation, type RuntimeRecord } from './instance.js';
-import { createStarter, type LaunchAttemptPort } from './start.js';
+import { createStarter, type LaunchAttemptPort, type LaunchWithdrawal } from './start.js';
 import type { ProcessIntegration } from './lifecycle.js';
 import { claimedLayout, selectedLayout, type BuildSelection } from './selection.js';
 import { ownerLock, withOwnerLockForCustody, type OwnerLease, type RegistryLease } from '../profiles/locking.js';
@@ -126,14 +126,17 @@ export async function pendingLaunchAttempt(profile: ProfileSnapshot, host: Verif
 /** Cancellation records permanent loss of this one attempt only. It neither
  * withdraws a submitted NSWorkspace notification nor claims custody/exit. */
 export async function cancelLaunchAttempt(profile: ProfileSnapshot, platform: PlatformPort,
-  request: string, nonce: string, deadline: number): Promise<LaunchAttempt | undefined> {
+  request: string, nonce: string, deadline: number): Promise<LaunchWithdrawal> {
   return withLaunchAttempt(profile, platform, deadline, transaction => {
     const current = transaction.current;
-    if (!current) return undefined;
-    if (current.request !== request || current.nonce !== nonce || current.profileInstance !== profile.record.instance)
+    if (!current || current.request !== request) return 'absent';
+    if (current.nonce !== nonce || current.profileInstance !== profile.record.instance)
       throw unavailable('profile');
-    if (current.phase === 'closed' || current.phase === 'cancelled') return current;
-    const next: LaunchAttempt = frozen({ ...current, phase: 'cancelled' }); transaction.replace(next); return next;
+    if (current.phase === 'ready' || current.phase === 'closing' || current.stage === 'admitted') return 'committed';
+    if (current.phase === 'pending' || current.phase === 'claimed') {
+      transaction.replace(frozen({ ...current, phase: 'cancelled' }));
+    }
+    return 'withdrawn';
   });
 }
 
@@ -174,9 +177,12 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
   assertPlatform(platform); assertProductionExitAuthority(exits);
   const pending = new Map<string, LaunchAttempt>();
   return Object.freeze({
-    async reserve(profile: ProfileSnapshot, request: string, deadline: number, heldBuild?: import('./start.js').BuildGuard) {
+    async reserve(profile: ProfileSnapshot, request: string, deadline: number,
+      heldBuild?: import('./start.js').BuildGuard, signal?: AbortSignal) {
+      if (signal?.aborted) throw unavailable('browser');
       // The native reservation below still requires a complete current proof.
       await assertHostStartupContinuity(host, deadline, deadline);
+      if (signal?.aborted) throw unavailable('browser');
       const next = await pendingLaunchAttempt(profile, host, platform, request, deadline);
       if (pending.has(request)) throw unavailable('browser'); pending.set(request, next);
       // Every production reservation, including the first and an expired
@@ -191,14 +197,16 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
           guard: host.identity.layout.guard, explicit: true }, platform);
         // The genuine private Build handover, rather than this structural cast,
         // authorizes native admission. A fake or unrelated guard is rejected.
+        if (signal?.aborted) throw unavailable('browser');
         await exits.reserve(profile, owner, host, build, next, deadline);
         await owner.assert(); await build.assert(); assertTime(deadline);
       } finally { owner.release(); if (!heldBuild) build?.release(); }
     },
-    async launched(profile: ProfileSnapshot, request: string, pid: number, deadline: number) {
+    async launched(profile: ProfileSnapshot, request: string, pid: number, deadline: number, signal?: AbortSignal) {
       const expected = pending.get(request);
       if (!expected || !Number.isSafeInteger(pid) || pid <= 1) throw unavailable('browser');
       for (;;) {
+        if (signal?.aborted) throw unavailable('browser');
         assertTime(deadline);
         const accepted = await withLaunchAttempt(profile, platform, deadline, transaction => {
           const current = transaction.current;
@@ -220,7 +228,7 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
           return true;
         });
         if (accepted) return assertHostStartupContinuity(host, deadline, deadline);
-        await setTimeout(Math.min(10, Math.max(1, deadline - now())));
+        await setTimeout(Math.min(10, Math.max(1, deadline - now())), undefined, signal ? { signal } : undefined);
       }
     },
     async publishedReady(profile: ProfileSnapshot, request: string, pid: number, deadline: number) {
@@ -314,10 +322,8 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
     },
     async cancel(profile: ProfileSnapshot, request: string, deadline: number) {
       const expected = pending.get(request);
-      if (!expected) return; // reservation failed before any native write/submission
-      const belongs = await withLaunchAttempt(profile, platform, deadline, tx => tx.current?.request === request);
-      if (!belongs) return; // reservation refused an unrelated already-owned attempt
-      await cancelLaunchAttempt(profile, platform, request, expected.nonce, deadline);
+      if (!expected) return 'absent'; // reservation failed before any native write/submission
+      return cancelLaunchAttempt(profile, platform, request, expected.nonce, deadline);
     },
   });
 }
@@ -363,10 +369,12 @@ export function createProductionProcessIntegration(host: VerifiedHost, selection
       await assertHostStartupContinuity(host, cutoff, cutoff);
     },
     async start(profile: ProfileSnapshot, endpoint: import('./transport.js').Endpoint, deadline: number,
-      contentionDeadline: number, label?: string) {
+      contentionDeadline: number, label?: string, signal?: AbortSignal) {
       noteOpenCommand(observation, 'open-current-signed-start');
+      if (signal?.aborted) throw unavailable('browser');
       assertTime(deadline);
       await assertHostStartupContinuity(host, deadline, deadline);
+      if (signal?.aborted) throw unavailable('browser');
       if (profile.paths.state !== host.policy.stateRoot) throw unavailable('profile');
       const attempts = createLaunchTransactions(host, platform, exits);
       const starter = createStarter({ selection, platform, attempts, ...(observation ? { observation } : {}),
@@ -398,9 +406,8 @@ export function createProductionProcessIntegration(host: VerifiedHost, selection
           },
         },
       });
-      return starter(profile, endpoint, deadline, contentionDeadline, label);
+      return starter(profile, endpoint, deadline, contentionDeadline, label, signal);
     },
-    async mcp() { throw unavailable('browser'); },
   });
 }
 

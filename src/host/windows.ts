@@ -1,5 +1,5 @@
 import { consumeArmedHostSnapshot, type ArmedHostSnapshot } from '../runtime/custody.js';
-import { BaseWindow, WebContentsView, View, type Session } from 'electron';
+import { BaseWindow, WebContentsView, View, type Input, type Session } from 'electron';
 import { EventEmitter } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { realpathSync } from 'node:fs';
@@ -62,6 +62,11 @@ export function assertPageSurface(page: PageSurface): void {
   if (!surfaces.has(page)) throw unavailable('browser');
   assertWindowHost(page.window);
 }
+function clipboardShortcut(input: Input): boolean {
+  const key = input.key.toLowerCase();
+  return input.meta && !input.alt && !input.control && (key === 'c' || key === 'x');
+}
+
 function preferences(session: Session) {
   return { session, sandbox: true, contextIsolation: true, nodeIntegration: false,
     nodeIntegrationInWorker: false, nodeIntegrationInSubFrames: false, webSecurity: true,
@@ -87,6 +92,9 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
   shellBinding = boundary.native.ownership.mark(bindingKey(shellBinding), false);
   if (shellBinding.blocked || shellBinding.retired) return boundary.fatal.fail('native_boundary_unavailable');
   shell.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  shell.webContents.on('before-input-event', (event, input) => {
+    if (clipboardShortcut(input)) event.preventDefault();
+  });
   shell.webContents.on('will-navigate', event => event.preventDefault());
   shell.webContents.on('will-frame-navigate', event => event.preventDefault());
   shell.webContents.on('will-attach-webview', event => event.preventDefault());
@@ -166,8 +174,8 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
       const shield = new View();
       shield.setBackgroundColor('#00000000');
       window.contentView.addChildView(shield);
-      view.webContents.on('before-input-event', (event) => {
-        if (retired || current.blocked) event.preventDefault();
+      view.webContents.on('before-input-event', (event, input) => {
+        if (retired || current.blocked || clipboardShortcut(input)) event.preventDefault();
       });
       view.webContents.on('will-attach-webview', event => event.preventDefault());
       // The default popup route never permits Electron to create/retarget a window.

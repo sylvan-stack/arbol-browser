@@ -4,11 +4,14 @@ import { validator } from '../contracts/schema.js';
 export type Command =
   | { kind: 'info' }
   | { kind: 'open'; profile: string; url?: string }
-  | { kind: 'close' | 'mcp'; profile: string }
+  | { kind: 'close'; profile: string }
+  | { kind: 'agent'; profile: string; label: string }
+  | { kind: 'agent-describe' }
   | { kind: 'profiles-list' }
   | { kind: 'profiles-create'; profile: string; creationRequest?: string }
   | { kind: 'profiles-remove'; profile: string; deleteData: true };
 const profileId = validator('browser.ProfileId');
+const clientLabel = validator('browser.ClientLabel');
 const creationRequest = /^create_[A-Za-z0-9_-]{22}$/;
 
 /** Command-supplied navigation uses the agent URL policy, including Unicode bounds. */
@@ -25,15 +28,16 @@ function checkedUrl(value: string): string {
 
 export function parse(args: readonly string[]): Command {
   // Command comes first; leading Build selection belongs to the common launcher.
-  if (!['info', 'open', 'close', 'mcp', 'profiles'].includes(args[0] ?? '')) throw invalidInput();
+  if (!['info', 'open', 'close', 'agent', 'profiles'].includes(args[0] ?? '')) throw invalidInput();
   const words: string[] = [];
   const options = new Map<string, string | true>();
   for (let i = 0; i < args.length; i++) {
     const word = args[i]!;
     if (!word.startsWith('-')) { words.push(word); continue; }
-    if (!['--profile', '--url', '--creation-request', '--delete-data'].includes(word)) throw invalidInput();
+    if (!['--profile', '--url', '--creation-request', '--delete-data', '--contract', '--label', '--describe'].includes(word))
+      throw invalidInput();
     let value: string | true = true;
-    if (word !== '--delete-data') {
+    if (word !== '--delete-data' && word !== '--describe') {
       const next = args[++i];
       if (!next || next.startsWith('-')) throw invalidInput();
       value = next;
@@ -50,14 +54,26 @@ export function parse(args: readonly string[]): Command {
   };
   const [command, subcommand, id] = words;
   if (command === 'info' && words.length === 1) { allowed(); return { kind: 'info' }; }
-  if (['open', 'close', 'mcp'].includes(command ?? '') && words.length === 1) {
+  if ((command === 'open' || command === 'close') && words.length === 1) {
     allowed('--profile', ...(command === 'open' ? ['--url'] : []));
     const profile = selectedProfile(options.get('--profile') ?? 'default');
     if (command === 'open') {
       const url = options.get('--url');
       return { kind: 'open', profile, ...(typeof url === 'string' ? { url: checkedUrl(url) } : {}) };
     }
-    return { kind: command as 'close' | 'mcp', profile };
+    return { kind: 'close', profile };
+  }
+  if (command === 'agent' && words.length === 1) {
+    if (options.get('--contract') !== '1') throw invalidInput();
+    if (options.has('--describe')) {
+      allowed('--contract', '--describe');
+      return { kind: 'agent-describe' };
+    }
+    allowed('--contract', '--profile', '--label');
+    const profile = selectedProfile(options.get('--profile') ?? 'default');
+    const label = options.get('--label') ?? 'Browser client';
+    if (!clientLabel(label)) throw invalidInput();
+    return { kind: 'agent', profile, label };
   }
   if (command === 'profiles') {
     if (subcommand === 'list' && words.length === 2) { allowed(); return { kind: 'profiles-list' }; }

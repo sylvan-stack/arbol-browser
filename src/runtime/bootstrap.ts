@@ -15,7 +15,7 @@ export const foundationPorts: CommandPorts = Object.freeze({
   process: Object.freeze({
     open: async () => preflightPageAdmission(),
     close: async () => { throw unavailable('browser'); },
-    mcp: async () => { throw unavailable('browser'); },
+    attachAgent: async () => preflightPageAdmission(),
   }),
   profiles: Object.freeze({
     list: async () => { throw unavailable('profile'); },
@@ -359,7 +359,8 @@ export async function integrateTrustedShell(port: NativeShellPort, prepared: Hos
  * installed Native and lifecycle brands. ABR-29 still owns complete qualified
  * assembly and initial admission; ordinary entry remains closed above. */
 export async function prepareRendererControl(boundary: NativeFailureBoundary, prepared: HostPreparation,
-  selection: BuildSelection, deadline = performance.now() + 5000): Promise<import('../host/recovery.js').RendererControl> {
+  selection: BuildSelection, sessions: ProfileSessions, clipboard: import('./platform.js').SystemClipboardProtection,
+  deadline = performance.now() + 5000): Promise<import('../host/recovery.js').RendererControl> {
   const custody = handovers.get(boundary.watchdog);
   if (!installedBoundaries.has(boundary) || !custody) throw unavailable('browser');
   await prepared.instance.owner.assert(); await assertPreparationBuild(prepared, deadline); await prepared.engine.assertReady();
@@ -373,5 +374,5 @@ export async function prepareRendererControl(boundary: NativeFailureBoundary, pr
   const identity = Object.freeze({ contract: 1 as const,
     profile: prepared.instance.record.profile, instance: prepared.instance.record.instance, build: prepared.instance.record.build });
   const proof = await prepareStartupConstructionSnapshot(prepared.custody, boundary.native.trust, 'ownership', identity, deadline);
-  return control.createRendererControl(boundary, identity, proof);
+  return control.createRendererControl(boundary, identity, { sessions, custody: prepared.custody, clipboard }, proof);
 }

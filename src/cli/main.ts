@@ -4,6 +4,8 @@ import { resolve, dirname, basename } from 'node:path';
 import { stateDirectory } from '../profiles/paths.js';
 import { fileURLToPath } from 'node:url';
 import { parse } from './parse.js';
+import { runAgentSession } from './agent-session.js';
+import { describeAgentTools } from './agent-tools.js';
 import { publicFailure, unavailable, type ExitCode } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
 import type { Contract } from '../contracts/generated.js';
@@ -50,6 +52,10 @@ interface InstalledLaunch {
   platform: PlatformPort;
   lock: HeldLock;
   deadline: number;
+}
+function releaseInstalledLaunch(launch: InstalledLaunch | undefined): void {
+  try { launch?.lock.release(); }
+  catch { /* The installed launcher retains its original guard until this process exits. */ }
 }
 async function installedLaunch(cutoff: number): Promise<InstalledLaunch | undefined> {
   const payload = resolve(fileURLToPath(new URL('../../', import.meta.url)));
@@ -142,17 +148,42 @@ export async function componentInfo(): Promise<Contract<'wire.ComponentInfo'>> {
 export async function runCli(args: readonly string[], ports: CommandPorts = defaultPorts,
   io: Stdio = process): Promise<ExitCode> {
   const commandCutoff = performance.now() + 60000;
-  // On the MCP path stdout is reserved exclusively for the MCP transport, including failures.
-  const mcp = args[0] === 'mcp';
+  const agent = args[0] === 'agent';
   let observation: ColdObservation | undefined;
   let installed: InstalledLaunch | undefined;
   try {
     const command = parse(args);
+    if (command.kind === 'agent-describe') {
+      io.stdout.write(`${JSON.stringify(describeAgentTools())}\n`);
+      return 0;
+    }
+    if (command.kind === 'agent') {
+      const { stdin, stdout, stderr } = io;
+      return await runAgentSession({ profile: command.profile, label: command.label, stdin, stdout, stderr,
+        cutoff: commandCutoff, async attach(input) {
+          if (ports !== defaultPorts) return ports.process.attachAgent(input);
+          const launch = await installedLaunch(input.deadline);
+          if (input.signal.aborted) {
+            releaseInstalledLaunch(launch);
+            throw unavailable('browser');
+          }
+          installed = launch;
+          const deadline = Math.min(input.deadline, launch?.deadline ?? Infinity);
+          if (performance.now() >= deadline) throw unavailable('browser');
+          const metadata = launch?.host.identity.component ?? await componentInfo();
+          if (input.signal.aborted || performance.now() >= deadline) throw unavailable('browser');
+          const payload = resolve(fileURLToPath(new URL('../../', import.meta.url)));
+          const selection = launch?.selection ?? consumePackagedSelection(metadata.build, payload);
+          const activePorts = await productionPorts(selection, undefined, deadline, launch);
+          if (input.signal.aborted || performance.now() >= deadline) throw unavailable('browser');
+          return activePorts.process.attachAgent({ ...input, deadline });
+        },
+      });
+    }
     if (ports === defaultPorts) installed = await installedLaunch(commandCutoff);
     const openCutoff = ports === defaultPorts && command.kind === 'open' ? installed?.deadline ?? commandCutoff : undefined;
     if (ports === defaultPorts && (command.kind === 'open' || command.kind === 'profiles-create'))
       observation = { stage: 'package-metadata' };
-    if (ports === defaultPorts && command.kind === 'mcp') throw unavailable('browser');
     let activePorts = ports;
     if (ports === defaultPorts && command.kind !== 'info') {
       if (openCutoff !== undefined && performance.now() >= openCutoff) throw unavailable('browser');
@@ -161,7 +192,6 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
       const selection = installed?.selection ?? consumePackagedSelection(metadata.build, resolve(fileURLToPath(new URL('../../', import.meta.url))));
       activePorts = await productionPorts(selection, observation, openCutoff, installed);
     }
-    if (command.kind === 'mcp') { await activePorts.process.mcp(command.profile, io); return 0; }
     let result: unknown;
     let check: (value: unknown) => boolean;
     noteCold(observation, 'command-dispatch');
@@ -185,21 +215,14 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
     return 0;
   } catch (error) {
     const failure = publicFailure(error);
-    if (!validator('browser.BrowserError')(failure.detail)) {
-      const internal = publicFailure(undefined);
-      if (!mcp) io.stdout.write(`${JSON.stringify({ error: internal.detail })}\n`);
-      io.stderr.write(`arbol-browser: internal\n${coldFailureSuffix(observation, 70)}`);
-      return 70;
-    }
-    if (!mcp) io.stdout.write(`${JSON.stringify({ error: failure.detail })}\n`);
+    const { detail, exitCode } = validator('browser.BrowserError')(failure.detail) ? failure : publicFailure(undefined);
+    const frame = agent ? { event: 'error', error: detail } : { error: detail };
+    io.stdout.write(`${JSON.stringify(frame)}\n`);
     // No thrown messages, arguments, URLs, protocol bodies or stack traces.
-    io.stderr.write(`arbol-browser: ${failure.detail.code}\n${coldFailureSuffix(observation, failure.exitCode)}`);
-    return failure.exitCode;
+    io.stderr.write(`arbol-browser: ${detail.code}\n${coldFailureSuffix(observation, exitCode)}`);
+    return exitCode;
   } finally {
-    if (installed) {
-      try { installed.lock.release(); }
-      catch { /* The installed launcher still retains the original guard until this process exits. */ }
-    }
+    releaseInstalledLaunch(installed);
   }
 }
 

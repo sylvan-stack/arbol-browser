@@ -17,7 +17,7 @@ import { profileUnavailable, statOrAbsent, stateDirectory } from '../profiles/pa
 import { selectProfile } from '../profiles/create.js';
 import { ownerLock, type OwnerLease, type RegistryLease } from '../profiles/locking.js';
 import type { ProfileRuntimePort } from '../profiles/manage.js';
-import type { ProcessPort, Stdio } from './ports.js';
+import type { ProcessPort } from './ports.js';
 import type { HostPreparation } from './host-entry.js';
 import { productionSessionShutdown, type ProfileSessions } from '../profiles/session.js';
 
@@ -253,12 +253,10 @@ export async function closeProfile(profile: ProfileSnapshot, selection: BuildSel
 }
 export interface ProcessIntegration {
   assertAdmissionAvailable(deadline?: number): Promise<void>;
-  start(profile: ProfileSnapshot, endpoint: Endpoint, deadline: number, contentionDeadline: number, label?: string): Promise<{
+  start(profile: ProfileSnapshot, endpoint: Endpoint, deadline: number, contentionDeadline: number,
+    label?: string, signal?: AbortSignal): Promise<{
     client: RuntimeClient; record: RuntimeRecord; alreadyRunning: boolean;
   }>;
-  /** Later MCP stage supplies protocol/SDK handling. It may connect once after
-   * initialize and must never retry buffered calls across transport loss. */
-  mcp(connect: (label: string) => Promise<RuntimeClient>, io: Stdio): Promise<void>;
 }
 export function createProcessService(options: { selection: BuildSelection; platform: () => PlatformPort;
   state?: string; integration?: ProcessIntegration; exits?: ExitAuthority; closeHost?: VerifiedHost;
@@ -305,27 +303,31 @@ export function createProcessService(options: { selection: BuildSelection; platf
         return await closeProfile(profile, options.selection, platform, options.exits, deadline);
       } finally { if (command) await platform.retireCloseBudget(command.native); }
     },
-    async mcp(id, io) {
+    async attachAgent(input) {
       const integration = options.integration;
-      if (!integration) throw unavailable('browser');
-      let attempted = false, client: RuntimeClient | undefined, disconnected = false;
-      const stop = () => { disconnected = true; client?.close(); };
-      io.stdin.once('end', stop); io.stdin.once('close', stop); io.stdin.once('error', stop);
+      if (!integration) return preflightPageAdmission();
+      const deadline = Math.min(input.deadline, options.openCutoff ?? Infinity);
+      const contentionDeadline = Math.min(deadline, now() + 10000);
+      const current = () => {
+        if (input.signal.aborted || !Number.isFinite(deadline)) throw unavailable('browser');
+        assertTime(deadline);
+      };
+      current();
+      await integration.assertAdmissionAvailable(deadline); current();
+      const profile = await selectProfile(input.profile, options.platform(),
+        { state, createDefault: true, deadline: contentionDeadline, signal: input.signal });
+      current();
+      const { client, record } = await integration.start(profile, 'agent', deadline, contentionDeadline, input.label, input.signal);
       try {
-        await integration.mcp(async label => {
-          if (attempted || disconnected) throw unavailable('browser');
-          attempted = true;
-          const deadline = startupDeadline(), contentionDeadline = Math.min(deadline, now() + 10000);
-          await within(deadline, () => integration.assertAdmissionAvailable(deadline));
-          const profile = await within(deadline, () => selectProfile(id, options.platform(), { state, createDefault: true, deadline: contentionDeadline }));
-          client = (await acquireWithin(deadline,
-            () => integration.start(profile, 'agent', deadline, contentionDeadline, label), result => result.client.close())).client;
-          if (disconnected) { client.close(); throw unavailable('browser'); }
-          return client;
-        }, io);
-      } finally {
-        stop(); io.stdin.removeListener('end', stop); io.stdin.removeListener('close', stop); io.stdin.removeListener('error', stop);
-      }
+        current();
+        const hello = client.hello;
+        if (client.signal.aborted || !hello.attachment || record.profile !== profile.record.id ||
+            record.profileInstance !== profile.record.instance || hello.profile !== record.profile ||
+            hello.profileInstance !== record.profileInstance || hello.instance !== record.instance ||
+            hello.nonce !== record.nonce || hello.build !== record.build ||
+            (options.selection.explicit && record.build !== options.selection.build)) throw unavailable('browser');
+        return client;
+      } catch (error) { client.close(); throw error; }
     },
   });
 }

@@ -4,19 +4,25 @@ import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import type { PlatformPort } from '../runtime/platform.js';
 import type { Contract } from '../contracts/generated.js';
-import { BrowserFailure, invalidInput } from '../contracts/errors.js';
+import { BrowserFailure, invalidInput, unavailable } from '../contracts/errors.js';
 import { profilePaths, directory, assertDirectory, statOrAbsent, syncDirectory, profileUnavailable, profileId, privateFile, stateDirectory, profileMissing } from './paths.js';
 import { writeNewFile, readProfile, newRecord, type ProfileRecord, type ProfileSnapshot } from './records.js';
 import { lockExisting, registryLock, lockDeadline, type RegistryLease } from './locking.js';
 
+function requireActiveSelection(signal?: AbortSignal): void {
+  if (signal?.aborted) throw unavailable('browser');
+}
+
 /** Internal transaction. No cleanup of uncertain staging directories and no adoption.
  * A failure after rename may have committed creation; only the exact receipt may retry. */
 export async function publishProfile(registry: RegistryLease, record: Readonly<ProfileRecord>,
-  deadline: number): Promise<ProfileSnapshot> {
+  deadline: number, signal?: AbortSignal): Promise<ProfileSnapshot> {
+  requireActiveSelection(signal);
   if (performance.now() >= deadline) throw profileUnavailable();
   await registry.assert();
   const paths = profilePaths(record.id, registry.state);
   if (await statOrAbsent(paths.root)) throw profileUnavailable();
+  requireActiveSelection(signal);
   const staged = join(paths.profiles, `.creating-${randomBytes(16).toString('hex')}`);
   await mkdir(staged, { mode: 0o700 });
   const stagedIdentity = await directory(staged);
@@ -27,7 +33,9 @@ export async function publishProfile(registry: RegistryLease, record: Readonly<P
   await syncDirectory(staged);
   await registry.assert(); await assertDirectory(staged, stagedIdentity);
   if (performance.now() >= deadline) throw profileUnavailable();
+  requireActiveSelection(signal);
   registry.platform.publishDirectory(staged, paths.root);
+  // Continue to verify the committed profile even if the caller now leaves.
   await syncDirectory(paths.profiles);
   await registry.assert(); await assertDirectory(paths.root, stagedIdentity);
   const published = await readProfile(paths);
@@ -66,15 +74,19 @@ function requestToken(request: string | undefined): void {
   if (request !== undefined && !/^create_[A-Za-z0-9_-]{22}$/.test(request)) throw invalidInput();
 }
 async function createManaged(id: string, request: string | undefined, platform: PlatformPort,
-  state: string, allowDefault: boolean, deadline = lockDeadline()): Promise<Contract<'profile.ProfileCreated'>> {
+  state: string, allowDefault: boolean, deadline = lockDeadline(), signal?: AbortSignal): Promise<Contract<'profile.ProfileCreated'>> {
   profileId(id, !allowDefault); requestToken(request);
   const paths = profilePaths(id, state);
   try {
+    requireActiveSelection(signal);
     // Unsupported existing metadata is read/refused before even registry creation.
     if (await statOrAbsent(paths.root)) await readProfile(paths);
+    requireActiveSelection(signal);
     const registry = await registryLock(state, platform, true, deadline);
     try {
+      requireActiveSelection(signal);
       const records = await managedProfiles(registry);
+      requireActiveSelection(signal);
       const existing = records.find(item => item.record.id === id);
       if (existing) {
         // Internal default first use may converge, ordinary explicit creation may not.
@@ -85,7 +97,7 @@ async function createManaged(id: string, request: string | undefined, platform: 
       if (records.length >= MAX_PROFILES) throw new BrowserFailure({ code: 'control_refused',
         message: 'The profile registry is at capacity.', retryable: false,
         remedy: 'Remove an unused profile explicitly before creating another.' });
-      const created = await publishProfile(registry, newRecord(id, request), deadline);
+      const created = await publishProfile(registry, newRecord(id, request), deadline, signal);
       return { profile: { ...created.record }, created: true };
     } finally { registry.release(); }
   } catch (error) { if (error instanceof BrowserFailure) throw error; throw profileUnavailable(); }
@@ -94,16 +106,22 @@ export function createProfile(id: string, request: string | undefined, platform:
   state = stateDirectory()): Promise<Contract<'profile.ProfileCreated'>> {
   return createManaged(id, request, platform, state, false);
 }
-/** The process service calls this before owner arbitration. Only open/mcp may set
- * createDefault; close/list and all additional-profile selections are read-only. */
+/** The process service calls this before owner arbitration. Only startup may
+ * create the default profile; existing and named selections are read-only. */
 export async function selectProfile(id: string, platform: PlatformPort,
-  options: { state?: string; createDefault?: boolean; deadline?: number } = {}): Promise<ProfileSnapshot> {
+  options: { state?: string; createDefault?: boolean; deadline?: number; signal?: AbortSignal } = {}): Promise<ProfileSnapshot> {
   profileId(id);
   const state = options.state ?? stateDirectory(), paths = profilePaths(id, state);
   try {
-    if (await statOrAbsent(paths.root)) return await readProfile(paths);
-    if (id !== 'default' || !options.createDefault) throw profileMissing();
-    await createManaged(id, undefined, platform, state, true, options.deadline);
-    return await readProfile(paths);
+    requireActiveSelection(options.signal);
+    if (!await statOrAbsent(paths.root)) {
+      requireActiveSelection(options.signal);
+      if (id !== 'default' || !options.createDefault) throw profileMissing();
+      await createManaged(id, undefined, platform, state, true, options.deadline, options.signal);
+    }
+    requireActiveSelection(options.signal);
+    const selected = await readProfile(paths);
+    requireActiveSelection(options.signal);
+    return selected;
   } catch (error) { if (error instanceof BrowserFailure) throw error; throw profileUnavailable(); }
 }

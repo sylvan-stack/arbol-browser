@@ -8,8 +8,13 @@ template <typename Function> static void textMutation(id object, SEL selector, F
     catch (const std::exception&) { poison("native_text_failed"); } }
   @catch (NSException*) { poison("native_text_failed"); }
 }
+static bool writesGeneralClipboard(SEL selector) {
+  return selector == sel_registerName("copy:") || selector == sel_registerName("cut:");
+}
 static void editObject(id self, SEL selector, id argument) {
-  textMutation(self, selector, [&] { ((void(*)(id, SEL, id))originalFor(self, selector))(self, selector, argument); });
+  textMutation(self, selector, [&] {
+    if (!writesGeneralClipboard(selector)) ((void(*)(id, SEL, id))originalFor(self, selector))(self, selector, argument);
+  });
 }
 static void textFinish(id self, SEL selector) {
   textMutation(self, selector, [&] { ((void(*)(id, SEL))originalFor(self, selector))(self, selector); });
@@ -20,7 +25,9 @@ static bool knownCommand(SEL command) {
   return false;
 }
 static void textCommand(id self, SEL selector, SEL command) {
-  textMutation(self, selector, [&] { if (knownCommand(command)) ((void(*)(id, SEL, SEL))originalFor(self, selector))(self, selector, command); });
+  textMutation(self, selector, [&] {
+    if (knownCommand(command) && !writesGeneralClipboard(command)) ((void(*)(id, SEL, SEL))originalFor(self, selector))(self, selector, command);
+  });
 }
 static void textInsert(id self, SEL selector, id text, NSRange replacement) {
   textMutation(self, selector, [&] { ((void(*)(id, SEL, id, NSRange))originalFor(self, selector))(self, selector, text, replacement); });

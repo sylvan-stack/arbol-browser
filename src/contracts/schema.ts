@@ -48,6 +48,10 @@ export function compileContracts(): number {
       count++;
     }
   }
+  for (const { inputSchema, resultSchema } of agentDescriptionSchemas()) {
+    ajv.compile(inputSchema);
+    ajv.compile(resultSchema);
+  }
   return count;
 }
 
@@ -88,6 +92,20 @@ export const agentToolSchemas = Object.entries(browser['x-tools']).map(([name, t
 /** Select the outstanding method, including private screenshot transport; a
  * generic success union cannot validate a correlated tool reply. */
 export type AgentToolName = keyof typeof browser['x-tools'];
+
+/** Project canonical tool input and success separately for the direct CLI. */
+export function agentDescriptionSchemas() {
+  const names = Object.keys(browser['x-tools']) as AgentToolName[];
+  return names.map(name => {
+    const tool = browser['x-tools'][name];
+    const inputSchema = publicRoot([tool.input.$ref]);
+    const resultSchema = publicRoot([tool.success.$ref]);
+    if (inputSchema.type !== 'object' || resultSchema.type !== 'object')
+      throw new Error('Browser tool discovery requires object root schemas');
+    return { name, inputSchema, resultSchema };
+  });
+}
+
 export function agentToolValidator(name: AgentToolName, direction: 'input' | 'success' | 'wireSuccess'): ValidateFunction {
   const ref = direction === 'wireSuccess' && name === 'browser_screenshot'
     ? `${browser.$id}#/$defs/ScreenshotPayload`

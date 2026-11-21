@@ -1,4 +1,6 @@
-import type { ArmedHostSnapshot } from '../runtime/custody.js';
+import type { ArmedHostSnapshot, HostCustody } from '../runtime/custody.js';
+import type { SystemClipboardProtection } from '../runtime/platform.js';
+import type { ProfileSessions } from '../profiles/session.js';
 import { webFrameMain, type WebContents } from 'electron';
 import { performance } from 'node:perf_hooks';
 import { setTimeout as pause } from 'node:timers/promises';
@@ -8,6 +10,8 @@ import { BrowserFailure, unavailable } from '../contracts/errors.js';
 import { assertNativeFailureBoundary, type NativeFailureBoundary } from '../runtime/bootstrap.js';
 import { staleSnapshot, type RecoveryTransition } from './authority.js';
 import { bounded, createOwnershipHost, type OwnershipHost } from './handoff.js';
+import { HostCapabilities } from './capabilities.js';
+import { createHostToolOperations, createInspectionTools, createTrustedActionTools, type HostToolOperation } from './tool-dispatch.js';
 import { physicalFrames, HostDocuments, type HostDocument, type PhysicalFrame } from './documents.js';
 import { RendererHealth, type RecoveryAttempt } from './health.js';
 import { assertPageRetirement, type PageSurface, type WindowHost } from './windows.js';
@@ -43,7 +47,8 @@ export class PageRecovery {
   private readonly pending = new Map<TabTarget, Job>();
   private readonly reports = new Map<TabTarget, RecoveryReport>();
   constructor(readonly host: OwnershipHost, readonly documents: HostDocuments, readonly health: RendererHealth,
-    readonly commit: (transition: RecoveryTransition, receipt: HostDocument, assertCurrent: () => void) => void) {
+    readonly commit: (transition: RecoveryTransition, receipt: HostDocument, assertCurrent: () => void) => void,
+    readonly preparePage: (target: TabTarget, guard: () => void, transition?: RecoveryTransition) => Promise<() => void>) {
     assertNativeFailureBoundary(host.authority.boundary);
     if (host.authority.documents !== documents || health.documents !== documents || health.owner !== host.authority)
       throw refused('control_refused');
@@ -235,13 +240,15 @@ export class PageRecovery {
         const replacement = original.window.createPage(); job.replacement = replacement; guard();
         tabs.replace(target, original, replacement, guard, () => {
           owner.rebindRecovery(transition, replacement);
-          this.documents.watch(target, true); // no early DOM/compositor proof can unlock before exact load success
           this.health.replaced(attempt, replacement);
         });
         guard(); reason = 'load_failed';
-        const contents = this.documents.originalContents(target, replacement);
+        const consume = await this.preparePage(target, guard, transition);
         await this.within(workDeadline - 2000, guard, () => {
-          guard(); return contents.loadURL(address); // fresh WebContents, no postData/referrer/history/form state
+          guard(); consume();
+          // Keep publication of renderer readiness held until the exact load succeeds.
+          this.documents.watch(target, true);
+          return this.documents.originalContents(target, replacement).loadURL(address);
         }, () => { job.active = false; });
         guard(); reason = 'readiness_failed';
         const receipt = this.documents.releasePreparation(target, replacement, workDeadline);
@@ -297,7 +304,9 @@ export interface RendererControl {
 /** Executable control-only contribution. The caller supplies genuine installed
  * Native custody and owned metadata. There is no EngineAuthority, normal launch
  * path, permissive engine operation or dependency on a later Tools adapter. */
-export function createRendererControl(boundary: NativeFailureBoundary, identity: ControlIdentity, proof?: ArmedHostSnapshot): RendererControl {
+export function createRendererControl(boundary: NativeFailureBoundary, identity: ControlIdentity,
+  protection: { sessions: ProfileSessions; custody: HostCustody; clipboard: SystemClipboardProtection },
+  proof: ArmedHostSnapshot): RendererControl {
   assertNativeFailureBoundary(boundary);
   if (identity.contract !== 1 || !validator('browser.ProfileId')(identity.profile) ||
       !validator('browser.InstanceId')(identity.instance) || !validator('browser.Build')(identity.build) ||
@@ -306,12 +315,38 @@ export function createRendererControl(boundary: NativeFailureBoundary, identity:
   const documents = new HostDocuments(boundary), readiness = new PageReadiness(boundary, documents);
   const registrations = new Map<WindowHost, ShellRegistration>();
   let ownership!: OwnershipHost, recovery!: PageRecovery, health!: RendererHealth, removeReady = () => {};
+  let capabilities!: HostCapabilities;
+  let dispatchTools!: HostToolOperation;
+  let inspection!: ReturnType<typeof createInspectionTools>, mutation!: ReturnType<typeof createTrustedActionTools>;
+  const preparePage = async (target: TabTarget, guard: () => void, transition?: RecoveryTransition) => {
+    guard(); capabilities.bindPage(target, transition);
+    await capabilities.armInitialPage(target, guard); guard();
+    return () => capabilities.consumeInitialPageArm(target, guard);
+  };
+  const prepareCoverage = async (receipt: HostDocument, guard: () => void) => {
+    const frames = await readiness.inspection(receipt, guard);
+    for (const frame of frames) await capabilities.armFileChooser(frame, guard);
+    await readiness.verifyInspection(frames, guard);
+    const current = () => capabilities.assertAgentAdmission(receipt, frames, guard);
+    current(); return current;
+  };
   ownership = createOwnershipHost(boundary, documents, {
     info: () => info,
-    async agent() {
-      // Classified inspection/input/ref/settlement belongs to the actual Tools
-      // producer. Refuse before issuing a command; never return fabricated work.
-      throw unavailable('browser');
+    async agent(request, execution, inspectionIdentity) {
+      if (request.params.name !== 'browser_screenshot') {
+        const guard = inspection.inspection.guard(execution, execution.action !== undefined);
+        guard();
+        await prepareCoverage(documents.current(execution.stamp.target), guard);
+        guard();
+      }
+      return dispatchTools(request, execution, inspectionIdentity);
+    },
+    preparePage,
+    async prepareReturn(target, document, guard) {
+      guard();
+      const receipt = documents.current(target);
+      if (receipt !== document) throw staleSnapshot();
+      return prepareCoverage(receipt, guard);
     },
     async user(request, target, job) {
       await documents.navigateUser(target, request.method === 'user_navigate' ? request.params.url : request.method, job);
@@ -327,12 +362,19 @@ export function createRendererControl(boundary: NativeFailureBoundary, identity:
       // Authority is already sealed. Remove real shell observers before native
       // retirement can publish a selection event into closed admission.
       for (const registration of registrations.values()) registration.dispose(); registrations.clear();
+      inspection.close(); mutation.close(); capabilities.close();
       recovery.closeAll(); documents.closeAll(); health.closeAll(); removeReady();
     },
   }, proof, identity);
   health = new RendererHealth(documents, readiness, ownership.authority, fault => ownership.healthFailure(fault.target, fault));
-  recovery = new PageRecovery(ownership, documents, health, (transition, receipt, guard) => ownership.recovered(transition, receipt, guard));
+  recovery = new PageRecovery(ownership, documents, health, (transition, receipt, guard) => ownership.recovered(transition, receipt, guard),
+    preparePage);
   documents.bind(ownership.authority, readiness, fault => health.failed(fault));
+  capabilities = new HostCapabilities(ownership.authority, documents, readiness, protection.sessions,
+    protection.custody, protection.clipboard);
+  inspection = createInspectionTools(ownership.authority, documents, readiness);
+  mutation = createTrustedActionTools(inspection.inspection);
+  dispatchTools = createHostToolOperations({ inspection: inspection.agent, mutation: mutation.agent });
   removeReady = documents.subscribe(event => {
     if (event.kind !== 'ready' || !event.receipt || event.target.page !== event.page ||
         ownership.authority.wasClosed(event.target) || health.recovering(event.target)) return;

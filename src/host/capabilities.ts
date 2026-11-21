@@ -6,8 +6,8 @@ import type { HostCustody } from '../runtime/custody.js';
 import { assertNativeFailureBoundary } from '../runtime/bootstrap.js';
 import { assertNativeFeatures } from '../native/features.js';
 import { assertSystemClipboardProtection, type SystemClipboardProtection } from '../runtime/platform.js';
-import { staleSnapshot, type TabAuthority } from './authority.js';
-import type { HostDocument, HostDocuments } from './documents.js';
+import { staleSnapshot, type RecoveryTransition, type TabAuthority } from './authority.js';
+import { physicalFrames, type HostDocument, type HostDocuments } from './documents.js';
 import type { InspectionFrame, PageReadiness } from './readiness.js';
 import { assertPageSurface, type PageSurface } from './windows.js';
 import type { TabTarget } from './tabs.js';
@@ -31,8 +31,9 @@ interface PageRecord {
   readonly dialog: (...args: any[]) => void;
   readonly choosers: Map<string, ChooserAcknowledgement>;
   readonly modals: Set<object>; readonly denyModalReplies: Set<() => void>;
+  readonly generation: number; readonly recovery: RecoveryTransition | undefined;
   initial: 'unarmed' | 'arming' | 'armed' | 'consumed' | 'failed';
-  initialArm?: Promise<void>; initialChannel?: object; initialFrame?: string;
+  initialArm?: Promise<void>; initialChannel?: object; initialFrame?: string; seededBlank?: true;
   active: boolean;
 }
 const installed = new WeakSet<object>();
@@ -167,13 +168,18 @@ export class HostCapabilities {
   /** Must run on the newly created genuine page, before website load/exposure.
    * Retain the sole window-gated -run-dialog listener which owns the genuine
    * Electron modal promise. Verify its identity and never clone or evaluate it. */
-  bindPage(target: TabTarget): void {
+  bindPage(target: TabTarget, recovery?: RecoveryTransition): void {
     this.identity(); assertPageSurface(target.page);
+    if (recovery) {
+      this.authority.assertRecovery(recovery);
+      if (recovery.target !== target || recovery.original === target.page || recovery.generation <= 1) throw unavailableBoundary();
+    }
     if (this.closed || this.records.has(target) || this.records.size >= 64 || target.page.session !== this.sessions.website || target.page.retirement()) throw unavailableBoundary();
     const page = target.page, contents = page.view.webContents, emitter = contents as unknown as EventEmitter;
     if (this.contents.has(contents) || contents.session !== this.sessions.website || !['', 'about:blank'].includes(contents.getURL())) throw unavailableBoundary();
     const binding = page.binding(), state = this.authority.state(target);
-    if (binding.revision !== 0 || !binding.blocked || state.generation !== 1 || state.inputReady || state.navigation !== undefined ||
+    const generation = recovery?.generation ?? 1;
+    if (binding.revision !== 0 || !binding.blocked || state.generation !== generation || state.inputReady || state.navigation !== undefined ||
         this.documents.originalReceipt(target, page) !== undefined || contents.navigationHistory.length() > 1) throw unavailableBoundary();
     const raw = EventEmitter.prototype.rawListeners.call(emitter, '-run-dialog');
     const listeners = EventEmitter.prototype.listeners.call(emitter, '-run-dialog');
@@ -210,7 +216,8 @@ export class HostCapabilities {
         deny(); modals.delete(token); denyModalReplies.delete(deny);
       });
     };
-    record = { target, page, contents, emitter, stockDialog: stock, dialog, choosers: new Map(), modals, denyModalReplies, active: true, initial: 'unarmed' };
+    record = { target, page, contents, emitter, stockDialog: stock, dialog, choosers: new Map(), modals, denyModalReplies,
+      generation, recovery, active: true, initial: 'unarmed' };
     this.records.set(target, record); this.contents.set(contents, record);
     EventEmitter.prototype.removeListener.call(emitter, '-run-dialog', stock);
     EventEmitter.prototype.on.call(emitter, '-run-dialog', dialog);
@@ -219,8 +226,10 @@ export class HostCapabilities {
   }
   private initialGuard(record: PageRecord, guard: () => void): void {
     this.original(record); const result: unknown = guard(); if (result !== undefined) throw unavailableBoundary();
+    if (record.recovery) this.authority.assertRecovery(record.recovery);
     const binding = record.page.binding(), state = this.authority.state(record.target);
-    if (!['unarmed', 'arming', 'armed'].includes(record.initial) || binding.revision !== 0 || !binding.blocked || state.generation !== 1 ||
+    if (!['unarmed', 'arming', 'armed'].includes(record.initial) || binding.revision !== 0 || !binding.blocked ||
+        state.generation !== record.generation ||
         state.inputReady || state.navigation !== undefined || this.documents.originalReceipt(record.target, record.page) !== undefined ||
         !['', 'about:blank'].includes(record.contents.getURL()) || record.contents.navigationHistory.length() > 1 || record.modals.size)
       throw unavailableBoundary();
@@ -235,18 +244,35 @@ export class HostCapabilities {
     record.initial = 'arming';
     const check = () => this.initialGuard(record, guard);
     const running = (async () => {
-      check(); const channel = this.readiness.channel(record.page); check();
+      // A fresh WebContents need not have renderer-side objects. The only load
+      // allowed before interception is the host's inert blank in this original view.
+      check();
+      if (record.contents.getURL() === '' || record.contents.mainFrame.osProcessId <= 0) {
+        await record.contents.loadURL('about:blank');
+        check();
+        const history = record.contents.navigationHistory;
+        if (record.contents.getURL() !== 'about:blank' || history.length() !== 1 || history.getActiveIndex() !== 0 ||
+            history.getEntryAtIndex(0)?.url !== 'about:blank') throw unavailableBoundary();
+        record.seededBlank = true;
+      }
+      check();
+      const frames = physicalFrames(record.page);
+      if (frames.length !== 1 || frames[0]?.handle !== record.contents.mainFrame || frames[0].parent !== null)
+        throw unavailableBoundary();
+      const channel = this.readiness.channel(record.page); check();
       acknowledge(await this.readiness.command(record.page, check, 'Page.enable')); check();
       const before = await this.readiness.command(record.page, check, 'Page.getFrameTree') as {
         frameTree?: { frame?: { id?: string; url?: string }; childFrames?: unknown[] } };
       check(); const frame = before.frameTree?.frame;
-      if (!frame?.id || frame.url !== 'about:blank' || before.frameTree?.childFrames?.length) throw unavailableBoundary();
+      if (!frame?.id || (frame.url !== '' && frame.url !== 'about:blank') || before.frameTree?.childFrames?.length)
+        throw unavailableBoundary();
       acknowledge(await this.readiness.command(record.page, check, 'Page.setInterceptFileChooserDialog', { enabled: true, cancel: true })); check();
       const after = await this.readiness.command(record.page, check, 'Page.getFrameTree') as {
         frameTree?: { frame?: { id?: string; url?: string }; childFrames?: unknown[] } };
       check();
       if (this.readiness.channel(record.page) !== channel || after.frameTree?.frame?.id !== frame.id ||
-          after.frameTree?.frame?.url !== 'about:blank' || after.frameTree.childFrames?.length) throw unavailableBoundary();
+          after.frameTree?.frame?.url !== frame.url || after.frameTree.childFrames?.length) throw unavailableBoundary();
+      await this.readiness.armChildChoosers(record.page, check, () => this.original(record)); check();
       record.initialChannel = channel; record.initialFrame = frame.id; record.initial = 'armed';
     })();
     record.initialArm = running;
@@ -260,6 +286,20 @@ export class HostCapabilities {
     this.initialGuard(record, guard);
     if (record.initial !== 'armed' || !record.initialFrame || record.initialChannel !== this.readiness.channel(record.page)) throw unavailableBoundary();
     record.initial = 'consumed';
+    if (record.seededBlank) {
+      const removeSeedAfterCommit = (_event: unknown, _address: string, _code: number, _text: string, main: boolean) => {
+        if (!main) return;
+        record.contents.removeListener('did-frame-navigate', removeSeedAfterCommit);
+        if (record.contents.isDestroyed() || record.page.retirement()) return;
+        this.original(record);
+        const history = record.contents.navigationHistory;
+        // A same-entry commit consumes the seed in place. On a distinct entry,
+        // remove only the original preceding blank, before readiness is emitted.
+        if (history.getActiveIndex() > 0 && history.getEntryAtIndex(0)?.url === 'about:blank' &&
+            !history.removeEntryAtIndex(0)) return this.authority.boundary.fatal.fail('native_boundary_unavailable');
+      };
+      record.contents.on('did-frame-navigate', removeSeedAfterCommit);
+    }
   }
   /** Fixed renderer-session chooser refusal, including pinned Blink's HTML and
    * File System Access picker paths. ABR-30 must arm each genuine paused/new

@@ -496,6 +496,23 @@ export interface RuntimeClient {
   cancel(requestId: string, deadline?: number): Promise<Contract<'wire.CancelResult'>>;
   close(): void;
 }
+export type RuntimeTermination = 'lost' | 'malformed' | 'refused' | 'timeout' | 'client-closed';
+const terminations = new WeakMap<RuntimeClient, () => RuntimeTermination | undefined>();
+export function runtimeTermination(client: RuntimeClient): RuntimeTermination | undefined {
+  return terminations.get(client)?.();
+}
+class MalformedAgentReply extends BrowserFailure {}
+const cancelledRequest = Object.freeze(new Error('Private request waiter cancelled'));
+export function isMalformedAgentReply(error: unknown): boolean { return error instanceof MalformedAgentReply; }
+export function isCancelledRequest(error: unknown): boolean { return error === cancelledRequest; }
+
+interface PendingReply {
+  check(value: unknown): boolean;
+  resolve(value: unknown): void;
+  reject(error: unknown): void;
+  timer: NodeJS.Timeout;
+  cancel?: Readonly<{ id: string; original: PendingReply | undefined }>;
+}
 export type ManagementCloseObservation =
   | Readonly<{ kind: 'ack' }>
   | Readonly<{ kind: 'refused'; error: unknown }>
@@ -512,25 +529,31 @@ export function requestManagementClose(client: RuntimeClient, budget: import('./
 }
 /** One connection attempt only. Never reconnects or replays on loss. */
 export async function connectRuntime(location: RuntimeLocation, record: RuntimeRecord, endpoint: Endpoint,
-  selection: BuildSelection, platform: PlatformPort, deadline: number, label = 'Browser client'): Promise<RuntimeClient> {
+  selection: BuildSelection, platform: PlatformPort, deadline: number, label = 'Browser client',
+  signal?: AbortSignal): Promise<RuntimeClient> {
+  if (signal?.aborted) throw unavailable('browser');
   if (record.phase !== 'ready' || (selection.explicit && selection.build !== record.build) || !originalAlive(record, platform))
     throw profileUnavailable();
   const path = endpoint === 'agent' ? location.agent : location.management;
   await assertSocket(location, path);
+  if (signal?.aborted || now() >= deadline) throw unavailable('browser');
   const socket = createConnection(path), helloId = token('req'), seen = new Set<string>([helloId]);
   const lost = new AbortController();
-  let stopReason: 'lost' | 'malformed' | 'refused' = 'lost';
+  let stopReason: RuntimeTermination = 'lost';
   let closeRequest: string | undefined, closeWritten = false, explicitCloseRefusal: BrowserFailure | undefined;
   let dead = false, hello: Contract<'wire.HelloResult'>['result'] | undefined;
-  const pending = new Map<string, { check(value: unknown): boolean; resolve(value: unknown): void; reject(error: unknown): void; timer: NodeJS.Timeout }>();
+  const pending = new Map<string, PendingReply>();
   let heartbeat: NodeJS.Timeout, lastPong = now(), pingId: string | undefined;
   let resolveHello: (value: RuntimeClient) => void, rejectHello: (error: unknown) => void;
   const ready = new Promise<RuntimeClient>((resolve, reject) => { resolveHello = resolve; rejectHello = reject; });
-  const timer = setTimeout(() => stop(), Math.max(1, Math.min(deadline, now() + 5000) - now()));
-  function stop(reason: 'lost' | 'malformed' | 'refused' = 'lost') {
+  const timer = setTimeout(() => stop('timeout'), Math.max(1, Math.min(deadline, now() + 5000) - now()));
+  function cancelLocal() { stop('client-closed'); }
+  function stop(reason: RuntimeTermination = 'lost') {
     if (dead) return; stopReason = reason; dead = true; clearTimeout(timer); clearInterval(heartbeat); socket.destroy();
+    signal?.removeEventListener('abort', cancelLocal);
     lost.abort();
-    rejectHello(unavailable('browser'));
+    const failure = unavailable('browser');
+    rejectHello(endpoint === 'agent' && reason === 'malformed' ? new MalformedAgentReply(failure.detail) : failure);
     for (const entry of pending.values()) { clearTimeout(entry.timer); entry.reject(unavailable('browser')); }
     pending.clear();
   }
@@ -558,7 +581,7 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
           if (!originalAlive(record, platform)) { stop('lost'); return; }
         }
       }
-      verify();
+      try { verify(); } catch (error) { if (endpoint === 'agent') { stop('lost'); return; } throw error; }
       if (!hello) {
         if (!validator('wire.HelloResult')(value) || value.id !== helloId) throw unavailable('browser');
         const result = value.result;
@@ -568,22 +591,25 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
         hello = Object.freeze(result); clearTimeout(timer);
         heartbeat = setInterval(() => {
           try {
-            if (now() - lastPong >= 6000 || seen.size >= 65536) { stop(); return; }
+            if (now() - lastPong >= 6000) { stop('timeout'); return; }
+            if (seen.size >= 65536) { stop(); return; }
             if (!pingId) { pingId = token('req'); seen.add(pingId); write(socket, { wire: 1, id: pingId, method: 'ping', params: {} }); }
           } catch { stop(); }
         }, 2000);
-        const send = (request: Request | Contract<'wire.Cancel'>, limit: number, check: (value: unknown) => boolean): Promise<unknown> => {
+        const send = (request: Request | Contract<'wire.Cancel'>, limit: number, check: (value: unknown) => boolean,
+          cancel?: PendingReply['cancel']): Promise<unknown> => {
           const maximum = request.method === 'cancel' ? 64 : 32;
+          if (endpoint === 'agent' && seen.size >= 65536) stop();
           if (dead || seen.has(request.id) || seen.size >= 65536 || pending.size >= maximum || now() >= limit)
             return Promise.reject(unavailable('browser'));
           seen.add(request.id);
           return new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => stop('lost'), Math.max(1, limit - now()));
-            pending.set(request.id, { check, resolve, reject, timer: timeout });
+            const timeout = setTimeout(() => stop('timeout'), Math.max(1, limit - now()));
+            pending.set(request.id, { check, resolve, reject, timer: timeout, ...(cancel ? { cancel } : {}) });
             try { verify(); write(socket, request, 1024 * 1024); if (request.id === closeRequest) closeWritten = true; } catch { stop('refused'); }
           });
         };
-        const client: RuntimeClient = Object.freeze({ hello, signal: lost.signal, close: () => stop(),
+        const client: RuntimeClient = Object.freeze({ hello, signal: lost.signal, close: () => stop('client-closed'),
           call(request: Request, limit = now() + duration(request)): Promise<unknown> {
             if (!(endpoint === 'agent' ? validator('wire.ToolRequest')(request) : validator('wire.ManagementRequest')(request)))
               return Promise.reject(unavailable('browser'));
@@ -592,7 +618,8 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
           cancel(requestId: string, limit = now() + 2000): Promise<Contract<'wire.CancelResult'>> {
             if (!validator('browser.RequestId')(requestId) || !seen.has(requestId)) return Promise.reject(unavailable('browser'));
             return send({ wire: 1, id: token('req'), method: 'cancel', params: { request: requestId } }, limit,
-              value => validator('wire.CancelResult')(value) && value.request === requestId) as Promise<Contract<'wire.CancelResult'>>;
+              value => validator('wire.CancelResult')(value) && value.request === requestId,
+              endpoint === 'agent' ? { id: requestId, original: pending.get(requestId) } : undefined) as Promise<Contract<'wire.CancelResult'>>;
           },
         });
         if (endpoint === 'management') actualCloseClients.set(client, async (budget, limit) => {
@@ -611,6 +638,7 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
             return { kind: 'lost', stamped, written: closeWritten };
           }
         });
+        if (endpoint === 'agent') terminations.set(client, () => dead ? stopReason : undefined);
         resolveHello(client); return;
       }
       if (validator('wire.Ping')(value)) {
@@ -626,8 +654,17 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
       if (!entry) throw unavailable('browser');
       if (value.ok && !entry.check(value.result)) throw unavailable('browser');
       pending.delete(value.id); clearTimeout(entry.timer);
+      const cancellation = entry.cancel;
+      if (value.ok && cancellation?.original && validator('wire.CancelResult')(value.result) && value.result.found &&
+          pending.get(cancellation.id) === cancellation.original) {
+        pending.delete(cancellation.id);
+        clearTimeout(cancellation.original.timer);
+        cancellation.original.reject(cancelledRequest);
+      }
       if (value.ok) entry.resolve(value.result); else entry.reject(new BrowserFailure(value.error));
     } catch { stop('malformed'); }
   }, reason => stop(reason ?? 'lost'));
+  signal?.addEventListener('abort', cancelLocal, { once: true });
+  if (signal?.aborted) cancelLocal();
   return ready;
 }

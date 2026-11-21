@@ -54,7 +54,13 @@ await mkdir(join(root, 'dist/cli'), { recursive: true }); await mkdir(join(root,
 // No bundler may duplicate WeakMap brands or relocate import.meta.url consumers.
 await writeFile(join(root, 'dist/cli/main.mjs'), `const address = new URL('./main.js', import.meta.url).href;
 try { const cli = await import(address); process.exitCode = await cli.runCli(process.argv.slice(2)); }
-catch { if (process.argv[2] !== 'mcp') process.stdout.write('{"error":{"code":"internal","message":"Browser operation failed.","retryable":false,"remedy":"Preserve state and inspect the compatible Build."}}\\n'); process.stderr.write('arbol-browser: internal\\n'); process.exitCode = 70; }
+catch {
+  const error = { code: 'internal', message: 'Browser operation failed.', retryable: false, remedy: 'Preserve state and inspect the compatible Build.' };
+  const frame = process.argv[2] === 'agent' ? { event: 'error', error } : { error };
+  process.stdout.write(JSON.stringify(frame) + '\\n');
+  process.stderr.write('arbol-browser: internal\\n');
+  process.exitCode = 70;
+}
 `);
 await writeFile(join(root, 'dist/host/main.mjs'), `let host;
 try { const address = new URL('../runtime/host-entry.js', import.meta.url).href; host = await import(address); }
@@ -71,10 +77,12 @@ for (const name of ['cli/main.js', 'runtime/process.js', 'runtime/exit.js', 'run
     if (edge.external && /^(?:node:)?electron(?:\/|$)|^original-fs$/.test(edge.path)) throw new Error('Electron implementation entered Node CLI graph');
   graphs[name] = Object.keys(result.metafile.inputs).map(path => relative(root, resolve(root, path))).sort();
 }
+if (!['agent-session.js', 'agent-tools.js'].every(file => graphs['cli/main.js'].includes(`dist/lib/cli/${file}`)))
+  throw new Error('The direct Browser session and description must be reachable from the Node CLI');
 // Compile each genuine external provider graph without evaluation. Compare
 // every actual package input and manifest/side-asset projection under the lock.
 const runtimeProjection = await installedRuntimeProjection(), vendorInputs = {};
-for (const entry of ['ajv/dist/2020.js', 'ajv-formats', '@modelcontextprotocol/sdk/server/index.js', '@modelcontextprotocol/sdk/types.js']) {
+for (const entry of ['ajv/dist/2020.js', 'ajv-formats']) {
   const result = await build({ stdin: { contents: `import * as provider from ${JSON.stringify(entry)}; export { provider };`, resolveDir: root },
     write: false, bundle: true, format: 'esm', platform: 'node', metafile: true, logLevel: 'silent' });
   for (const input of Object.keys(result.metafile.inputs)) if (input !== '<stdin>') {

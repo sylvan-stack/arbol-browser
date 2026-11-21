@@ -8,7 +8,7 @@ import type { DocumentReceipt } from './authority.js';
 import type { HostDocuments, HostDocument, DocumentPreparation, PhysicalFrame } from './documents.js';
 import { PresentationSuperseded, presentationCategory, physicalFrames } from './documents.js';
 import { staleSnapshot } from './authority.js';
-import { assertPageSurface, type PageSurface } from './windows.js';
+import { assertPageRetirement, assertPageSurface, type PageSurface } from './windows.js';
 import type { TabTarget } from './tabs.js';
 
 export type InspectionMethod = 'Page.getFrameTree' | 'Accessibility.enable' | 'Accessibility.getFullAXTree' |
@@ -104,6 +104,7 @@ interface DebuggerOwner { events: number; readonly limit: number; bad: boolean; 
 interface ChildSession {
   readonly targetId: string; readonly parent: string | undefined;
   readonly contexts: Map<string, DefaultContext>; readonly worlds: Map<string, ContentWorld>; detached: boolean; prepared?: Promise<void>; debuggerOwner?: DebuggerOwner;
+  chooserReady?: Promise<void>;
 }
 interface FrameRoute { readonly id: string; readonly loader: string; readonly parent: string | undefined }
 interface FrameGraph {
@@ -127,6 +128,8 @@ interface Channel {
   detached: boolean;
   graphEpoch: number;
   readonly root: ChildSession;
+  protectChoosers?: () => void;
+  closing?: true;
   proof?: Promise<void>;
   challenge?: FrameChallenge;
   interception: 'unknown' | 'enabled' | 'disabled';
@@ -146,6 +149,8 @@ interface Channel {
 function emptyAck(value: unknown): void {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length) throw staleSnapshot();
 }
+const pausedFrameAttachment = Object.freeze({ autoAttach: true, waitForDebuggerOnStart: true, flatten: true,
+  filter: [{ type: 'iframe' }, { exclude: true }] });
 /** Isolated native DOM objects only. Every open-shadow scope is latched before
  * AX reads, but composition inside every shadow host is still excluded by DOM
  * classification: manual slot assignment has no complete mutation signal. */
@@ -251,6 +256,15 @@ export class PageReadiness implements DocumentPreparation {
       channel.active = false;
       if (channel.actionWorld) delete channel.actionWorld.context;
       for (const observer of [...channel.actionObservers]) observer.close();
+      if (channel.protectChoosers && !channel.contents.isDestroyed()) {
+        const retirement = page.retirement();
+        if (retirement?.phase !== 'retiring') return this.boundary.fatal.fail('native_boundary_unavailable');
+        try { assertPageRetirement(page, retirement); }
+        catch { return this.boundary.fatal.fail('native_boundary_unavailable'); }
+        // The exact native transition owns the bounded destruction proof and
+        // fatal failure path. The debugger's detach reason alone proves neither.
+        void retirement.completion.catch(() => {});
+      }
       this.documents.channelLost(page, channel.identity); // literal original page/channel, never target.page
     });
     try { debugger_.attach('1.3'); this.assertChannel(channel); }
@@ -259,7 +273,7 @@ export class PageReadiness implements DocumentPreparation {
   }
   private assertChannel(channel: Channel): void {
     this.native();
-    if (!channel.active || channel.poisoned || this.channels.get(channel.page) !== channel || channel.page.retirement() ||
+    if (!channel.active || channel.closing || channel.poisoned || this.channels.get(channel.page) !== channel || channel.page.retirement() ||
         channel.contents.isDestroyed() || !channel.debugger.isAttached()) throw staleSnapshot();
     const binding = channel.page.binding();
     if (binding.id !== channel.page.identity.id || binding.nonce !== channel.page.identity.nonce ||
@@ -267,6 +281,37 @@ export class PageReadiness implements DocumentPreparation {
   }
   private owned(page: PageSurface): Channel {
     const channel = this.channels.get(page); if (!channel) throw staleSnapshot(); this.assertChannel(channel); return channel;
+  }
+  /** Attach to fresh renderer targets before their JS can run. The caller's
+   * pre-load guard is separate from the physical page lifetime guard. */
+  async armChildChoosers(page: PageSurface, beforeLoad: () => void, original: () => void): Promise<void> {
+    const channel = this.owned(page);
+    this.synchronous(beforeLoad); this.synchronous(original);
+    if (channel.protectChoosers || channel.sessions.size) throw staleSnapshot();
+    channel.protectChoosers = original;
+    emptyAck(await this.command(page, beforeLoad, 'Target.setAutoAttach', pausedFrameAttachment));
+    this.synchronous(beforeLoad);
+  }
+  private protectChild(channel: Channel, session: string, original: ChildSession, waiting: unknown): void {
+    const protect = channel.protectChoosers;
+    if (!protect || waiting !== true) return this.boundary.fatal.fail('native_boundary_unavailable');
+    const current = () => {
+      this.synchronous(protect);
+      this.assertChannel(channel);
+      if (channel.sessions.get(session) !== original || original.detached) throw staleSnapshot();
+    };
+    const ready = (async () => {
+      current();
+      emptyAck(await this.command(channel.page, current, 'Page.enable', undefined, session));
+      emptyAck(await this.command(channel.page, current, 'Page.setInterceptFileChooserDialog', { enabled: true, cancel: true }, session));
+      emptyAck(await this.command(channel.page, current, 'Target.setAutoAttach', pausedFrameAttachment, session));
+      emptyAck(await this.command(channel.page, current, 'Runtime.runIfWaitingForDebugger', undefined, session));
+    })();
+    original.chooserReady = ready;
+    void ready.catch(() => {
+      if (channel.active && !channel.closing && channel.sessions.get(session) === original && !original.detached &&
+          !channel.page.retirement() && !channel.contents.isDestroyed()) this.boundary.fatal.fail('native_boundary_unavailable');
+    });
   }
   /** Host-only callers retain original page/job guards. Result data does not
    * carry authority and is checked again after the actual channel response. */
@@ -308,12 +353,22 @@ export class PageReadiness implements DocumentPreparation {
     };
     if (method === 'Target.attachedToTarget') {
       changed();
+      if (channel.closing && channel.protectChoosers) {
+        // A closing page retains its debugger through destruction. Keep any
+        // new target paused so it never runs code while retirement is pending.
+        if (data?.waitingForDebugger !== true) return this.boundary.fatal.fail('native_boundary_unavailable');
+        return;
+      }
       if (!scalar(data?.sessionId) || !scalar(data?.targetInfo?.targetId) || data.targetInfo.type !== 'iframe' ||
           channel.sessions.has(data.sessionId) || channel.sessions.size >= 255 || (session && !channel.sessions.has(session))) {
+        if (channel.protectChoosers) return this.boundary.fatal.fail('native_boundary_unavailable');
         channel.unknownActivity = true; if (channel.challenge) channel.challenge.failed = true; return;
       }
-      channel.sessions.set(data.sessionId, { targetId: data.targetInfo.targetId, parent: session,
-        contexts: new Map(), worlds: new Map(), detached: false }); return;
+      const state: ChildSession = { targetId: data.targetInfo.targetId, parent: session,
+        contexts: new Map(), worlds: new Map(), detached: false };
+      channel.sessions.set(data.sessionId, state);
+      if (channel.protectChoosers) this.protectChild(channel, data.sessionId, state, data.waitingForDebugger);
+      return;
     }
     if (method === 'Target.detachedFromTarget') {
       changed(); const state = channel.sessions.get(data?.sessionId);
@@ -375,10 +430,16 @@ export class PageReadiness implements DocumentPreparation {
     const state = this.state(channel, session);
     if (!state.prepared) {
       const setup = (async () => {
+        if (channel.protectChoosers && session !== undefined) {
+          if (!state.chooserReady) throw staleSnapshot();
+          await state.chooserReady; guard();
+        }
         for (const method of ['Page.enable', 'DOM.enable', 'Runtime.enable', 'Animation.enable', 'Network.enable'])
           emptyAck(await this.command(channel.page, guard, method, undefined, session));
-        emptyAck(await this.command(channel.page, guard, 'Target.setAutoAttach',
-          { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }, session));
+        if (!channel.protectChoosers) {
+          emptyAck(await this.command(channel.page, guard, 'Target.setAutoAttach',
+            { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }, session));
+        }
         emptyAck(await this.command(channel.page, guard, 'Page.setLifecycleEventsEnabled', { enabled: true }, session));
       })();
       state.prepared = setup;
@@ -913,9 +974,14 @@ export class PageReadiness implements DocumentPreparation {
   }
   close(page: PageSurface): void {
     const channel = this.channels.get(page); if (!channel || !channel.active) return;
-    channel.active = false; // before detach callbacks can reenter
+    if (channel.closing) return;
+    channel.closing = true; // revoke logical use before any observer can reenter
     if (channel.actionWorld) delete channel.actionWorld.context;
     for (const observer of [...channel.actionObservers]) observer.close();
+    // Detaching a live protected page would reopen the system chooser. The
+    // debugger's original target closes as part of native view destruction.
+    if (channel.protectChoosers && !channel.contents.isDestroyed()) return;
+    channel.active = false;
     if (!channel.contents.isDestroyed() && channel.debugger.isAttached()) channel.debugger.detach();
   }
 }

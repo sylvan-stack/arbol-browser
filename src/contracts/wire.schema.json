@@ -764,6 +764,224 @@
     },
     "CliError": {
       "$ref": "urn:arbol-browser:contract:1#/$defs/ErrorResult"
+    },
+    "CliAgentId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,64}$"
+    },
+    "CliAgentCall": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "urn:arbol-browser:wire:1#/$defs/CliAgentId"
+        },
+        "tool": {
+          "enum": [
+            "browser_info",
+            "browser_tabs_list",
+            "browser_tab_open",
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_click",
+            "browser_type",
+            "browser_press_key",
+            "browser_scroll",
+            "browser_drag",
+            "browser_screenshot",
+            "browser_tab_close",
+            "browser_release"
+          ]
+        },
+        "arguments": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "id",
+        "tool",
+        "arguments"
+      ],
+      "additionalProperties": false,
+      "description": "Validate arguments against the required x-tools input for the selected name before dispatch."
+    },
+    "CliAgentCancel": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "urn:arbol-browser:wire:1#/$defs/CliAgentId"
+        },
+        "cancel": {
+          "$ref": "urn:arbol-browser:wire:1#/$defs/CliAgentId"
+        }
+      },
+      "required": [
+        "id",
+        "cancel"
+      ],
+      "additionalProperties": false
+    },
+    "CliAgentCancelResult": {
+      "type": "object",
+      "properties": {
+        "request": {
+          "$ref": "urn:arbol-browser:wire:1#/$defs/CliAgentId"
+        },
+        "found": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "request",
+        "found"
+      ],
+      "additionalProperties": false
+    },
+    "CliAgentReady": {
+      "type": "object",
+      "properties": {
+        "event": {
+          "const": "ready"
+        },
+        "contract": {
+          "const": 1
+        },
+        "profile": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ProfileId"
+        },
+        "build": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Build"
+        }
+      },
+      "required": [
+        "event",
+        "contract",
+        "profile",
+        "build"
+      ],
+      "additionalProperties": false
+    },
+    "CliAgentError": {
+      "type": "object",
+      "properties": {
+        "event": {
+          "const": "error"
+        },
+        "error": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/BrowserError"
+        }
+      },
+      "required": [
+        "event",
+        "error"
+      ],
+      "additionalProperties": false
+    },
+    "CliAgentReply": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "urn:arbol-browser:wire:1#/$defs/CliAgentId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "required": [
+            "id",
+            "ok",
+            "result"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "urn:arbol-browser:wire:1#/$defs/CliAgentId"
+            },
+            "ok": {
+              "const": false
+            },
+            "error": {
+              "$ref": "urn:arbol-browser:contract:1#/$defs/BrowserError"
+            }
+          },
+          "required": [
+            "id",
+            "ok",
+            "error"
+          ],
+          "additionalProperties": false
+        }
+      ],
+      "description": "Validate success against the exact outstanding tool result or CliAgentCancelResult. The first release refuses screenshot before capture."
+    },
+    "CliAgentDescription": {
+      "type": "object",
+      "properties": {
+        "contract": {
+          "const": 1
+        },
+        "tools": {
+          "type": "array",
+          "minItems": 13,
+          "maxItems": 13,
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "enum": [
+                  "browser_info",
+                  "browser_tabs_list",
+                  "browser_tab_open",
+                  "browser_navigate",
+                  "browser_snapshot",
+                  "browser_click",
+                  "browser_type",
+                  "browser_press_key",
+                  "browser_scroll",
+                  "browser_drag",
+                  "browser_screenshot",
+                  "browser_tab_close",
+                  "browser_release"
+                ]
+              },
+              "description": {
+                "type": "string",
+                "minLength": 1
+              },
+              "inputSchema": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "resultSchema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "name",
+              "description",
+              "inputSchema",
+              "resultSchema"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "contract",
+        "tools"
+      ],
+      "additionalProperties": false,
+      "description": "Emit every x-tools name once with self-contained input and successful result schemas. The screenshot description states that capture is unavailable in the first release."
     }
   }
 }
