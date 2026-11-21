@@ -97,6 +97,7 @@ export async function verifyPostStapleRelease({ image, signedReceiptPath, delive
     const data = JSON.parse(run('/usr/bin/plutil', ['-convert', 'json', '-o', '-', '--', '-'], attached).stdout);
     const app = await mountedApplication(image, mount, data);
     checkSignature(app, publisher.bundleIdentifier, true);
+    run('/usr/sbin/spctl', ['--assess', '--type', 'exec', app]);
     await assertPhysicalCap(app);
     const files = await inventory(app);
     const policy = await json(join(app, relativePolicy));
@@ -233,14 +234,30 @@ async function installedImageReceipt(support, selected) {
   return value;
 }
 
-async function recoverInstall(support, executable, provider, uses) {
+async function installedAlias(alias, executable) {
+  let info;
+  try { info = await lstat(alias, { bigint: true }); } catch (error) { if (error.code === 'ENOENT') return undefined; throw error; }
+  if (!info.isSymbolicLink() || info.uid !== BigInt(userInfo().uid) || await readlink(alias) !== executable)
+    throw new Error('Browser PATH entry has a different owner or target');
+  return { device: info.dev, inode: info.ino };
+}
+
+async function ensureAlias(alias, executable) {
+  if (await installedAlias(alias, executable)) return;
+  await symlink(executable, alias);
+  if (!await installedAlias(alias, executable)) throw new Error('Published Browser PATH entry disappeared');
+  await syncPath(dirname(alias));
+}
+
+async function recoverInstall(support, executable, alias, provider, uses) {
   const journal = join(support, 'install-transaction.json'), backup = join(support, 'install-previous-launcher');
   const pending = await optionalFile(journal, 4096);
   if (!pending) return;
-  const { format, before, after } = JSON.parse(pending.bytes.toString('utf8'));
+  const { format, before, after, aliasBefore } = JSON.parse(pending.bytes.toString('utf8'));
   const checked = item => item && item.selection?.format === 1 && buildNumber(item.selection.build) &&
     digest(item.selection.imageSha256) && digest(item.launcherSha256);
-  if (pending.identity.mode !== 0o600 || pending.identity.uid !== userInfo().uid || format !== 1 ||
+  if (pending.identity.mode !== 0o600 || pending.identity.uid !== userInfo().uid ||
+      ![1, 2].includes(format) || (format === 2 && typeof aliasBefore !== 'boolean') ||
       (before !== null && !checked(before)) || !checked(after) ||
       before?.selection.build === after.selection.build) throw new Error('Browser installation journal is unsafe');
   const selectionPath = join(support, 'selected.json');
@@ -252,6 +269,17 @@ async function recoverInstall(support, executable, provider, uses) {
   const target = canonical(selected) === canonical(after.selection) ? after : before;
   const unchanged = target && current?.sha256 === target.launcherSha256;
   await withLock(provider, join(uses, selected?.build ?? after.selection.build), async () => {
+    if (format === 2) {
+      const entry = await installedAlias(alias, executable);
+      if ((target === after || aliasBefore) && !entry) throw new Error('Browser PATH entry changed during installation');
+      if (target !== after && !aliasBefore && entry) {
+        const observed = await installedAlias(alias, executable);
+        if (!observed || entry.device !== observed.device || entry.inode !== observed.inode)
+          throw new Error('Browser PATH entry changed during rollback');
+        await unlink(alias);
+        await syncPath(dirname(alias));
+      }
+    }
     if (target && !unchanged) {
       if (target === after || (current && current.sha256 !== after.launcherSha256)) throw new Error('Uncertain installed launcher identity');
       const original = await exactFile(backup, launcherLimit);
@@ -280,11 +308,13 @@ export async function installRelease(options) {
   const uses = await safeDirectories(home, installation.stableUses, privateFrom);
   const bin = await safeDirectories(home, [...installation.stableBuilds.slice(0, 2), 'bin'], 1);
   const executable = join(bin, 'arbol-browser');
+  const alias = join(await safeDirectories(home, ['.local', 'bin'], 2), 'arbol-browser');
   const selectionPath = join(support, 'selected.json');
   const selected = { format: 1, build: release.build, imageSha256: release.imageSha256 };
   return withLockProvider(release.platform, provider => withLock(provider, join(support, 'selection.lock'), async () => {
-    await recoverInstall(support, executable, provider, uses);
+    await recoverInstall(support, executable, alias, provider, uses);
     const previous = await optionalSelection(selectionPath);
+    const aliasBefore = Boolean(await installedAlias(alias, executable));
     const same = canonical(previous) === canonical(selected);
     if (previous && !same && BigInt(`0x${previous.build}`) >= BigInt(`0x${release.build}`)) {
       throw new Error('Browser release number is older or already belongs to different signed bytes');
@@ -305,10 +335,6 @@ export async function installRelease(options) {
         launcherSha256: release.launcher.sha256 });
       await publishExact(join(receipts, `${release.build}.json`), 4096, hash(receipt), path => writeExclusive(path, receipt));
 
-      const alias = join(await safeDirectories(home, ['.local', 'bin'], 2), 'arbol-browser');
-      try { await symlink(executable, alias); } catch (error) { if (error.code !== 'EEXIST') throw error; }
-      if (await readlink(alias) !== executable) throw new Error('Browser PATH entry has a different target');
-      await syncPath(dirname(alias));
       const current = await optionalFile(executable, launcherLimit);
       const old = previous ? await installedImageReceipt(support, previous) : undefined;
       if (old ? current?.sha256 !== old.launcherSha256 : current !== undefined) throw new Error('Existing launcher differs from its release receipt');
@@ -319,16 +345,18 @@ export async function installRelease(options) {
           checkSignature(executable, launcherIdentifier);
           await publishExact(backup, launcherLimit, current.sha256, path => writeExclusive(path, current.bytes, 0o755));
         }
-        const transaction = encode({ format: 1,
+        const transaction = encode({ format: 2, aliasBefore,
           before: old ? { selection: previous, launcherSha256: old.launcherSha256 } : null,
           after: { selection: selected, launcherSha256: release.launcher.sha256 } });
         await publishExact(journal, 4096, hash(transaction), path => writeExclusive(path, transaction));
         await replaceFile(executable, release.launcher.bytes, 0o755);
         if ((await exactFile(executable, launcherLimit)).sha256 !== release.launcher.sha256) throw new Error('Installed launcher differs');
         checkSignature(executable, launcherIdentifier);
+        await ensureAlias(alias, executable);
         await replaceFile(selectionPath, encode(selected), 0o600);
       } else {
         checkSignature(executable, launcherIdentifier);
+        await ensureAlias(alias, executable);
       }
       return { build: release.build, source: release.source, imageSha256: release.imageSha256, executable, image, mount, alias };
     };
@@ -337,7 +365,7 @@ export async function installRelease(options) {
     try {
       result = previous && !same ? await withLock(provider, join(uses, previous.build), candidate, false) : await candidate();
     } finally {
-      await recoverInstall(support, executable, provider, uses);
+      await recoverInstall(support, executable, alias, provider, uses);
     }
     return result;
   }));
