@@ -1,13 +1,12 @@
-# Broader Browser qualification
+# Optional Browser verification
 
-ABR-25 performs the guarded same-account production rehearsal, notarization,
-independent post-staple verification, and stable installation as explicit
-release operations. The automatic pre-notary gate checks the exact signed
-candidate inventory. The independent verifier in
-`tests/qualification/verify_release.mjs` consumes the submitted and delivered
-images and the Apple result and log. Cold launch, Open and complete Close
-from Applications require a dedicated Browser profile and separately observed
-filesystem activity from the original host and helpers.
+ABR-25 uses the Browser unit selection and the signed installer for stable
+promotion. The independent artifact verifier in
+`tests/qualification/verify_release.mjs` verifies the submitted and delivered
+images, Apple result and log, stapled ticket and Gatekeeper. It does not
+launch the Browser. A guarded rehearsal, cold launch, Open and complete Close
+are separately requested runtime checks. For a reported issue, use the exact
+installed Build and select the checks needed to investigate it.
 
 Get explicit approval before each Browser test run, including production
 rehearsals, integration checks and installed launch verification. Use the

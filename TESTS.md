@@ -7,9 +7,15 @@ retaining ABR-8's earlier cases and recorded limitations. The exact case and
 scenario selection, admission reasons and unavailable routes are in
 [test-tiers.json](test-tiers.json). No earlier low-tier bodies existed.
 
-The normal isolated Build gate selects all six Foundation cases, ten Native
-cases with 50 scenarios, and five Control cases. ABR-12 owns current-host
-qualification. A production release Build also runs `releaseArtifactIdentity`
+The default Build uses the explicit `promotionUnitTests` selection in
+`arbol-build.json`. Browser currently has no standalone unit tests. Its Build
+record carries the empty declaration and the results of any checks that ran.
+Signing and artifact verification follow the release procedure.
+
+The separately requested `browser-verification` check selects all six
+Foundation cases, ten Native cases with 50 scenarios, and five Control cases.
+ABR-12 owns the recorded current-host evidence. When expressly selected for a
+Build that produces a signed release image, it also runs `releaseArtifactIdentity`
 against the exact signed disk image named by the original Building record.
 The case mounts that image read-only and verifies its Publisher, Build, runtime,
 native executables, and full app inventory. It leaves the selected installation
@@ -26,14 +32,16 @@ There are 50 separately recorded native scenarios.
 Case and scenario selection is fixed. Missing sources, results or required
 observations fail the gate.
 
-Get the user's explicit approval for each test run, including individual cases
-and Builds that run the gate. After approval, set the opt-in for that invocation
-only. Run the normal Build with a fresh isolated registry and bin directory
+Get the user's explicit approval for the requested Browser verification scope,
+including any launch or rerun. Choose a focused integration check when it can
+answer the question. To request the complete retained verification suite, add
+the named check to a Build with a fresh isolated registry and bin directory
 outside the checkout.
 
 ```sh
 ARBOL_BROWSER_MANUAL_FOCUS=1 arbol-builds build arbol-browser --repo /Users/msix/repos/sylvan-stack/arbol-browser \
-  --registry-dir /absolute/new-private-run/registry --bin-dir /absolute/new-private-run/bin
+  --registry-dir /absolute/new-private-run/registry --bin-dir /absolute/new-private-run/bin \
+  --check browser-verification
 ```
 
 Native scenarios that depend on real keyboard focus show a passive window
@@ -43,8 +51,9 @@ title bar of each new fixture when it appears. If you leave a fixture, it stops
 sending focus-dependent input and reports the missing evidence. Timeout or
 missing focus evidence leaves the scenario unqualified.
 
-The gate writes `result.json`, a Foundation worker result and private native
-case directories under `<isolated-registry>/arbol-browser/.qualification-<build>/`.
+The verification check writes `result.json`, a Foundation worker result and
+private native case directories under
+`<isolated-registry>/arbol-browser/.verification-<build>/`.
 It validates the ordinary candidate payload and executing Foundation runtime
 against its metadata and current package source. Independently, it binds the
 accepted ABR-46 consumer manifest, frozen source, compiled closure, exact signed
@@ -59,8 +68,8 @@ that real record, canonical layout and actual `.uses` inode; it supplies no
 native authority. The gate cannot force a record working or repeat Control
 through an arbitrary staged package. Use a clean detached managed testing commit
 and fresh private registry/bin/state under canonical non-writable ancestors
-beneath `/Users/msix/Builds/sylvan-stack/arbol-browser/`, with the normal Build
-command above.
+beneath `/Users/msix/Builds/sylvan-stack/arbol-browser/`, with the explicit
+verification command above.
 
 The five Control cases cover startup arbitration and listener observations,
 ungranted connection isolation and release, genuine renderer hang latching,
@@ -70,8 +79,8 @@ before and after use, exact sealed assembly and separate lane results. Control
 supplies no Tools provider or privileged shell fixture.
 
 Keep the run outside owner profiles, the normal registry and the accepted
-consumer's artifact tree. The isolated `working` status covers the documented
-Foundation and pinned-consumer cases. Production host start, complete family
+consumer's artifact tree. Read the named check and its result to see which
+Foundation and pinned-consumer cases ran. Production host start, complete family
 confinement, clean close, complementary input and full release remain tracked
 in [MID_TIER.md](MID_TIER.md). Evidence stays outside Git.
 
@@ -109,7 +118,7 @@ supported signed helper exit, a distinct still-live primary timeout, and the
 positive cached aria-actions cycle with its original AX tab attached through
 retirement. All earlier cases/scenarios remain selected. The census record binds
 the driver, effective frozen shared header, compile command and actual binary;
-the ordinary gate rechecks those bytes and all four effective callback headers.
+the verification check rechecks those bytes and all four effective callback headers.
 The one-time published-predecessor sensitivity is separate from candidate gate
 results. Natural primary SIGHUP remains distinct from measured timeout SIGKILL.
 Actual installed route guards and sealed features do not qualify unmeasured
