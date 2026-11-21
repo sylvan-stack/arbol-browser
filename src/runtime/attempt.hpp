@@ -100,6 +100,27 @@ inline NSString* physicalAccountHome() {
       !arbol_boundary::canonical(account.pw_dir)) return nil;
   return [NSString stringWithUTF8String:account.pw_dir];
 }
+inline std::string stableLauncherPath(NSString* home) {
+  NSString* component = [home stringByAppendingPathComponent:@ARBOL_INSTALLATION_STABLE_BUILDS]
+    .stringByDeletingLastPathComponent.stringByDeletingLastPathComponent;
+  NSString* path = [component stringByAppendingPathComponent:@"bin/arbol-browser"];
+  return path ? path.fileSystemRepresentation : "";
+}
+inline bool signedIdentity(const std::string& path, NSString* identifier, bool nested = false) {
+  if (!arbol_boundary::signature(path, false)) return false;
+  NSString* physical = [NSString stringWithUTF8String:path.c_str()];
+  SecStaticCodeRef code = nullptr;
+  CFDictionaryRef info = nullptr;
+  if (!physical || SecStaticCodeCreateWithPath((__bridge CFURLRef)[NSURL fileURLWithPath:physical], kSecCSDefaultFlags, &code) != errSecSuccess)
+    return false;
+  bool valid = (!nested || SecStaticCodeCheckValidity(code, kSecCSStrictValidate | kSecCSCheckNestedCode, nullptr) == errSecSuccess) &&
+    SecCodeCopySigningInformation(code, kSecCSSigningInformation, &info) == errSecSuccess && info &&
+    [((__bridge NSDictionary*)info)[(__bridge NSString*)kSecCodeInfoIdentifier] isEqual:identifier];
+  if (info) CFRelease(info);
+  CFRelease(code);
+  return valid;
+}
+inline constexpr int cliBuildDescriptor = 10, cliCapsuleDescriptor = 11;
 inline bool packagedLayout(const std::string& bundle, PackagedLayout& out) {
   NSString* app = [NSString stringWithUTF8String:bundle.c_str()];
   if (!path(app) || ![app.lastPathComponent isEqual:@"ArbolBrowser.app"]) return false;

@@ -8,7 +8,9 @@ import { publicFailure, unavailable, type ExitCode } from '../contracts/errors.j
 import { validator } from '../contracts/schema.js';
 import type { Contract } from '../contracts/generated.js';
 import type { CommandPorts, Stdio, PackageMetadata } from '../runtime/ports.js';
-import { consumePackagedSelection, type BuildSelection } from '../runtime/selection.js';
+import { buildLocation, consumePackagedSelection, packagedLayout, type BuildSelection } from '../runtime/selection.js';
+import type { VerifiedHost } from '../runtime/authorities.js';
+import type { HeldLock, PlatformPort } from '../runtime/platform.js';
 
 const coldStages = ['package-metadata', 'selected-build', 'runtime-imports', 'signed-bundle',
   'signed-policy-metadata-compatibility', 'isolated-roots', 'build-guard', 'initial-verified-host',
@@ -41,9 +43,32 @@ function coldFailureSuffix(observation: ColdObservation | undefined, status: Exi
   return '';
 }
 
-// All native/profile/runtime work is lazy. info remains metadata only.
 const defaultPorts = Object.freeze({}) as CommandPorts;
-async function productionPorts(selection: BuildSelection, observation?: ColdObservation, openCutoff?: number): Promise<CommandPorts> {
+interface InstalledLaunch {
+  selection: BuildSelection;
+  host: VerifiedHost;
+  platform: PlatformPort;
+  lock: HeldLock;
+  deadline: number;
+}
+async function installedLaunch(cutoff: number): Promise<InstalledLaunch | undefined> {
+  const payload = resolve(fileURLToPath(new URL('../../', import.meta.url)));
+  const parent = dirname(dirname(dirname(dirname(payload))));
+  if (basename(parent) !== 'app') return undefined;
+  const root = dirname(parent), build = basename(root);
+  if (buildLocation(build, root)?.scope !== 'installed') return undefined;
+  const layout = packagedLayout(build, payload);
+  if (process.type === 'browser' || process.execPath !== layout.engine) throw unavailable('browser');
+  const selection = consumePackagedSelection(build, payload);
+  const { verifyPackagedOpenHost } = await import('../runtime/authorities.js');
+  const host = await verifyPackagedOpenHost(selection, payload, cutoff);
+  const { loadPlatform } = await import('../runtime/platform.js');
+  const platform = loadPlatform();
+  const { lock, deadline } = platform.adoptInstalledLaunch(layout.bundle);
+  return { selection, host, platform, lock, deadline: Math.min(cutoff, deadline) };
+}
+async function productionPorts(selection: BuildSelection, observation?: ColdObservation, openCutoff?: number,
+  installed?: InstalledLaunch): Promise<CommandPorts> {
   if (openCutoff !== undefined && performance.now() >= openCutoff) throw unavailable('browser');
   noteCold(observation, 'runtime-imports');
   const [{ createProfileService }, { loadPlatform }, { createProcessService, createProfileRuntime },
@@ -52,7 +77,7 @@ async function productionPorts(selection: BuildSelection, observation?: ColdObse
     import('../runtime/authorities.js'), import('../runtime/exit.js'), import('../runtime/process.js'),
   ]);
   const payload = resolve(fileURLToPath(new URL('../../', import.meta.url)));
-  const deadline = openCutoff ?? performance.now() + 30000;
+  const deadline = openCutoff ?? installed?.deadline ?? performance.now() + 30000;
   // Verify the real current outer/payload before loading its native support.
   // The fixed packaged entry must be running as the exact stock engine in
   // Node mode; no system Node, older Foundation or ad hoc helper substitution.
@@ -60,7 +85,7 @@ async function productionPorts(selection: BuildSelection, observation?: ColdObse
   const verification = observation ? authorities.createHostVerificationObservation() : undefined;
   try { if (observation && verification) observation.verification = Object.freeze({ module: authorities, observation: verification }); }
   catch { /* Optional readback cannot alter production provider construction. */ }
-  const selectedHost = openCutoff === undefined
+  const selectedHost = installed ? Promise.resolve(installed.host) : openCutoff === undefined
     ? authorities.verifyPackagedHost(selection, payload, deadline, undefined, verification)
     : authorities.verifyPackagedOpenHost(selection, payload, openCutoff, verification);
   const host = await selectedHost.catch(error => {
@@ -82,7 +107,7 @@ async function productionPorts(selection: BuildSelection, observation?: ColdObse
   if (openCutoff === undefined) await host.assertTrusted(deadline);
   else await authorities.assertHostStartupContinuity(host, deadline, openCutoff);
   noteCold(observation, 'native-platform');
-  const platform = loadPlatform();
+  const platform = installed?.platform ?? loadPlatform();
   noteCold(observation, 'production-adapters');
   const exits = createProductionExitAuthority(platform, selection);
   const openObservation = observation ? authorities.createOpenCommandObservation() : undefined;
@@ -120,26 +145,28 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
   // On the MCP path stdout is reserved exclusively for the MCP transport, including failures.
   const mcp = args[0] === 'mcp';
   let observation: ColdObservation | undefined;
+  let installed: InstalledLaunch | undefined;
   try {
     const command = parse(args);
-    const openCutoff = ports === defaultPorts && command.kind === 'open' ? commandCutoff : undefined;
+    if (ports === defaultPorts) installed = await installedLaunch(commandCutoff);
+    const openCutoff = ports === defaultPorts && command.kind === 'open' ? installed?.deadline ?? commandCutoff : undefined;
     if (ports === defaultPorts && (command.kind === 'open' || command.kind === 'profiles-create'))
       observation = { stage: 'package-metadata' };
     if (ports === defaultPorts && command.kind === 'mcp') throw unavailable('browser');
     let activePorts = ports;
     if (ports === defaultPorts && command.kind !== 'info') {
       if (openCutoff !== undefined && performance.now() >= openCutoff) throw unavailable('browser');
-      const metadata = await componentInfo();
+      const metadata = installed?.host.identity.component ?? await componentInfo();
       noteCold(observation, 'selected-build');
-      const selection = consumePackagedSelection(metadata.build, resolve(fileURLToPath(new URL('../../', import.meta.url))));
-      activePorts = await productionPorts(selection, observation, openCutoff);
+      const selection = installed?.selection ?? consumePackagedSelection(metadata.build, resolve(fileURLToPath(new URL('../../', import.meta.url))));
+      activePorts = await productionPorts(selection, observation, openCutoff, installed);
     }
     if (command.kind === 'mcp') { await activePorts.process.mcp(command.profile, io); return 0; }
     let result: unknown;
     let check: (value: unknown) => boolean;
     noteCold(observation, 'command-dispatch');
     switch (command.kind) {
-      case 'info': result = await componentInfo(); check = validator('wire.ComponentInfo'); break;
+      case 'info': result = installed?.host.identity.component ?? await componentInfo(); check = validator('wire.ComponentInfo'); break;
       case 'open': result = await activePorts.process.open(command); check = validator('wire.OpenResult'); break;
       case 'close': result = await activePorts.process.close(command.profile); check = validator('wire.CloseResult'); break;
       case 'profiles-list': result = await activePorts.profiles.list(); check = validator('profile.ProfileList'); break;
@@ -168,6 +195,11 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
     // No thrown messages, arguments, URLs, protocol bodies or stack traces.
     io.stderr.write(`arbol-browser: ${failure.detail.code}\n${coldFailureSuffix(observation, failure.exitCode)}`);
     return failure.exitCode;
+  } finally {
+    if (installed) {
+      try { installed.lock.release(); }
+      catch { /* The installed launcher still retains the original guard until this process exits. */ }
+    }
   }
 }
 

@@ -116,7 +116,7 @@ export async function currentHostCompilation() {
   const actualOutputs = { libraryDigest: inventoryDigest(await inventory(join(root, 'dist/lib'))),
     entryDigest: (await exactFile(join(root, 'dist/cli/main.mjs'), 16777216)).sha256,
     hostDigest: (await exactFile(join(root, 'dist/host/main.mjs'), 16777216)).sha256, native: {} };
-  for (const name of ['ownership.node', 'platform.node', 'host-bootstrap', 'host-launch', 'watchdog'])
+  for (const name of ['ownership.node', 'platform.node', 'host-bootstrap', 'host-launch', 'watchdog', 'stable-launch'])
     actualOutputs.native[name] = (await exactFile(join(root, 'dist/native', name), 67108864)).sha256;
   if (!sha(record.productDigest) || record.productDigest !== inventoryDigest(productSources) ||
       canonical(record.productSources) !== canonical(productSources) ||
@@ -350,7 +350,10 @@ export async function prepareUnsignedHost({ out, buildRoot, stateRoot, runtimeAr
   const stock = await stockRuntime(runtimeArchive, scratch), payload = join(bundle, 'Contents/Resources/browser');
   await mkdir(payload, { recursive: true, mode: 0o700 });
   const copy = { recursive: true, force: false, errorOnExist: true, verbatimSymlinks: true };
-  await cp(join(root, 'dist/lib'), join(payload, 'lib'), copy); await cp(join(root, 'dist/native'), join(payload, 'native'), copy);
+  await cp(join(root, 'dist/lib'), join(payload, 'lib'), copy);
+  await cp(join(root, 'dist/native'), join(payload, 'native'), {
+    ...copy, filter: path => path !== join(root, 'dist/native/stable-launch'),
+  });
   for (const name of ['cli', 'host']) await cp(join(root, 'dist', name, 'main.mjs'), join(payload, 'lib', name, 'main.mjs'), copy);
   await mkdir(join(payload, 'runtime')); await cp(join(stock, 'Electron.app'), join(payload, 'runtime/Electron.app'), copy);
   for (const name of ['LICENSE', 'LICENSES.chromium.html']) await cp(join(stock, name), join(payload, 'runtime', name), copy);

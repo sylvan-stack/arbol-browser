@@ -12,8 +12,8 @@ const frozenConsumer = '/Users/msix/Builds/sylvan-stack/arbol-browser/ABR-46-202
 const frozenDigest = '25fe40877f7c3415bc5c5cce034320440bdfbb287170e30c9cb319728ca9490e';
 export const platformCompilerPolicy = Object.freeze({ compiler: nativeCompilerPolicy.compiler, sdk: nativeCompilerPolicy.sdk,
   architecture: 'arm64', deployment: '27.0', compiledNapi: 8, protocol: 1, headerArchive: nativeCompilerPolicy.headerArchive,
-  frozenConsumer: frozenDigest, outputs: ['platform.node', 'host-launch', 'host-bootstrap'], qualification: 'unexecuted' });
-const names = ['src/runtime/platform.mm', 'src/runtime/host-launch.mm', 'src/runtime/host-bootstrap.mm'];
+  frozenConsumer: frozenDigest, outputs: ['platform.node', 'host-launch', 'host-bootstrap', 'stable-launch'], qualification: 'unexecuted' });
+const names = ['src/runtime/platform.mm', 'src/runtime/host-launch.mm', 'src/runtime/host-bootstrap.mm', 'src/runtime/stable-launch.mm'];
 const installationConsumers = new Set([...names, 'watchdog/main.mm']);
 const installationSource = 'src/runtime/installation-paths.json';
 const productionPublisherSource = 'native/production-publisher-requirement.json';
@@ -86,12 +86,13 @@ export async function captureCompilerInputs(sourceNames, headers = officialHeade
       staticCommand('/usr/bin/xcrun', ['clang++', '--version']).split('\n')[0] !== platformCompilerPolicy.compiler)
     throw new Error('Unsupported pinned compiler or SDK');
   const installationPaths = sourceNames.some(name => installationConsumers.has(name)) ? await installationInput() : undefined;
-  const productionPublisher = sourceNames.includes(names[2]) ? await productionPublisherInput() : undefined;
+  const usesProductionPublisher = name => name === names[2] || name === names[3];
+  const productionPublisher = sourceNames.some(usesProductionPublisher) ? await productionPublisherInput() : undefined;
   const paths = new Map();
   for (const name of sourceNames) {
     const flags = [
       ...(installationConsumers.has(name) ? installationPaths.flags : []),
-      ...(name === names[2] ? productionPublisher.flags : []),
+      ...(usesProductionPublisher(name) ? productionPublisher.flags : []),
     ];
     const output = staticCommand('/usr/bin/xcrun', ['clang++', '-std=c++17', '-fobjc-arc', '-fblocks', '-DNAPI_VERSION=8',
       '-arch', 'arm64', '-mmacosx-version-min=27.0', '-isysroot', sdk, '-I', headers, ...flags, '-M', '-MT', 'closure', name]);
@@ -117,7 +118,8 @@ export async function captureCompilerInputs(sourceNames, headers = officialHeade
     ...(installationPaths ? { installationPaths } : {}),
     ...(productionPublisher ? { productionPublisher } : {}),
     compiler: hash(await readFile(compilerPath)), linker: hash(await readFile(linkerPath)), linkerInputs,
-    frameworks: { 'platform.node': ['Foundation', 'Security', 'AppKit'], 'host-launch': ['AppKit'], 'host-bootstrap': ['Foundation', 'Security'] },
+    frameworks: { 'platform.node': ['Foundation', 'Security', 'AppKit'], 'host-launch': ['AppKit'],
+      'host-bootstrap': ['Foundation', 'Security'], 'stable-launch': ['Foundation', 'Security'] },
     sdkSettings: hash(settings), files };
 }
 async function sources() {
@@ -145,8 +147,9 @@ export async function compilePlatform(headers = officialHeaders) {
     '-bundle', '-undefined', 'dynamic_lookup', '-I', headers, ...input.installationPaths.flags, names[0],
     '-lbsm', '-framework', 'Foundation', '-framework', 'Security', '-framework', 'AppKit',
     '-o', join(root, 'dist/native/platform.node')]);
-  for (const [source, name, frameworks] of [[names[1], 'host-launch', ['AppKit']], [names[2], 'host-bootstrap', ['Foundation', 'Security']]]) {
-    const flags = [...input.installationPaths.flags, ...(source === names[2] ? input.productionPublisher.flags : [])];
+  for (const [source, name, frameworks] of [[names[1], 'host-launch', ['AppKit']], [names[2], 'host-bootstrap', ['Foundation', 'Security']],
+    [names[3], 'stable-launch', ['Foundation', 'Security']]]) {
+    const flags = [...input.installationPaths.flags, ...(source !== names[1] ? input.productionPublisher.flags : [])];
     staticCommand('/usr/bin/xcrun', [...common, ...flags, source, ...frameworks.flatMap(value => ['-framework', value]), '-o', join(root, 'dist/native', name)]);
   }
   const outputs = {};
@@ -161,7 +164,7 @@ export async function compilePlatform(headers = officialHeaders) {
     throw new Error('Platform source/compiler input changed');
   await writeFile(join(root, 'dist/native/platform-compile.json'), JSON.stringify({ format: 1, sources: before, input, outputs }, null, 2) + '\n');
   await validatePlatformCompilation();
-  console.log('Compiled/inspected platform, fixed bootstrap and LaunchServices helper; no emitted code executed');
+  console.log('Compiled/inspected platform, fixed bootstrap, LaunchServices helper and installed launcher');
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   if (process.argv.length !== 2) throw new Error('compile-platform.mjs accepts only the exact pinned header provider');

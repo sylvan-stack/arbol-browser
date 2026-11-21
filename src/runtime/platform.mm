@@ -562,6 +562,65 @@ static napi_value adoptHostBuild(napi_env env,napi_callback_info info) {
   } }
 }
 
+static napi_value adoptInstalledLaunch(napi_env env, napi_callback_info info) {
+  static bool attempted = false;
+  if (attempted) return fail(env);
+  attempted = true;
+  napi_value arg;
+  std::string bundle;
+  if (!argument(env, info, &arg) || !string(env, arg, bundle)) return fail(env);
+  @autoreleasepool { try { @try {
+    arbol_attempt::PackagedLayout layout;
+    if (!arbol_attempt::packagedLayout(bundle, layout) || !layout.installed || !arbol_boundary::canonical(bundle))
+      return fail(env);
+    constexpr int capsule = arbol_attempt::cliCapsuleDescriptor, fd = arbol_attempt::cliBuildDescriptor;
+    struct stat before{}, after{}, guard{};
+    if (fstat(capsule, &before) || !S_ISREG(before.st_mode) || before.st_uid != geteuid() || before.st_nlink ||
+        (before.st_mode & 07777) != 0600 || before.st_size < 1 || before.st_size > (off_t)arbol_attempt::limit ||
+        (fcntl(capsule, F_GETFL) & O_ACCMODE) != O_RDONLY || fcntl(capsule, F_SETFD, FD_CLOEXEC) ||
+        fstat(fd, &guard) || (fcntl(fd, F_GETFL) & O_ACCMODE) != O_RDWR || fcntl(fd, F_SETFD, FD_CLOEXEC)) return fail(env);
+    std::string raw(size_t(before.st_size), '\0');
+    size_t offset = 0;
+    while (offset < raw.size()) {
+      ssize_t count = pread(capsule, raw.data() + offset, raw.size() - offset, off_t(offset));
+      if (count > 0) offset += size_t(count);
+      else if (count != -1 || errno != EINTR) return fail(env);
+    }
+    if (fstat(capsule, &after) || after.st_nlink || after.st_dev != before.st_dev || after.st_ino != before.st_ino ||
+        after.st_mode != before.st_mode || after.st_size != before.st_size || after.st_uid != before.st_uid ||
+        after.st_mtimespec.tv_sec != before.st_mtimespec.tv_sec || after.st_mtimespec.tv_nsec != before.st_mtimespec.tv_nsec ||
+        after.st_ctimespec.tv_sec != before.st_ctimespec.tv_sec || after.st_ctimespec.tv_nsec != before.st_ctimespec.tv_nsec ||
+        close(capsule)) return fail(env);
+    NSDictionary* packet = arbol_attempt::json(raw);
+    const int parentPid = getppid();
+    NSDictionary* parent = arbol_attempt::processRecord(parentPid);
+    const std::string launcher = arbol_attempt::stableLauncherPath(arbol_attempt::physicalAccountHome());
+    NSDictionary* self = arbol_attempt::processRecord(getpid());
+    if (!arbol_attempt::keys(packet, @[@"format", @"parent", @"deadline", @"guard", @"bundle"]) ||
+        ![packet[@"format"] isEqual:@1] || ![packet[@"bundle"] isEqual:[NSString stringWithUTF8String:bundle.c_str()]] ||
+        parentPid <= 1 || ![packet[@"parent"] isEqual:parent] ||
+        ![parent[@"executable"] isEqual:[NSString stringWithUTF8String:launcher.c_str()]] ||
+        ![self[@"executable"] isEqual:[NSString stringWithUTF8String:layout.engine.c_str()]] ||
+        ![packet[@"deadline"] isKindOfClass:NSNumber.class] ||
+        !arbol_attempt::signedIdentity(launcher, @"com.sylvan-stack.arbol-browser.launcher") ||
+        ![parent isEqual:arbol_attempt::processRecord(parentPid)] || getppid() != parentPid) return fail(env);
+    arbol_boundary::Lock original{fd,layout.guard,uint64_t(guard.st_dev),guard.st_ino,guard.st_uid,0600,LOCK_SH};
+    if (!arbol_boundary::lockIdentity(original) || ![packet[@"guard"] isEqual:arbol_boundary::capsuleLock(original)] ||
+        flock(fd, LOCK_SH | LOCK_NB) || !arbol_boundary::lockIdentity(original)) return fail(env);
+    const double remaining = [packet[@"deadline"] doubleValue] - arbol_boundary::clockMs();
+    if (!std::isfinite(remaining) || remaining <= 0 || remaining > 60000) return fail(env);
+    auto* lock = new HeldLock{fd,layout.guard,guard.st_dev,guard.st_ino,LOCK_SH};
+    napi_value handle, result, duration;
+    if (napi_create_external(env, lock, finalize, nullptr, &handle) != napi_ok) {
+      finalize(env, lock, nullptr); return fail(env);
+    }
+    liveLocks.insert(lock);
+    if (napi_create_double(env, remaining, &duration) != napi_ok || napi_create_object(env, &result) != napi_ok ||
+        !property(env, result, "lock", handle) || !property(env, result, "remaining", duration)) return fail(env);
+    return result;
+  } @catch (NSException*) { return fail(env); } } catch (...) { return fail(env); } }
+}
+
 // Process-lifetime native custody is intentionally not garbage-collected. Once
 // created it has no unlock/disarm export; retained originals survive JS failure.
 struct RetainedPipe {
@@ -2229,6 +2288,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"assertHostClipboard",nullptr,assertHostClipboard,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"latchWatchdogFatal",nullptr,latchWatchdogFatal,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"adoptHostBuild",nullptr,adoptHostBuild,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"adoptInstalledLaunch",nullptr,adoptInstalledLaunch,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"continuousTime",nullptr,continuousTime,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"processProvenance",nullptr,processProvenance,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"readLaunchAttempt",nullptr,readLaunchAttempt,nullptr,nullptr,nullptr,napi_default,nullptr},

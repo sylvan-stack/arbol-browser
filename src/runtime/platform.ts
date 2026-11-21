@@ -197,6 +197,7 @@ export interface PlatformPort {
   inspectExit(owner: HeldLock, build: HeldLock, input: NativeExitInput, deadline: number, guards?: Readonly<{ data?: HeldLock; next?: HeldLock }>): Promise<ExitInspectionReceipt>;
   /** One-use fixed-exec native adoption. No numeric FD or role is accepted. */
   adoptHostBuild(requestPath: string, guard: string, bundle: string): HeldLock;
+  adoptInstalledLaunch(bundle: string): { lock: HeldLock; deadline: number };
   /** Actual adopted original only: authentic no-use terminal or retained real
    * custody unwind, never normal adoption from cancellation or a public kill. */
   terminateAdoptedHost(build: HeldLock, owner?: HeldLock): never;
@@ -261,6 +262,7 @@ interface NativeSupport {
   assertHostFinalization(handle: object): void;
   latchWatchdogFatal(handle: object): void;
   adoptHostBuild(requestPath: string, guard: string, bundle: string): object;
+  adoptInstalledLaunch?(bundle: string): { lock: object; remaining: number };
   terminateAdoptedHost(build: object, owner: object | null): never;
   continuousTime(): number;
   processProvenance(pid: number): ProcessProvenance | null;
@@ -463,6 +465,18 @@ export function loadPlatform(): PlatformPort {
         throw unavailable('browser');
       const lease = wrapLock(call(() => native.adoptHostBuild(requestPath, guard, bundle)), true);
       lease.assertIdentity(); return lease;
+    },
+    adoptInstalledLaunch(bundle: string): { lock: HeldLock; deadline: number } {
+      if (process.type === 'browser' || typeof native.adoptInstalledLaunch !== 'function' ||
+          !isAbsolute(bundle) || bundle.includes('\0')) throw unavailable('browser');
+      const adopt = native.adoptInstalledLaunch;
+      const began = performance.now();
+      const { lock, remaining } = call(() => adopt(bundle));
+      if (!lock || typeof lock !== 'object' || !Number.isFinite(remaining) || remaining <= 0 || remaining > 60000)
+        throw unavailable('browser');
+      const held = wrapLock(lock);
+      held.assertIdentity();
+      return { lock: held, deadline: began + remaining };
     },
     continuousTime(): number {
       const value = call(() => native.continuousTime());

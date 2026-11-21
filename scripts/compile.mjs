@@ -95,7 +95,7 @@ if (inventoryDigest(await sourceInventory()) !== inventoryDigest(sources) || inv
     git(['rev-parse', 'HEAD']) !== sourceIdentity.commit) throw new Error('Source changed during compilation');
 const productOutputs = { libraryDigest: inventoryDigest(await inventory(join(root, 'dist/lib'))),
   entryDigest: hash(await readFile(join(root, 'dist/cli/main.mjs'))), hostDigest: hash(await readFile(join(root, 'dist/host/main.mjs'))), native: {} };
-for (const name of ['ownership.node', 'platform.node', 'host-bootstrap', 'host-launch', 'watchdog']) productOutputs.native[name] = hash(await readFile(join(root, 'dist/native', name)));
+for (const name of ['ownership.node', 'platform.node', 'host-bootstrap', 'host-launch', 'watchdog', 'stable-launch']) productOutputs.native[name] = hash(await readFile(join(root, 'dist/native', name)));
 const record = { sourceDigest: inventoryDigest(sources), sources, sourceIdentity, productDigest: inventoryDigest(productSources), productSources,
   ...productOutputs, nativeDigest: inventoryDigest(await inventory(join(root, 'dist/native'))), productOutputs, compilerInputs, graphs,
   qualification: 'unexecuted', testsRun: false };
