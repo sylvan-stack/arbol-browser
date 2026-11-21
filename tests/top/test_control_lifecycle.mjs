@@ -1,6 +1,11 @@
-import { readFile, lstat, readdir } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { readFile, lstat, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 import { assert, cli, success, create, open, runtime, closes, save, family, delay, loopback, until, agent, tool, listeners, load } from '../support/control.mjs';
+import { snapshot } from '../support/foundation.mjs';
+
+const run = promisify(execFile);
 
 async function waitingStarterRemoval(c, profile, runtimeBefore) {
   const { platform, location } = runtimeBefore;
@@ -93,11 +98,82 @@ export async function controlStartupBoundary(c) {
   return { boundary: 'actual sealed CLI Building allocation and single original arbitration', authenticFailedLaunchReplay: 'unavailable' };
 }
 
+async function retainedEngineStages(c, original, started, finished) {
+  const { stdout: uuidReport } = await run('/usr/bin/dwarfdump', ['--uuid', join(c.payload, 'native/platform.node')]);
+  const uuid = /^UUID: ([a-f0-9-]{36}) \(arm64\) /im.exec(uuidReport)?.[1].toLowerCase();
+  assert.ok(uuid, 'No arm64 UUID for the sealed platform addon');
+  const prefix = 'arbol-browser retained-stage ';
+  const predicate = `processIdentifier == ${original.pid} AND eventMessage BEGINSWITH "${prefix}"`;
+  let stages = [];
+  for (let attempt = 0; attempt < 3; ++attempt) {
+    const { stdout } = await run('/usr/bin/log', ['show', '--style', 'ndjson', '--last', '3m', '--predicate', predicate],
+      { timeout: 5000, maxBuffer: 1024 * 1024 });
+    stages = stdout.trim().split('\n').filter(Boolean).map(line => JSON.parse(line)).filter(row => {
+      const time = Date.parse(row.timestamp?.replace(' ', 'T'));
+      // Unified Log may reuse an image path from another load of an identical
+      // Mach-O. Match its image UUID and the independently sampled PID/birth.
+      return row.processID === original.pid && row.userID === original.uid && row.senderImageUUID?.toLowerCase() === uuid &&
+        time >= started && time <= finished && row.eventMessage?.startsWith(prefix);
+    }).map(row => ({ at: row.timestamp, name: row.eventMessage.slice(prefix.length), imageUUID: uuid }));
+    if (stages.some(stage => stage.name === 'marker-read')) break;
+    await delay(150);
+  }
+  return stages;
+}
+
+async function refusedUnmanagedEngine(c, platform) {
+  const [{ readProfile }, { profilePaths }, { readRuntime, runtimeLocation }] = await Promise.all([
+    load(c, 'profiles/records'), load(c, 'profiles/paths'), load(c, 'runtime/instance'),
+  ]);
+  const profile = 'control-reader-unmanaged-data';
+  await create(c, profile);
+  const paths = profilePaths(profile, c.state), original = await readProfile(paths);
+  await writeFile(join(paths.data, 'reader-fixture'), 'fictional unmanaged data\n', { mode: 0o600, flag: 'wx' });
+  const before = await snapshot(paths.root), started = Date.now();
+  const identities = new Map();
+  let finished = false;
+  const attempt = cli(c, ['open', '--profile', profile]).finally(() => { finished = true; });
+  const observe = async () => {
+    const executable = join(c.payload, 'runtime/Electron.app/Contents/MacOS/Electron');
+    while (!finished) {
+      const location = await runtimeLocation(original);
+      const record = location && await readRuntime(location);
+      if (record) {
+        const identity = platform.processProvenance(record.pid);
+        if (identity?.startId === record.processStartId && identity.uid === process.getuid() && identity.executable === executable)
+          identities.set(identity.startId, { identity, phase: record.phase });
+      }
+      await delay(75);
+    }
+  };
+  const [result] = await Promise.all([attempt, observe()]);
+  const after = await snapshot(paths.root), births = [...identities.values()];
+  const stages = births.length === 1 ? await retainedEngineStages(c, births[0].identity, started, Date.now()) : [];
+  await save(join(c.output, 'unmanaged-engine-refusal.json'), { profile, before, after, births, stages, result });
+  assert.equal(result.status, 4, JSON.stringify(result));
+  assert.ok(['browser_unavailable', 'profile_unavailable'].includes(result.value?.error?.code), JSON.stringify(result));
+  assert.deepEqual(after, before, 'Reader refusal changed the unmanaged profile data');
+  const location = await runtimeLocation(original);
+  if (location) for (const socket of [location.agent, location.management]) await assert.rejects(lstat(socket), { code: 'ENOENT' });
+  assert.deepEqual(await family(c, 'reader-unmanaged-after'), [], 'Refused original retained a package process');
+  // Preserve the deliberately unmanaged fixture once the exact family is gone.
+  c.profiles.delete(profile);
+  assert.equal(births.length, 1, 'Exact refused original process was not observed');
+  const [{ identity, phase }] = births;
+  assert.equal(phase, 'starting');
+  assert.notEqual(platform.processIdentity(identity.pid)?.startId, identity.startId);
+  const names = stages.map(stage => stage.name);
+  assert.ok(names.includes('fresh-marker-compatibility'), 'Refusal did not demonstrably reach the fresh reader transaction');
+  for (const forbidden of ['verified-prior-exit', 'native-marker-permit', 'host-session-configure-before', 'host-session-configure-after'])
+    assert.ok(!names.includes(forbidden), `Reader refusal reached ${forbidden}`);
+}
+
 export async function controlProfilePersistence(c) {
   const left = 'control-session-left', right = 'control-session-right';
   await create(c, left); await create(c, right);
   const page = await loopback(c);
   try {
+    const leftStarted = Date.now();
     const a = await open(c, left, page.url('left-seed', 'left-fictional'));
     const b = await open(c, right, page.url('right-seed', 'right-fictional'));
     assert.notEqual(a.process, b.process); assert.notEqual(a.instance, b.instance);
@@ -106,6 +182,9 @@ export async function controlProfilePersistence(c) {
       const row = seeded.find(o => o.name === name); assert.ok(row); assert.equal(row.stored, value); assert.equal(row.cookie, 'fictional=' + value);
     }
     const ar = await runtime(c, left), br = await runtime(c, right);
+    const engineStages = await retainedEngineStages(c, ar.identity, leftStarted, Date.now());
+    for (const stage of ['marker-read', 'native-marker-permit', 'host-session-configure-after'])
+      assert.ok(engineStages.some(row => row.name === stage), `Allowed reader was not observed at ${stage}`);
     assert.notEqual(ar.location.agent, br.location.agent); assert.notEqual(ar.identity.startId + ':' + ar.identity.pid, br.identity.startId + ':' + br.identity.pid);
     await closes(c, left); await closes(c, right);
     for (const profile of [left, right]) assert.equal(JSON.parse(await readFile(join(c.state, 'profiles', profile, 'engine.json'))).cleanExit, true);
@@ -116,9 +195,13 @@ export async function controlProfilePersistence(c) {
       const peer = await agent(c, profile, 'fictional restart observer');
       assert.deepEqual((await tool(peer, 'browser_tabs_list')).tabs, [], 'Restart must not restore old grants');
     }
-    await save(join(c.output, 'observations.json'), { a, b, firstIdentities: [ar.identity, br.identity], data: page.observations,
-      dirtyRecovery: 'unavailable: no admitted engine transaction/force-close oracle' });
-    return { boundary: 'two actual persistent website Sessions and clean restart', dirtyRecovery: 'unavailable' };
+    await save(join(c.output, 'observations.json'), { a, b, firstIdentities: [ar.identity, br.identity], engineStages, data: page.observations,
+      dirtyRecovery: 'unavailable: no admitted force-close oracle' });
+    for (const peer of c.peers) peer.close();
+    await closes(c, left); await closes(c, right);
+    await refusedUnmanagedEngine(c, ar.platform);
+    return { boundary: 'two actual persistent website Sessions, clean restart and unmanaged storage refusal',
+      incompatibleWriter: 'unavailable: exact separately signed prior writer needed', dirtyRecovery: 'unavailable' };
   } finally { await page.close(); }
 }
 
