@@ -3,7 +3,8 @@
 Arbol Browser is an independent component of Arbol 2. ABR-1 implements its
 package foundation: typed contracts, command dispatch, private macOS process
 support and test-free candidate compilation. The local preview below is
-available for User Demos. The ordinary signed release requires qualification.
+available for User Demos. Stable promotion uses the declared unit selection
+and verifies the signed artifact.
 
 ## First User Demo
 
@@ -221,39 +222,37 @@ original Build guard to the embedded CLI. It uses the installed image and
 selection even when `~/Builds` is unavailable. `-v <build>` accepts only the
 selected stable Build. Browser profile state lives in `~/.arbol/browser`.
 
-Run an ordinary isolated Build using the registry and bin paths in [TESTS.md](TESTS.md).
-Its launcher lives in that run's `bin/`, with its own registry and profile
-state. A release Build consumes the published commit with exact production
-source admission and uses the normal isolated Build to retain the existing gate.
-The release Build runs tests. Get the user's approval for the specific run
-before setting the opt-in below. The Native cases that need keyboard focus
-wait for the user to select the fixture window described in [TESTS.md](TESTS.md).
+A release Build consumes a published commit with exact production source
+admission. It runs the declared `promotionUnitTests` selection, which is
+currently empty. Reuse the signed candidate for the intended revision when
+its recorded promotion checks and artifact still apply. Choose tests beyond
+that selection only for an explicitly requested [verification run](TESTS.md).
 
 ```sh
 browser_run=$(forester builds run arbol-browser -- sh -eu -c 'printf "%s\n" "$BUILD_DIR"')
 forester builds keep --minutes 60 "$browser_run"
 mkdir -m 700 "$browser_run/registry" "$browser_run/bin"
-ARBOL_BROWSER_MANUAL_FOCUS=1 "$HOME/Applications/Arbol/bin/arbol-builds" build arbol-browser --repo "$reviewed_source_checkout" \
+"$HOME/Applications/Arbol/bin/arbol-builds" build arbol-browser --repo "$reviewed_source_checkout" \
   --registry-dir "$browser_run/registry" --bin-dir "$browser_run/bin" \
   --browser-release "$release_review_commit"
 ```
 
-Forester allocates and tracks the private run. Invoke the Common Build directly
-with those paths so it can reserve the canonical production number and the
-qualification gate can use the native process observers. The build record gives the path and SHA-256 of
-`release-<build>/ArbolBrowser.dmg` and `signed-release.json`. The receipt binds
-the signed app inventory, source, runtime and publisher. Keep the exact signed
-candidate and receipts long enough to finish qualification. Ordinary temporary
-output retention still applies. ABR-25 qualifies those bytes, checks the
-Browser Tools, Seqoya and Codex hand-overs, submits the exact image to Apple,
-staples it and records the delivered SHA-256 in `delivery.json`.
+Forester allocates and tracks the private run. The Common Build reserves the
+canonical production number. Its record gives the declared unit selection,
+check results, and paths and SHA-256 digests for `release-<build>/ArbolBrowser.dmg`
+and `signed-release.json`. Match the exact image and source to the working
+Build record before promotion. The receipt binds the signed app inventory,
+source, runtime and publisher. ABR-25 submits the exact image to Apple and
+staples the accepted ticket. The standalone artifact verifier
+`tests/qualification/verify_release.mjs` checks the original and delivered
+images, Apple result and log, ticket and Gatekeeper, then writes `delivery.json`.
 
 ```sh
 node scripts/install-release.mjs verify --image "$delivered_image" \
   --signed-receipt "$signed_receipt" --delivery-receipt "$delivery_receipt"
 node scripts/install-release.mjs install --image "$delivered_image" \
   --signed-receipt "$signed_receipt" --delivery-receipt "$delivery_receipt"
-"$HOME/Applications/Arbol Browser/bin/arbol-browser" info
+"$HOME/Applications/Arbol/bin/arbol-builds" browser-release inspect
 ```
 
 Installation checks the stapled ticket and exact extracted signed inventory
@@ -265,12 +264,12 @@ verified exit or data-writer evidence. The prior-exit verifier can remount that
 image at its original path. Forester uses Arbol's guarded retirement operation
 to remove an image after the profile references and Build users are gone.
 
-## Qualification and integration limits
+## Optional runtime verification
 
-[TESTS.md](TESTS.md) identifies the complete isolated gate and [MID_TIER.md](MID_TIER.md)
-records the broader release and integration obligations. Static compilation and
-an unsigned stage supply packaging evidence. Stable activation depends on the
-signed candidate, cross-component qualification and post-staple artifact checks.
+Use [TESTS.md](TESTS.md) and [MID_TIER.md](MID_TIER.md) to select checks for a
+specific question. Record the source and artifact each check covers. For a
+reported issue on a stable Build, identify the installed image and obtain
+approval before launching it or running the requested verification.
 
 Browser indexing is currently disabled and the configured Mycel store is
 unreachable. Source declarations are retained for reconciliation; ingest,
