@@ -26,6 +26,15 @@ bool fileIdentity(int fd, const std::string& path, const struct stat& original) 
     arbol_attempt::sameFile(original, held) && arbol_attempt::sameFile(held, named);
 }
 
+bool lockUntil(int fd, int mode, double deadline) {
+  while (clockMs() < deadline) {
+    if (!flock(fd, mode | LOCK_NB)) return true;
+    if (errno != EWOULDBLOCK && errno != EAGAIN && errno != EINTR) return false;
+    usleep(2000);
+  }
+  return false;
+}
+
 std::string readSelection(const std::string& path) {
   FD file(openInstalledFile(path));
   struct stat before{};
@@ -132,6 +141,13 @@ int launch(int argc, const char* argv[], double deadline) {
       !arbol_attempt::signedIdentity(launcher, @"com.sylvan-stack.arbol-browser.launcher")) return 4;
   NSString* uses = [home stringByAppendingPathComponent:@ARBOL_INSTALLATION_STABLE_USES];
   NSString* support = uses.stringByDeletingLastPathComponent;
+  const std::string installPath = [support stringByAppendingPathComponent:@"selection.lock"].fileSystemRepresentation;
+  FD install(openInstalledFile(installPath));
+  struct stat installStat{}, transaction{};
+  if (install.get() < 0 || fstat(install.get(), &installStat) || !arbol_attempt::privateFile(installStat) ||
+      !lockUntil(install.get(), LOCK_SH, deadline) || !fileIdentity(install.get(), installPath, installStat) ||
+      !lstat([support stringByAppendingPathComponent:@"install-transaction.json"].fileSystemRepresentation, &transaction) || errno != ENOENT)
+    return 4;
   const std::string selectionPath = [support stringByAppendingPathComponent:@"selected.json"].fileSystemRepresentation;
   const std::string selected = readSelection(selectionPath);
   NSDictionary* receipt = arbol_attempt::json(selected);
@@ -163,6 +179,11 @@ int launch(int argc, const char* argv[], double deadline) {
   if (backing.get() < 0 || fstat(backing.get(), &imageStat) ||
       ![imageDigest(backing.get(), imagePath, imageStat, deadline) isEqual:receipt[@"imageSha256"]]) return 4;
 
+  const std::string mountGuardPath = layout.guard + ".mount";
+  FD mountGuard(openInstalledFile(mountGuardPath));
+  struct stat mountGuardStat{};
+  if (mountGuard.get() < 0 || fstat(mountGuard.get(), &mountGuardStat) || !arbol_attempt::privateFile(mountGuardStat) ||
+      !lockUntil(mountGuard.get(), LOCK_EX, deadline) || !fileIdentity(mountGuard.get(), mountGuardPath, mountGuardStat)) return 4;
   struct statfs fs{};
   if (statfs(mount.c_str(), &fs)) return 4;
   if (mount != fs.f_mntonname) {
@@ -173,7 +194,8 @@ int launch(int argc, const char* argv[], double deadline) {
   }
   if (!mountedImage(mount, image, deadline) || !fileIdentity(backing.get(), imagePath, imageStat) ||
       !arbol_boundary::canonical(bundle) || !arbol_attempt::signedIdentity(bundle, @ARBOL_PRODUCTION_BUNDLE_ID, true) ||
-      !arbol_boundary::lockIdentity(lock) || readSelection(selectionPath) != selected || clockMs() >= deadline) return 4;
+      !arbol_boundary::lockIdentity(lock) || !fileIdentity(mountGuard.get(), mountGuardPath, mountGuardStat) ||
+      readSelection(selectionPath) != selected || clockMs() >= deadline || flock(mountGuard.get(), LOCK_UN)) return 4;
 
   NSDictionary* parent = arbol_attempt::processRecord(getpid());
   if (!parent) return 4;
@@ -202,6 +224,8 @@ int launch(int argc, const char* argv[], double deadline) {
   posix_spawn_file_actions_destroy(&actions);
   copies.closeCopies();
   if (result) return 4;
+  // The child's original Build guard now protects the running release.
+  (void)flock(install.get(), LOCK_UN);
   int status = 0;
   pid_t waited;
   do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);

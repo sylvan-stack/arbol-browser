@@ -1,19 +1,23 @@
 import { fileURLToPath } from 'node:url';
 /** Independent production closure. No Electron import, JS clean writer, PID
  * signal, lock-as-exit shortcut or receipt-only force provider lives here. */
-import { join, basename, resolve } from 'node:path';
-import { realpath } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { constants } from 'node:fs';
+import { join, basename, dirname, resolve } from 'node:path';
+import { lstat, open, readdir, realpath } from 'node:fs/promises';
 import { setTimeout } from 'node:timers/promises';
+import { promisify } from 'node:util';
 import { unavailable } from '../contracts/errors.js';
 import { assertProfile, readJson, type ProfileSnapshot } from '../profiles/records.js';
-import { statOrAbsent } from '../profiles/paths.js';
+import { directory, identity, privateFile, sameIdentity, statOrAbsent } from '../profiles/paths.js';
 import { ownerLock, withOwnerLockForCustody, type OwnerLease } from '../profiles/locking.js';
 import { acquireBuildLease, withBuildLockForCustody, type BuildLease } from './build-lease.js';
 import { assertHostCloseContinuity, assertHostStartupContinuity, assertTrustedHost, assertVerifiedHostMetadata, verifyPackagedHost, type VerifiedHost } from './authorities.js';
 import { assertPlatform, assertExitInspectionReceipt, type PlatformPort, type ExitInspectionReceipt, type PriorMarkerExpectation } from './platform.js';
 import { withLaunchAttempt, type LaunchAttempt } from './process.js';
 import { now, assertTime, runtimeLocation, type RuntimeRecord } from './instance.js';
-import { buildLocation, claimedLayout, selectedLayout, type BuildSelection } from './selection.js';
+import { buildLocation, claimedLayout, selectedLayout, type BuildSelection, type PackagedLayout } from './selection.js';
 import type { HostPreviousExit } from './host-entry.js';
 import type { ExitAuthority } from './lifecycle.js';
 import type { EngineExitEvidence } from '../profiles/compatibility.js';
@@ -59,6 +63,56 @@ function closedCandidate(value: unknown, profile: ProfileSnapshot, hash: string)
   if (![join(prefix, 'activation.json'), join(prefix, 'terminal.json'), join(prefix, 'unused.json')].includes(attempt.terminal.path)) throw unavailable('profile');
   claimedLayout(attempt); return attempt;
 }
+
+const diskImage = promisify(execFile);
+
+/** Re-establish the previous immutable bundle at the path named by its real Claim.
+ * The caller still proves the original native snapshot and policies before trusting it. */
+async function mountRetainedImage(layout: PackagedLayout, build: BuildLease, platform: PlatformPort, deadline: number): Promise<void> {
+  if (layout.scope !== 'installed' || await statOrAbsent(layout.bundle)) return;
+  const guard = `${layout.guard}.mount`;
+  privateFile(await lstat(guard));
+  let mountGuard: ReturnType<PlatformPort['tryLock']>;
+  do {
+    assertTime(deadline);
+    mountGuard = platform.tryLock(guard);
+    if (!mountGuard) await setTimeout(Math.min(10, Math.max(1, deadline - now())));
+  } while (!mountGuard);
+  try {
+    await build.assert(); mountGuard.assertIdentity();
+    if (await statOrAbsent(layout.bundle)) return;
+    const mount = dirname(layout.bundle), support = dirname(dirname(layout.guard));
+    const point = await directory(mount);
+    await directory(join(support, 'images'));
+    await directory(join(support, 'releases'));
+    const receipt = (await readJson(join(support, 'releases', `${layout.build}.json`), 4096)).value as Record<string, unknown>;
+    if (receipt.format !== 1 || receipt.build !== layout.build || typeof receipt.imageSha256 !== 'string' ||
+        !/^[0-9a-f]{64}$/.test(receipt.imageSha256)) throw unavailable('profile');
+    const image = join(support, 'images', `${layout.build}.dmg`);
+    const fd = await open(image, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const before = await fd.stat(); privateFile(before);
+      if (before.size < 1 || before.size > 1073741824) throw unavailable('profile');
+      const hash = createHash('sha256');
+      for await (const bytes of fd.createReadStream({ autoClose: false })) { assertTime(deadline); hash.update(bytes); }
+      const matches = async () => {
+        const held = await fd.stat(), named = await lstat(image); privateFile(held); privateFile(named);
+        return [held, named].every(stat => sameIdentity(identity(stat), identity(before)) && stat.size === before.size &&
+          stat.mtimeMs === before.mtimeMs && stat.ctimeMs === before.ctimeMs);
+      };
+      if (hash.digest('hex') !== receipt.imageSha256 || !await matches() || (await readdir(mount)).length ||
+          !sameIdentity(await directory(mount), point)) throw unavailable('profile');
+      await build.assert(); mountGuard.assertIdentity(); assertTime(deadline);
+      await diskImage('/usr/bin/hdiutil', ['attach', image, '-readonly', '-nokernel', '-mountpoint', mount,
+        '-noautoopen', '-nobrowse', '-plist'], { timeout: Math.max(1, Math.floor(deadline - now())), maxBuffer: 1048576,
+        env: { PATH: '/usr/bin:/bin' } });
+      if (!await matches() || await realpath(layout.bundle) !== layout.bundle) throw unavailable('profile');
+      await build.assert(); mountGuard.assertIdentity(); assertTime(deadline);
+    } finally { await fd.close(); }
+  } catch { throw unavailable('profile'); }
+  finally { mountGuard.release(); }
+}
+
 /** Build selection is the current CLI location only. A previous instance's
  * signed package and original stable Build guard are always proved separately. */
 export function createProductionExitAuthority(platform: PlatformPort, selection: BuildSelection, startingHost?: VerifiedHost): ProductionExitAuthority {
@@ -144,6 +198,7 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
         }
       }
       if (!host) {
+        if (attempt.phase === 'closed') await mountRetainedImage(layout, build, platform, deadline);
         host = await verifyPackagedHost(oldSelection, layout.payload, deadline);
         if (!matchesAttempt(host)) throw unavailable('profile');
         await host.assertTrusted(deadline);

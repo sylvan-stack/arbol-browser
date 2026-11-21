@@ -1,7 +1,9 @@
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { constants } from 'node:fs';
-import { chmod, copyFile, link, lstat, mkdir, mkdtemp, open, readdir, realpath, rmdir, unlink } from 'node:fs/promises';
+import { chmod, copyFile, link, lstat, mkdir, mkdtemp, open, readdir, readlink, realpath, rename, rmdir, symlink,
+  unlink } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { tmpdir, userInfo } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,6 +16,7 @@ const imageLimit = 1073741824;
 const launcherLimit = 67108864;
 const launcherIdentifier = 'com.sylvan-stack.arbol-browser.launcher';
 const relativeLauncher = 'Contents/Resources/browser/native/stable-launch';
+const relativePlatform = 'Contents/Resources/browser/native/platform.node';
 const relativePolicy = 'Contents/Resources/host-policy.json';
 const digest = value => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
 const buildNumber = value => typeof value === 'string' && /^[1-9a-f][0-9a-f]{0,15}$/.test(value);
@@ -41,6 +44,7 @@ async function signedReceipt(path) {
       !digest(value.imageSha256) || !digest(value.payloadDigest) || !digest(value.launcherDigest) ||
       !digest(value.reviewDigest) || canonical(value.publisher) !== canonical(publisher) ||
       value.files?.[relativeLauncher] !== value.launcherDigest || !digest(value.files?.[relativePolicy]) ||
+      !digest(value.files?.[relativePlatform]) ||
       !value.policy || value.policy.purpose !== 'production' || value.policy.build !== value.build ||
       value.policy.buildRoot !== join(...installation.stableBuilds, value.build) ||
       value.policy.stateRoot !== join(installation.root, installation.browser) ||
@@ -86,7 +90,7 @@ export async function verifyPostStapleRelease({ image, signedReceiptPath, delive
   const mount = await mkdtemp(join(await realpath(tmpdir()), 'arbol-browser-release-'));
   await privateDirectory(mount);
   let attached;
-  let launcher;
+  let launcher, platform;
   try {
     attached = run('/usr/bin/hdiutil', ['attach', image, '-readonly', '-nokernel', '-mountpoint', mount,
       '-noautoopen', '-nobrowse', '-plist']).stdout;
@@ -104,6 +108,10 @@ export async function verifyPostStapleRelease({ image, signedReceiptPath, delive
     checkSignature(path, launcherIdentifier);
     launcher = await exactFile(path, launcherLimit);
     if (launcher.sha256 !== expected.launcherDigest) throw new Error('Signed launcher digest differs');
+    const addon = join(app, relativePlatform);
+    checkSignature(addon);
+    platform = await exactFile(addon, launcherLimit);
+    if (platform.sha256 !== expected.files[relativePlatform]) throw new Error('Signed installer lock provider differs');
     if ((await exactFile(image, imageLimit)).sha256 !== receipt.imageSha256 || (await json(signedReceiptPath)).sha256 !== signed.sha256 ||
         (await json(deliveryReceiptPath)).sha256 !== delivered.sha256) throw new Error('Release inputs changed during verification');
   } finally {
@@ -111,7 +119,7 @@ export async function verifyPostStapleRelease({ image, signedReceiptPath, delive
     await rmdir(mount);
   }
   return { build: expected.build, source: expected.source, imageSha256: receipt.imageSha256,
-    payloadDigest: expected.payloadDigest, launcher };
+    payloadDigest: expected.payloadDigest, launcher, platform };
 }
 
 async function safeDirectories(home, parts, privateFrom) {
@@ -151,46 +159,187 @@ async function publishExact(path, maximum, sha256, stage) {
   return result;
 }
 
-/** First installation or idempotent reinstall of this exact release. Selection is published last. */
+async function optionalFile(path, maximum) {
+  try { return await exactFile(path, maximum); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  return undefined;
+}
+
+async function optionalSelection(path) {
+  const file = await optionalFile(path, 4096);
+  if (!file) return null;
+  const value = JSON.parse(file.bytes.toString('utf8'));
+  if (Object.keys(value).sort().join(',') !== 'build,format,imageSha256' || value.format !== 1 ||
+      !buildNumber(value.build) || !digest(value.imageSha256) || file.identity.mode !== 0o600 ||
+      file.identity.uid !== userInfo().uid) throw new Error('Installed Browser selection is unsafe');
+  return value;
+}
+
+function encode(value) { return Buffer.from(JSON.stringify(value) + '\n'); }
+
+async function replaceFile(path, bytes, mode) {
+  const tmp = join(dirname(path), `.replace-${randomBytes(12).toString('hex')}`);
+  await writeExclusive(tmp, bytes, mode);
+  try {
+    await rename(tmp, path);
+    await syncPath(dirname(path));
+  } finally {
+    try { await unlink(tmp); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+}
+
+async function checkedGuard(path, create = true) {
+  if (create) {
+    try { await writeExclusive(path, ''); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+  }
+  const guard = await lstat(path, { bigint: true });
+  if (!guard.isFile() || guard.uid !== BigInt(userInfo().uid) || guard.nlink !== 1n || (guard.mode & 0o7777n) !== 0o600n ||
+      await realpath(path) !== path) throw new Error('Installed Build guard is unsafe');
+  return guard;
+}
+
+async function withLock(provider, path, work, create = true) {
+  const expected = await checkedGuard(path, create);
+  const held = provider.tryLock(path);
+  if (!held) throw new Error('The Browser installation or selected Build is in use');
+  try {
+    const current = provider.assertLock(held);
+    if (current.device !== String(expected.dev) || current.inode !== String(expected.ino)) throw new Error('Browser Build guard changed');
+    return await work();
+  }
+  finally { provider.releaseLock(held); }
+}
+
+async function withLockProvider(platform, work) {
+  const tmp = await mkdtemp(join(await realpath(tmpdir()), 'arbol-browser-installer-'));
+  const path = join(tmp, 'platform.node');
+  try {
+    await writeExclusive(path, platform.bytes);
+    if ((await exactFile(path, launcherLimit)).sha256 !== platform.sha256) throw new Error('Installer lock provider changed');
+    checkSignature(path);
+    const provider = createRequire(import.meta.url)(path);
+    return await work(provider);
+  } finally {
+    try { await unlink(path); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    await rmdir(tmp);
+  }
+}
+
+async function installedImageReceipt(support, selected) {
+  const receipt = await json(join(support, 'releases', `${selected.build}.json`)), { value } = receipt;
+  if (receipt.identity.mode !== 0o600 || receipt.identity.uid !== userInfo().uid || value.format !== 1 ||
+      value.build !== selected.build || value.imageSha256 !== selected.imageSha256 ||
+      !digest(value.launcherSha256) || !digest(value.payloadDigest)) throw new Error('Installed release receipt differs from selection');
+  return value;
+}
+
+async function recoverInstall(support, executable, provider, uses) {
+  const journal = join(support, 'install-transaction.json'), backup = join(support, 'install-previous-launcher');
+  const pending = await optionalFile(journal, 4096);
+  if (!pending) return;
+  const { format, before, after } = JSON.parse(pending.bytes.toString('utf8'));
+  const checked = item => item && item.selection?.format === 1 && buildNumber(item.selection.build) &&
+    digest(item.selection.imageSha256) && digest(item.launcherSha256);
+  if (pending.identity.mode !== 0o600 || pending.identity.uid !== userInfo().uid || format !== 1 ||
+      (before !== null && !checked(before)) || !checked(after) ||
+      before?.selection.build === after.selection.build) throw new Error('Browser installation journal is unsafe');
+  const selectionPath = join(support, 'selected.json');
+  const selected = await optionalSelection(selectionPath);
+  if (![before?.selection ?? null, after.selection].some(value => canonical(value) === canonical(selected))) {
+    throw new Error('Browser selection changed outside its installation transaction');
+  }
+  const current = await optionalFile(executable, launcherLimit);
+  const target = canonical(selected) === canonical(after.selection) ? after : before;
+  const unchanged = target && current?.sha256 === target.launcherSha256;
+  await withLock(provider, join(uses, selected?.build ?? after.selection.build), async () => {
+    if (target && !unchanged) {
+      if (target === after || (current && current.sha256 !== after.launcherSha256)) throw new Error('Uncertain installed launcher identity');
+      const original = await exactFile(backup, launcherLimit);
+      if (original.sha256 !== target.launcherSha256) throw new Error('Previous launcher recovery bytes differ');
+      checkSignature(backup, launcherIdentifier);
+      await replaceFile(executable, original.bytes, 0o755);
+    } else if (!target && current) {
+      if (current.sha256 !== after.launcherSha256) throw new Error('Uncertain first installation');
+      await unlink(executable);
+      await syncPath(dirname(executable));
+    }
+    if (target) checkSignature(executable, launcherIdentifier);
+    await unlink(journal);
+    try { await unlink(backup); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    await syncPath(support);
+  }, false);
+}
+
+/** Publish the exact selected binary and image under the same guards used by launch and retirement. */
 export async function installRelease(options) {
   const release = await verifyPostStapleRelease(options);
   const { homedir: home } = userInfo();
   const supportParts = installation.stableUses.slice(0, -1);
-  const support = await safeDirectories(home, supportParts, supportParts.length - 1);
+  const privateFrom = supportParts.length - 1;
+  const support = await safeDirectories(home, supportParts, privateFrom);
+  const uses = await safeDirectories(home, installation.stableUses, privateFrom);
+  const bin = await safeDirectories(home, [...installation.stableBuilds.slice(0, 2), 'bin'], 1);
+  const executable = join(bin, 'arbol-browser');
   const selectionPath = join(support, 'selected.json');
   const selected = { format: 1, build: release.build, imageSha256: release.imageSha256 };
-  try {
-    const current = await json(selectionPath);
-    if (canonical(current.value) !== canonical(selected)) throw new Error('Installed selection requires a guarded upgrade');
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-  }
+  return withLockProvider(release.platform, provider => withLock(provider, join(support, 'selection.lock'), async () => {
+    await recoverInstall(support, executable, provider, uses);
+    const previous = await optionalSelection(selectionPath);
+    const same = canonical(previous) === canonical(selected);
+    if (previous && !same && BigInt(`0x${previous.build}`) >= BigInt(`0x${release.build}`)) {
+      throw new Error('Browser release number is older or already belongs to different signed bytes');
+    }
+    const update = async () => {
+      const images = await safeDirectories(home, [...supportParts, 'images'], privateFrom);
+      const receipts = await safeDirectories(home, [...supportParts, 'releases'], privateFrom);
+      const mount = await safeDirectories(home, [...installation.stableBuilds, release.build, 'app'], 1);
+      const image = join(images, `${release.build}.dmg`);
+      const saved = await publishExact(image, imageLimit, release.imageSha256, async path => {
+        await copyFile(options.image, path, constants.COPYFILE_EXCL);
+        await chmod(path, 0o600);
+      });
+      if (saved.identity.mode !== 0o600) throw new Error('Installed image permissions differ');
+      await checkedGuard(join(uses, `${release.build}.mount`));
+      await syncPath(uses);
+      const receipt = encode({ ...selected, source: release.source, payloadDigest: release.payloadDigest,
+        launcherSha256: release.launcher.sha256 });
+      await publishExact(join(receipts, `${release.build}.json`), 4096, hash(receipt), path => writeExclusive(path, receipt));
 
-  const images = await safeDirectories(home, [...supportParts, 'images'], supportParts.length - 1);
-  const uses = await safeDirectories(home, installation.stableUses, supportParts.length - 1);
-  const mount = await safeDirectories(home, [...installation.stableBuilds, release.build, 'app'], 1);
-  const bin = await safeDirectories(home, [...installation.stableBuilds.slice(0, 2), 'bin'], 1);
-  const image = join(images, `${release.build}.dmg`);
-  const saved = await publishExact(image, imageLimit, release.imageSha256, async path => {
-    await copyFile(options.image, path, constants.COPYFILE_EXCL);
-    await chmod(path, 0o600);
-  });
-  if (saved.identity.mode !== 0o600) throw new Error('Installed image permissions differ');
-  const guard = join(uses, release.build);
-  try { await writeExclusive(guard, ''); } catch (error) { if (error.code !== 'EEXIST') throw error; }
-  const g = await lstat(guard);
-  if (!g.isFile() || g.uid !== userInfo().uid || g.nlink !== 1 || (g.mode & 0o7777) !== 0o600)
-    throw new Error('Installed Build guard is unsafe');
-  await syncPath(uses);
-  const executable = join(bin, 'arbol-browser');
-  const launcher = await publishExact(executable, launcherLimit, release.launcher.sha256,
-    path => writeExclusive(path, release.launcher.bytes, 0o755));
-  if (launcher.identity.mode !== 0o755) throw new Error('Installed launcher permissions differ');
-  checkSignature(executable, launcherIdentifier);
-  const selection = Buffer.from(JSON.stringify(selected) + '\n');
-  await publishExact(selectionPath, 4096, hash(selection), path => writeExclusive(path, selection));
-  return { build: release.build, source: release.source, imageSha256: release.imageSha256,
-    executable, image, mount };
+      const alias = join(await safeDirectories(home, ['.local', 'bin'], 2), 'arbol-browser');
+      try { await symlink(executable, alias); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+      if (await readlink(alias) !== executable) throw new Error('Browser PATH entry has a different target');
+      await syncPath(dirname(alias));
+      const current = await optionalFile(executable, launcherLimit);
+      const old = previous ? await installedImageReceipt(support, previous) : undefined;
+      if (old ? current?.sha256 !== old.launcherSha256 : current !== undefined) throw new Error('Existing launcher differs from its release receipt');
+      if (!same) {
+        const journal = join(support, 'install-transaction.json');
+        const backup = join(support, 'install-previous-launcher');
+        if (current) {
+          checkSignature(executable, launcherIdentifier);
+          await publishExact(backup, launcherLimit, current.sha256, path => writeExclusive(path, current.bytes, 0o755));
+        }
+        const transaction = encode({ format: 1,
+          before: old ? { selection: previous, launcherSha256: old.launcherSha256 } : null,
+          after: { selection: selected, launcherSha256: release.launcher.sha256 } });
+        await publishExact(journal, 4096, hash(transaction), path => writeExclusive(path, transaction));
+        await replaceFile(executable, release.launcher.bytes, 0o755);
+        if ((await exactFile(executable, launcherLimit)).sha256 !== release.launcher.sha256) throw new Error('Installed launcher differs');
+        checkSignature(executable, launcherIdentifier);
+        await replaceFile(selectionPath, encode(selected), 0o600);
+      } else {
+        checkSignature(executable, launcherIdentifier);
+      }
+      return { build: release.build, source: release.source, imageSha256: release.imageSha256, executable, image, mount, alias };
+    };
+    const candidate = () => withLock(provider, join(uses, release.build), update, !same);
+    let result;
+    try {
+      result = previous && !same ? await withLock(provider, join(uses, previous.build), candidate, false) : await candidate();
+    } finally {
+      await recoverInstall(support, executable, provider, uses);
+    }
+    return result;
+  }));
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
@@ -202,5 +351,6 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const options = { image: resolve(image), signedReceiptPath: resolve(signedReceiptPath), deliveryReceiptPath: resolve(deliveryReceiptPath) };
   const result = await (action === 'verify' ? verifyPostStapleRelease(options) : installRelease(options));
   delete result.launcher;
+  delete result.platform;
   console.log(JSON.stringify(result));
 }
