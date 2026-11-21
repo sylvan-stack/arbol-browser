@@ -1,6 +1,65 @@
-import { readFile, lstat } from 'node:fs/promises';
+import { readFile, lstat, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
-import { assert, cli, success, create, open, runtime, closes, save, family, delay, loopback, until, agent, tool, listeners } from '../support/control.mjs';
+import { assert, cli, success, create, open, runtime, closes, save, family, delay, loopback, until, agent, tool, listeners, load } from '../support/control.mjs';
+
+async function waitingStarterRemoval(c, profile, runtimeBefore) {
+  const { platform, location } = runtimeBefore;
+  const original = location.profile, oldLock = await lstat(original.paths.owner);
+  const [{ createOpenCommandObservation, verifyPackagedHost }, { createProductionProcessIntegration },
+    { createProductionExitAuthority }, { createProcessService }] = await Promise.all([
+    load(c, 'runtime/authorities'), load(c, 'runtime/process'), load(c, 'runtime/exit'), load(c, 'runtime/lifecycle'),
+  ]);
+  const cutoff = performance.now() + 60000;
+  const host = await verifyPackagedHost(c.selection, c.payload, cutoff);
+  const exits = createProductionExitAuthority(platform, c.selection, host);
+  const observation = createOpenCommandObservation();
+  const integration = createProductionProcessIntegration(host, c.selection, platform, exits, observation, cutoff);
+  const starter = createProcessService({ selection: c.selection, state: c.state, platform: () => platform,
+    integration, exits, observation, openCutoff: cutoff });
+  const lockPath = join(location.leaf, 'startup.lock');
+  const startup = platform.tryLock(lockPath);
+  assert.ok(startup, 'Independent contender must own the original startup lock');
+  const observed = [];
+  let outcome;
+  const waiter = starter.open({ profile }).then(value => { outcome = { value }; }, error => {
+    outcome = { code: error.detail?.code, stage: observation.stage };
+  });
+  try {
+    await until(() => {
+      if (outcome) assert.fail('Starter returned before it reached contention');
+      return observation.stage === 'open-startup-arbitration';
+    }, Math.max(1, Math.floor(cutoff - performance.now() - 20000)));
+    for (let i = 0; i < 3; ++i) {
+      await delay(75);
+      assert.equal(observation.stage, 'open-startup-arbitration');
+      assert.equal(outcome, undefined);
+      assert.equal(platform.tryLock(lockPath), null);
+      const same = await lstat(original.paths.owner);
+      assert.deepEqual([same.dev, same.ino], [oldLock.dev, oldLock.ino]);
+      observed.push({ at: performance.now(), stage: observation.stage, lock: startup.assertIdentity() });
+    }
+    const removal = await cli(c, ['profiles', 'remove', profile, '--delete-data'], true);
+    assert.match(removal.tty, /^\?+$/, 'Removal worker unexpectedly has a controlling terminal');
+    assert.deepEqual(success(removal), { profile, dataRemoved: true });
+    c.profiles.delete(profile);
+    await assert.rejects(lstat(original.paths.root), { code: 'ENOENT' });
+    const tombstones = [];
+    for (const name of await readdir(original.paths.profiles)) {
+      if (!/^\.deleting-[0-9a-f]{32}$/.test(name)) continue;
+      const path = join(original.paths.profiles, name);
+      const held = await lstat(join(path, 'owner.lock'));
+      if (held.dev === oldLock.dev && held.ino === oldLock.ino) tombstones.push(path);
+    }
+    assert.equal(tombstones.length, 1);
+    assert.deepEqual(await readdir(tombstones[0]), ['owner.lock']);
+    await waiter;
+    assert.ok(['profile_not_found', 'profile_unavailable'].includes(outcome?.code), JSON.stringify(outcome));
+    assert.equal(outcome.stage, 'open-startup-arbitration');
+    assert.deepEqual(await family(c, 'after-waiting-starter-removal'), []);
+    await save(join(c.output, 'waiting-starter-removal.json'), { profile, original: original.record,
+      owner: { device: oldLock.dev, inode: oldLock.ino }, observed, removal, tombstone: tombstones[0], outcome });
+  } finally { startup.release(); await waiter; }
+}
 
 export async function controlStartupBoundary(c) {
   let absent; try { absent = await lstat(join(c.state, 'profiles/control-startup')); } catch (e) { if (e.code !== 'ENOENT') throw e; }
@@ -30,6 +89,7 @@ export async function controlStartupBoundary(c) {
     noRestart.push({ monotonic: performance.now(), originalIdentity: identity, current, runtime: marker });
   }
   await save(join(c.output, 'observations.json'), { info, values, repeated, identity: r.identity, record: r.record, tree, result, noRestart });
+  await waitingStarterRemoval(c, profile, r);
   return { boundary: 'actual sealed CLI Building allocation and single original arbitration', authenticFailedLaunchReplay: 'unavailable' };
 }
 

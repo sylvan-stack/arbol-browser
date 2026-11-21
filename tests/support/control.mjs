@@ -42,15 +42,19 @@ export async function contextFor(input, id) {
     guardIdentity: c.guardIdentity, payload: input.payload, state });
   return c;
 }
-export async function cli(c, args) {
+export async function cli(c, args, detached = false) {
   const sequence = c.calls.length + 1;
   const row = { sequence, args, startedAt: new Date().toISOString() }; c.calls.push(row);
   await save(join(c.output, 'calls.json'), c.calls);
   const result = await new Promise((resolve, reject) => {
     const child = spawn(join(c.buildRoot, 'bin/arbol-browser'), args, { cwd: c.output,
       env: { HOME: c.home, PATH: '/usr/bin:/bin', LANG: 'en_US.UTF-8', TMPDIR: c.output + '/',
-        ARBOL_BROWSER_SELECTION: JSON.stringify(c.selection) }, stdio: ['ignore', 'pipe', 'pipe'] });
+        ARBOL_BROWSER_SELECTION: JSON.stringify(c.selection) }, detached, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '', stderr = '';
+    if (detached && child.pid) {
+      row.pid = child.pid;
+      row.tty = execFileSync('/bin/ps', ['-o', 'tty=', '-p', String(child.pid)], { encoding: 'utf8' }).trim();
+    }
     const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('Actual CLI exceeded 75 s')); }, 75000);
     child.stdout.on('data', b => { stdout += b; }); child.stderr.on('data', b => { stderr += b; });
     child.once('error', e => { clearTimeout(timer); reject(e); });
@@ -60,7 +64,7 @@ export async function cli(c, args) {
   await save(join(c.output, 'calls.json'), c.calls);
   const lines = result.stdout.trim().split('\n').filter(Boolean);
   assert.equal(lines.length, 1, 'CLI must return exactly one real JSON result: ' + result.stderr);
-  return { ...result, value: JSON.parse(lines[0]) };
+  return { ...result, ...(detached ? { pid: row.pid, tty: row.tty } : {}), value: JSON.parse(lines[0]) };
 }
 export function success(result) { assert.equal(result.status, 0, JSON.stringify(result)); return result.value; }
 export async function create(c, profile) {
