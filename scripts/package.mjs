@@ -1,15 +1,21 @@
-import { createHash } from 'node:crypto';
-import { mkdir, realpath, rm, unlink } from 'node:fs/promises';
+import { createHash, randomBytes } from 'node:crypto';
+import { chmod, mkdir, mkdtemp, readdir, realpath, rm, unlink, writeFile } from 'node:fs/promises';
 import { userInfo } from 'node:os';
-import { dirname, join, resolve, sep } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { inventory, inventoryDigest, root } from './package-base.mjs';
 import {
-  assertHostIsolation, assertPhysicalCap, canonical, exactFile, prepareUnsignedHost, privateDirectory,
-  refreshHostRecords, writeExclusive,
+  acceptedReleaseProduct, assertHostIsolation, assertPhysicalCap, canonical, command, currentHostCompilation,
+  exactFile, json, outerPlist, prepareUnsignedHost, privateDirectory, refreshHostRecords, writeExclusive,
 } from './package-host.mjs';
+import { signBundle } from './sign.mjs';
+import installation from '../src/runtime/installation-paths.json' with { type: 'json' };
+import publisher from '../native/production-publisher-requirement.json' with { type: 'json' };
 
 const payloadPath = 'Contents/Resources/browser';
+const launcherPath = `${payloadPath}/native/stable-launch`;
+const identity = 'F1B6782A3BACC18E73FE08CA424C0A81450A982C';
+const productionResources = new Set(['Contents/Info.plist', 'Contents/Resources/publisher-requirement.json']);
 const compilationRecords = new Set([
   'native/ownership-compile.json', 'native/platform-compile.json', 'native/watchdog-compile.json',
 ]);
@@ -85,12 +91,23 @@ export async function prepareReleasePayload({ out, buildRoot, runtimeArchive }) 
   const compilerFiles = Object.keys(staged.record.files).filter(compilationOnly);
   const excluded = new Set([...compilerFiles, ...await removeVendorDevelopmentFiles(bundle, staged.record)]);
   for (const file of compilerFiles) await unlink(join(bundle, file));
-  const { metadata } = await refreshHostRecords(bundle, staged.record);
+  const production = { ...staged.record, delivery: 'production',
+    buildRoot: join(...installation.stableBuilds, basename(buildRoot)),
+    stateRoot: join(installation.root, installation.browser) };
+  const launcher = await exactFile(join(root, 'dist/native/stable-launch'), 67108864);
+  if (launcher.sha256 !== production.productOutputs.native['stable-launch']) {
+    throw new Error('Release launcher differs from the compiled output');
+  }
+  await writeExclusive(join(bundle, launcherPath), launcher.bytes, 0o755);
+  await writeFile(join(bundle, 'Contents/Info.plist'), outerPlist(publisher));
+  await writeFile(join(bundle, 'Contents/Resources/publisher-requirement.json'), JSON.stringify(publisher, null, 2) + '\n');
+  const { metadata } = await refreshHostRecords(bundle, production);
   const files = await inventory(bundle);
   const expected = Object.entries(staged.record.files).filter(([name]) => !excluded.has(name));
-  if (Object.keys(files).length !== expected.length ||
-      expected.some(([name, digest]) => !Object.hasOwn(files, name) || (!rewrittenRecords.has(name) && files[name] !== digest))) {
-    throw new Error('Release staging changed a file outside the recorded exclusions.');
+  if (Object.keys(files).length !== expected.length + 1 || files[launcherPath] !== launcher.sha256 ||
+      expected.some(([name, digest]) => !Object.hasOwn(files, name) ||
+        (!rewrittenRecords.has(name) && !productionResources.has(name) && files[name] !== digest))) {
+    throw new Error('Release staging changed a file outside the recorded changes');
   }
   const runtime = join(bundle, payloadPath);
   const physicalEntries = { bundle: await assertPhysicalCap(bundle), payload: await assertPhysicalCap(runtime) };
@@ -100,16 +117,90 @@ export async function prepareReleasePayload({ out, buildRoot, runtimeArchive }) 
   }
   await rm(staged.scratch, { recursive: true });
   await unlink(`${bundle}.unsigned.json`);
-  const record = { ...staged.record, kind: 'unsigned-release-payload', runtime: metadata.runtime,
+  const record = { ...production, kind: 'unsigned-release-payload', runtime: metadata.runtime,
     physicalEntries, excluded: [...excluded].sort(), files, payloadDigest: inventoryDigest(files) };
   await writeExclusive(join(out, 'release-payload.json'), `${JSON.stringify(record, null, 2)}\n`);
   return { bundle, productDigest: record.productDigest, payloadDigest: record.payloadDigest };
 }
 
+/** Produce one reviewed signed candidate. Qualification and Apple distribution are separate operations. */
+export async function sealReleaseImage({ out, buildRoot, runtimeArchive, review }) {
+  if (process.platform !== 'darwin' || process.arch !== 'arm64') throw new Error('Release signing requires Darwin arm64');
+  const compiled = await currentHostCompilation();
+  const lock = (await json(join(root, 'package-lock.json'))).value;
+  if (!compiled.productSources['src/cli/agent-session.ts'] ||
+      Object.entries(lock.packages).some(([path, record]) => !record.dev && path.endsWith('/@modelcontextprotocol/sdk'))) {
+    throw new Error('Production signing requires the direct agent CLI and removal of the packaged MCP SDK');
+  }
+  const accepted = await acceptedReleaseProduct(review, compiled);
+  const { bundle } = await prepareReleasePayload({ out, buildRoot, runtimeArchive });
+  const replay = join(dirname(out), `.release-replay-${randomBytes(12).toString('hex')}`);
+  await prepareReleasePayload({ out: replay, buildRoot, runtimeArchive });
+  const receipt = await json(join(out, 'release-payload.json'));
+  const reproduced = (await json(join(replay, 'release-payload.json'))).value;
+  if (canonical(receipt.value) !== canonical(reproduced) || reproduced.purpose !== 'blocked' ||
+      reproduced.compileDigest !== compiled.digest || canonical(await inventory(bundle)) !== canonical(reproduced.files)) {
+    throw new Error('Production signing input did not reproduce exactly');
+  }
+  const production = { ...reproduced, purpose: 'production', reviewHandover: review, reviewDigest: accepted.digest };
+  const changed = new Set(rewrittenRecords);
+  const signatureResource = name => /(?:^|\/)_CodeSignature\/CodeResources$/.test(name);
+  async function checkSignedFiles() {
+    const files = await inventory(bundle);
+    if (Object.entries(reproduced.files).some(([name, digest]) => !Object.hasOwn(files, name) ||
+        (!changed.has(name) && !signatureResource(name) && files[name] !== digest)) ||
+        Object.keys(files).some(name => !Object.hasOwn(reproduced.files, name) && !signatureResource(name))) {
+      throw new Error('Signing changed an input outside the permitted code and signature records');
+    }
+    return files;
+  }
+  const { audit, records } = await signBundle({ bundle, identity, publisher, async sealResources(code) {
+    for (const name of code) changed.add(name);
+    const records = await refreshHostRecords(bundle, production);
+    await checkSignedFiles();
+    await assertPhysicalCap(bundle);
+    await assertPhysicalCap(join(bundle, payloadPath));
+    return records;
+  } });
+  const files = await checkSignedFiles();
+  if ((await currentHostCompilation()).digest !== compiled.digest ||
+      (await json(join(out, 'release-payload.json'))).sha256 !== receipt.sha256 ||
+      records.policy.reviewDigest !== accepted.digest || records.policy.productDigest !== compiled.record.productDigest) {
+    throw new Error('Production signing evidence changed');
+  }
+
+  const source = await mkdtemp(join(out, '.image-source-'));
+  const copy = join(source, basename(bundle));
+  command('/bin/cp', ['-pR', bundle, copy]);
+  if ((await readdir(source)).join(',') !== basename(bundle) ||
+      canonical(await inventory(copy)) !== canonical(files)) throw new Error('Image source differs from the signed app');
+  await assertPhysicalCap(source);
+  const image = join(out, 'ArbolBrowser.dmg');
+  const { uid, gid } = userInfo();
+  command('/usr/bin/hdiutil', ['create', '-fs', 'APFS', '-srcfolder', source, '-volname', 'ArbolBrowser',
+    '-uid', String(uid), '-gid', String(gid), '-mode', '0700', '-format', 'UDRO', '-plist', image]);
+  await chmod(image, 0o600);
+  command('/usr/bin/codesign', ['--sign', identity, '--timestamp', image]);
+  command('/usr/bin/codesign', ['--verify', '--strict', '-R', `=${publisher.requirement}`, image]);
+  const { sha256: imageSha256 } = await exactFile(image, 1073741824);
+  const signed = { format: 1, kind: 'signed-production-candidate', source: production.sourceIdentity.commit,
+    productDigest: production.productDigest, runtime: production.runtime, publisher, build: production.component.build,
+    review, reviewDigest: accepted.digest, image: basename(image), imageSha256,
+    payloadDigest: inventoryDigest(files), files, policy: records.policy, launcherDigest: files[launcherPath], audit,
+    qualification: 'unexecuted' };
+  await writeExclusive(join(out, 'signed-release.json'), JSON.stringify(signed, null, 2) + '\n');
+  await rm(source, { recursive: true });
+  await rm(replay, { recursive: true });
+  return { image, imageSha256, payloadDigest: signed.payloadDigest, qualification: signed.qualification };
+}
+
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const args = process.argv.slice(2);
-  if (args.length !== 6 || args[0] !== '--out' || args[2] !== '--build-root' || args[4] !== '--runtime-archive') {
-    throw new Error('Usage: package.mjs --out <fresh-directory> --build-root <isolated-Build> --runtime-archive <pinned.zip>');
+  if ((args.length !== 6 && (args.length !== 8 || args[6] !== '--review-handover')) ||
+      args[0] !== '--out' || args[2] !== '--build-root' || args[4] !== '--runtime-archive') {
+    throw new Error('Usage: package.mjs --out <fresh-directory> --build-root <allocated-Build> --runtime-archive <pinned.zip> [--review-handover <Forester-commit>]');
   }
-  console.log(JSON.stringify(await prepareReleasePayload({ out: args[1], buildRoot: args[3], runtimeArchive: args[5] })));
+  const options = { out: args[1], buildRoot: args[3], runtimeArchive: args[5] };
+  console.log(JSON.stringify(await (args.length === 8 ? sealReleaseImage({ ...options, review: args[7] }) :
+    prepareReleasePayload(options))));
 }

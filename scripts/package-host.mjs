@@ -155,8 +155,10 @@ export async function currentHostCompilation() {
 // Review authority is an already published exact Forester hand-over, never
 // a caller-written JSON file or the source checkout's current HEAD itself.
 const foresterRoot = '/Users/msix/Artifacts/forester';
-const handoverPath = 'sagas/sylvan-stack/arbol-browser/browser-control-health/ABR-29.md';
-export async function acceptedHostProduct(commit, compiled) {
+async function acceptedProduct(commit, compiled, production) {
+  const handoverPath = production ? 'sagas/sylvan-stack/arbol-browser/browser-release/ABR-24.md' :
+    'sagas/sylvan-stack/arbol-browser/browser-control-health/ABR-29.md';
+  const marker = production ? 'ABR-24-RELEASE-SOURCE-ADMISSION' : 'ABR-29-HOST-SOURCE-ADMISSION';
   if (typeof commit !== 'string' || !/^[0-9a-f]{40}$/.test(commit)) fail('Exact published review hand-over commit required');
   if (await realpath(foresterRoot) !== foresterRoot) fail('Nonphysical review repository');
   const git = args => command('/usr/bin/git', ['-C', foresterRoot, ...args]).trim();
@@ -165,16 +167,18 @@ export async function acceptedHostProduct(commit, compiled) {
     fail('Wrong independent hand-over authority');
   git(['merge-base', '--is-ancestor', commit, 'refs/remotes/origin/main']);
   const text = git(['show', `${commit}:${handoverPath}`]);
-  const blocks = [...text.matchAll(/<!-- ABR-29-HOST-SOURCE-ADMISSION:BEGIN -->\s*([\s\S]*?)\s*<!-- ABR-29-HOST-SOURCE-ADMISSION:END -->/g)];
+  const blocks = [...text.matchAll(new RegExp(`<!-- ${marker}:BEGIN -->\\s*([\\s\\S]*?)\\s*<!-- ${marker}:END -->`, 'g'))];
   if (blocks.length !== 1) fail('Published hand-over has no unique accepted host source admission');
   const value = JSON.parse(blocks[0][1]);
-  if (value.format !== 1 || value.status !== 'accepted' || !Number.isSafeInteger(value.acceptedSourceOrdinal) || value.acceptedSourceOrdinal < 1 ||
+  if (value.format !== 1 || value.status !== 'accepted' || (production && value.scope !== 'production-candidate') ||
+      !Number.isSafeInteger(value.acceptedSourceOrdinal) || value.acceptedSourceOrdinal < 1 ||
       !/^[0-9a-f]{40}$/.test(value.sourceGit) || !sha(value.productDigest) || value.productDigest !== compiled.record.productDigest ||
       canonical(value.productSources) !== canonical(compiled.productSources) ||
       canonical(value.productOutputs) !== canonical(compiled.productOutputs) ||
       canonical(value.compilerInputs) !== canonical(compiled.record.compilerInputs)) fail('Exact independently accepted product identity differs');
   const checkpoint = await json(value.sourceCheckpoint.path), verdict = await exactFile(value.sourceVerdict.path);
   if (checkpoint.sha256 !== value.sourceCheckpoint.sha256 || verdict.sha256 !== value.sourceVerdict.sha256 ||
+      (production && checkpoint.value.scope !== 'production-candidate') ||
       checkpoint.value.ordinal !== value.acceptedSourceOrdinal || checkpoint.value.source !== value.sourceGit ||
       checkpoint.value.productDigest !== value.productDigest || canonical(checkpoint.value.productSources) !== canonical(value.productSources) ||
       canonical(checkpoint.value.productOutputs) !== canonical(value.productOutputs) ||
@@ -186,6 +190,8 @@ export async function acceptedHostProduct(commit, compiled) {
   command('/usr/bin/git', ['merge-base', '--is-ancestor', value.sourceGit, compiled.sourceIdentity.commit]);
   return { digest: hash(canonical({ foresterCommit: commit, handoverPath, admission: value })), value, foresterCommit: commit };
 }
+export function acceptedHostProduct(commit, compiled) { return acceptedProduct(commit, compiled, false); }
+export function acceptedReleaseProduct(commit, compiled) { return acceptedProduct(commit, compiled, true); }
 export async function writeExclusive(path, value, mode = 0o600) {
   const fd = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_NONBLOCK, mode);
   try { await fd.chmod(mode); await fd.writeFile(value); await fd.sync(); } finally { await fd.close(); }
@@ -304,17 +310,20 @@ async function productionDependencies(payload, scratch) {
   }
   return archives;
 }
-function outerPlist(policy) {
+export function outerPlist(policy) {
   return `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>${policy.bundleIdentifier}</string><key>CFBundleName</key><string>Arbol Browser</string><key>CFBundleExecutable</key><string>arbol-browser-native</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleVersion</key><string>1</string><key>LSMinimumSystemVersion</key><string>27.0.1</string><key>LSMultipleInstancesProhibited</key><false/></dict></plist>\n`;
 }
 export async function refreshHostRecords(bundle, staged) {
-  const payload = join(bundle, 'Contents/Resources/browser'), readerKey = `host-${staged.purpose === 'isolated-qualification' ? 'isolated' : 'blocked'}:1:${staged.productDigest}`;
+  const payload = join(bundle, 'Contents/Resources/browser');
+  const scope = staged.purpose === 'isolated-qualification' ? 'isolated' : staged.purpose;
+  const readerKey = `host-${scope}:1:${staged.productDigest}`;
   const metadata = { format: 1, component: staged.component, runtime: hostRuntime, sourceDigest: staged.sourceDigest,
     sourceIdentity: staged.sourceIdentity, host: { layout: 1, compileDigest: staged.compileDigest, productDigest: staged.productDigest },
     files: await inventory(payload, (await readdir(payload)).filter(name => name !== 'metadata.json')) };
   await writeFile(join(payload, 'metadata.json'), JSON.stringify(metadata, null, 2) + '\n', { mode: 0o600 });
   const nativeABI = (await json(join(root, 'native/expected-inventory.json'))).value;
-  const publisher = (await json(join(root, 'native/publisher-requirement.json'))).value;
+  const publisher = (await json(join(root, staged.delivery === 'production' ?
+    'native/production-publisher-requirement.json' : 'native/publisher-requirement.json'))).value;
   const compatibility = { abi: 1, runtime: hostRuntime, nativeABI, publisherTeam: publisher.team, bundleIdentifier: publisher.bundleIdentifier,
     featureConfiguration: { sitePerProcess: true, disabledFeatures: ['MacAccessibilityTextOperation'], extraChromiumArguments: [] },
     files: Object.fromEntries(Object.entries(await inventory(payload)).map(([path, digest]) => [`Contents/Resources/browser/${path}`, digest])),

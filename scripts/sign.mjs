@@ -25,6 +25,8 @@ function command(program, args, input) {
 export async function signBundle({ bundle, identity, publisher, sealResources }) {
   if (!allowedPublishers.has(canonical(publisher))) throw new Error('Unrecognized Browser publisher policy');
   const bootstrap = join(bundle, 'Contents/MacOS/arbol-browser-native');
+  const installedLauncher = join(bundle, 'Contents/Resources/browser/native/stable-launch');
+  const installedLauncherID = 'com.sylvan-stack.arbol-browser.launcher';
   const electron = join(bundle, 'Contents/Resources/browser/runtime/Electron.app');
   const frameworks = join(electron, 'Contents/Frameworks');
   const jitTargets = new Set([electron, join(electron, 'Contents/MacOS/Electron')]);
@@ -58,6 +60,7 @@ export async function signBundle({ bundle, identity, publisher, sealResources })
   }
   await walk(bundle);
   if (!mutable.has(relative(bundle, bootstrap)) ||
+      (publisher.bundleIdentifier === productionPublisher.bundleIdentifier && !leaves.includes(installedLauncher)) ||
       [...jitTargets].some(file => !leaves.includes(file) && !containers.includes(file))) {
     throw new Error('Pinned Electron or Browser launcher layout is incomplete');
   }
@@ -65,6 +68,7 @@ export async function signBundle({ bundle, identity, publisher, sealResources })
   const entitlements = await exactFile(entitlementPath);
   function sign(file) {
     command('/usr/bin/codesign', ['--force', '--sign', identity, '--options', 'runtime', '--timestamp',
+      ...(file === installedLauncher ? ['--identifier', installedLauncherID] : []),
       ...(jitTargets.has(file) ? ['--entitlements', entitlementPath] : []), file]);
   }
   const deepestFirst = (left, right) => right.split(sep).length - left.split(sep).length;
@@ -76,7 +80,8 @@ export async function signBundle({ bundle, identity, publisher, sealResources })
 
   const audit = [];
   for (const file of [...leaves, ...containers, bootstrap, bundle]) {
-    const requirement = publisher.requirement + (file === bundle ? ` and identifier "${publisher.bundleIdentifier}"` : '');
+    const identifier = file === bundle ? publisher.bundleIdentifier : file === installedLauncher ? installedLauncherID : undefined;
+    const requirement = publisher.requirement + (identifier ? ` and identifier "${identifier}"` : '');
     command('/usr/bin/codesign', ['--verify', '--strict', ...(file === bundle ? ['--deep'] : []), '-R', `=${requirement}`, file]);
     const details = command('/usr/bin/codesign', ['-dvvv', file]).stderr;
     if (!details.includes(`TeamIdentifier=${publisher.team}`) || !details.includes('runtime)') || !details.includes('Timestamp=')) {
