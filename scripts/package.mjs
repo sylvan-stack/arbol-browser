@@ -36,6 +36,7 @@ const vendorDevelopmentDirectories = [
   ].map(name => `${name}/test`),
   '@modelcontextprotocol/sdk/dist/cjs/examples',
   '@modelcontextprotocol/sdk/dist/esm/examples',
+  'ajv/lib', 'ajv-formats/src', 'fast-uri/types',
   'fast-uri/benchmark', 'json-schema-traverse/spec', 'object-inspect/example',
   'zod/src/v3/benchmarks', 'zod/src/v3/tests', 'zod/src/v4/classic/tests',
   'zod/src/v4/core/tests', 'zod/src/v4/mini/tests',

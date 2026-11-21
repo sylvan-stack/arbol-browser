@@ -64,7 +64,7 @@ export function assertPageSurface(page: PageSurface): void {
 }
 function clipboardShortcut(input: Input): boolean {
   const key = input.key.toLowerCase();
-  return input.meta && !input.alt && !input.control && (key === 'c' || key === 'x');
+  return input.meta && !input.alt && !input.control && !input.shift && (key === 'c' || key === 'x');
 }
 
 function preferences(session: Session) {
