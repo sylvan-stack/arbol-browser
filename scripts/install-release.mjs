@@ -168,6 +168,7 @@ async function optionalSelection(path) {
   const file = await optionalFile(path, 4096);
   if (!file) return null;
   const value = JSON.parse(file.bytes.toString('utf8'));
+  if (value?.scope === 'rehearsal') throw new Error('Withdraw the guarded Browser rehearsal before installing a release');
   if (Object.keys(value).sort().join(',') !== 'build,format,imageSha256' || value.format !== 1 ||
       !buildNumber(value.build) || !digest(value.imageSha256) || file.identity.mode !== 0o600 ||
       file.identity.uid !== userInfo().uid) throw new Error('Installed Browser selection is unsafe');

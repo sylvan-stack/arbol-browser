@@ -35,6 +35,42 @@ bool lockUntil(int fd, int mode, double deadline) {
   return false;
 }
 
+bool rehearsalCommand(NSString* profile, int argc, const char* argv[]) {
+  const char* name = profile.UTF8String;
+  if (argc == 1 && !strcmp(argv[0], "info")) return true;
+  if (argc == 3 && !strcmp(argv[1], "--profile") && !strcmp(argv[2], name))
+    return !strcmp(argv[0], "open") || !strcmp(argv[0], "close");
+  if (argc == 3 && !strcmp(argv[0], "profiles") && !strcmp(argv[1], "create") && !strcmp(argv[2], name)) return true;
+  return argc == 4 && !strcmp(argv[0], "profiles") && !strcmp(argv[1], "remove") &&
+    !strcmp(argv[2], name) && !strcmp(argv[3], "--delete-data");
+}
+
+bool admitRehearsal(NSDictionary* receipt, int argc, const char* argv[]) {
+  NSString* profile = receipt[@"profile"];
+  NSDictionary* parent = receipt[@"parent"];
+  if (![receipt[@"scope"] isEqual:@"rehearsal"] || !arbol_attempt::pattern(profile, @"^[a-z](?:[a-z0-9-]{0,62}[a-z0-9])?$") ||
+      [profile isEqual:@"default"] || !arbol_attempt::pattern(receipt[@"capabilitySha256"], @"^[0-9a-f]{64}$") ||
+      !arbol_attempt::process(parent) || [parent[@"pid"] intValue] != getppid() ||
+      !arbol_attempt::currentProcess(parent) || !rehearsalCommand(profile, argc, argv)) return false;
+  // The supervisor supplies a closed-writer, unlinked regular description.
+  // A pathname, environment variable or a human-entered value is insufficient.
+  constexpr int capability = 12;
+  char bytes[32];
+  struct stat before{}, after{};
+  int flags = fcntl(capability, F_GETFL);
+  if (flags < 0 || (flags & O_ACCMODE) != O_RDONLY || fstat(capability, &before) || !S_ISREG(before.st_mode) ||
+      before.st_uid != geteuid() || (before.st_mode & 07777) != 0600 || before.st_nlink != 0 ||
+      before.st_size != static_cast<off_t>(sizeof(bytes)) ||
+      pread(capability, bytes, sizeof(bytes), 0) != static_cast<ssize_t>(sizeof(bytes)) ||
+      fstat(capability, &after) || close(capability)) return false;
+  return before.st_dev == after.st_dev && before.st_ino == after.st_ino && before.st_mode == after.st_mode &&
+    before.st_uid == after.st_uid && before.st_nlink == after.st_nlink && before.st_size == after.st_size &&
+    before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec && before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec &&
+    before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec && before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec &&
+    [arbol_attempt::digest(std::string(bytes, sizeof(bytes))) isEqual:receipt[@"capabilitySha256"]] &&
+    [parent[@"pid"] intValue] == getppid() && arbol_attempt::currentProcess(parent);
+}
+
 std::string readSelection(const std::string& path) {
   FD file(openInstalledFile(path));
   struct stat before{};
@@ -152,14 +188,19 @@ int launch(int argc, const char* argv[], double deadline) {
   const std::string selected = readSelection(selectionPath);
   NSDictionary* receipt = arbol_attempt::json(selected);
   NSString* build = receipt[@"build"];
-  if (!arbol_attempt::keys(receipt, @[@"format", @"build", @"imageSha256"]) ||
-      ![receipt[@"format"] isEqual:@1] || !arbol_attempt::pattern(build, @"^[1-9a-f][0-9a-f]{0,15}$") ||
+  const bool stable = arbol_attempt::keys(receipt, @[@"format", @"build", @"imageSha256"]);
+  const bool rehearsal = arbol_attempt::keys(receipt,
+    @[@"format", @"build", @"imageSha256", @"scope", @"profile", @"parent", @"capabilitySha256"]);
+  uint64_t format = 0;
+  if ((!stable && !rehearsal) || !arbol_attempt::uintNumber(receipt[@"format"], format) || format != 1 ||
+      !arbol_attempt::pattern(build, @"^[1-9a-f][0-9a-f]{0,15}$") ||
       !arbol_attempt::pattern(receipt[@"imageSha256"], @"^[0-9a-f]{64}$")) return 4;
   int first = 1;
   if (argc > 1 && !strcmp(argv[1], "-v")) {
     if (argc < 4 || strcmp(argv[2], build.UTF8String)) return 4;
     first = 3;
   }
+  if (rehearsal && !admitRehearsal(receipt, argc - first, argv + first)) return 4;
   NSString* root = [[home stringByAppendingPathComponent:@ARBOL_INSTALLATION_STABLE_BUILDS] stringByAppendingPathComponent:build];
   const std::string mount = [root stringByAppendingPathComponent:@"app"].fileSystemRepresentation;
   const std::string bundle = mount + "/ArbolBrowser.app";
