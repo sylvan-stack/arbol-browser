@@ -210,15 +210,62 @@ arbol-browser:@artifact/specs/00-the-browser-component.md#Interface
 arbol-browser:@artifact/specs/00-the-browser-component.md#Startup arbitration and local identity
 -->
 
+## Stable macOS release
+
+The installed entry is `~/Applications/Arbol Browser/bin/arbol-browser`.
+The `arbol-browser` PATH entry resolves to that executable. The selected disk
+image lives in `~/.local/lib/sylvan-stack/arbol-browser/images/` and mounts
+read-only under `~/Applications/Arbol Browser/.mounted/arbol-browser/<build>/app`.
+The launcher verifies the selected image digest and signed app, and passes the
+original Build guard to the embedded CLI. It uses the installed image and
+selection even when `~/Builds` is unavailable. `-v <build>` accepts only the
+selected stable Build. Browser profile state lives in `~/.arbol/browser`.
+
+Run an ordinary isolated Build using the registry and bin paths in [TESTS.md](TESTS.md).
+Its launcher lives in that run's `bin/`, with its own registry and profile
+state. A release Build consumes the published commit with exact production
+source admission and uses the normal isolated Build to retain the existing gate.
+
+```sh
+forester builds run arbol-browser -- sh -eu -c '
+  arbol-builds build arbol-browser --repo "$1" \
+    --registry-dir "$BUILD_DIR/registry" --bin-dir "$BUILD_DIR/bin" \
+    --browser-release "$2"
+' sh "$reviewed_source_checkout" "$release_review_commit"
+```
+
+The Common Build reserves a production number in the canonical registry and
+builds into the private run. The build record gives the path and SHA-256 of
+`release-<build>/ArbolBrowser.dmg` and `signed-release.json`. The receipt binds
+the signed app inventory, source, runtime and publisher. Keep the exact signed
+candidate and receipts long enough to finish qualification. Ordinary temporary
+output retention still applies. ABR-25 qualifies those bytes, checks the
+Browser Tools, Seqoya and Codex hand-overs, submits the exact image to Apple,
+staples it and records the delivered SHA-256 in `delivery.json`.
+
+```sh
+node scripts/install-release.mjs verify --image "$delivered_image" \
+  --signed-receipt "$signed_receipt" --delivery-receipt "$delivery_receipt"
+node scripts/install-release.mjs install --image "$delivered_image" \
+  --signed-receipt "$signed_receipt" --delivery-receipt "$delivery_receipt"
+"$HOME/Applications/Arbol Browser/bin/arbol-browser" info
+```
+
+Installation checks the stapled ticket and exact extracted signed inventory
+before updating the selection. An upgrade waits for the previous Build to be
+unused. If an installation is interrupted, rerun the installer with the exact
+verified delivery so it can recover the transaction before proceeding. An older
+image may remain in managed support while an existing profile still needs its
+verified exit or data-writer evidence. The prior-exit verifier can remount that
+image at its original path. Forester uses Arbol's guarded retirement operation
+to remove an image after the profile references and Build users are gone.
+
 ## Qualification and integration limits
 
-No behavioral test, fixture, test inventory, test-running Build, GUI/native
-qualification, browser launch, profile mutation, signing upload or installation
-is part of ABR-1. ABR-4 owns foundation qualification. `arbol-build.json` retains
-an explicitly failing gate until ABR-4 supplies the real gate; compilation and
-candidate packaging cannot mark a normal Build working. Never activate an
-incomplete candidate as the normal browser. Native input/manifest/watchdog,
-complete MCP tools and final distribution qualification remain later work.
+[TESTS.md](TESTS.md) identifies the complete isolated gate and [MID_TIER.md](MID_TIER.md)
+records the broader release and integration obligations. Static compilation and
+an unsigned stage supply packaging evidence. Stable activation depends on the
+signed candidate, cross-component qualification and post-staple artifact checks.
 
 Browser indexing is currently disabled and the configured Mycel store is
 unreachable. Source declarations are retained for reconciliation; ingest,
