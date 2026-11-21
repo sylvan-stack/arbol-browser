@@ -25,7 +25,7 @@ export const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 export const canonical = value => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
   ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b, 'en'))) : item);
 const fail = message => { throw new Error(message); };
-const inside = (path, parent) => path === parent || path.startsWith(parent + sep);
+const inside = (path, parent) => path === parent || path.startsWith(parent === sep ? sep : parent + sep);
 const sha = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 
 /** Physical bounded same-description inputs, never ASAR, FIFO or a final link. */
@@ -80,14 +80,29 @@ function protectedLocations(home) {
   return [join(home, ...installation.builds), join(home, ...installation.payloads),
     join(home, installation.root, installation.browser)];
 }
-export async function assertHostIsolation(buildRoot, stateRoot) {
+export async function assertHostIsolation(buildRoot, stateRoot, output) {
   if (resolve(buildRoot) !== buildRoot || resolve(stateRoot) !== stateRoot || basename(dirname(buildRoot)) !== 'arbol-browser' ||
       !/^[1-9a-f][0-9a-f]{0,15}$/.test(basename(buildRoot))) fail('Invalid isolated Build layout');
   const account = userInfo(), home = await realpath(account.homedir);
   if (!process.geteuid || process.geteuid() !== account.uid) fail('Qualification OS account differs');
+  const protectedRoots = [];
   for (const path of protectedLocations(home)) {
     const protectedRoot = await protectedPath(path);
+    protectedRoots.push(protectedRoot);
     for (const actual of [buildRoot, stateRoot]) if (inside(actual, protectedRoot) || inside(protectedRoot, actual)) fail('Owner installation/data is not qualification state');
+  }
+  if (output !== undefined) {
+    if (resolve(output) !== output || await protectedPath(output) !== output) fail('Staging output must be physical');
+    protectedRoots.push(await realpath(root), buildRoot, stateRoot,
+      await protectedPath(join(home, 'Applications', 'Arbol Browser')));
+    // A prospective leaf has no inode yet. Conservatively compare spellings
+    // that can refer to the same path on macOS volumes that fold case or Unicode.
+    const comparable = path => path.normalize('NFC').toLowerCase();
+    const candidate = comparable(output);
+    for (const path of protectedRoots) {
+      const protectedRoot = comparable(path);
+      if (inside(candidate, protectedRoot) || inside(protectedRoot, candidate)) fail('Staging output overlaps protected Browser files');
+    }
   }
   for (const path of [dirname(buildRoot), buildRoot, stateRoot]) await privateDirectory(path, true);
   if (inside(stateRoot, buildRoot) || inside(buildRoot, stateRoot)) fail('Qualification state overlaps product');

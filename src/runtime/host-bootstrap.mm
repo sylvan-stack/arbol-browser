@@ -44,7 +44,8 @@ static NSString* protectedPath(NSString* path) {
   current=[NSString stringWithUTF8String:physical]; for(NSString* name in suffix) current=[current stringByAppendingPathComponent:name]; return current;
 }
 static bool overlaps(NSString* a,NSString* b) {
-  return [a isEqual:b] || [a hasPrefix:[b stringByAppendingString:@"/"]] || [b hasPrefix:[a stringByAppendingString:@"/"]];
+  return [a isEqual:@"/"] || [b isEqual:@"/"] || [a isEqual:b] ||
+    [a hasPrefix:[b stringByAppendingString:@"/"]] || [b hasPrefix:[a stringByAppendingString:@"/"]];
 }
 static bool isolated(NSString* buildRoot,NSString* state) {
   if(!safeDirectory(buildRoot,true)||!safeDirectory(buildRoot.stringByDeletingLastPathComponent,true)||!safeDirectory(state,true)||overlaps(buildRoot,state)) return false;

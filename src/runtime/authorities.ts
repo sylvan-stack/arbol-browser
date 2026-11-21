@@ -149,7 +149,9 @@ const hostPolicyKeys = ['format', 'purpose', 'build', 'buildRoot', 'stateRoot', 
 function canonicalPath(value: unknown): value is string {
   return typeof value === 'string' && isAbsolute(value) && resolve(value) === value && !value.includes('\0');
 }
-function below(path: string, parent: string): boolean { return path === parent || path.startsWith(parent + '/'); }
+function below(path: string, parent: string): boolean {
+  return path === parent || path.startsWith(parent === '/' ? '/' : parent + '/');
+}
 /** Resolve even a not-yet-created protected location through its real nearest
  * ancestor. An existing installation alias must not hide its physical target. */
 async function protectedLocation(path: string, deadline: number): Promise<string> {
