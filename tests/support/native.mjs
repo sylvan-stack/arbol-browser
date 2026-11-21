@@ -396,6 +396,8 @@ async function observeWithMarker(fixtures, directory, command, request, markerNa
 export async function launchNativeFixture(fixtures, {
   mode = 'boundary', callback = fixtures.record.callback?.path, output, variant, poisonScenario, bindingScenario, retirementScenario, startupScenario, failureScenario, monitorScenario,
 }) {
+  const manualFocusApproved = process.env.ARBOL_BROWSER_MANUAL_FOCUS === '1';
+  assert.ok(manualFocusApproved, 'Get the user’s approval before starting a Browser Native fixture');
   const callbackModes = ['callbacks', 'resolver-control', 'install-poison', 'binding-lifetime', 'cached-routes', 'concurrent-responder', 'retirement', 'startup-custody', 'failure-custody', 'monitor-loss', 'helper-exit', 'custom-ax'];
   assert.ok(['boundary', 'frozen-trust', 'frozen-trust-restored', 'provider-mismatch', ...callbackModes].includes(mode));
   assert.ok(callback || !callbackModes.includes(mode));
@@ -424,7 +426,7 @@ export async function launchNativeFixture(fixtures, {
   const home = join(directory, 'home'); await mkdir(home, { mode: 0o700 });
   for (const name of ['app-data', 'session-data']) await mkdir(join(home, name), { mode: 0o700 });
   if (callback) { assert.equal(callback, fixtures.record.callback?.path); assert.equal(hash(await readFile(callback)), fixtures.record.callback.signedDigest); }
-  const config = { format: 1, mode, bundle: variant?.candidate ?? fixtures.consumer.candidate, output: directory, home, trustProbe: Boolean(variant),
+  const config = { format: 1, mode, manualFocusApproved, bundle: variant?.candidate ?? fixtures.consumer.candidate, output: directory, home, trustProbe: Boolean(variant),
     providerMethod: variant?.providerChange?.method, poisonScenario, bindingScenario, retirementScenario, startupScenario, failureScenario, monitorScenario,
     owner: join(directory, 'owner.lock'), build: join(directory, 'build.lock'), callback };
   const request = join(directory, 'request.json');

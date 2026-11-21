@@ -252,14 +252,32 @@ function observeCall(call) {
   try { return { returned: call() }; }
   catch (error) { return { error: String(error.message ?? error) }; }
 }
-async function waitForObservation(read, matches, message) {
-  const deadline = performance.now() + 2500;
+async function waitForObservation(read, matches, message, timeoutMs = 2500) {
+  const deadline = performance.now() + timeoutMs;
   for (;;) {
     const observed = await read();
     if (matches(observed)) return observed;
     assert.ok(performance.now() < deadline, message);
     await new Promise(accept => setTimeout(accept, 50));
   }
+}
+function requireFixtureFocus(window) {
+  assert.ok(window.isFocused(), 'The selected Browser test window lost keyboard focus');
+}
+async function selectFixtureWindow(window, contents) {
+  if (!window.isVisible()) {
+    const label = [config.mode, config.bindingScenario ?? config.retirementScenario].filter(Boolean).join(' / ');
+    window.setTitle(`Arbol Browser test · Click title bar · ${label}`);
+    window.showInactive();
+    await event('manual-focus-required', { label });
+    await waitForObservation(() => window.isFocused(), Boolean,
+      'Select the Browser test window by clicking its title bar', 20000);
+    window.setTitle(`Arbol Browser test · ${label}`);
+    await event('manual-focus-selected', { label });
+  }
+  // Select the local responder only after the operator made this window key.
+  requireFixtureFocus(window);
+  contents.focus();
 }
 async function loadFixturePage(view, label) {
   const html = `<!doctype html><button id="button" aria-label="${label}">0</button>
@@ -287,7 +305,10 @@ async function observeBindingLifetime(bridge, addon) {
   const bind = view => native.bind(handle, view.webContents.id, () => attach(view));
   const bounds = view => view.setBounds({ x: 0, y: 0, width: 640, height: 360 });
   const state = token => JSON.parse(bridge.state(token));
-  const press = token => JSON.parse(bridge.invoke(token, 'press'));
+  const press = token => {
+    requireFixtureFocus(window);
+    return JSON.parse(bridge.invoke(token, 'press'));
+  };
   const readPage = view => view.webContents.executeJavaScript('({count:Number(button.textContent),clicks:[...clicks]})');
   const captureClient = async (stage, contents) => {
     let client;
@@ -332,14 +353,13 @@ async function observeBindingLifetime(bridge, addon) {
       const user = native.mark(bindingKey(created), false);
       const restored = native.restore(bindingKey(user));
       await loadFixturePage(view, 'Original fixture button');
-      window.show();
-      window.focus();
-      view.webContents.focus();
+      await selectFixtureWindow(window, view.webContents);
       await event('binding-original-loaded', { created });
       const oldClient = await captureClient('original', view.webContents);
       const oldPress = press(oldClient.token);
       const oldEffect = await waitForObservation(() => readPage(view), value => value.count === 1, 'Original native click did not arrive');
       await event('binding-original-clicked', { oldClient, oldPress, oldEffect });
+      requireFixtureFocus(window);
       const resigned = JSON.parse(bridge.invoke(oldClient.token, 'resignFocus'));
       assert.equal(resigned.returned, true);
       const blocked = native.mark(bindingKey(restored), true);
@@ -368,7 +388,7 @@ async function observeBindingLifetime(bridge, addon) {
       bounds(newView);
       const replacementUser = native.mark(bindingKey(replacement), false);
       await loadFixturePage(newView, 'Replacement fixture button');
-      newView.webContents.focus();
+      await selectFixtureWindow(window, newView.webContents);
       await event('binding-replacement-loaded', { replacement });
       const newClient = await captureClient('replacement', newView.webContents);
       const newRoots = roots(), newBefore = await readPage(newView);
@@ -474,7 +494,10 @@ async function observeCachedRoutes(bridge) {
       return client;
     }, value => value?.button && value?.field, 'Real cached accessibility controls unavailable');
   };
-  const invoke = (token, route) => observeCall(() => JSON.parse(bridge.invoke(token, route)));
+  const invoke = (token, route) => {
+    requireFixtureFocus(window);
+    return observeCall(() => JSON.parse(bridge.invoke(token, route)));
+  };
   const state = () => {
     assert.equal(observation.unexpectedInputCount, 0, 'An unrelated keyboard event reached the disposable fixture');
     return contents.executeJavaScript(
@@ -500,7 +523,7 @@ async function observeCachedRoutes(bridge) {
   observation.milestone = 'initial-page-load';
   await contents.loadURL(`http://127.0.0.1:${port}/page`);
   observation.milestone = 'initial-focus';
-  window.show(); window.focus(); contents.focus();
+  await selectFixtureWindow(window, contents);
   await settle();
   const original = await capture('original');
   const originalState = JSON.parse(bridge.state(original.token));
@@ -512,6 +535,7 @@ async function observeCachedRoutes(bridge) {
   observation.milestone = 'press-contexts';
   await reset();
   const beforeContexts = await state();
+  requireFixtureFocus(window);
   const contexts = ['unknown', 'off-main', 'reentrant'].map(context => JSON.parse(bridge.invokePressContext(original.token, context)));
   await settle();
   const afterContexts = await state();
@@ -574,7 +598,7 @@ async function observeCustomAX(bridge) {
     view.setBounds({ x: 0, y: 0, width: 640, height: 360 });
     const user = ownership.mark(bindingKey(binding), false);
     await contents.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
-    window.show(); window.focus(); contents.focus();
+    await selectFixtureWindow(window, contents);
     const client = await waitForObservation(() => {
       const value = JSON.parse(bridge.capture(handle));
       if (!value.cachedHandler) bridge.releaseClients(value.token);
@@ -586,6 +610,7 @@ async function observeCustomAX(bridge) {
     await page.contents.executeJavaScript('clicks.length=0');
     const state = () => page.contents.executeJavaScript('({clicks:[...clicks],tabAttached:document.querySelector("[role=tab]").isConnected})');
     const before = await state(), nativeBefore = JSON.parse(bridge.state(page.client.token));
+    requireFixtureFocus(window);
     const dispatched = JSON.parse(bridge.invoke(page.client.token, 'custom'));
     await new Promise(accept => setTimeout(accept, 180));
     return { phase, token: page.client.token, origin: page.client.actionOriginIdentity, before, nativeBefore, dispatched,
@@ -658,7 +683,7 @@ async function observeConcurrentResponder(bridge) {
   const agent = await page('agent', 0), shell = await page('shell', 1), user = await page('user', 2);
   const unknown = await page('unknown', 3);
   const targets = { agent, shell, user, unknown };
-  window.show(); window.focus(); user.contents.focus();
+  await selectFixtureWindow(window, user.contents);
   await event('concurrent-window-shown', { pages: pages(), windows: BaseWindow.getAllWindows().length });
   for (const target of Object.values(targets)) {
     target.client = await waitForObservation(() => {
@@ -675,8 +700,14 @@ async function observeConcurrentResponder(bridge) {
   const read = target => target.contents.executeJavaScript(`({ text:field.value, button:Number(button.textContent),
     focused:document.activeElement===field, capture:held!==null&&pointer.hasPointerCapture(held), records:[...records] })`);
   const native = target => JSON.parse(bridge.state(target.client.token));
-  const invoke = (target, route) => JSON.parse(bridge.invoke(target.client.token, route));
-  const input = action => JSON.parse(bridge.windowInput(user.client.token, action));
+  const invoke = (target, route) => {
+    requireFixtureFocus(window);
+    return JSON.parse(bridge.invoke(target.client.token, route));
+  };
+  const input = action => {
+    requireFixtureFocus(window);
+    return JSON.parse(bridge.windowInput(user.client.token, action));
+  };
   const focusField = target => target.contents.executeJavaScript('field.focus()');
   const focus = invoke(user, 'focus');
   await focusField(user);
@@ -717,7 +748,7 @@ async function observeConcurrentResponder(bridge) {
       : await read(target);
     ax[target.kind] = { before, press, after };
   }
-  window.focus();
+  requireFixtureFocus(window);
   await waitForObservation(() => native(user), state => state.windowKey, 'Disposable window did not regain key status');
   const refocus = invoke(user, 'focus');
   await focusField(user);
@@ -740,7 +771,7 @@ async function observeConcurrentResponder(bridge) {
     value.page.records.some(event => event.type === 'lostpointercapture'), 'Native pointer capture did not release');
   await event('concurrent-pointer-observed', { idle, down, held, heldAgain, up, released });
 
-  window.focus();
+  requireFixtureFocus(window);
   await waitForObservation(() => native(user), state => state.windowKey, 'Disposable window lost key status before composition');
   invoke(user, 'focus');
   await focusField(user);
@@ -790,7 +821,7 @@ async function observeRetirement(bridge, addon) {
   const user = ownership.mark(bindingKey(created), false);
   view.setBounds({ x: 0, y: 0, width: 420, height: 260 });
   await loadFixturePage(view, 'Retirement fixture activation');
-  window.show(); window.focus(); contents.focus();
+  await selectFixtureWindow(window, contents);
   const client = await waitForObservation(() => {
     try {
       const candidate = JSON.parse(bridge.capture(handle));
@@ -804,10 +835,13 @@ async function observeRetirement(bridge, addon) {
   const press = () => JSON.parse(bridge.invoke(client.token, 'press'));
   const state = () => JSON.parse(bridge.state(client.token));
   const button = () => contents.executeJavaScript('({button:Number(button.textContent), clicks:[...clicks]})');
-  const baseline = await button(), positive = press();
+  const baseline = await button();
+  requireFixtureFocus(window);
+  const positive = press();
   const activated = await waitForObservation(button, value => value.button === baseline.button + 1, 'Native retirement positive click unavailable');
-  window.focus();
+  requireFixtureFocus(window);
   await waitForObservation(state, value => value.windowKey, 'Retirement window lost key status');
+  requireFixtureFocus(window);
   const resigned = JSON.parse(bridge.invoke(client.token, 'resignFocus'));
   const realRemove = parent.removeChildView.bind(parent), realClose = contents.close.bind(contents);
   let destroyed = 0, admission = true, fixtureAuthority = contents.id;
@@ -889,11 +923,13 @@ async function observeInstallPoison(bootstrapURL) {
   watchdog.terminate();
 }
 try {
+  app.setActivationPolicy('accessory');
   const path = process.env.ARBOL_BROWSER_QUALIFICATION_REQUEST;
   assert.ok(path && await realpath(path) === path);
   const stat = await lstat(path);
   assert.ok(stat.isFile() && stat.uid === process.getuid() && (stat.mode & 0o7777) === 0o600 && stat.nlink === 1 && stat.size <= 16384);
   config = JSON.parse(await readFile(path, 'utf8'));
+  assert.equal(config.manualFocusApproved, true, 'Native fixture request lacks per-run approval');
   assert.equal(config.format, 1); assert.ok(['boundary', 'callbacks', 'frozen-trust', 'frozen-trust-restored', 'provider-mismatch', resolverMode, poisonMode, bindingMode,
     cachedRoutesMode, concurrentResponderMode, retirementMode, startupCustodyMode, failureCustodyMode, monitorCustodyMode, helperExitMode, customAXMode].includes(config.mode));
   const startupScenarios = ['startup-descriptors', 'bootstrap-identity-refused', 'late-readiness',
@@ -1128,18 +1164,21 @@ try {
           field.focus();
         </script>`;
       await view.webContents.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
-      window.showInactive(); view.webContents.focus();
+      await selectFixtureWindow(window, view.webContents);
       await new Promise(accept => setTimeout(accept, 350));
       const cached = JSON.parse(bridge.capture(window.getNativeWindowHandle()));
       await event('callback-view', { binding, cached, state: JSON.parse(bridge.state(cached.token)), appReady: app.isReady() });
+      requireFixtureFocus(window);
       const focus = JSON.parse(bridge.invoke(cached.token, 'focus'));
       await event('callback-focus-observation', { focus, state: JSON.parse(bridge.state(cached.token)) });
       const before = await view.webContents.executeJavaScript('({text:field.value,events:[...events]})');
+      requireFixtureFocus(window);
       const invocation = JSON.parse(bridge.invoke(cached.token, 'text'));
       await new Promise(accept => setTimeout(accept, 150));
       const after = await view.webContents.executeJavaScript('({text:field.value,events:[...events]})');
       await event('callback-positive-observation', { before, invocation, after, state: JSON.parse(bridge.state(cached.token)) });
       const pressBefore = await view.webContents.executeJavaScript('({button:button.textContent,events:[...events]})');
+      requireFixtureFocus(window);
       const press = JSON.parse(bridge.invoke(cached.token, 'press'));
       await new Promise(accept => setTimeout(accept, 150));
       const pressAfter = await view.webContents.executeJavaScript('({button:button.textContent,events:[...events]})');
@@ -1151,6 +1190,7 @@ try {
         await view.webContents.executeJavaScript("field.value='edit'; field.focus(); field.setSelectionRange(4,4); events.length=0");
         for (const route of routes) {
           const before = await fieldState();
+          requireFixtureFocus(window);
           let invocation;
           try { invocation = JSON.parse(bridge.invoke(cached.token, route)); }
           catch (error) { invocation = { route, unavailable: String(error.message ?? error) }; }
@@ -1167,6 +1207,7 @@ try {
       assert.equal(returned.returnedAfterMs, 40);
       assert.ok(elapsedMs >= 40);
       await event('callback-bounded-main-thread-observation', { returned, observedMs: elapsedMs });
+      requireFixtureFocus(window);
       const resigned = JSON.parse(bridge.invoke(cached.token, 'resignFocus'));
       await event('callback-focus-released', { resigned, state: JSON.parse(bridge.state(cached.token)) });
       if (!resigned.returned) throw new Error('fixture_native_focus_release_unavailable');
