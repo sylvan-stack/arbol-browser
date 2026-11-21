@@ -8,7 +8,8 @@
     "npm ci --ignore-scripts --no-audit --no-fund",
     "node node_modules/electron/install.js",
     "npm run compile",
-    "npm run package:host"
+    "npm run package:host",
+    "npm run package:release-allocated"
   ],
   "checks": [
     {

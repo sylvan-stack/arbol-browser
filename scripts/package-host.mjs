@@ -192,6 +192,28 @@ async function acceptedProduct(commit, compiled, production) {
 }
 export function acceptedHostProduct(commit, compiled) { return acceptedProduct(commit, compiled, false); }
 export function acceptedReleaseProduct(commit, compiled) { return acceptedProduct(commit, compiled, true); }
+export async function verifyReleaseAllocation(buildRoot, compiled, review) {
+  const build = basename(buildRoot), account = userInfo();
+  const canonicalRoot = join(account.homedir, ...installation.builds, 'arbol-browser');
+  const stateRoot = join(dirname(dirname(dirname(buildRoot))), 'browser-state');
+  await assertHostIsolation(buildRoot, stateRoot);
+  const reservationRoot = join(canonicalRoot, build);
+  await privateDirectory(reservationRoot, true);
+  const allocation = await json(join(buildRoot, 'build.json'));
+  const proof = await json(join(reservationRoot, 'production-reservation.json'));
+  const record = allocation.value, release = record.productionRelease;
+  const source = { repository: await realpath(root), branch: compiled.sourceIdentity.branch,
+    commit: compiled.sourceIdentity.commit, uncommittedChanges: false };
+  if (allocation.identity.uid !== account.uid || allocation.identity.mode !== 0o600 ||
+      proof.identity.uid !== account.uid || proof.identity.mode !== 0o600 ||
+      record.component !== 'arbol-browser' || record.build !== build || record.status !== 'building' ||
+      !Array.isArray(record.checks) || record.checks.length || canonical(record.source) !== canonical(source) ||
+      release?.review !== review || !/^[0-9a-f]{32}$/.test(release?.reservation) ||
+      canonical(proof.value) !== canonical({ format: 1, component: 'arbol-browser', build, folder: buildRoot,
+        source, review, reservation: release.reservation })) fail('Production release does not hold its canonical Build allocation');
+  return canonical({ allocation: allocation.sha256, proof: proof.sha256 });
+}
+
 export async function writeExclusive(path, value, mode = 0o600) {
   const fd = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_NONBLOCK, mode);
   try { await fd.chmod(mode); await fd.writeFile(value); await fd.sync(); } finally { await fd.close(); }

@@ -6,7 +6,8 @@ import { fileURLToPath } from 'node:url';
 import { inventory, inventoryDigest, root } from './package-base.mjs';
 import {
   acceptedReleaseProduct, assertHostIsolation, assertPhysicalCap, canonical, command, currentHostCompilation,
-  exactFile, json, outerPlist, prepareUnsignedHost, privateDirectory, refreshHostRecords, writeExclusive,
+  exactFile, json, outerPlist, prepareUnsignedHost, preservedStockArchive, privateDirectory, refreshHostRecords,
+  verifyReleaseAllocation, writeExclusive,
 } from './package-host.mjs';
 import { signBundle } from './sign.mjs';
 import installation from '../src/runtime/installation-paths.json' with { type: 'json' };
@@ -133,6 +134,7 @@ export async function sealReleaseImage({ out, buildRoot, runtimeArchive, review 
     throw new Error('Production signing requires the direct agent CLI and removal of the packaged MCP SDK');
   }
   const accepted = await acceptedReleaseProduct(review, compiled);
+  const allocation = await verifyReleaseAllocation(buildRoot, compiled, review);
   const { bundle } = await prepareReleasePayload({ out, buildRoot, runtimeArchive });
   const replay = join(dirname(out), `.release-replay-${randomBytes(12).toString('hex')}`);
   await prepareReleasePayload({ out: replay, buildRoot, runtimeArchive });
@@ -164,6 +166,7 @@ export async function sealReleaseImage({ out, buildRoot, runtimeArchive, review 
   } });
   const files = await checkSignedFiles();
   if ((await currentHostCompilation()).digest !== compiled.digest ||
+      (await verifyReleaseAllocation(buildRoot, compiled, review)) !== allocation ||
       (await json(join(out, 'release-payload.json'))).sha256 !== receipt.sha256 ||
       records.policy.reviewDigest !== accepted.digest || records.policy.productDigest !== compiled.record.productDigest) {
     throw new Error('Production signing evidence changed');
@@ -183,6 +186,7 @@ export async function sealReleaseImage({ out, buildRoot, runtimeArchive, review 
   command('/usr/bin/codesign', ['--sign', identity, '--timestamp', image]);
   command('/usr/bin/codesign', ['--verify', '--strict', '-R', `=${publisher.requirement}`, image]);
   const { sha256: imageSha256 } = await exactFile(image, 1073741824);
+  if ((await verifyReleaseAllocation(buildRoot, compiled, review)) !== allocation) throw new Error('Production Build allocation changed');
   const signed = { format: 1, kind: 'signed-production-candidate', source: production.sourceIdentity.commit,
     productDigest: production.productDigest, runtime: production.runtime, publisher, build: production.component.build,
     review, reviewDigest: accepted.digest, image: basename(image), imageSha256,
@@ -196,11 +200,19 @@ export async function sealReleaseImage({ out, buildRoot, runtimeArchive, review 
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const args = process.argv.slice(2);
-  if ((args.length !== 6 && (args.length !== 8 || args[6] !== '--review-handover')) ||
-      args[0] !== '--out' || args[2] !== '--build-root' || args[4] !== '--runtime-archive') {
-    throw new Error('Usage: package.mjs --out <fresh-directory> --build-root <allocated-Build> --runtime-archive <pinned.zip> [--review-handover <Forester-commit>]');
+  if (args.length === 1 && args[0] === '--allocated') {
+    const { ARBOL_BUILD_DIR: buildRoot, ARBOL_BUILD_NUMBER: build } = process.env;
+    if (!buildRoot || !build || resolve(buildRoot) !== buildRoot || basename(buildRoot) !== build)
+      throw new Error('Release staging requires the normal Build allocation');
+    const { value: record } = await json(join(buildRoot, 'build.json'));
+    if (record.productionRelease !== undefined) {
+      const out = join(dirname(dirname(dirname(buildRoot))), `release-${build}`);
+      console.log(JSON.stringify(await sealReleaseImage({ out, buildRoot, runtimeArchive: preservedStockArchive,
+        review: record.productionRelease?.review })));
+    }
+  } else {
+    if (args.length !== 6 || args[0] !== '--out' || args[2] !== '--build-root' || args[4] !== '--runtime-archive')
+      throw new Error('Usage: package.mjs --out <fresh-directory> --build-root <allocated-Build> --runtime-archive <pinned.zip>');
+    console.log(JSON.stringify(await prepareReleasePayload({ out: args[1], buildRoot: args[3], runtimeArchive: args[5] })));
   }
-  const options = { out: args[1], buildRoot: args[3], runtimeArchive: args[5] };
-  console.log(JSON.stringify(await (args.length === 8 ? sealReleaseImage({ ...options, review: args[7] }) :
-    prepareReleasePayload(options))));
 }

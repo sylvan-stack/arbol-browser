@@ -16,7 +16,8 @@
     "compile": "node scripts/compile.mjs",
     "package:candidate": "node scripts/package-base.mjs",
     "package:host": "node scripts/package-host.mjs --allocated",
-    "package:release-payload": "node scripts/package.mjs"
+    "package:release-payload": "node scripts/package.mjs",
+    "package:release-allocated": "node scripts/package.mjs --allocated"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.2",
