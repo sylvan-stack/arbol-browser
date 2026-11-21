@@ -225,12 +225,15 @@ Run an ordinary isolated Build using the registry and bin paths in [TESTS.md](TE
 Its launcher lives in that run's `bin/`, with its own registry and profile
 state. A release Build consumes the published commit with exact production
 source admission and uses the normal isolated Build to retain the existing gate.
+The release Build runs tests. Get the user's approval for the specific run
+before setting the opt-in below. The Native cases that need keyboard focus
+wait for the user to select the fixture window described in [TESTS.md](TESTS.md).
 
 ```sh
 browser_run=$(forester builds run arbol-browser -- sh -eu -c 'printf "%s\n" "$BUILD_DIR"')
 forester builds keep --minutes 60 "$browser_run"
 mkdir -m 700 "$browser_run/registry" "$browser_run/bin"
-"$HOME/Applications/Arbol/bin/arbol-builds" build arbol-browser --repo "$reviewed_source_checkout" \
+ARBOL_BROWSER_MANUAL_FOCUS=1 "$HOME/Applications/Arbol/bin/arbol-builds" build arbol-browser --repo "$reviewed_source_checkout" \
   --registry-dir "$browser_run/registry" --bin-dir "$browser_run/bin" \
   --browser-release "$release_review_commit"
 ```
