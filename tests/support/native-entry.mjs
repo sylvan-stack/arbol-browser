@@ -27,6 +27,7 @@ const bindingKey = ({ id, nonce, webContentsId, revision }) => ({ id, nonce, web
 let eventWrite = Promise.resolve();
 let retirementEffect;
 let failureEffect, failureProtocol;
+let cachedRouteObservation;
 async function event(stage, values = {}) {
   const value = { stage, elapsedMs: performance.now(), ...values }; events.push(value);
   process.stdout.write(JSON.stringify(value) + '\n');
@@ -408,12 +409,22 @@ async function observeBindingLifetime(bridge, addon) {
   watchdog.terminate();
 }
 async function observeCachedRoutes(bridge) {
+  const observation = cachedRouteObservation = {
+    milestone: 'window-creation', unexpectedInput: [], unexpectedInputCount: 0,
+    capture: { original: { polls: 0, widgetUnavailable: 0, incompletePair: 0 },
+      replacement: { polls: 0, widgetUnavailable: 0, incompletePair: 0 } },
+  };
   app.setAccessibilitySupportEnabled(true);
   const window = new BaseWindow({ title: 'Arbol Browser native test', width: 640, height: 360, show: false });
   const handle = window.getNativeWindowHandle();
   const view = new WebContentsView(viewOptions), contents = view.webContents;
-  let unrelatedKeyEvents = 0;
-  contents.on('before-input-event', () => { unrelatedKeyEvents++; });
+  contents.on('before-input-event', (_event, input) => {
+    ++observation.unexpectedInputCount;
+    if (observation.unexpectedInput.length < 4) {
+      const type = ['keyDown', 'keyUp', 'rawKeyDown', 'char'].includes(input.type) ? input.type : 'other';
+      observation.unexpectedInput.push({ type, repeat: input.isAutoRepeat === true, milestone: observation.milestone });
+    }
+  });
   const ownership = boundary.native.ownership;
   const created = ownership.bind(handle, contents.id, () => window.contentView.addChildView(view));
   view.setBounds({ x: 0, y: 0, width: 640, height: 360 });
@@ -445,24 +456,34 @@ async function observeCachedRoutes(bridge) {
     const { url, osProcessId, processId, routingId, frameTreeNodeId } = contents.mainFrame;
     return { url, osProcessId, processId, routingId, frameTreeNodeId };
   };
-  const capture = () => waitForObservation(() => {
-    let client;
-    try { client = JSON.parse(bridge.capture(handle)); } catch (error) {
-      if (error.message !== 'fixture_requires_one_actual_widget') throw error;
-      return undefined;
-    }
-    if (!client.button || !client.field) bridge.releaseClients(client.token);
-    return client;
-  }, value => value?.button && value?.field, 'Real cached accessibility controls unavailable');
+  const capture = which => {
+    observation.milestone = `capture-${which}`;
+    const samples = observation.capture[which];
+    return waitForObservation(() => {
+      ++samples.polls;
+      let client;
+      try { client = JSON.parse(bridge.capture(handle)); } catch (error) {
+        if (error.message !== 'fixture_requires_one_actual_widget') throw error;
+        ++samples.widgetUnavailable;
+        return undefined;
+      }
+      if (!client.button || !client.field) {
+        ++samples.incompletePair;
+        bridge.releaseClients(client.token);
+      }
+      return client;
+    }, value => value?.button && value?.field, 'Real cached accessibility controls unavailable');
+  };
   const invoke = (token, route) => observeCall(() => JSON.parse(bridge.invoke(token, route)));
   const state = () => {
-    assert.equal(unrelatedKeyEvents, 0, 'An unrelated keyboard event reached the disposable fixture');
+    assert.equal(observation.unexpectedInputCount, 0, 'An unrelated keyboard event reached the disposable fixture');
     return contents.executeJavaScript(
       '({button:Number(button.textContent),text:field.value,selection:[field.selectionStart,field.selectionEnd],events:[...records]})');
   };
   const reset = () => contents.executeJavaScript("button.textContent='0';field.value='edit';field.focus();field.setSelectionRange(4,4);records.length=0");
   const settle = () => new Promise(accept => setTimeout(accept, 180));
   const matrix = async (phase, token, sequences) => {
+    observation.milestone = `matrix-${phase}`;
     const routes = [];
     for (const sequence of sequences) {
       await reset();
@@ -473,19 +494,22 @@ async function observeCachedRoutes(bridge) {
         routes.push({ route, before, responder, dispatched, after: await state() });
       }
     }
-    await event('cached-route-matrix', { phase, routes });
+    await event('cached-route-matrix', { phase, routes, observation: structuredClone(observation) });
     return routes;
   };
+  observation.milestone = 'initial-page-load';
   await contents.loadURL(`http://127.0.0.1:${port}/page`);
+  observation.milestone = 'initial-focus';
   window.show(); window.focus(); contents.focus();
   await settle();
-  const original = await capture();
+  const original = await capture('original');
   const originalState = JSON.parse(bridge.state(original.token));
   const originalFrame = frame();
   const focus = invoke(original.token, 'focus');
   const axRoutes = [['press'], ['axValue']];
   const allRoutes = [...axRoutes, ['text'], ['delete'], ['directDelete'], ['selectAll'], ['mark', 'unmark']];
   const user = await matrix('user', original.token, allRoutes);
+  observation.milestone = 'press-contexts';
   await reset();
   const beforeContexts = await state();
   const contexts = ['unknown', 'off-main', 'reentrant'].map(context => JSON.parse(bridge.invokePressContext(original.token, context)));
@@ -497,6 +521,7 @@ async function observeCachedRoutes(bridge) {
   const resumedBinding = ownership.mark(bindingKey(restored), false);
   const resumed = await matrix('resumed-user', original.token, allRoutes);
 
+  observation.milestone = 'composition';
   await reset();
   const prime = invoke(original.token, 'mark');
   await settle();
@@ -515,9 +540,13 @@ async function observeCachedRoutes(bridge) {
   const liveUnmark = { prime, primed, beforeUnmark, deniedUnmark, afterUnmark, allowedUnmark, cleared };
   const resigned = invoke(original.token, 'resignFocus');
   const navigationBlocked = ownership.mark(bindingKey(compositionUser), true);
-  await event('cached-route-navigating', { originalFrame, navigationBlocked });
+  observation.milestone = 'replacement-navigation';
+  await event('cached-route-navigating', { originalFrame, navigationBlocked, observation: structuredClone(observation) });
   await contents.loadURL(`http://localhost:${port}/page`);
-  const replacementFrame = frame(), replacement = await capture();
+  const replacementFrame = frame();
+  observation.replacementFrame = { osProcessId: replacementFrame.osProcessId, processId: replacementFrame.processId,
+    routingId: replacementFrame.routingId, frameTreeNodeId: replacementFrame.frameTreeNodeId };
+  const replacement = await capture('replacement');
   const replacementBlocked = ownership.bindingInfo(bindingKey(navigationBlocked));
   const oldStateAfterNavigation = JSON.parse(bridge.state(original.token));
   const replacementState = JSON.parse(bridge.state(replacement.token));
@@ -1053,7 +1082,8 @@ try {
       const stage = { [bindingMode]: 'binding-unavailable', [cachedRoutesMode]: 'cached-route-unavailable',
         [concurrentResponderMode]: 'concurrent-responder-unavailable', [retirementMode]: 'retirement-unavailable',
         [failureCustodyMode]: 'failure-custody-unavailable', [monitorCustodyMode]: 'monitor-loss-unavailable', [helperExitMode]: 'helper-exit-unavailable', [customAXMode]: 'custom-ax-unavailable' }[config.mode];
-      await event(stage, { error: String(error.stack ?? error) });
+      await event(stage, { error: String(error.stack ?? error),
+        ...(stage === 'cached-route-unavailable' && cachedRouteObservation ? { observation: structuredClone(cachedRouteObservation) } : {}) });
       watchdog.terminate();
     });
   } else if (config.mode === 'callbacks') {
