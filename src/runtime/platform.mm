@@ -1163,12 +1163,15 @@ static bool signedDirty(Custody* c,const std::string& dirtyRaw,const std::string
   std::string policyHash,compatibilityHash;
   NSDictionary* policy=sealedObject(c,SignedObjectPurpose::policy,c->policyDigest,deadline,policyHash);
   NSDictionary* compatibility=sealedObject(c,SignedObjectPurpose::compatibility,c->compatibilityDigest,deadline,compatibilityHash);
+  arbol_attempt::PackagedLayout layout;
+  if(!arbol_attempt::claimedLayout(attempt,layout)) return false;
+  NSString* stateRoot=arbol_attempt::policyStateRoot(policy,layout);
+  NSString* readerPrefix=layout.installed?@"host-production:1:":@"host-isolated:1:";
   if(policyHash!=c->policyDigest||compatibilityHash!=c->compatibilityDigest||!policy||!compatibility||!nativeMarker(dirty)||![dirty[@"cleanExit"] isEqual:@NO]||
-     ![policy[@"purpose"] isEqual:@"isolated-qualification"]||![policy[@"build"] isEqual:attempt[@"build"]]||
-     ![policy[@"buildRoot"] isEqual:attempt[@"buildRoot"]]||![policy[@"sourceDigest"] isEqual:attempt[@"sourceDigest"]]||
+     !stateRoot||![policy[@"sourceDigest"] isEqual:attempt[@"sourceDigest"]]||
      ![policy[@"productDigest"] isEqual:attempt[@"productDigest"]]||
-     ![policy[@"stateRoot"] isEqual:[attempt[@"profile"] stringByDeletingLastPathComponent].stringByDeletingLastPathComponent]||
-     ![policy[@"readerKey"] isEqual:[@"host-isolated:1:" stringByAppendingString:attempt[@"productDigest"]]]||
+     ![stateRoot isEqual:[attempt[@"profile"] stringByDeletingLastPathComponent].stringByDeletingLastPathComponent]||
+     ![policy[@"readerKey"] isEqual:[readerPrefix stringByAppendingString:attempt[@"productDigest"]]]||
      ![compatibility[@"writerKey"] isEqual:policy[@"readerKey"]]||
      ![compatibility[@"compatibleReaderKeys"] isEqual:policy[@"readableReaderKeys"]]||
      ![compatibility[@"readableDataEpochs"] isEqual:policy[@"readableDataEpochs"]]||

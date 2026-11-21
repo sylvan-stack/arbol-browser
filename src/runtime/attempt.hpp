@@ -92,6 +92,14 @@ struct PackagedLayout {
   std::string build, buildRoot, guard, bundle, payload, launcher, bootstrap, engine;
   bool installed = false;
 };
+inline NSString* physicalAccountHome() {
+  struct passwd account{}, *record = nullptr;
+  char buffer[16384];
+  if (getuid() != geteuid() || getpwuid_r(getuid(), &account, buffer, sizeof(buffer), &record) ||
+      record != &account || account.pw_uid != geteuid() || !account.pw_dir ||
+      !arbol_boundary::canonical(account.pw_dir)) return nil;
+  return [NSString stringWithUTF8String:account.pw_dir];
+}
 inline bool packagedLayout(const std::string& bundle, PackagedLayout& out) {
   NSString* app = [NSString stringWithUTF8String:bundle.c_str()];
   if (!path(app) || ![app.lastPathComponent isEqual:@"ArbolBrowser.app"]) return false;
@@ -102,11 +110,7 @@ inline bool packagedLayout(const std::string& bundle, PackagedLayout& out) {
   NSString* uses = [component stringByAppendingPathComponent:@".uses"];
   const bool installed = [component hasSuffix:[@"/" stringByAppendingString:@ARBOL_INSTALLATION_STABLE_BUILDS]];
   if (installed) {
-    struct passwd account, *record = nullptr;
-    char accountBuffer[16384];
-    if (getuid() != geteuid() || getpwuid_r(getuid(), &account, accountBuffer, sizeof(accountBuffer), &record) ||
-        record != &account || !account.pw_dir || !arbol_boundary::canonical(account.pw_dir)) return false;
-    NSString* home = [NSString stringWithUTF8String:account.pw_dir];
+    NSString* home = physicalAccountHome();
     if (![component isEqual:[home stringByAppendingPathComponent:@ARBOL_INSTALLATION_STABLE_BUILDS]] ||
         ![parent.lastPathComponent isEqual:@"app"]) return false;
     uses = [home stringByAppendingPathComponent:@ARBOL_INSTALLATION_STABLE_USES];
@@ -119,6 +123,26 @@ inline bool packagedLayout(const std::string& bundle, PackagedLayout& out) {
   out.bootstrap = bundle + "/Contents/MacOS/arbol-browser-native";
   out.engine = out.payload + "/runtime/Electron.app/Contents/MacOS/Electron";
   return true;
+}
+// A signed release binds portable path components. Only this account's
+// canonical installed layout supplies the corresponding physical roots.
+inline NSString* policyStateRoot(NSDictionary* policy, const PackagedLayout& layout) {
+  NSString* build = [NSString stringWithUTF8String:layout.build.c_str()];
+  if (![policy[@"build"] isEqual:build]) return nil;
+  if (!layout.installed) {
+    if (![policy[@"purpose"] isEqual:@"isolated-qualification"] ||
+        ![policy[@"buildRoot"] isEqual:[NSString stringWithUTF8String:layout.buildRoot.c_str()]] ||
+        !path(policy[@"stateRoot"])) return nil;
+    return policy[@"stateRoot"];
+  }
+  NSString* home = physicalAccountHome();
+  NSString* buildPath = [@ARBOL_INSTALLATION_STABLE_BUILDS stringByAppendingPathComponent:build];
+  NSString* state = [@ARBOL_INSTALLATION_ROOT stringByAppendingPathComponent:@ARBOL_INSTALLATION_BROWSER];
+  if (!home || ![policy[@"purpose"] isEqual:@"production"] ||
+      ![policy[@"buildRoot"] isEqual:buildPath] || ![policy[@"stateRoot"] isEqual:state] ||
+      ![[home stringByAppendingPathComponent:buildPath] isEqual:[NSString stringWithUTF8String:layout.buildRoot.c_str()]])
+    return nil;
+  return [home stringByAppendingPathComponent:state];
 }
 inline bool claimedLayout(NSDictionary* attempt, PackagedLayout& out) {
   NSDictionary* starter = attempt[@"starter"];

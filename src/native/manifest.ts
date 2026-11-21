@@ -19,7 +19,7 @@ const { constants, lstatSync, openSync, fstatSync, readSync, closeSync, opendirS
 
 export const publisher = Object.freeze({ team: '7V372XL59S', bundleIdentifier: 'com.sylvan-stack.arbol-browser.native-candidate',
   requirement: 'anchor apple generic and certificate leaf[subject.OU] = "7V372XL59S" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists' });
-const productionPublisher = Object.freeze({ ...publisher, bundleIdentifier: 'com.sylvan-stack.arbol-browser' });
+export const productionPublisher = Object.freeze({ ...publisher, bundleIdentifier: 'com.sylvan-stack.arbol-browser' });
 type PublisherScope = 'isolated' | 'production';
 export const pinnedRuntime = Object.freeze({ electron: '45.3.2', chromium: '156.0.8078.100', node: '24.22.2', napi: '10', modules: '150', platform: 'darwin', arch: 'arm64', macOS: '27.0.1' });
 export const nativeLimit = 1048576;
@@ -736,6 +736,12 @@ export function assertRetainedReadOnlyStorage(signed: SignedBundle, deadline: nu
     if (signed === trustedCandidate) poisonedTrust = true;
     throw error;
   }
+}
+
+export function assertInstalledImage(signed: SignedBundle, image: string, deadline: number): void {
+  const snapshot = signedSnapshots.get(signed);
+  if (snapshot?.storage?.descriptions[1].path !== image || !assertRetainedReadOnlyStorage(signed, deadline))
+    refuseVerification('storage-context');
 }
 
 let attemptedTrust = false, poisonedTrust = false;

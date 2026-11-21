@@ -184,11 +184,14 @@ async function assertIsolation(layout: PackagedLayout, state: string, deadline: 
   }
   for (const path of [dirname(layout.buildRoot), layout.buildRoot, state]) { assertBudget(deadline); await directory(path); }
 }
-function readPolicy(input: unknown): Readonly<HostPolicy> {
+export function installedImagePath(layout: PackagedLayout): string | undefined {
+  if (layout.scope === 'installed') return join(dirname(dirname(layout.guard)), 'images', `${layout.build}.dmg`);
+}
+function readPolicy(input: unknown, layout: PackagedLayout): Readonly<HostPolicy> {
   const value = input as HostPolicy;
   if (!value || Object.keys(value).sort().join(',') !== hostPolicyKeys || value.format !== 1 ||
       !['blocked', 'isolated-qualification', 'production'].includes(value.purpose) ||
-      !validator('browser.Build')(value.build) || !canonicalPath(value.buildRoot) || !canonicalPath(value.stateRoot) ||
+      value.build !== layout.build ||
       ![value.sourceDigest, value.productDigest, value.metadataDigest, value.compatibilityDigest,
         value.reviewDigest, value.qualificationDigest].every(digest) ||
       typeof value.readerKey !== 'string' || !value.readerKey || value.readerKey.length > 256 ||
@@ -199,7 +202,20 @@ function readPolicy(input: unknown): Readonly<HostPolicy> {
       new Set(value.readableReaderKeys).size !== value.readableReaderKeys.length ||
       new Set(value.readableDataEpochs).size !== value.readableDataEpochs.length ||
       !value.readableReaderKeys.includes(value.readerKey)) throw unavailable('browser');
-  return Object.freeze({ ...value, readableReaderKeys: Object.freeze([...value.readableReaderKeys]),
+  let { buildRoot, stateRoot } = value;
+  if (layout.scope === 'installed') {
+    const account = userInfo();
+    const expectedBuild = join(...installation.stableBuilds, layout.build);
+    const expectedState = join(installation.root, installation.browser);
+    if (value.purpose !== 'production' || account.uid !== process.geteuid?.() ||
+        buildRoot !== expectedBuild || stateRoot !== expectedState ||
+        join(account.homedir, expectedBuild) !== layout.buildRoot) throw unavailable('browser');
+    buildRoot = layout.buildRoot;
+    stateRoot = join(account.homedir, expectedState);
+  } else if (value.purpose === 'production' || !canonicalPath(buildRoot) || !canonicalPath(stateRoot)) {
+    throw unavailable('browser');
+  }
+  return Object.freeze({ ...value, buildRoot, stateRoot, readableReaderKeys: Object.freeze([...value.readableReaderKeys]),
     readableDataEpochs: Object.freeze([...value.readableDataEpochs]) });
 }
 /** Source-owned metadata only. Callers retain independent full signed proof
@@ -279,7 +295,7 @@ async function verifySelectedHost(selection: BuildSelection, payload: string, de
   noteHostVerification(observation, 'signed-bundle');
   assertBudget(deadline);
   const layout = selectedLayout(selection, payload);
-  if (layout.scope !== 'isolated') throw unavailable('browser');
+  const image = installedImagePath(layout);
   const manifestURL = new URL('../native/manifest.js', import.meta.url).href;
   const manifests = await import(manifestURL) as typeof import('../native/manifest.js');
   let signed: SignedBundle;
@@ -288,7 +304,8 @@ async function verifySelectedHost(selection: BuildSelection, payload: string, de
       // The canonical bootstrap alone owns this Native candidate brand. Reuse
       // that exact original frozen object, with no second signer or snapshot.
       signed = manifests.reuseNativeCandidateForHost(layout.bundle, bootstrapSigned, deadline);
-    } else signed = manifests.verifySignedBundle(layout.bundle, deadline);
+    } else signed = manifests.verifySignedBundle(layout.bundle, deadline, image ? 'production' : 'isolated');
+    if (image) manifests.assertInstalledImage(signed, image, deadline);
   } catch (error) {
     try {
       const phase = manifests.readSignedVerificationPhase(error);
@@ -300,25 +317,30 @@ async function verifySelectedHost(selection: BuildSelection, payload: string, de
   assertBudget(deadline);
   noteHostVerification(observation, 'signed-policy-metadata-compatibility');
   const policyFile = join(layout.bundle, 'Contents/Resources/host-policy.json');
-  const rawPolicy = await physicalJson(policyFile, 1048576, deadline), policy = readPolicy(rawPolicy.value);
+  const rawPolicy = await physicalJson(policyFile, 1048576, deadline), policy = readPolicy(rawPolicy.value, layout);
   const identity = await readPackagedIdentity(selection, payload, policy.stateRoot, deadline);
   const compatibility = await physicalJson(join(layout.bundle, 'Contents/Resources/native-compatibility.json'), 1048576, deadline);
   const manifest = signed.manifest;
-  // ABR-29 supplies no independent production release authority. A candidate's
-  // own signed qualification strings cannot authorize the owner's data.
-  if (policy.purpose !== 'isolated-qualification' || policy.build !== selection.build || policy.buildRoot !== layout.buildRoot ||
+  const publisher = (image ? manifests.productionPublisher : manifests.publisher).bundleIdentifier;
+  if (manifest.bundleIdentifier !== publisher || policy.purpose !== (image ? 'production' : 'isolated-qualification') ||
+      policy.build !== selection.build || policy.buildRoot !== layout.buildRoot ||
       policy.sourceDigest !== identity.sourceDigest || policy.productDigest !== identity.productDigest ||
       policy.metadataDigest !== identity.metadataDigest || policy.compatibilityDigest !== compatibility.digest ||
       manifest.writerKey !== policy.readerKey ||
       manifests.stable(manifest.compatibleReaderKeys) !== manifests.stable(policy.readableReaderKeys) ||
       manifests.stable(manifest.readableDataEpochs) !== manifests.stable(policy.readableDataEpochs)) throw unavailable('browser');
   if (below(policy.stateRoot, layout.buildRoot) || below(layout.buildRoot, policy.stateRoot)) throw unavailable('browser');
-  if (manifest.qualification !== `host-isolated:1:${policy.productDigest}` ||
-        policy.readerKey !== `host-isolated:1:${policy.productDigest}`) throw unavailable('browser');
-    // Explicit disposable roots are prepared by the separately authorized
-    // qualifier; no environment or request may relocate them or create a bypass.
+  const reader = `host-${image ? 'production' : 'isolated'}:1:${policy.productDigest}`;
+  if (manifest.qualification !== reader || policy.readerKey !== reader) throw unavailable('browser');
+  async function assertRoots(limit: number): Promise<void> {
+    if (!image) return assertIsolation(layout, policy.stateRoot, limit);
+    assertBudget(limit);
+    await directory(layout.buildRoot, false);
+    await directory(policy.stateRoot);
+    manifests.assertInstalledImage(signed, image, limit);
+  }
   noteHostVerification(observation, 'isolated-roots');
-  await assertIsolation(layout, policy.stateRoot, deadline);
+  await assertRoots(deadline);
   noteHostVerification(observation, 'build-guard');
   const usesIdentity = await directory(dirname(selection.guard)); assertBudget(deadline);
   const guard = await lstat(selection.guard, { bigint: true });
@@ -364,7 +386,7 @@ async function verifySelectedHost(selection: BuildSelection, payload: string, de
       if (observeReady) noteHostStartup(custody, 'ready-trust-metadata-after');
       assertBudget(limit);
       if (observeReady) noteHostStartup(custody, 'ready-trust-isolation-before');
-      await assertIsolation(layout, policy.stateRoot, limit);
+      await assertRoots(limit);
       if (observeReady) noteHostStartup(custody, 'ready-trust-isolation-after');
       if (observeReady) noteHostStartup(custody, 'ready-trust-guard-before');
       await assertGuard(limit);
@@ -426,7 +448,7 @@ export async function readPackagedComponentInfo(payload: string, deadline = perf
     assertBudget(deadline); if (await realpath(path) !== path) throw unavailable('browser');
   }
   const policyFile = join(layout.bundle, 'Contents/Resources/host-policy.json');
-  const rawPolicy = await physicalJson(policyFile, 16383, deadline), policy = readPolicy(rawPolicy.value);
+  const rawPolicy = await physicalJson(policyFile, 16383, deadline), policy = readPolicy(rawPolicy.value, layout);
   const identity = decodePackagedIdentity(layout, metadata, policy.stateRoot);
   if (policy.build !== layout.build || policy.buildRoot !== layout.buildRoot || policy.metadataDigest !== metadata.digest ||
       policy.sourceDigest !== identity.sourceDigest || policy.productDigest !== identity.productDigest) throw unavailable('browser');

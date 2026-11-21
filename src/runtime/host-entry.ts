@@ -11,7 +11,7 @@ import { consumeSelection, type BuildSelection } from './selection.js';
 import { validator } from '../contracts/schema.js';
 import { unavailable } from '../contracts/errors.js';
 import { adoptHostBuildLease, assertAdoptedBuildContinuity, captureHostBuild, terminateCapturedHostBuild, type CapturedHostBuild, type BuildLease } from './build-lease.js';
-import { assertVerifiedHostMetadata, assertHostEngineAuthority, type VerifiedHost } from './authorities.js';
+import { assertVerifiedHostMetadata, assertHostEngineAuthority, installedImagePath, type VerifiedHost } from './authorities.js';
 import { claimedHostAttempt } from './process.js';
 import { noteHostStartup, prepareHostCustody, abortUnadmittedHost, type HostCustody } from './custody.js';
 import type { NativeBoundaryPreparation } from './bootstrap.js';
@@ -253,7 +253,7 @@ export async function runHostEntry(): Promise<void> {
     const bootstrap = await import(bootstrapURL) as typeof import('./bootstrap.js');
     // This finite read-only budget is not new engine admission: Native owns
     // the immutable original expiry and its expired/cancelled terminal branch.
-    const native = await bootstrap.prepareNativeBoundary(bundle, localBudget);
+    const native = await bootstrap.prepareNativeBoundary(bundle, localBudget, installedImagePath(layout));
     capture = captureHostBuild(native.platform, selection, bundle, args[1]);
     const authoritiesURL = new URL('./authorities.js', import.meta.url).href;
     const authorities = await import(authoritiesURL) as typeof import('./authorities.js');

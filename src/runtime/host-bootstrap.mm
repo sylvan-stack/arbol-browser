@@ -61,10 +61,13 @@ static bool isolated(NSString* buildRoot,NSString* state) {
   }
   return inTime();
 }
-static bool signature(NSString* path, bool outer, bool jit) {
+static bool signature(NSString* path, bool outer, bool jit, bool installed = false) {
   if(!inTime()) return false;
   SecStaticCodeRef code = nullptr; SecRequirementRef requirement = nullptr; CFDictionaryRef information = nullptr;
-  NSString* text = outer ? [publisher stringByAppendingFormat:@" and identifier \"%@\"", bundleID] : publisher;
+  NSString* anchor = installed ? @ARBOL_PRODUCTION_PUBLISHER_REQUIREMENT : publisher;
+  NSString* identifier = installed ? @ARBOL_PRODUCTION_BUNDLE_ID : bundleID;
+  NSString* expectedTeam = installed ? @ARBOL_PRODUCTION_PUBLISHER_TEAM : team;
+  NSString* text = outer ? [anchor stringByAppendingFormat:@" and identifier \"%@\"", identifier] : anchor;
   if (SecStaticCodeCreateWithPath((__bridge CFURLRef)[NSURL fileURLWithPath:path], kSecCSDefaultFlags, &code) != errSecSuccess) return false;
   OSStatus result = SecRequirementCreateWithString((__bridge CFStringRef)text, kSecCSDefaultFlags, &requirement);
   if (result == errSecSuccess) result = SecStaticCodeCheckValidity(code, kSecCSStrictValidate | kSecCSCheckAllArchitectures | kSecCSCheckNestedCode, requirement);
@@ -74,7 +77,7 @@ static bool signature(NSString* path, bool outer, bool jit) {
     NSDictionary* info = (__bridge NSDictionary*)information;
     NSDictionary* entitlements = info[(__bridge NSString*)kSecCodeInfoEntitlementsDict];
     valid = ([info[(__bridge NSString*)kSecCodeInfoFlags] unsignedIntValue] & kSecCodeSignatureRuntime) &&
-      [info[(__bridge NSString*)kSecCodeInfoTeamIdentifier] isEqual:team] &&
+      [info[(__bridge NSString*)kSecCodeInfoTeamIdentifier] isEqual:expectedTeam] &&
       [info[(__bridge NSString*)kSecCodeInfoTimestamp] isKindOfClass:[NSDate class]];
     for (NSString* key in entitlements) if (![key isEqualToString:@"com.apple.security.cs.allow-jit"] || !jit || ![entitlements[key] isEqual:@YES]) valid = false;
   }
@@ -153,7 +156,7 @@ static bool payload(NSString* bundle, NSDictionary* manifest) {
     if (!link) {
       if (magic == MH_MAGIC_64 || magic == MH_CIGAM_64 || magic == FAT_MAGIC || magic == FAT_CIGAM) {
         bool jit = [relative hasPrefix:@"runtime/Electron.app/"] && [relative containsString:@"/Contents/MacOS/"];
-        if (!signature(path, false, jit)) return false;
+        if (!signature(path, false, jit, layout.installed)) return false;
       }
     }
   }
@@ -169,7 +172,7 @@ int main(int argc, const char* argv[]) {
       if (os.majorVersion != 27 || os.minorVersion != 0 || os.patchVersion != 1 || sizeof(void*) != 8) return 4;
       NSString* bundle = NSBundle.mainBundle.bundlePath;
       arbol_attempt::PackagedLayout layout;
-      if (!arbol_attempt::packagedLayout(bundle.fileSystemRepresentation,layout) || layout.installed) return 4;
+      if (!arbol_attempt::packagedLayout(bundle.fileSystemRepresentation,layout)) return 4;
       arbol_boundary::Lock build;
       if (!arbol_attempt::openBuild(bundle.fileSystemRepresentation,build)) return 4;
       // Read only authenticated private control metadata here, release the
@@ -184,30 +187,39 @@ int main(int argc, const char* argv[]) {
       arbol_boundary::Identity original; std::string originalPath;
       if(arbol_boundary::observe(getpid(),original)!=1 || original.group!=(uint32_t)getpid() || getsid(0)<=0 ||
           !arbol_boundary::executable(original,originalPath) || originalPath!=layout.bootstrap) return 4;
-      if (!signature(bundle, true, false)) return 4;
+      if (!signature(bundle, true, false, layout.installed)) return 4;
+      NSString* expectedTeam = layout.installed ? @ARBOL_PRODUCTION_PUBLISHER_TEAM : team;
+      NSString* expectedBundle = layout.installed ? @ARBOL_PRODUCTION_BUNDLE_ID : bundleID;
+      NSString* expectedPublisher = layout.installed ? @ARBOL_PRODUCTION_PUBLISHER_REQUIREMENT : publisher;
       NSDictionary* policy = json([bundle stringByAppendingPathComponent:@"Contents/Resources/publisher-requirement.json"]);
-      if (![policy isEqual:@{@"team": team, @"bundleIdentifier": bundleID, @"requirement": publisher}]) return 4;
+      if (![policy isEqual:@{@"team": expectedTeam, @"bundleIdentifier": expectedBundle, @"requirement": expectedPublisher}]) return 4;
       NSDictionary* manifest = json([bundle stringByAppendingPathComponent:@"Contents/Resources/native-compatibility.json"]);
       NSDictionary* runtime = @{@"electron": @"45.3.2", @"chromium": @"156.0.8078.100", @"node": @"24.22.2", @"napi": @"10", @"modules": @"150", @"platform": @"darwin", @"arch": @"arm64", @"macOS": @"27.0.1"};
       NSDictionary* features = @{@"sitePerProcess": @YES, @"disabledFeatures": @[@"MacAccessibilityTextOperation"], @"extraChromiumArguments": @[]};
-      if (![manifest[@"runtime"] isEqual:runtime] || ![manifest[@"featureConfiguration"] isEqual:features] || ![manifest[@"publisherTeam"] isEqual:team] || ![manifest[@"bundleIdentifier"] isEqual:bundleID] || !payload(bundle, manifest) || !signature(bundle, true, false)) return 4;
+      if (![manifest[@"runtime"] isEqual:runtime] || ![manifest[@"featureConfiguration"] isEqual:features] || ![manifest[@"publisherTeam"] isEqual:expectedTeam] || ![manifest[@"bundleIdentifier"] isEqual:expectedBundle] || !payload(bundle, manifest) || !signature(bundle, true, false, layout.installed)) return 4;
       NSString* root = [NSString stringWithUTF8String:layout.payload.c_str()];
       NSDictionary* hostPolicy=json([bundle stringByAppendingPathComponent:@"Contents/Resources/host-policy.json"]);
       NSDictionary* metadata=json([root stringByAppendingPathComponent:@"metadata.json"]);
-      if (![hostPolicy[@"purpose"] isEqual:@"isolated-qualification"] || ![hostPolicy[@"buildRoot"] isEqual:[NSString stringWithUTF8String:layout.buildRoot.c_str()]] ||
-          ![hostPolicy[@"build"] isEqual:[NSString stringWithUTF8String:layout.build.c_str()]] ||
+      NSString* stateRoot = arbol_attempt::policyStateRoot(hostPolicy, layout);
+      NSString* buildRoot = [NSString stringWithUTF8String:layout.buildRoot.c_str()];
+      if (!stateRoot ||
           ![metadata[@"component"][@"build"] isEqual:hostPolicy[@"build"]] ||
-          ![metadata[@"sourceDigest"] isEqual:hostPolicy[@"sourceDigest"]] || ![metadata[@"host"][@"productDigest"] isEqual:hostPolicy[@"productDigest"]] ||
-          !isolated(hostPolicy[@"buildRoot"],hostPolicy[@"stateRoot"])) return 4;
+          ![metadata[@"sourceDigest"] isEqual:hostPolicy[@"sourceDigest"]] || ![metadata[@"host"][@"productDigest"] isEqual:hostPolicy[@"productDigest"]]) return 4;
+      if (layout.installed) {
+        struct statfs volume{};
+        if (!safeDirectory(buildRoot, false) || !safeDirectory(stateRoot, true) ||
+            statfs(bundle.fileSystemRepresentation, &volume) || !(volume.f_flags & MNT_RDONLY) ||
+            strcmp(volume.f_fstypename, "apfs") || layout.buildRoot + "/app" != volume.f_mntonname) return 4;
+      } else if (!isolated(buildRoot, stateRoot)) return 4;
       // No owner lock, marker, session or engine resource is touched by a stale,
       // cancelled or already claimed LaunchServices delivery.
       arbol_attempt::Claim claim; std::string prior; NSDictionary* attempt=nil;
       if (!claim.acquire(argv[2],std::min(expiry,arbol_boundary::clockMs()+2000)) || !claim.read(prior,attempt) || prior!=initialRaw ||
           !arbol_attempt::launchRequest(claim,argv[2],attempt) ||
-          ![attempt[@"buildRoot"] isEqual:hostPolicy[@"buildRoot"]] || ![attempt[@"build"] isEqual:hostPolicy[@"build"]] ||
+          ![attempt[@"buildRoot"] isEqual:buildRoot] || ![attempt[@"build"] isEqual:hostPolicy[@"build"]] ||
           ![attempt[@"buildGuard"] isEqual:[NSString stringWithUTF8String:build.path.c_str()]] ||
           !arbol_attempt::pattern([attempt[@"profile"] lastPathComponent],@"^[a-z](?:[a-z0-9-]{0,62}[a-z0-9])?$") ||
-          ![attempt[@"profile"] isEqual:[[hostPolicy[@"stateRoot"] stringByAppendingPathComponent:@"profiles"] stringByAppendingPathComponent:[attempt[@"profile"] lastPathComponent]]] ||
+          ![attempt[@"profile"] isEqual:[[stateRoot stringByAppendingPathComponent:@"profiles"] stringByAppendingPathComponent:[attempt[@"profile"] lastPathComponent]]] ||
           ![attempt[@"starter"][@"executable"] isEqual:[NSString stringWithUTF8String:layout.engine.c_str()]] ||
           ![attempt[@"sourceDigest"] isEqual:hostPolicy[@"sourceDigest"]] || ![attempt[@"productDigest"] isEqual:hostPolicy[@"productDigest"]]) return 4;
       NSMutableDictionary* claimed=[attempt mutableCopy]; claimed[@"phase"]=@"claimed"; claimed[@"bootstrap"]=arbol_attempt::processRecord(getpid());
