@@ -15,8 +15,9 @@ export const platformCompilerPolicy = Object.freeze({ compiler: nativeCompilerPo
   frozenConsumer: frozenDigest, outputs: ['platform.node', 'host-launch', 'host-bootstrap'], qualification: 'unexecuted' });
 const names = ['src/runtime/platform.mm', 'src/runtime/host-launch.mm', 'src/runtime/host-bootstrap.mm'];
 const installationSource = 'src/runtime/installation-paths.json';
+const productionPublisherSource = 'native/production-publisher-requirement.json';
 const closure = [...names, 'src/runtime/platform.ts', 'src/runtime/system-clipboard.hpp', 'src/runtime/attempt.hpp', 'watchdog/boundary.hpp', 'watchdog/exit.hpp',
-  installationSource, 'native/publisher-requirement.json', 'scripts/compile-platform.mjs'];
+  installationSource, 'native/publisher-requirement.json', productionPublisherSource, 'scripts/compile-platform.mjs'];
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 async function installationInput() {
   const bytes = await readFile(join(root, installationSource));
@@ -28,6 +29,21 @@ async function installationInput() {
     return `-DARBOL_INSTALLATION_${name.toUpperCase()}=${JSON.stringify(parts.join('/'))}`;
   });
   return { sha256: hash(bytes), flags };
+}
+async function productionPublisherInput() {
+  const file = await readFile(join(root, productionPublisherSource));
+  const policy = JSON.parse(file);
+  const isolated = JSON.parse(await readFile(join(root, 'native/publisher-requirement.json')));
+  if (Object.keys(policy).sort().join(',') !== 'bundleIdentifier,requirement,team' ||
+      policy.team !== isolated.team || policy.requirement !== isolated.requirement ||
+      policy.bundleIdentifier !== 'com.sylvan-stack.arbol-browser' || policy.bundleIdentifier === isolated.bundleIdentifier)
+    throw new Error('Invalid production publisher policy');
+  const flags = [
+    `-DARBOL_PRODUCTION_PUBLISHER_TEAM=${JSON.stringify(policy.team)}`,
+    `-DARBOL_PRODUCTION_BUNDLE_ID=${JSON.stringify(policy.bundleIdentifier)}`,
+    `-DARBOL_PRODUCTION_PUBLISHER_REQUIREMENT=${JSON.stringify(policy.requirement)}`,
+  ];
+  return { sha256: hash(file), flags };
 }
 export function staticCommand(program, args, maximum = 8388608) {
   const result = spawnSync(program, args, { cwd: root, env: { PATH: '/usr/bin:/bin' }, encoding: 'utf8',
@@ -67,9 +83,10 @@ export async function captureCompilerInputs(sourceNames, headers = officialHeade
       staticCommand('/usr/bin/xcrun', ['clang++', '--version']).split('\n')[0] !== platformCompilerPolicy.compiler)
     throw new Error('Unsupported pinned compiler or SDK');
   const installationPaths = sourceNames.includes(names[2]) ? await installationInput() : undefined;
+  const productionPublisher = sourceNames.includes(names[2]) ? await productionPublisherInput() : undefined;
   const paths = new Map();
   for (const name of sourceNames) {
-    const flags = name === names[2] ? installationPaths.flags : [];
+    const flags = name === names[2] ? [...installationPaths.flags, ...productionPublisher.flags] : [];
     const output = staticCommand('/usr/bin/xcrun', ['clang++', '-std=c++17', '-fobjc-arc', '-fblocks', '-DNAPI_VERSION=8',
       '-arch', 'arm64', '-mmacosx-version-min=27.0', '-isysroot', sdk, '-I', headers, ...flags, '-M', '-MT', 'closure', name]);
     for (const item of dependencies(output)) {
@@ -92,6 +109,7 @@ export async function captureCompilerInputs(sourceNames, headers = officialHeade
     linkerInputs[path] = hash(await readFile(join(sdk, path)));
   return { policy: platformCompilerPolicy, providers: { sdkAlias, sdk, compilerAlias, compilerPath, linkerAlias, linkerPath },
     ...(installationPaths ? { installationPaths } : {}),
+    ...(productionPublisher ? { productionPublisher } : {}),
     compiler: hash(await readFile(compilerPath)), linker: hash(await readFile(linkerPath)), linkerInputs,
     frameworks: { 'platform.node': ['Foundation', 'Security', 'AppKit'], 'host-launch': ['AppKit'], 'host-bootstrap': ['Foundation', 'Security'] },
     sdkSettings: hash(settings), files };
@@ -121,7 +139,7 @@ export async function compilePlatform(headers = officialHeaders) {
     '-bundle', '-undefined', 'dynamic_lookup', '-I', headers, names[0], '-lbsm', '-framework', 'Foundation', '-framework', 'Security', '-framework', 'AppKit',
     '-o', join(root, 'dist/native/platform.node')]);
   for (const [source, name, frameworks] of [[names[1], 'host-launch', ['AppKit']], [names[2], 'host-bootstrap', ['Foundation', 'Security']]]) {
-    const flags = source === names[2] ? input.installationPaths.flags : [];
+    const flags = source === names[2] ? [...input.installationPaths.flags, ...input.productionPublisher.flags] : [];
     staticCommand('/usr/bin/xcrun', [...common, ...flags, source, ...frameworks.flatMap(value => ['-framework', value]), '-o', join(root, 'dist/native', name)]);
   }
   const outputs = {};

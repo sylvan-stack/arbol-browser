@@ -1,0 +1,5 @@
+{
+  "team": "7V372XL59S",
+  "bundleIdentifier": "com.sylvan-stack.arbol-browser",
+  "requirement": "anchor apple generic and certificate leaf[subject.OU] = \"7V372XL59S\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
+}

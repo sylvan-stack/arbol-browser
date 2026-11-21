@@ -3,10 +3,13 @@ import { constants } from 'node:fs';
 import { lstat, open, readdir, realpath } from 'node:fs/promises';
 import { join, relative, sep } from 'node:path';
 import { root } from './package-base.mjs';
-import { exactFile } from './package-host.mjs';
+import { canonical, exactFile } from './package-host.mjs';
+import isolatedPublisher from '../native/publisher-requirement.json' with { type: 'json' };
+import productionPublisher from '../native/production-publisher-requirement.json' with { type: 'json' };
 
 const jitEntitlement = 'com.apple.security.cs.allow-jit';
 const machOMagic = new Set(['cffaedfe', 'cefaedfe', 'feedfacf', 'cafebabe', 'bebafeca']);
+const allowedPublishers = new Set([canonical(isolatedPublisher), canonical(productionPublisher)]);
 
 function command(program, args, input) {
   const result = spawnSync(program, args, {
@@ -20,6 +23,7 @@ function command(program, args, input) {
 /** The caller must independently verify the unsigned bundle before signing.
  * Only the caller may regenerate the sealed metadata after nested signing. */
 export async function signBundle({ bundle, identity, publisher, sealResources }) {
+  if (!allowedPublishers.has(canonical(publisher))) throw new Error('Unrecognized Browser publisher policy');
   const bootstrap = join(bundle, 'Contents/MacOS/arbol-browser-native');
   const electron = join(bundle, 'Contents/Resources/browser/runtime/Electron.app');
   const frameworks = join(electron, 'Contents/Frameworks');

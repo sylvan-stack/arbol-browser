@@ -19,6 +19,8 @@ const { constants, lstatSync, openSync, fstatSync, readSync, closeSync, opendirS
 
 export const publisher = Object.freeze({ team: '7V372XL59S', bundleIdentifier: 'com.sylvan-stack.arbol-browser.native-candidate',
   requirement: 'anchor apple generic and certificate leaf[subject.OU] = "7V372XL59S" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists' });
+const productionPublisher = Object.freeze({ ...publisher, bundleIdentifier: 'com.sylvan-stack.arbol-browser' });
+type PublisherScope = 'isolated' | 'production';
 export const pinnedRuntime = Object.freeze({ electron: '45.3.2', chromium: '156.0.8078.100', node: '24.22.2', napi: '10', modules: '150', platform: 'darwin', arch: 'arm64', macOS: '27.0.1' });
 export const nativeLimit = 1048576;
 export type Compatibility = Contract<'native.BuildCompatibility'>;
@@ -134,10 +136,11 @@ function physicalFile(path: string, named: import('node:fs').Stats, deadline: nu
     return { digest: hash.digest('hex'), magic: header.subarray(0, Math.min(first.size, 4)).toString('hex') };
   } catch (error) { noteSnapshotFailure(observed, error); throw error; } finally { snapshotFilesystem(() => closeSync(fd), observed); }
 }
-function signature(path: string, outer = false, jit = false, deadline = Infinity): void {
+function signature(path: string, outer: boolean, jit: boolean, deadline: number,
+  expectedPublisher: typeof publisher | typeof productionPublisher): void {
   let phase: SignedVerificationPhase = outer ? 'outer-signature-verification' : 'nested-signature-verification';
   try {
-    const requirement = publisher.requirement + (outer ? ` and identifier "${publisher.bundleIdentifier}"` : '');
+    const requirement = expectedPublisher.requirement + (outer ? ` and identifier "${expectedPublisher.bundleIdentifier}"` : '');
     const result = spawnSync('/usr/bin/codesign', ['--verify', '--strict', '--deep', '-R', `=${requirement}`, path],
       { timeout: budget(deadline), maxBuffer: nativeLimit, env: { PATH: '/usr/bin:/bin' }, encoding: 'utf8' });
     budget(deadline);
@@ -145,7 +148,7 @@ function signature(path: string, outer = false, jit = false, deadline = Infinity
     phase = outer ? 'outer-signature-details' : 'nested-signature-details';
     const details = spawnSync('/usr/bin/codesign', ['-dvvv', path], { timeout: budget(deadline), maxBuffer: nativeLimit, encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
     budget(deadline);
-    if (details.error || details.status !== 0 || !details.stderr.includes(`TeamIdentifier=${publisher.team}`) ||
+    if (details.error || details.status !== 0 || !details.stderr.includes(`TeamIdentifier=${expectedPublisher.team}`) ||
         !details.stderr.includes('runtime)') || !details.stderr.includes('Timestamp=')) refuse();
     phase = outer ? 'outer-signature-entitlements' : 'nested-signature-entitlements';
     const ent = spawnSync('/usr/bin/codesign', ['-d', '--entitlements', ':-', path], { timeout: budget(deadline), maxBuffer: nativeLimit, encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
@@ -773,7 +776,7 @@ export function assertCandidateTrust(value: CandidateTrust): void {
   if (poisonedTrust || value !== trustedCandidate) refuse();
   value.assertIdentity();
 }
-export function verifySignedBundle(bundle: string, deadline = Infinity): SignedBundle {
+export function verifySignedBundle(bundle: string, deadline = Infinity, scope: PublisherScope = 'isolated'): SignedBundle {
   const observed: SnapshotFailure = {};
   let phase: SignedVerificationPhase = 'bundle-selection';
   let storage: StorageContext | undefined, retained = false;
@@ -781,15 +784,16 @@ export function verifySignedBundle(bundle: string, deadline = Infinity): SignedB
     budget(deadline);
     if (!bundle.endsWith('.app') || realpathSync(bundle) !== resolve(bundle)) refuse();
     const root = resolve(bundle);
+    const expectedPublisher = scope === 'production' ? productionPublisher : publisher;
     storage = discoverStorage(root, deadline);
     const check = (): Compatibility => {
-      signature(root, true, false, deadline);
+      signature(root, true, false, deadline, expectedPublisher);
       phase = 'publisher';
-      if (stable(boundedJson(join(root, 'Contents/Resources/publisher-requirement.json'), deadline)) !== stable(publisher)) refuse();
+      if (stable(boundedJson(join(root, 'Contents/Resources/publisher-requirement.json'), deadline)) !== stable(expectedPublisher)) refuse();
       phase = 'compatibility';
       const value = boundedJson(join(root, 'Contents/Resources/native-compatibility.json'), deadline);
       if (!validator('native.BuildCompatibility')(value)) return refuse();
-      if (value.publisherTeam !== publisher.team || value.bundleIdentifier !== publisher.bundleIdentifier ||
+      if (value.publisherTeam !== expectedPublisher.team || value.bundleIdentifier !== expectedPublisher.bundleIdentifier ||
           stable(value.runtime) !== stable(pinnedRuntime) || value.nativeABI.compiledNapi !== 8 ||
           stable(value.featureConfiguration) !== stable({ sitePerProcess: true, disabledFeatures: ['MacAccessibilityTextOperation'], extraChromiumArguments: [] })) refuse();
       phase = 'inventory';
@@ -807,7 +811,8 @@ export function verifySignedBundle(bundle: string, deadline = Infinity): SignedB
           else if (stat.isFile()) {
             const physical = physicalFile(path, stat, deadline, observed); inventory[key] = physical.digest;
             if (['cffaedfe', 'cefaedfe', 'feedfacf', 'cafebabe', 'bebafeca'].includes(physical.magic))
-              signature(path, false, key.startsWith('Contents/Resources/browser/runtime/Electron.app/') && key.includes('/Contents/MacOS/'), deadline);
+              signature(path, false, key.startsWith('Contents/Resources/browser/runtime/Electron.app/') && key.includes('/Contents/MacOS/'),
+                deadline, expectedPublisher);
           } else refuseSnapshot('snapshot-entry-identity', observed);
         }
       }
@@ -856,14 +861,17 @@ export function verifySignedBundle(bundle: string, deadline = Infinity): SignedB
   } catch (error) { noteSnapshotFailure(observed, error, phase); throw error; }
   finally { if (!retained && storage) for (const d of storage.descriptions) { try { closeSync(d.fd); } catch { /* Preserve construction refusal. */ } } }
 }
-export function verifyNativeCandidate(bundle: string, deadline = Infinity): CandidateTrust {
+export function verifyNativeCandidate(bundle: string, deadline = Infinity, scope: PublisherScope = 'isolated'): CandidateTrust {
   if (poisonedTrust) refuse();
   if (trustedCandidate) {
-    if (resolve(bundle) !== trustedCandidate.bundle) { poisonedTrust = true; return refuse(); }
+    const expectedPublisher = scope === 'production' ? productionPublisher : publisher;
+    if (resolve(bundle) !== trustedCandidate.bundle || trustedCandidate.manifest.bundleIdentifier !== expectedPublisher.bundleIdentifier) {
+      poisonedTrust = true; return refuse();
+    }
     trustedCandidate.assertIdentity(deadline); return trustedCandidate;
   }
   if (attemptedTrust) refuse(); attemptedTrust = true;
-  try { trustedCandidate = verifySignedBundle(bundle, deadline); return trustedCandidate; }
+  try { trustedCandidate = verifySignedBundle(bundle, deadline, scope); return trustedCandidate; }
   catch (error) { poisonedTrust = true; return refuseVerification('bundle-selection', error); }
 }
 
