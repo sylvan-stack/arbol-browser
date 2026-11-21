@@ -2,10 +2,11 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { lstat, mkdtemp, readdir, realpath, rmdir } from 'node:fs/promises';
 import { tmpdir, userInfo } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, dirname, join, sep } from 'node:path';
 import { inventory, inventoryDigest } from '../../scripts/package-base.mjs';
 import { canonical, exactFile, json, privateDirectory } from '../../scripts/package-host.mjs';
 import publisher from '../../native/production-publisher-requirement.json' with { type: 'json' };
+import installation from '../../src/runtime/installation-paths.json' with { type: 'json' };
 
 const imageLimit = 1024 ** 3;
 const appName = 'ArbolBrowser.app';
@@ -23,6 +24,77 @@ export function runReleaseTool(executable, args, input) {
 function plist(executable, args) {
   return JSON.parse(runReleaseTool('/usr/bin/plutil', ['-convert', 'json', '-o', '-', '--', '-'],
     runReleaseTool(executable, args).stdout).stdout);
+}
+
+async function directoryIdentity(path, uid) {
+  const stat = await lstat(path, { bigint: true });
+  assert.ok(stat.isDirectory() && stat.uid === BigInt(uid) && (stat.mode & 0o022n) === 0n, `Unsafe directory ${path}`);
+  assert.equal(await realpath(path), path, `Unresolved physical directory ${path}`);
+  return { dev: String(stat.dev), ino: String(stat.ino), uid, mode: Number(stat.mode & 0o7777n) };
+}
+
+/** Read the original first-install target without preparing, mounting or launching it. */
+export async function snapshotFirstInstall() {
+  assert.equal(process.platform, 'darwin');
+  const { homedir: home, uid } = userInfo();
+  assert.equal(uid, process.getuid());
+  const applications = join(home, installation.stableBuilds[0]);
+  const application = join(home, ...installation.stableBuilds.slice(0, 2));
+  const support = join(home, ...installation.stableUses.slice(0, -1));
+  const state = join(home, installation.root, installation.browser);
+  const alias = join(home, '.local/bin/arbol-browser');
+  const paths = { application, support, state, alias };
+  const read = async () => {
+    const parents = [];
+    for (const root of new Set([home, applications, dirname(support), dirname(state), dirname(alias)])) {
+      for (let path = root; path !== home; path = dirname(path)) {
+        assert.ok(path.startsWith(home + sep), 'First-install ancestry escaped the account');
+        if (parents.some(row => row.path === path)) continue;
+        parents.push({ path, ...(await directoryIdentity(path, uid)) });
+      }
+    }
+    for (const path of Object.values(paths)) await assert.rejects(lstat(path), { code: 'ENOENT' });
+    assert.ok(!runReleaseTool('/bin/ps', ['-axww', '-o', 'comm=']).stdout.split('\n')
+      .some(line => line.trim().startsWith(application + sep)), 'An installed Browser executable is live');
+    const images = plist('/usr/bin/hdiutil', ['info', '-plist']).images;
+    assert.ok(!images.some(image => image['image-path']?.startsWith(support + sep) ||
+      image['system-entities'].some(entity => entity['mount-point']?.startsWith(application + sep))),
+    'An installed Browser image is mounted');
+    return { home: await directoryIdentity(home, uid), parents, absent: paths };
+  };
+  const first = await read();
+  assert.deepEqual(await read(), first, 'First-install target changed during the read-only census');
+  return first;
+}
+
+/** A deliberate read of an owned token establishes enforcement for descendants of sandbox-exec. */
+export async function checkBuildsReadRestriction(control) {
+  const { homedir: home, uid } = userInfo();
+  const builds = join(home, 'Builds');
+  const before = await directoryIdentity(builds, uid);
+  assert.equal(await realpath(control), control);
+  assert.ok(control.startsWith(builds + sep), 'Read control must be physically inside Builds');
+  const fixture = await exactFile(control, 128);
+  assert.equal(fixture.identity.uid, uid);
+  assert.equal(fixture.identity.mode, 0o600);
+  assert.match(fixture.bytes.toString('utf8'), /^browser-release-control-[a-f0-9]{32}\n$/);
+  const sandbox = `(version 1) (allow default) (deny file-read* (subpath ${JSON.stringify(builds)}))`;
+  const allowed = '/System/Library/CoreServices/SystemVersion.plist';
+  const read = path => runReleaseTool('/bin/cat', [path]).stdout;
+  assert.equal(read(control), fixture.bytes.toString('utf8'));
+  const permitted = runReleaseTool('/usr/bin/sandbox-exec', ['-p', sandbox, '/bin/cat', allowed]);
+  assert.equal(permitted.stdout, read(allowed));
+  const denied = spawnSync('/usr/bin/sandbox-exec', ['-p', sandbox, '/bin/cat', control],
+    { encoding: 'utf8', timeout: 5000, maxBuffer: 4096, env: { PATH: '/usr/bin:/bin', LC_ALL: 'C' } });
+  assert.equal(denied.error, undefined);
+  assert.equal(denied.signal, null);
+  assert.equal(denied.status, 1);
+  assert.equal(denied.stdout, '');
+  assert.match(denied.stderr, /Operation not permitted|Permission denied/);
+  assert.deepEqual(await directoryIdentity(builds, uid), before, 'Builds permission or identity changed during control');
+  assert.equal((await exactFile(control, 128)).sha256, fixture.sha256, 'Control read changed its original bytes');
+  return { builds, buildsIdentity: before, control, controlSha256: fixture.sha256,
+    unrestricted: 'read', restricted: 'denied', outsideControl: 'read', scope: 'sandboxed direct process tree' };
 }
 
 function strictSignature(path, identifier, deep = false) {
