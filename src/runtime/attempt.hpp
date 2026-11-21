@@ -4,6 +4,7 @@
 #include "../../watchdog/boundary.hpp"
 #include <CommonCrypto/CommonDigest.h>
 #include <cmath>
+#include <pwd.h>
 namespace arbol_attempt {
 using arbol_boundary::Identity;
 constexpr size_t limit = 16384;
@@ -89,6 +90,7 @@ inline bool runtime(NSDictionary* p, NSDictionary* attempt) {
 // remain separate checks at every consumer.
 struct PackagedLayout {
   std::string build, buildRoot, guard, bundle, payload, launcher, bootstrap, engine;
+  bool installed = false;
 };
 inline bool packagedLayout(const std::string& bundle, PackagedLayout& out) {
   NSString* app = [NSString stringWithUTF8String:bundle.c_str()];
@@ -97,8 +99,21 @@ inline bool packagedLayout(const std::string& bundle, PackagedLayout& out) {
   NSString* root = [parent.lastPathComponent isEqual:@"app"] ? parent.stringByDeletingLastPathComponent : parent;
   NSString* component = root.stringByDeletingLastPathComponent;
   if (!pattern(root.lastPathComponent,@"^[1-9a-f][0-9a-f]{0,15}$") || ![component.lastPathComponent isEqual:@"arbol-browser"]) return false;
+  NSString* uses = [component stringByAppendingPathComponent:@".uses"];
+  const bool installed = [component hasSuffix:[@"/" stringByAppendingString:@ARBOL_INSTALLATION_STABLE_BUILDS]];
+  if (installed) {
+    struct passwd account, *record = nullptr;
+    char accountBuffer[16384];
+    if (getuid() != geteuid() || getpwuid_r(getuid(), &account, accountBuffer, sizeof(accountBuffer), &record) ||
+        record != &account || !account.pw_dir || !arbol_boundary::canonical(account.pw_dir)) return false;
+    NSString* home = [NSString stringWithUTF8String:account.pw_dir];
+    if (![component isEqual:[home stringByAppendingPathComponent:@ARBOL_INSTALLATION_STABLE_BUILDS]] ||
+        ![parent.lastPathComponent isEqual:@"app"]) return false;
+    uses = [home stringByAppendingPathComponent:@ARBOL_INSTALLATION_STABLE_USES];
+  }
   out.build = root.lastPathComponent.UTF8String; out.buildRoot = root.UTF8String; out.bundle = bundle;
-  out.guard = [[component stringByAppendingPathComponent:[@".uses/" stringByAppendingString:root.lastPathComponent]] UTF8String];
+  out.installed = installed;
+  out.guard = [uses stringByAppendingPathComponent:root.lastPathComponent].UTF8String;
   out.payload = bundle + "/Contents/Resources/browser";
   out.launcher = out.payload + "/native/host-launch";
   out.bootstrap = bundle + "/Contents/MacOS/arbol-browser-native";

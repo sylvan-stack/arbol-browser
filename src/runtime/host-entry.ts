@@ -241,11 +241,10 @@ export async function runHostEntry(): Promise<void> {
     const payload = resolve(fileURLToPath(new URL('../../', import.meta.url)));
     const bundle = dirname(dirname(dirname(payload))), parent = dirname(bundle);
     const buildRoot = basename(parent) === 'app' ? dirname(parent) : parent;
-    const selection: BuildSelection = Object.freeze({ build: basename(buildRoot), directory: buildRoot,
-      guard: join(dirname(buildRoot), '.uses', basename(buildRoot)), explicit: true });
     const selectionURL = new URL('./selection.js', import.meta.url).href;
     const selections = await import(selectionURL) as typeof import('./selection.js');
-    const layout = selections.selectedLayout(selection, payload), argv = [...process.argv];
+    const layout = selections.packagedLayout(basename(buildRoot), payload), argv = [...process.argv];
+    const selection: BuildSelection = Object.freeze({ build: layout.build, directory: layout.buildRoot, guard: layout.guard, explicit: true });
     if (argv.length !== 6 || argv[0] !== layout.engine || process.execPath !== layout.engine ||
         argv[1] !== '--site-per-process' || argv[2] !== '--disable-features=MacAccessibilityTextOperation' ||
         argv[3] !== layout.hostEntry || argv[4] !== '--arbol-host-request' || !argv[5]?.startsWith('/')) throw unavailable('browser');

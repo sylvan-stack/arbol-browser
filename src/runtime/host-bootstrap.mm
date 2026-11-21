@@ -169,7 +169,7 @@ int main(int argc, const char* argv[]) {
       if (os.majorVersion != 27 || os.minorVersion != 0 || os.patchVersion != 1 || sizeof(void*) != 8) return 4;
       NSString* bundle = NSBundle.mainBundle.bundlePath;
       arbol_attempt::PackagedLayout layout;
-      if (!arbol_attempt::packagedLayout(bundle.fileSystemRepresentation,layout)) return 4;
+      if (!arbol_attempt::packagedLayout(bundle.fileSystemRepresentation,layout) || layout.installed) return 4;
       arbol_boundary::Lock build;
       if (!arbol_attempt::openBuild(bundle.fileSystemRepresentation,build)) return 4;
       // Read only authenticated private control metadata here, release the

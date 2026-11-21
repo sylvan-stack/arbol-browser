@@ -1,9 +1,9 @@
-import { basename, dirname, join, resolve } from 'node:path';
+import { dirname, join } from 'node:path';
 import { lstat } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
 import { directory, assertDirectory, privateFile, sameIdentity, identity, profileUnavailable } from '../profiles/paths.js';
 import type { PlatformPort, HeldLock } from './platform.js';
-import { selectedLayout, type BuildSelection } from './selection.js';
+import { buildLocation, selectedLayout, type BuildSelection } from './selection.js';
 import type { BuildGuard } from './start.js';
 import { assertHostCloseContinuity, assertHostStartupContinuity, assertTrustedHost, type VerifiedHost } from './authorities.js';
 import { assertPlatform } from './platform.js';
@@ -79,7 +79,7 @@ export async function adoptHostBuildLease(host: VerifiedHost, platform: Platform
   assertPlatform(platform);
   const layout = host.identity.layout;
   const selection: BuildSelection = Object.freeze({ build: layout.build, directory: layout.buildRoot,
-    guard: join(dirname(layout.buildRoot), '.uses', layout.build), explicit: true });
+    guard: layout.guard, explicit: true });
   const token = capture ?? captureHostBuild(platform, selection, layout.bundle, requestPath);
   const original = capturedBuilds.get(token);
   if (!original) throw profileUnavailable();
@@ -116,17 +116,14 @@ export async function adoptHostBuildLease(host: VerifiedHost, platform: Platform
     assertOriginal(); return lease;
   } catch { return terminateCapturedHostBuild(token); }
 }
-/** Reacquire the launcher's exact stable .uses/<hex> shared kernel flock.
+/** Reacquire the selected Build's exact shared kernel flock.
  * This is Build-use protection, never publisher/native/engine compatibility
  * authority. Direct incomplete candidates have no production guard and refuse.
  * No inherited FD (through LaunchServices, shell or Electron) is assumed.
  * Browser-specific prune/install policy is still ABR-24's integration work. */
 export async function acquireBuildLease(input: BuildSelection, platform: PlatformPort): Promise<BuildLease> {
   const selection = Object.freeze({ ...input });
-  if (!selection.guard || basename(selection.directory) !== selection.build ||
-      basename(dirname(selection.directory)) !== 'arbol-browser' ||
-      resolve(selection.directory) !== selection.directory ||
-      selection.guard !== join(dirname(selection.directory), '.uses', selection.build)) throw profileUnavailable();
+  if (!selection.guard || selection.guard !== buildLocation(selection.build, selection.directory)?.guard) throw profileUnavailable();
   const component = dirname(selection.directory), uses = dirname(selection.guard);
   const componentIdentity = await directory(component, false);
   const buildIdentity = await directory(selection.directory, false), usesIdentity = await directory(uses);

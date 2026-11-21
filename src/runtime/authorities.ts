@@ -279,6 +279,7 @@ async function verifySelectedHost(selection: BuildSelection, payload: string, de
   noteHostVerification(observation, 'signed-bundle');
   assertBudget(deadline);
   const layout = selectedLayout(selection, payload);
+  if (layout.scope !== 'isolated') throw unavailable('browser');
   const manifestURL = new URL('../native/manifest.js', import.meta.url).href;
   const manifests = await import(manifestURL) as typeof import('../native/manifest.js');
   let signed: SignedBundle;

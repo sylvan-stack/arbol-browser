@@ -14,6 +14,7 @@ export const platformCompilerPolicy = Object.freeze({ compiler: nativeCompilerPo
   architecture: 'arm64', deployment: '27.0', compiledNapi: 8, protocol: 1, headerArchive: nativeCompilerPolicy.headerArchive,
   frozenConsumer: frozenDigest, outputs: ['platform.node', 'host-launch', 'host-bootstrap'], qualification: 'unexecuted' });
 const names = ['src/runtime/platform.mm', 'src/runtime/host-launch.mm', 'src/runtime/host-bootstrap.mm'];
+const installationConsumers = new Set([...names, 'watchdog/main.mm']);
 const installationSource = 'src/runtime/installation-paths.json';
 const productionPublisherSource = 'native/production-publisher-requirement.json';
 const closure = [...names, 'src/runtime/platform.ts', 'src/runtime/system-clipboard.hpp', 'src/runtime/attempt.hpp', 'watchdog/boundary.hpp', 'watchdog/exit.hpp',
@@ -22,11 +23,13 @@ const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 async function installationInput() {
   const bytes = await readFile(join(root, installationSource));
   const layout = JSON.parse(bytes);
-  const flags = ['root', 'builds', 'payloads', 'browser'].map(name => {
+  const flags = ['root', 'builds', 'payloads', 'browser', 'stableBuilds', 'stableUses'].map(name => {
     const parts = Array.isArray(layout[name]) ? layout[name] : [layout[name]];
-    if (!parts.length || parts.some(part => typeof part !== 'string' || !/^\.?[a-z][a-z0-9-]*$/i.test(part)))
+    if (!parts.length || parts.some(part => typeof part !== 'string' ||
+        (!/^\.?[a-z][a-z0-9-]*$/i.test(part) && !(name === 'stableBuilds' && part === 'Arbol Browser'))))
       throw new Error('Invalid installation directory component');
-    return `-DARBOL_INSTALLATION_${name.toUpperCase()}=${JSON.stringify(parts.join('/'))}`;
+    const macro = name.replace(/[A-Z]/g, letter => '_' + letter).toUpperCase();
+    return `-DARBOL_INSTALLATION_${macro}=${JSON.stringify(parts.join('/'))}`;
   });
   return { sha256: hash(bytes), flags };
 }
@@ -82,11 +85,14 @@ export async function captureCompilerInputs(sourceNames, headers = officialHeade
   if (JSON.parse(settings).CanonicalName !== platformCompilerPolicy.sdk ||
       staticCommand('/usr/bin/xcrun', ['clang++', '--version']).split('\n')[0] !== platformCompilerPolicy.compiler)
     throw new Error('Unsupported pinned compiler or SDK');
-  const installationPaths = sourceNames.includes(names[2]) ? await installationInput() : undefined;
+  const installationPaths = sourceNames.some(name => installationConsumers.has(name)) ? await installationInput() : undefined;
   const productionPublisher = sourceNames.includes(names[2]) ? await productionPublisherInput() : undefined;
   const paths = new Map();
   for (const name of sourceNames) {
-    const flags = name === names[2] ? [...installationPaths.flags, ...productionPublisher.flags] : [];
+    const flags = [
+      ...(installationConsumers.has(name) ? installationPaths.flags : []),
+      ...(name === names[2] ? productionPublisher.flags : []),
+    ];
     const output = staticCommand('/usr/bin/xcrun', ['clang++', '-std=c++17', '-fobjc-arc', '-fblocks', '-DNAPI_VERSION=8',
       '-arch', 'arm64', '-mmacosx-version-min=27.0', '-isysroot', sdk, '-I', headers, ...flags, '-M', '-MT', 'closure', name]);
     for (const item of dependencies(output)) {
@@ -136,10 +142,11 @@ export async function compilePlatform(headers = officialHeaders) {
   const common = ['clang++', '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror', '-fobjc-arc', '-fblocks', '-arch', 'arm64',
     '-mmacosx-version-min=27.0', '-isysroot', sdk];
   staticCommand('/usr/bin/xcrun', [...common, '-DNAPI_VERSION=8', '-DNODE_GYP_MODULE_NAME=arbol_browser_platform',
-    '-bundle', '-undefined', 'dynamic_lookup', '-I', headers, names[0], '-lbsm', '-framework', 'Foundation', '-framework', 'Security', '-framework', 'AppKit',
+    '-bundle', '-undefined', 'dynamic_lookup', '-I', headers, ...input.installationPaths.flags, names[0],
+    '-lbsm', '-framework', 'Foundation', '-framework', 'Security', '-framework', 'AppKit',
     '-o', join(root, 'dist/native/platform.node')]);
   for (const [source, name, frameworks] of [[names[1], 'host-launch', ['AppKit']], [names[2], 'host-bootstrap', ['Foundation', 'Security']]]) {
-    const flags = source === names[2] ? [...input.installationPaths.flags, ...input.productionPublisher.flags] : [];
+    const flags = [...input.installationPaths.flags, ...(source === names[2] ? input.productionPublisher.flags : [])];
     staticCommand('/usr/bin/xcrun', [...common, ...flags, source, ...frameworks.flatMap(value => ['-framework', value]), '-o', join(root, 'dist/native', name)]);
   }
   const outputs = {};

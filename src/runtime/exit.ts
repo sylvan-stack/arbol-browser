@@ -1,11 +1,10 @@
 import { fileURLToPath } from 'node:url';
 /** Independent production closure. No Electron import, JS clean writer, PID
  * signal, lock-as-exit shortcut or receipt-only force provider lives here. */
-import { join, dirname, basename, resolve } from 'node:path';
+import { join, basename, resolve } from 'node:path';
 import { realpath } from 'node:fs/promises';
 import { setTimeout } from 'node:timers/promises';
 import { unavailable } from '../contracts/errors.js';
-import { validator } from '../contracts/schema.js';
 import { assertProfile, readJson, type ProfileSnapshot } from '../profiles/records.js';
 import { statOrAbsent } from '../profiles/paths.js';
 import { ownerLock, withOwnerLockForCustody, type OwnerLease } from '../profiles/locking.js';
@@ -14,7 +13,7 @@ import { assertHostCloseContinuity, assertHostStartupContinuity, assertTrustedHo
 import { assertPlatform, assertExitInspectionReceipt, type PlatformPort, type ExitInspectionReceipt, type PriorMarkerExpectation } from './platform.js';
 import { withLaunchAttempt, type LaunchAttempt } from './process.js';
 import { now, assertTime, runtimeLocation, type RuntimeRecord } from './instance.js';
-import { claimedLayout, selectedLayout, type BuildSelection } from './selection.js';
+import { buildLocation, claimedLayout, selectedLayout, type BuildSelection } from './selection.js';
 import type { HostPreviousExit } from './host-entry.js';
 import type { ExitAuthority } from './lifecycle.js';
 import type { EngineExitEvidence } from '../profiles/compatibility.js';
@@ -51,9 +50,8 @@ function closedCandidate(value: unknown, profile: ProfileSnapshot, hash: string)
   // and exact actual current/head snapshot before trusting any exit evidence.
   if (!attempt || typeof attempt !== 'object' || attempt.format !== 1 || attempt.phase !== 'closed' ||
       attempt.profile !== profile.paths.root || attempt.profileInstance !== profile.record.instance || attempt.profilePathHash !== hash ||
-      !validator('browser.Build')(attempt.build) || typeof attempt.buildRoot !== 'string' || resolve(attempt.buildRoot) !== attempt.buildRoot ||
-      basename(attempt.buildRoot) !== attempt.build || basename(dirname(attempt.buildRoot)) !== 'arbol-browser' ||
-      attempt.buildGuard !== join(dirname(attempt.buildRoot), '.uses', attempt.build) ||
+      typeof attempt.buildRoot !== 'string' || typeof attempt.buildGuard !== 'string' ||
+      attempt.buildGuard !== buildLocation(attempt.build, attempt.buildRoot)?.guard ||
       !/^req_[A-Za-z0-9_-]{22}$/.test(attempt.request) || !attempt.terminal ||
       ![attempt.sourceDigest, attempt.productDigest, attempt.candidateDigest, attempt.terminal.digest].every(value => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value)))
     throw unavailable('profile');
@@ -109,7 +107,7 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
           stableCloseRuntimeFields.every(key => closing[key] === previous[key]) &&
           closeHost.identity.layout.build === oldSelection.build && closeHost.identity.layout.buildRoot === oldSelection.directory &&
           closeHost.identity.layout.bundle === layout.bundle && closeHost.identity.layout.payload === layout.payload &&
-          oldSelection.guard === join(closeHost.identity.layout.buildRoot, '../.uses', closeHost.identity.layout.build) &&
+          oldSelection.guard === closeHost.identity.layout.guard &&
           closeHost.policy.stateRoot === profile.paths.state && closeHost.signed.snapshotDigest === attempt.candidateDigest &&
           closeHost.identity.sourceDigest === attempt.sourceDigest && closeHost.identity.productDigest === attempt.productDigest) {
         const sameGuard = await withBuildLockForCustody(build, platform, held => {
@@ -132,7 +130,7 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
         const currentLayout = startingHost.identity.layout;
         if (currentLayout.build === oldSelection.build && currentLayout.buildRoot === oldSelection.directory &&
             currentLayout.bundle === layout.bundle && currentLayout.payload === layout.payload &&
-            oldSelection.guard === join(currentLayout.buildRoot, '../.uses', currentLayout.build) && matchesAttempt(startingHost)) {
+            oldSelection.guard === currentLayout.guard && matchesAttempt(startingHost)) {
           const sameGuard = await withBuildLockForCustody(build, platform, held => {
             const actual = held.assertIdentity(), expected = startingHost.guardIdentity;
             return actual.device === expected.device && actual.inode === expected.inode && actual.uid === expected.uid;

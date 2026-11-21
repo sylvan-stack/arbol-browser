@@ -118,7 +118,7 @@ export async function pendingLaunchAttempt(profile: ProfileSnapshot, host: Verif
   return frozen({ format: 1, request, nonce: randomBytes(32).toString('base64url'),
     profile: profile.paths.root, profileInstance: profile.record.instance, profilePathHash: location.hash,
     build: host.identity.layout.build, buildRoot: host.identity.layout.buildRoot,
-    buildGuard: join(host.identity.layout.buildRoot, '../.uses', host.identity.layout.build),
+    buildGuard: host.identity.layout.guard,
     sourceDigest: host.identity.sourceDigest, productDigest: host.identity.productDigest,
     candidateDigest: host.signed.snapshotDigest, expires, starter, phase: 'pending', stage: 'untransferred',
     bootstrap: null, engine: null, runtime: null, terminal: null });
@@ -148,7 +148,7 @@ export async function claimedHostAttempt(profile: ProfileSnapshot, host: Verifie
     if (!current || current.request !== request || current.profileInstance !== profile.record.instance ||
         current.phase !== 'claimed' || current.stage !== 'untransferred' || current.expires <= platform.continuousTime() ||
         current.build !== layout.build || current.buildRoot !== layout.buildRoot ||
-        current.buildGuard !== join(layout.buildRoot, '../.uses', layout.build) ||
+        current.buildGuard !== layout.guard ||
         current.sourceDigest !== host.identity.sourceDigest || current.productDigest !== host.identity.productDigest ||
         current.candidateDigest !== host.signed.snapshotDigest ||
         current.profile !== join(host.policy.stateRoot, 'profiles', profile.record.id) ||
@@ -169,7 +169,7 @@ export async function claimedHostAttempt(profile: ProfileSnapshot, host: Verifie
 export function createLaunchTransactions(host: VerifiedHost, platform: PlatformPort,
   exits: ProductionExitAuthority = createProductionExitAuthority(platform, {
     build: host.identity.layout.build, directory: host.identity.layout.buildRoot,
-    guard: join(host.identity.layout.buildRoot, '../.uses', host.identity.layout.build), explicit: true,
+    guard: host.identity.layout.guard, explicit: true,
   }), closeVerification = false): LaunchAttemptPort {
   assertPlatform(platform); assertProductionExitAuthority(exits);
   const pending = new Map<string, LaunchAttempt>();
@@ -188,7 +188,7 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
       try {
         build = heldBuild as BuildLease | undefined;
         if (!build) build = await acquireBuildLease({ build: host.identity.layout.build, directory: host.identity.layout.buildRoot,
-          guard: join(host.identity.layout.buildRoot, '../.uses', host.identity.layout.build), explicit: true }, platform);
+          guard: host.identity.layout.guard, explicit: true }, platform);
         // The genuine private Build handover, rather than this structural cast,
         // authorizes native admission. A fake or unrelated guard is rejected.
         await exits.reserve(profile, owner, host, build, next, deadline);
@@ -278,7 +278,7 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
             const authorityURL = new URL('./authorities.js', import.meta.url).href;
             const authorities = await import(authorityURL) as typeof import('./authorities.js');
             const sameHost = host.identity.layout.bundle === layout.bundle && host.identity.layout.build === admitted.build && host.identity.layout.buildRoot === admitted.buildRoot &&
-              join(host.identity.layout.buildRoot, '../.uses', host.identity.layout.build) === admitted.buildGuard &&
+              host.identity.layout.guard === admitted.buildGuard &&
               host.signed.snapshotDigest === admitted.candidateDigest && host.identity.sourceDigest === admitted.sourceDigest &&
               host.identity.productDigest === admitted.productDigest;
             const originalHost = sameHost ? host : await authorities.verifyPackagedHost(selected,
@@ -336,7 +336,7 @@ export async function assertProductionCloseReady(profile: ProfileSnapshot, recor
       assertVerifiedHostMetadata(verifiedHost, deadline);
       if (verifiedHost.identity.layout.build !== layout.build || verifiedHost.identity.layout.buildRoot !== layout.buildRoot ||
           verifiedHost.identity.layout.bundle !== layout.bundle || verifiedHost.identity.layout.payload !== layout.payload ||
-          selection.guard !== join(layout.buildRoot, '../.uses', layout.build)) throw unavailable('browser');
+          selection.guard !== layout.guard) throw unavailable('browser');
       const manifestURL = new URL('../native/manifest.js', import.meta.url).href;
       const manifest = await import(manifestURL) as typeof import('../native/manifest.js');
       if (manifest.assertRetainedReadOnlyStorage(verifiedHost.signed, deadline)) retained = verifiedHost;
@@ -355,7 +355,7 @@ export function createProductionProcessIntegration(host: VerifiedHost, selection
   // reservation and the host's final readiness proof remain independent.
   assertPlatform(platform); assertProductionExitAuthority(exits); assertVerifiedHostMetadata(host, now() + 5000);
   if (host.identity.layout.build !== selection.build || host.identity.layout.buildRoot !== selection.directory ||
-      selection.guard !== join(selection.directory, '../.uses', selection.build)) throw unavailable('browser');
+      selection.guard !== host.identity.layout.guard) throw unavailable('browser');
   return Object.freeze({
     async assertAdmissionAvailable(deadline = now() + 5000) {
       if (openCutoff === undefined) return host.assertTrusted(deadline);

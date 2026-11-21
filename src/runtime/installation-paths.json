@@ -2,5 +2,7 @@
   "root": ".arbol",
   "browser": "browser",
   "builds": ["Builds", "registries", "arbol"],
-  "payloads": [".local", "lib", "sylvan-stack", "arbol", "stable"]
+  "payloads": [".local", "lib", "sylvan-stack", "arbol", "stable"],
+  "stableBuilds": ["Applications", "Arbol Browser", ".mounted", "arbol-browser"],
+  "stableUses": [".local", "lib", "sylvan-stack", "arbol-browser", "uses"]
 }

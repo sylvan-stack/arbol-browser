@@ -11,7 +11,7 @@ export const watchdogCompilerPolicy = Object.freeze({ compiler: 'Apple clang ver
   arch: 'arm64', deployment: '27.0', protocol: 1, modes: ['--watchdog', '--custody'], frameworks: ['Foundation', 'Security'], qualification: 'unexecuted' });
 async function sources() {
   const files = Object.fromEntries(Object.entries(await inventory(join(root, 'watchdog'))).map(([name,digest]) => [`watchdog/${name}`,digest]));
-  for (const name of ['scripts/compile-watchdog.mjs', 'scripts/compile-platform.mjs', 'src/runtime/platform.mm', 'src/runtime/platform.ts', 'src/runtime/host-bootstrap.mm', 'src/runtime/attempt.hpp', 'native/publisher-requirement.json'])
+  for (const name of ['scripts/compile-watchdog.mjs', 'scripts/compile-platform.mjs', 'src/runtime/platform.mm', 'src/runtime/platform.ts', 'src/runtime/host-bootstrap.mm', 'src/runtime/attempt.hpp', 'src/runtime/installation-paths.json', 'native/publisher-requirement.json'])
     files[name] = hash(await readFile(join(root,name)));
   return Object.fromEntries(Object.entries(files).sort(([a],[b]) => a.localeCompare(b,'en')));
 }
@@ -38,7 +38,7 @@ export async function compileWatchdog() {
   const before = await sources(), input = await inputs(), output = join(root,'dist/native/watchdog');
   await mkdir(join(root,'dist/native'),{recursive:true});
   run(['clang++','-std=c++17','-O2','-Wall','-Wextra','-Werror','-fobjc-arc','-fblocks','-arch','arm64','-mmacosx-version-min=27.0','-isysroot',input.sdk,
-    'watchdog/main.mm','-framework','Foundation','-framework','Security','-lbsm','-o',output]);
+    ...input.closure.installationPaths.flags,'watchdog/main.mm','-framework','Foundation','-framework','Security','-lbsm','-o',output]);
   if(inventoryDigest(before) !== inventoryDigest(await sources()) || JSON.stringify(input) !== JSON.stringify(await inputs())) throw new Error('Watchdog source/input changed during compilation');
   await writeFile(join(root,'dist/native/watchdog-compile.json'),JSON.stringify({format:1,policy:watchdogCompilerPolicy,input:input.closure,sources:before,payload:hash(await readFile(output))},null,2)+'\n');
   await validateWatchdogCompilation();

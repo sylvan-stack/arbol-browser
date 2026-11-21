@@ -1,19 +1,31 @@
-import { isAbsolute, resolve, dirname, basename, join } from 'node:path';
+import { isAbsolute, resolve, dirname, basename, join, sep } from 'node:path';
+import { userInfo } from 'node:os';
 import { validator } from '../contracts/schema.js';
 import { unavailable } from '../contracts/errors.js';
+import installation from './installation-paths.json' with { type: 'json' };
 
 export interface BuildSelection {
   readonly build: string; readonly explicit: boolean;
   readonly directory: string; readonly guard: string;
 }
-/** Closed production layouts. Paths are structural identities, not signature proof.
- * The registry owns buildRoot; every executable and metadata input is sealed
- * inside its single outer application. Foundation-only packages stay distinct. */
+/** Paths describe the package and its guard. Signature and image proof remain separate. */
 export interface PackagedLayout {
   readonly build: string; readonly buildRoot: string; readonly bundle: string;
+  readonly guard: string; readonly scope: 'isolated' | 'installed';
   readonly payload: string; readonly launcher: string; readonly engine: string;
   readonly bootstrap: string;
   readonly cliEntry: string; readonly hostEntry: string;
+}
+export function buildLocation(build: string, buildRoot: string): Pick<PackagedLayout, 'guard' | 'scope'> | undefined {
+  if (!validator('browser.Build')(build) || !isAbsolute(buildRoot) || resolve(buildRoot) !== buildRoot ||
+      basename(buildRoot) !== build || basename(dirname(buildRoot)) !== 'arbol-browser') return undefined;
+  const component = dirname(buildRoot);
+  if (component.endsWith(sep + join(...installation.stableBuilds))) {
+    const home = userInfo().homedir;
+    if (component !== join(home, ...installation.stableBuilds)) return undefined;
+    return { scope: 'installed', guard: join(home, ...installation.stableUses, build) };
+  }
+  return { scope: 'isolated', guard: join(component, '.uses', build) };
 }
 export function packagedLayout(build: string, payload: string): PackagedLayout {
   if (!validator('browser.Build')(build) || !isAbsolute(payload) || resolve(payload) !== payload ||
@@ -21,9 +33,10 @@ export function packagedLayout(build: string, payload: string): PackagedLayout {
       basename(dirname(dirname(payload))) !== 'Contents') throw unavailable('browser');
   const bundle = dirname(dirname(dirname(payload))), parent = dirname(bundle);
   const buildRoot = basename(parent) === 'app' ? dirname(parent) : parent;
-  if (basename(bundle) !== 'ArbolBrowser.app' || basename(buildRoot) !== build ||
-      basename(dirname(buildRoot)) !== 'arbol-browser') throw unavailable('browser');
-  return Object.freeze({ build, buildRoot, bundle, payload,
+  const location = buildLocation(build, buildRoot);
+  if (basename(bundle) !== 'ArbolBrowser.app' || !location ||
+      (location.scope === 'installed' && basename(parent) !== 'app')) throw unavailable('browser');
+  return Object.freeze({ build, buildRoot, bundle, payload, ...location,
     launcher: join(payload, 'native/host-launch'),
     bootstrap: join(bundle, 'Contents/MacOS/arbol-browser-native'),
     engine: join(payload, 'runtime/Electron.app/Contents/MacOS/Electron'),
@@ -49,7 +62,7 @@ export function claimedLayout(attempt: {
 export function selectedLayout(selection: BuildSelection, payload: string): PackagedLayout {
   const layout = packagedLayout(selection.build, payload);
   if (selection.directory !== layout.buildRoot ||
-      selection.guard !== join(dirname(layout.buildRoot), '.uses', selection.build)) throw unavailable('browser');
+      selection.guard !== layout.guard) throw unavailable('browser');
   return layout;
 }
 /** The physical CLI lives below Contents/Resources/browser, not at Build root.
@@ -76,8 +89,7 @@ export function consumeSelection(packagedBuild: string, directory: string,
         value.format !== 1 || value.build !== packagedBuild || typeof value.explicit !== 'boolean' ||
         typeof value.directory !== 'string' || !isAbsolute(value.directory) || resolve(value.directory) !== directory ||
         typeof value.guard !== 'string' || !isAbsolute(value.guard) || resolve(value.guard) !== value.guard ||
-        basename(directory) !== packagedBuild || basename(dirname(directory)) !== 'arbol-browser' ||
-        value.guard !== join(dirname(directory), '.uses', packagedBuild)) throw new Error();
+        value.guard !== buildLocation(packagedBuild, directory)?.guard) throw new Error();
     return Object.freeze({ build: packagedBuild, explicit: value.explicit, directory, guard: value.guard });
   } catch { throw unavailable('browser'); }
 }
