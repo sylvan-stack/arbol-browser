@@ -1856,7 +1856,7 @@ struct RetainedMigrationProof {
   static NSDictionary* policyContent(id value) {
     uint64_t mode;
     if(!arbol_attempt::keys(value,@[@"identity",@"sha256",@"base64"])||
-       !arbol_attempt::uintNumber(value[@"identity"][@"mode"],mode)||(mode!=0444&&mode!=0644)||
+       !arbol_attempt::uintNumber(value[@"identity"][@"mode"],mode)||(mode!=0600&&mode!=0444&&mode!=0644)||
        !arbol_exit::migrationIdentity(value[@"identity"],(unsigned)mode)) return nil;
     NSMutableDictionary* normalized=[value mutableCopy],*identity=[value[@"identity"] mutableCopy];
     identity[@"mode"]=@0600; normalized[@"identity"]=identity;
@@ -1927,6 +1927,132 @@ struct RetainedMigrationProof {
     return false;
   }
 };
+// Reproduce manifest.ts completeSnapshot/stable from the actual immutable
+// adopted candidate. Neither a caller's expected digest nor its enumeration
+// supplies authority. English collation and JSON string escaping are the
+// established snapshot encoding; files, modes, directories and internal links
+// all participate, including the outer signature seal.
+static NSString* maintenanceCandidateDigest(double deadline) {
+  using namespace arbol_attempt; using namespace arbol_exit;
+  static std::mutex mutex; static bool attempted=false; static NSString* retained=nil;
+  while(!mutex.try_lock()) { if(arbol_boundary::clockMs()>=deadline) return nil; usleep(1000); }
+  std::unique_lock<std::mutex> held(mutex,std::adopt_lock);
+  auto current=[&] { return maintenanceCustody&&maintenanceCustody->accepted&&
+    arbol_boundary::clockMs()<deadline&&maintenanceCustody->current(); };
+  if(!current()) return nil;
+  if(attempted) return retained; attempted=true;
+  const std::string root=maintenanceCustody->layout().bundle;
+  std::vector<std::pair<NSString*,NSString*>> entries; size_t count=0;
+  auto string=[](const char* bytes,size_t length) -> NSString* {
+    NSData* data=[NSData dataWithBytes:bytes length:length];
+    NSString* value=[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    return value&&[[value dataUsingEncoding:NSUTF8StringEncoding] isEqual:data]?value:nil;
+  };
+  auto lexical=[](NSString* a,NSString* b) {
+    const NSUInteger length=std::min(a.length,b.length);
+    for(NSUInteger i=0;i<length;++i) { auto x=[a characterAtIndex:i],y=[b characterAtIndex:i]; if(x!=y) return x<y; }
+    return a.length<b.length;
+  };
+  auto names=[&](int fd,std::vector<std::string>& values) {
+    int copy=openat(fd,".",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC); if(copy<0) return false;
+    DIR* directory=fdopendir(copy); if(!directory) { close(copy); return false; }
+    bool ok=true; errno=0;
+    while(auto* entry=readdir(directory)) {
+      std::string name=entry->d_name; if(name=="."||name=="..") continue;
+      if(values.size()>=4096||name.empty()||name.size()>255||!string(name.data(),name.size())||
+         arbol_boundary::clockMs()>=deadline) { ok=false; break; }
+      values.push_back(name); errno=0;
+    }
+    if(errno||closedir(directory)) ok=false;
+    std::sort(values.begin(),values.end(),[&](const auto& a,const auto& b) { return lexical(string(a.data(),a.size()),string(b.data(),b.size())); });
+    return ok&&std::adjacent_find(values.begin(),values.end())==values.end();
+  };
+  auto fileDigest=[&](int parent,const std::string& name,const std::string& path,const struct stat& original) -> NSString* {
+    NativeFile file; file.fd=openat(parent,name.c_str(),O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
+    struct stat first{},last{},named{};
+    if(file.fd<0||fstat(file.fd,&first)||!sameFile(first,original)||!S_ISREG(first.st_mode)||first.st_nlink!=1||
+       first.st_size<0||!arbol_boundary::canonical(path)) return nil;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    CC_SHA256_CTX hash; CC_SHA256_Init(&hash); std::vector<char> bytes(512*1024); off_t offset=0;
+    while(offset<first.st_size) {
+      if(arbol_boundary::clockMs()>=deadline) return nil;
+      ssize_t n=pread(file.fd,bytes.data(),size_t(std::min(off_t(bytes.size()),first.st_size-offset)),offset);
+      if(n>0) { CC_SHA256_Update(&hash,bytes.data(),CC_LONG(n)); offset+=n; }
+      else if(n<0&&errno==EINTR) continue; else return nil;
+    }
+    char overflow; if(pread(file.fd,&overflow,1,offset)!=0||fstat(file.fd,&last)||
+       fstatat(parent,name.c_str(),&named,AT_SYMLINK_NOFOLLOW)||!sameFile(first,last)||!sameFile(last,named)||!file.finish()) return nil;
+    unsigned char output[CC_SHA256_DIGEST_LENGTH]; CC_SHA256_Final(output,&hash);
+#pragma clang diagnostic pop
+    NSMutableString* value=[NSMutableString new]; for(unsigned char byte:output) [value appendFormat:@"%02x",byte]; return value;
+  };
+  std::function<bool(const std::string&)> walk;
+  walk=[&](const std::string& path) {
+    if(path.size()>=PATH_MAX||arbol_boundary::clockMs()>=deadline||!arbol_boundary::canonical(path)) return false;
+    NativeFile directory; directory.fd=open(path.c_str(),O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    struct stat before{},after{},named{}; std::vector<std::string> first,last;
+    if(directory.fd<0||fstat(directory.fd,&before)||lstat(path.c_str(),&named)||!sameFile(before,named)||
+       !S_ISDIR(before.st_mode)||!names(directory.fd,first)||count+first.size()>4096) return false;
+    count+=first.size();
+    for(const auto& name:first) {
+      const std::string full=path+"/"+name,key=full.substr(root.size()+1); struct stat initial{},checked{};
+      if(full.size()>=PATH_MAX||fstatat(directory.fd,name.c_str(),&initial,AT_SYMLINK_NOFOLLOW)||arbol_boundary::clockMs()>=deadline) return false;
+      NSString* value=nil;
+      if(S_ISDIR(initial.st_mode)) {
+        value=[NSString stringWithFormat:@"directory:%u",initial.st_mode&07777];
+        entries.emplace_back(string(key.data(),key.size()),value); if(!walk(full)) return false;
+      } else if(S_ISREG(initial.st_mode)) {
+        NSString* hash=fileDigest(directory.fd,name,full,initial); if(!hash) return false;
+        value=[NSString stringWithFormat:@"file:%u:%@",initial.st_mode&07777,hash];
+        entries.emplace_back(string(key.data(),key.size()),value);
+      } else if(S_ISLNK(initial.st_mode)) {
+        char raw[PATH_MAX]{},again[PATH_MAX]{},resolved[PATH_MAX]{};
+        ssize_t length=readlinkat(directory.fd,name.c_str(),raw,sizeof(raw));
+        if(length<=0||length>=PATH_MAX||memchr(raw,'\0',length)||!realpath(full.c_str(),resolved)||!within(resolved,root)||
+           readlinkat(directory.fd,name.c_str(),again,sizeof(again))!=length||memcmp(raw,again,length)) return false;
+        NSString* link=string(raw,length); if(!link) return false;
+        // Resolve dot segments lexically without expanding a tilde or following
+        // any link, matching path.resolve(dirname(path), link).
+        std::string joined=raw[0]=='/'?std::string(raw,length):path+"/"+std::string(raw,length);
+        std::vector<std::string> components; size_t start=1;
+        for(size_t i=1;i<=joined.size();++i) if(i==joined.size()||joined[i]=='/') {
+          std::string part=joined.substr(start,i-start); start=i+1;
+          if(part.empty()||part==".") continue;
+          if(part=="..") { if(!components.empty()) components.pop_back(); } else components.push_back(part);
+        }
+        std::string normalized; for(const auto& part:components) normalized+="/"+part;
+        if(!within(normalized,root)) return false;
+        value=[@"symlink:" stringByAppendingString:link]; entries.emplace_back(string(key.data(),key.size()),value);
+      } else return false;
+      if(fstatat(directory.fd,name.c_str(),&checked,AT_SYMLINK_NOFOLLOW)||!sameFile(initial,checked)) return false;
+    }
+    return names(directory.fd,last)&&first==last&&!fstat(directory.fd,&after)&&!lstat(path.c_str(),&named)&&
+      sameFile(before,after)&&sameFile(after,named)&&directory.finish();
+  };
+  if(!walk(root)||!current()) return nil;
+  NSLocale* english=[[NSLocale alloc] initWithLocaleIdentifier:@"en"];
+  std::stable_sort(entries.begin(),entries.end(),[&](const auto& a,const auto& b) {
+    return [a.first compare:b.first options:0 range:NSMakeRange(0,a.first.length) locale:english]==NSOrderedAscending;
+  });
+  auto quote=[](NSString* text) {
+    NSData* data=[text dataUsingEncoding:NSUTF8StringEncoding]; const unsigned char* bytes=(const unsigned char*)data.bytes;
+    std::string out="\""; const char* digits="0123456789abcdef";
+    for(NSUInteger i=0;i<data.length;++i) {
+      unsigned char c=bytes[i];
+      if(c=='"'||c=='\\') { out+='\\'; out+=char(c); }
+      else if(c=='\b') out+="\\b"; else if(c=='\f') out+="\\f"; else if(c=='\n') out+="\\n";
+      else if(c=='\r') out+="\\r"; else if(c=='\t') out+="\\t";
+      else if(c<32) { out+="\\u00"; out+=digits[c>>4]; out+=digits[c&15]; } else out+=char(c);
+    }
+    return out+"\"";
+  };
+  std::string encoded="{"; bool first=true;
+  for(const auto& entry:entries) { if(!first) encoded+=','; first=false; encoded+=quote(entry.first)+":"+quote(entry.second); }
+  encoded+='}'; if(!current()) return nil;
+  retained=digest(encoded); return retained;
+}
+
 struct MigrationPublication {
   arbol_attempt::MaintenanceDirectory root,attempt,profile,staging;
   arbol_attempt::MaintenanceFile currentFile,transactionFile,stagedFile,recordFile,markerFile,stagedRecord;
@@ -1941,7 +2067,7 @@ struct MigrationPublication {
     if(receipt[@"convertedMarker"]!=NSNull.null) return markerFile.current();
     errno=0; return fstatat(profile.fd,"engine.json",&st,AT_SYMLINK_NOFOLLOW)<0&&errno==ENOENT;
   }
-  bool open(NSDictionary* input,bool recover=false) {
+  bool open(NSDictionary* input,bool recover,double deadline) {
     using namespace arbol_attempt; using namespace arbol_exit;
     recovery=recover;
     id request=input[@"migration"];
@@ -1971,7 +2097,8 @@ struct MigrationPublication {
        ![transaction[@"selection"] isEqual:selected]||![transaction[@"selectionFile"] isEqual:selectedFile]||
        ![transaction[@"oldBuild"] isEqual:maintenanceCustody->journalObject()[@"before"]]||
        ![transaction[@"newBuild"] isEqual:maintenanceCustody->journalObject()[@"after"]]||
-       ![transaction[@"sourceSha256"] isEqual:policy[@"sourceDigest"]]||![transaction[@"productSha256"] isEqual:policy[@"productDigest"]]) return false;
+       ![transaction[@"sourceSha256"] isEqual:policy[@"sourceDigest"]]||![transaction[@"productSha256"] isEqual:policy[@"productDigest"]]||
+       ![transaction[@"candidateSha256"] isEqual:maintenanceCandidateDigest(deadline)]) return false;
     for(id candidate in transaction[@"profiles"]) if([candidate[@"pathSha256"] isEqual:input[@"profilePathHash"]]) entry=candidate;
     if(!entry) return false;
     NSString* expected=[[maintenanceCustody->stateRoot() stringByAppendingPathComponent:@"profiles"] stringByAppendingPathComponent:entry[@"id"]];
@@ -2601,7 +2728,8 @@ struct MigrationSourceCapture {
     if(bundle.fd<0||fstat(bundle.fd,&identity)||!S_ISDIR(identity.st_mode)||identity.st_uid!=geteuid()||
        (identity.st_mode&0022)||!(identity.st_mode&0100)) return false;
     const std::string policyPath=path+"/Contents/Resources/host-policy.json"; struct stat policyIdentity{};
-    if(lstat(policyPath.c_str(),&policyIdentity)||((policyIdentity.st_mode&07777)!=0644&&(policyIdentity.st_mode&07777)!=0444)||
+    if(lstat(policyPath.c_str(),&policyIdentity)||((policyIdentity.st_mode&07777)!=0600&&
+       (policyIdentity.st_mode&07777)!=0644&&(policyIdentity.st_mode&07777)!=0444)||
        !policy.openPath(policyPath,policyIdentity.st_mode&07777,limit,true)) return false;
     NSData* content=[NSData dataWithBytes:policy.content.data() length:policy.content.size()];
     auto historical=guard; historical.heldMode=LOCK_SH;
@@ -2678,7 +2806,8 @@ static bool migrationNeverOpened(NSDictionary* receipt,ExitInspection& job) {
 }
 
 static bool publishMigration(ExitInspection& job,NSDictionary* closed,NSDictionary* data,NSDictionary* derived,
-                             const std::function<bool()>& claimsCurrent) {
+                             const std::function<bool()>& claimsCurrent,const std::function<bool(int)>& bindHistory,
+                             bool historyWasAbsent) {
   using namespace arbol_attempt; using namespace arbol_exit;
   auto* publication=job.publication;
   if(!job.maintenance||job.migrated||!publication||!job.within()||!publication->current()||
@@ -2700,12 +2829,13 @@ static bool publishMigration(ExitInspection& job,NSDictionary* closed,NSDictiona
     (!closed||closedSource.current())&&(!data||same||dataSource.current()); };
   if(!current()) return false;
   MaintenanceDirectory state,exits,history,claims,captures,receipts; struct stat identity{};
-  auto directory=[&](MaintenanceDirectory& parent,const std::string& name,MaintenanceDirectory& child) {
-    return current()&&privateDirectoryAt(parent.fd,name.c_str(),identity)&&identity.st_dev==parent.identity.st_dev&&
-      child.openPath(parent.path+"/"+name,maintenanceIdentity(identity))&&parent.current()&&child.current()&&current();
+  auto directory=[&](MaintenanceDirectory& parent,const std::string& name,MaintenanceDirectory& child,bool historyNode=false) {
+    return current()&&privateDirectoryAt(parent.fd,name.c_str(),identity,historyNode&&historyWasAbsent)&&identity.st_dev==parent.identity.st_dev&&
+      child.openPath(parent.path+"/"+name,maintenanceIdentity(identity))&&(!historyNode||bindHistory(child.fd))&&
+      parent.current()&&child.current()&&current();
   };
   if(!state.openPath([maintenanceCustody->stateRoot() UTF8String],publication->transaction[@"root"][@"identity"])||
-     !directory(state,"exit-evidence",exits)||!directory(exits,[receipt[@"profileSha256"] UTF8String],history)||
+     !directory(state,"exit-evidence",exits)||!directory(exits,[receipt[@"profileSha256"] UTF8String],history,true)||
      !directory(history,"claims",claims)||!directory(history,"migration",captures)||
      !directory(publication->root,"receipts",receipts)) return false;
   // Immutable native evidence is idempotent only for byte-identical existing
@@ -2760,7 +2890,7 @@ static bool inspectExit(ExitInspection& job) {
   MigrationPublication publication;
   struct PublicationScope { ExitInspection& job; ~PublicationScope() { job.publication=nullptr; } } publicationScope{job};
   if(commit||recover) {
-    if(!publication.open(input,recover)) return false; job.publication=&publication;
+    if(!publication.open(input,recover,job.deadline)) return false; job.publication=&publication;
     if(!rewrittenMigrationMetadata(job)) return false;
   } else if(migration&&!migrationSource.capture(job)) return false;
   arbol_exit::NativeFile history; struct stat historyIdentity{};
@@ -2782,6 +2912,9 @@ static bool inspectExit(ExitInspection& job) {
   bool historyMissing=history.fd<0&&errno==ENOENT;
   if(!historyMissing&&(history.fd<0||!arbol_boundary::canonical(historyPath.fileSystemRepresentation)||
     fstat(history.fd,&historyIdentity)||!S_ISDIR(historyIdentity.st_mode)||historyIdentity.st_uid!=geteuid()||(historyIdentity.st_mode&07777)!=0700)) return false;
+  MaintenanceDirectory historyAuthority;
+  if(migration&&!historyMissing&&(!historyAuthority.openPath(historyPath.fileSystemRepresentation)||
+     historyAuthority.identity.st_dev!=historyIdentity.st_dev||historyAuthority.identity.st_ino!=historyIdentity.st_ino)) return false;
   Claim claim; std::string currentRaw,headRaw,pointerRaw; bool absent=true,headAbsent=true,pointerAbsent=true;
   MissingMigrationRuntime missingRuntime; bool runtimeMissing=false; struct stat runtimeIdentity{};
   if(migration&&lstat(leaf.fileSystemRepresentation,&runtimeIdentity)) {
@@ -2816,16 +2949,16 @@ static bool inspectExit(ExitInspection& job) {
           if(runtimeMissing) { if(!missingRuntime.current()) return false; }
           else if(!unchanged(claim.at)||!readAt(claim.at.directory,"claim.json",actual,missing)||
             missing!=absent||actual!=currentRaw) return false;
-          arbol_attempt::MaintenanceDirectory createdHistory; int historyFd=history.fd;
-          if(historyMissing) {
+          int historyFd=history.fd;
+          if(historyAuthority.fd<0) {
             struct stat named{}; errno=0;
-            if(lstat(historyPath.fileSystemRepresentation,&named)) return errno==ENOENT;
-            if(!createdHistory.openPath(historyPath.fileSystemRepresentation)) return false;
-            historyFd=createdHistory.fd;
+            return historyMissing&&lstat(historyPath.fileSystemRepresentation,&named)<0&&errno==ENOENT;
           }
+          if(!historyAuthority.current()) return false;
+          historyFd=historyAuthority.fd;
           if(!readAt(historyFd,"previous-claim.json",actual,missing)||missing!=headAbsent||actual!=headRaw||
              !readAt(historyFd,"current-attempt.json",actual,missing)||missing!=pointerAbsent||actual!=pointerRaw) return false;
-          return historyMissing?createdHistory.current():true;
+          return historyAuthority.current();
         };
         if(recover) {
           if(!reverify||!claimsCurrent()||![evidence isEqual:publication.entry[@"evidence"]]||
@@ -2848,7 +2981,12 @@ static bool inspectExit(ExitInspection& job) {
             @"record":publication.targetRecord().record()});
           return !job.result.empty()&&job.within()&&claimsCurrent();
         }
-        return publishMigration(job,closed,data,evidence,claimsCurrent)&&claimsCurrent();
+        auto bindHistory=[&](int original) {
+          struct stat held{}; if(fstat(original,&held)) return false;
+          if(historyAuthority.fd<0&&(!historyMissing||!historyAuthority.openPath(historyPath.fileSystemRepresentation))) return false;
+          return historyAuthority.current()&&historyAuthority.identity.st_dev==held.st_dev&&historyAuthority.identity.st_ino==held.st_ino&&claimsCurrent();
+        };
+        return publishMigration(job,closed,data,evidence,claimsCurrent,bindHistory,historyMissing)&&claimsCurrent();
       }
       job.result=bytes(@{@"format":@1,@"kind":@"migration-verification",@"epoch":maintenanceCustody->epoch,
         @"profileInstance":input[@"profileInstance"],@"profilePathHash":input[@"profilePathHash"],@"evidence":evidence,
