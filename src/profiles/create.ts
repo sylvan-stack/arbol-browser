@@ -74,7 +74,7 @@ function requestToken(request: string | undefined): void {
   if (request !== undefined && !/^create_[A-Za-z0-9_-]{22}$/.test(request)) throw invalidInput();
 }
 async function createManaged(id: string, request: string | undefined, platform: PlatformPort,
-  state: string, allowDefault: boolean, deadline = lockDeadline(), signal?: AbortSignal): Promise<Contract<'profile.ProfileCreated'>> {
+  state: string, allowDefault: boolean, deadline = lockDeadline(), signal?: AbortSignal): Promise<Contract<'profile2.ProfileCreated'>> {
   profileId(id, !allowDefault); requestToken(request);
   const paths = profilePaths(id, state);
   try {
@@ -103,7 +103,7 @@ async function createManaged(id: string, request: string | undefined, platform: 
   } catch (error) { if (error instanceof BrowserFailure) throw error; throw profileUnavailable(); }
 }
 export function createProfile(id: string, request: string | undefined, platform: PlatformPort,
-  state = stateDirectory()): Promise<Contract<'profile.ProfileCreated'>> {
+  state = stateDirectory()): Promise<Contract<'profile2.ProfileCreated'>> {
   return createManaged(id, request, platform, state, false);
 }
 /** The process service calls this before owner arbitration. Only startup may

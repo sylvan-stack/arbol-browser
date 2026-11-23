@@ -18,9 +18,9 @@ export interface ProcessPort {
   attachAgent(input: AgentAttachment): Promise<RuntimeClient>;
 }
 export interface ProfilePort {
-  list(): Promise<Contract<'profile.ProfileList'>>;
-  create(profile: string, creationRequest?: string): Promise<Contract<'profile.ProfileCreated'>>;
-  remove(profile: string): Promise<Contract<'profile.ProfileRemoved'>>;
+  list(): Promise<Contract<'profile2.ProfileList'>>;
+  create(profile: string, creationRequest?: string): Promise<Contract<'profile2.ProfileCreated'>>;
+  remove(profile: string): Promise<Contract<'profile2.ProfileRemoved'>>;
 }
 export interface CommandPorts { readonly process: ProcessPort; readonly profiles: ProfilePort }
 
@@ -29,7 +29,7 @@ export interface CommandPorts { readonly process: ProcessPort; readonly profiles
  * is evidence of native readiness, signature trust or compatibility with data. */
 export interface PackageMetadata {
   format: 1;
-  component: Omit<Contract<'wire.ComponentInfo'>, 'stateDirectory'>;
+  component: Omit<Contract<'profile2.ComponentInfo'>, 'stateDirectory'>;
   runtime: Contract<'native.Runtime'>;
   admission: 'blocked';
   nativeInput: false;

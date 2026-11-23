@@ -1,12 +1,13 @@
 import { constants, openSync, closeSync, fstatSync, lstatSync, readSync } from 'node:fs';
 import { lstat, open } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
+import { parseStrictJson } from './strict-json.js';
 import { validator } from '../contracts/schema.js';
 import type { Contract } from '../contracts/generated.js';
 import { directory, directorySync, identity, sameIdentity, privateFile, profileId, profileMissing, profileUnavailable,
   missing, type Identity, type ProfilePaths, assertDirectory } from './paths.js';
 
-export type ProfileRecord = Contract<'profile.ProfileRecord'>;
+export type ProfileRecord = Contract<'profile2.ProfileRecord'>;
 export interface ProfileSnapshot {
   readonly paths: ProfilePaths; readonly record: Readonly<ProfileRecord>;
   readonly rootIdentity: Identity; readonly recordIdentity: Identity; readonly dataIdentity: Identity;
@@ -24,7 +25,7 @@ export async function readJson(path: string, maxBytes = 65536): Promise<{ value:
     if (!sameIdentity(identity(published), identity(before))) throw profileUnavailable();
     if (bytesRead !== before.size || bytesRead > maxBytes || after.size !== before.size ||
         after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) throw profileUnavailable();
-    const value: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, bytesRead)));
+    const value: unknown = parseStrictJson(bytes.subarray(0, bytesRead), maxBytes);
     return { value, identity: identity(before) };
   } finally { await handle.close(); }
 }
@@ -40,17 +41,17 @@ function readJsonSync(path: string, maxBytes = 65536): { value: unknown; identit
     if (!sameIdentity(identity(published), identity(before))) throw profileUnavailable();
     if (bytesRead !== before.size || bytesRead > maxBytes || after.size !== before.size ||
         after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) throw profileUnavailable();
-    const value: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, bytesRead)));
+    const value: unknown = parseStrictJson(bytes.subarray(0, bytesRead), maxBytes);
     return { value, identity: identity(before) };
   } finally { closeSync(descriptor); }
 }
 export function validatedRecord(value: unknown, id: string): Readonly<ProfileRecord> {
-  if (!validator('profile.ProfileRecord')(value) || value.id !== id || !value.createdAt.endsWith('Z')) throw profileUnavailable();
+  if (!validator('profile2.ProfileRecord')(value) || value.id !== id || !value.createdAt.endsWith('Z')) throw profileUnavailable();
   return Object.freeze({ ...value });
 }
 export function newRecord(id: string, creationRequest = `create_${randomBytes(16).toString('base64url')}`): Readonly<ProfileRecord> {
   profileId(id);
-  return validatedRecord({ format: 1, id, instance: `prf_${randomBytes(16).toString('base64url')}`,
+  return validatedRecord({ format: 2, id, instance: `prf_${randomBytes(16).toString('base64url')}`,
     creationRequest, createdAt: new Date().toISOString() }, id);
 }
 export async function readProfile(paths: ProfilePaths): Promise<ProfileSnapshot> {

@@ -47,7 +47,7 @@ const unopenedRuntime: ProfileRuntimePort = Object.freeze({
 async function validateRemovalMarker(profile: ProfileSnapshot): Promise<void> {
   if (!await statOrAbsent(profile.paths.engine)) return;
   const read = await readJson(profile.paths.engine);
-  if (!validator('profile.EngineMarker')(read.value) || read.value.profileInstance !== profile.record.instance)
+  if (!validator('profile2.EngineMarker')(read.value) || read.value.profileInstance !== profile.record.instance)
     throw profileUnavailable();
 }
 async function existingRegistry(state: string, platform: PlatformPort, deadline: number) {

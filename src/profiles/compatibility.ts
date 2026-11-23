@@ -9,7 +9,7 @@ import { profileUnavailable, statOrAbsent, sameIdentity, syncDirectory, ownerUid
 import { readJson, writeNewFile, type ProfileSnapshot } from './records.js';
 import type { OwnerLease } from './locking.js';
 
-export type EngineMarker = Contract<'profile.EngineMarker'>;
+export type EngineMarker = Contract<'profile2.EngineMarker'>;
 // Opaque artifacts Electron places beside the explicit website data directory.
 const nonEngineRootNames = new Set(['profile.json', 'engine.json', 'owner.lock', 'logs', 'data', 'userData']);
 const knownEngineRootTypes = new Map([['Local State', 'file'], ['GraphiteDawnCache', 'directory'], ['GPUPersistentCache', 'directory']]);
@@ -105,7 +105,7 @@ interface StoredMarker { readonly marker: Readonly<EngineMarker>; readonly ident
 async function storedMarker(profile: ProfileSnapshot): Promise<StoredMarker | undefined> {
   if (!await statOrAbsent(profile.paths.engine)) return undefined;
   const read = await readJson(profile.paths.engine);
-  if (!validator('profile.EngineMarker')(read.value) || read.value.profileInstance !== profile.record.instance)
+  if (!validator('profile2.EngineMarker')(read.value) || read.value.profileInstance !== profile.record.instance)
     throw profileUnavailable();
   return { marker: Object.freeze({ ...read.value }), identity: read.identity };
 }
@@ -174,10 +174,10 @@ export async function prepareEngine(owner: OwnerLease, authority: EngineAuthorit
     note('verified-prior-exit');
     await authority.assertPreviousEngineExited(profile);
     await owner.assert(); await assertMarker(profile, previous);
-    const dirty: EngineMarker = { format: 1, profileInstance: profile.record.instance, engine: 'chromium',
+    const dirty: EngineMarker = { format: 2, profileInstance: profile.record.instance, engine: 'chromium',
       dataEpoch: manifest.dataEpoch, lastWriterBuild: build, lastWriterChromium: manifest.runtime.chromium,
       lastWriterElectron: manifest.runtime.electron, requiredReader: manifest.writerKey, cleanExit: false };
-    if (!validator('profile.EngineMarker')(dirty)) throw profileUnavailable();
+    if (!validator('profile2.EngineMarker')(dirty)) throw profileUnavailable();
     note('native-marker-permit');
     const mutation = await authority.beginMutation?.(owner, Object.freeze({ ...dirty }));
     let current: StoredMarker;
