@@ -203,10 +203,79 @@ export async function currentHostCompilation() {
 // Review authority is an already published exact Forester hand-over, never
 // a caller-written JSON file or the source checkout's current HEAD itself.
 const foresterRoot = '/Users/msix/Artifacts/forester';
+function strictAdmissionJson(bytes, limit = 65536) {
+  if (!Number.isSafeInteger(limit) || limit < 1 || bytes.byteLength > limit) throw new Error('Invalid management JSON');
+  const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+  let at = 0;
+  const fail = () => { throw new Error('Invalid management JSON'); };
+  const space = () => { while (at < text.length && /[\x20\x09\x0a\x0d]/.test(text[at])) at++; };
+  const string = () => {
+    if (text[at] !== '"') return fail();
+    const start = at++;
+    while (at < text.length) {
+      const char = text[at++];
+      if (char === '"') {
+        const result = JSON.parse(text.slice(start, at));
+        return typeof result === 'string' ? result : fail();
+      }
+      if (char === '\\') { if (at >= text.length) return fail(); at++; }
+      else if (char.charCodeAt(0) < 0x20) return fail();
+    }
+    return fail();
+  };
+  const value = (depth) => {
+    if (depth > 128) return fail();
+    space();
+    if (text[at] === '"') { string(); return; }
+    if (text[at] === '{') {
+      at++; space();
+      const keys = new Set();
+      if (text[at] === '}') { at++; return; }
+      for (;;) {
+        space(); const key = string();
+        if (keys.has(key)) return fail();
+        keys.add(key); space();
+        if (text[at++] !== ':') return fail();
+        value(depth + 1); space();
+        const delimiter = text[at++];
+        if (delimiter === '}') return;
+        if (delimiter !== ',') return fail();
+      }
+    }
+    if (text[at] === '[') {
+      at++; space();
+      if (text[at] === ']') { at++; return; }
+      for (;;) {
+        value(depth + 1); space();
+        const delimiter = text[at++];
+        if (delimiter === ']') return;
+        if (delimiter !== ',') return fail();
+      }
+    }
+    const token = /^(?:true|false|null|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)/.exec(text.slice(at));
+    if (!token) return fail();
+    at += token[0].length;
+  };
+  value(0); space();
+  if (at !== text.length) return fail();
+  return JSON.parse(text);
+}
+
+const migrationAdmissionPath = 'sagas/sylvan-stack/arbol-format-2-migration/browser-profile-migration/AFM-9.md';
+const migrationAdmissionMarkers = { production: 'AFM-9-RELEASE-SOURCE-ADMISSION', isolated: 'AFM-9-ISOLATED-MIGRATION-SOURCE-ADMISSION' };
+function admittedBlock(text, marker) {
+  const comments = [...text.matchAll(/<!--[\s\S]*?(?:-->|$)/g)].filter(m => m[0].includes(marker));
+  if (!comments.length) return null;
+  if (comments.length !== 2 || comments[0][0] !== `<!-- ${marker}:BEGIN -->` || comments[1][0] !== `<!-- ${marker}:END -->`)
+    fail('Malformed or duplicate migration admission delimiters');
+  return strictAdmissionJson(Buffer.from(text.slice(comments[0].index + comments[0][0].length, comments[1].index).trim()), 8388608);
+}
+const admissionObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+
 async function acceptedProduct(commit, compiled, production) {
-  const handoverPath = production ? 'sagas/sylvan-stack/arbol-browser/browser-release/ABR-24.md' :
-    'sagas/sylvan-stack/arbol-browser/browser-control-health/ABR-29.md';
-  const marker = production ? 'ABR-24-RELEASE-SOURCE-ADMISSION' : 'ABR-29-HOST-SOURCE-ADMISSION';
+  const handoverPath = migrationAdmissionPath;
+  const marker = production ? migrationAdmissionMarkers.production : migrationAdmissionMarkers.isolated;
+  const scope = production ? 'production-candidate' : 'isolated-migration-candidate';
   if (typeof commit !== 'string' || !/^[0-9a-f]{40}$/.test(commit)) fail('Exact published review hand-over commit required');
   if (await realpath(foresterRoot) !== foresterRoot) fail('Nonphysical review repository');
   const git = args => command('/usr/bin/git', ['-C', foresterRoot, ...args]).trim();
@@ -215,18 +284,27 @@ async function acceptedProduct(commit, compiled, production) {
     fail('Wrong independent hand-over authority');
   git(['merge-base', '--is-ancestor', commit, 'refs/remotes/origin/main']);
   const text = git(['show', `${commit}:${handoverPath}`]);
-  const blocks = [...text.matchAll(new RegExp(`<!-- ${marker}:BEGIN -->\\s*([\\s\\S]*?)\\s*<!-- ${marker}:END -->`, 'g'))];
-  if (blocks.length !== 1) fail('Published hand-over has no unique accepted host source admission');
-  const value = JSON.parse(blocks[0][1]);
-  if (value.format !== 1 || value.status !== 'accepted' || (production && value.scope !== 'production-candidate') ||
+  const blocks = Object.fromEntries(Object.entries(migrationAdmissionMarkers).map(([role, name]) => [name, admittedBlock(text, name)]));
+  for (const [name, block] of Object.entries(blocks)) {
+    if (block && (!admissionObject(block) || block.format !== 1 || block.status !== 'accepted' ||
+        block.scope !== (name === migrationAdmissionMarkers.production ? 'production-candidate' : 'isolated-migration-candidate')))
+      fail('Wrong migration admission role or status');
+  }
+  const value = blocks[marker];
+  if (!value) fail('Exact published AFM-9 source admission is absent');
+  if (value.format !== 1 || value.status !== 'accepted' || value.scope !== scope ||
+      ![value.productSources, value.productOutputs, value.compilerInputs, value.sourceCheckpoint, value.sourceVerdict].every(admissionObject) ||
+      !sha(value.sourceCheckpoint?.sha256) || !sha(value.sourceVerdict?.sha256) ||
+      ![value.sourceCheckpoint?.path, value.sourceVerdict?.path].every(path => typeof path === 'string' && path.length <= 4096 && resolve(path) === path) ||
       !Number.isSafeInteger(value.acceptedSourceOrdinal) || value.acceptedSourceOrdinal < 1 ||
       !/^[0-9a-f]{40}$/.test(value.sourceGit) || !sha(value.productDigest) || value.productDigest !== compiled.record.productDigest ||
       canonical(value.productSources) !== canonical(compiled.productSources) ||
       canonical(value.productOutputs) !== canonical(compiled.productOutputs) ||
       canonical(value.compilerInputs) !== canonical(compiled.record.compilerInputs)) fail('Exact independently accepted product identity differs');
-  const checkpoint = await json(value.sourceCheckpoint.path), verdict = await exactFile(value.sourceVerdict.path);
+  const checkpointFile = await exactFile(value.sourceCheckpoint.path);
+  const checkpoint = { ...checkpointFile, value: strictAdmissionJson(checkpointFile.bytes, 1048576) }, verdict = await exactFile(value.sourceVerdict.path);
   if (checkpoint.sha256 !== value.sourceCheckpoint.sha256 || verdict.sha256 !== value.sourceVerdict.sha256 ||
-      (production && checkpoint.value.scope !== 'production-candidate') ||
+      checkpoint.value.scope !== scope ||
       checkpoint.value.ordinal !== value.acceptedSourceOrdinal || checkpoint.value.source !== value.sourceGit ||
       checkpoint.value.productDigest !== value.productDigest || canonical(checkpoint.value.productSources) !== canonical(value.productSources) ||
       canonical(checkpoint.value.productOutputs) !== canonical(value.productOutputs) ||
