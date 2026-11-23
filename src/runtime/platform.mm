@@ -2872,10 +2872,10 @@ static bool inspectExit(ExitInspection& job) {
   NSDictionary* input=job.input,*expected=input[@"attempt"]; NSString* leaf=input[@"runtimeLeaf"],*profile=input[@"profile"];
   bool prior=[input[@"mode"] isEqual:@"prior"],hostMode=[input[@"mode"] isEqual:@"host"],
     retire=[input[@"mode"] isEqual:@"retire"],reserve=[input[@"mode"] isEqual:@"reserve"],withdraw=[input[@"mode"] isEqual:@"withdraw"];
-  bool recover=[input[@"mode"] isEqual:@"migrate-recover"],commit=[input[@"mode"] isEqual:@"migrate-commit"],
-    migration=recover||commit||[input[@"mode"] isEqual:@"migrate-verify"];
+  bool progress=[input[@"mode"] isEqual:@"receipt-progress"],recover=[input[@"mode"] isEqual:@"migrate-recover"],
+    commit=[input[@"mode"] isEqual:@"migrate-commit"],migration=progress||recover||commit||[input[@"mode"] isEqual:@"migrate-verify"];
   NSArray* inputKeys=@[@"format",@"mode",@"profile",@"profileInstance",@"profilePathHash",@"runtimeLeaf",@"bundle",@"attempt",@"previous",@"dataAttempt",@"pending"];
-  if(commit||recover) inputKeys=[inputKeys arrayByAddingObject:@"migration"];
+  if(commit||recover||progress) inputKeys=[inputKeys arrayByAddingObject:@"migration"];
   if(!job.within()||!keys(input,inputKeys)||
      ![input[@"format"] isEqual:@1]||(![@[@"prior",@"host",@"full",@"retire",@"reserve",@"withdraw"] containsObject:input[@"mode"]]&&!migration)||
      (migration&&!job.maintenance)||
@@ -2889,7 +2889,7 @@ static bool inspectExit(ExitInspection& job) {
   MigrationObservation migrationSource;
   MigrationPublication publication;
   struct PublicationScope { ExitInspection& job; ~PublicationScope() { job.publication=nullptr; } } publicationScope{job};
-  if(commit||recover) {
+  if(commit||recover||progress) {
     if(!publication.open(input,recover,job.deadline)) return false; job.publication=&publication;
     if(!rewrittenMigrationMetadata(job)) return false;
   } else if(migration&&!migrationSource.capture(job)) return false;
@@ -3052,6 +3052,55 @@ static bool inspectExit(ExitInspection& job) {
          !receiptMetadata(job.hostCapability,current,job)) return false;
     }
   } else if(hostMode) return false;
+  if(progress) {
+    if(!originalMaintenanceBuild(job.build)||job.build.path!=maintenanceCustody->newGuard().lock.path||
+       ![input[@"bundle"] isEqual:[NSString stringWithUTF8String:maintenanceCustody->layout().bundle.c_str()]]||
+       (closed?![closed isEqual:expected]:expected!=(id)NSNull.null)||!reclaim()) return false;
+    RetainedMigrationProof proof;
+    if(!proof.open([NSString stringWithUTF8String:maintenanceCustody->runtime().path.c_str()],maintenanceCustody->stateRoot(),
+         input[@"profilePathHash"],input[@"profileInstance"],false)||
+       ![proof.chain.receipt[@"attempt"] isEqual:input[@"migration"][@"attempt"]]||
+       ![proof.chain.receipt[@"transactionSha256"] isEqual:input[@"migration"][@"transactionSha256"]]||
+       ![proof.chain.transaction isEqual:publication.transaction]||
+       (closed?![closed isEqual:proof.closed]:proof.closed!=nil)) return false;
+    bool unused=closed&&[[closed[@"terminal"][@"path"] lastPathComponent] isEqual:@"unused.json"];
+    id expectedData=unused&&proof.data?proof.data:(id)NSNull.null;
+    if(![input[@"dataAttempt"] isEqual:expectedData]) return false;
+    MaintenanceDirectory progressAuthority;
+    if(!progressAuthority.openPath(publication.attempt.path+"/progress")) return false;
+    const std::string committed=std::string([input[@"profilePathHash"] UTF8String])+".committed.json";
+    auto continuity=[&] {
+      std::string raw; bool missing; struct stat named{};
+      if(!job.within()||!publication.current()||!proof.current()) return false;
+      if(runtimeMissing) { if(!missingRuntime.current()) return false; }
+      else if(!unchanged(claim.at)||!readAt(claim.at.directory,"claim.json",raw,missing)||missing!=absent||raw!=currentRaw) return false;
+      // A published receipt necessarily retained normal native evidence here.
+      if(historyMissing||!historyAuthority.current()||
+         !readAt(historyAuthority.fd,"previous-claim.json",raw,missing)||missing!=headAbsent||raw!=headRaw||
+         !readAt(historyAuthority.fd,"current-attempt.json",raw,missing)||missing!=pointerAbsent||raw!=pointerRaw) return false;
+      errno=0; if(!fstatat(publication.attempt.fd,"completed.json",&named,AT_SYMLINK_NOFOLLOW)||errno!=ENOENT) return false;
+      if(!progressAuthority.current()) return false;
+      errno=0; return fstatat(progressAuthority.fd,committed.c_str(),&named,AT_SYMLINK_NOFOLLOW)<0&&errno==ENOENT&&progressAuthority.current();
+    };
+    if(!continuity()||!verifyRetainedMigration(proof,job)||!continuity()) return false;
+    if(input[@"previous"]!=NSNull.null) {
+      id previous=input[@"previous"];
+      bool latest=closed&&closed[@"runtime"]!=NSNull.null&&runtime(previous,closed)&&sameRuntimeBinding(previous,closed[@"runtime"]);
+      bool writer=proof.data&&proof.data[@"runtime"]!=NSNull.null&&runtime(previous,proof.data)&&sameRuntimeBinding(previous,proof.data[@"runtime"]);
+      bool prefix=false;
+      if(unused) {
+        std::string raw; NSDictionary* witness=nil; struct stat identity{};
+        if(!exitReceiptAt(closed[@"terminal"][@"path"],raw,witness,identity)||![digest(raw) isEqual:closed[@"terminal"][@"digest"]]) return false;
+        prefix=runtime(previous,closed)&&[previous[@"phase"] isEqual:@"starting"]&&
+          [previous[@"pid"] isEqual:witness[@"actor"][@"pid"]]&&[previous[@"processStartId"] isEqual:witness[@"actor"][@"startId"]];
+      }
+      if(!latest&&!writer&&!prefix) return false;
+    }
+    job.result=bytes(@{@"format":@1,@"kind":@"migration-receipt-progress",@"epoch":maintenanceCustody->epoch,
+      @"attempt":proof.chain.receipt[@"attempt"],@"profileInstance":input[@"profileInstance"],@"profilePathHash":input[@"profilePathHash"],
+      @"receipt":proof.chain.receiptFile.record()});
+    return !job.result.empty()&&continuity();
+  }
   NSDictionary* data=nil,*capability=nil,*receipt=nil,*frontier=nil,*unusedReceipt=nil;
   bool unused=closed&&[[closed[@"terminal"][@"path"] lastPathComponent] isEqual:@"unused.json"];
   auto verify=[&] {

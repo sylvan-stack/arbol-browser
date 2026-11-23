@@ -121,6 +121,7 @@ export type NativeMigrationInput = Omit<NativeExitInput, 'mode' | 'pending'> & R
 export type NativeMigrationCommitInput = Omit<NativeMigrationInput, 'mode'> & Readonly<{
   mode: 'migrate-commit'; migration: Readonly<{ attempt: string; transactionSha256: string }>;
 }>;
+export type NativeMigrationProgressInput = Omit<NativeMigrationCommitInput, 'mode'> & Readonly<{ mode: 'receipt-progress' }>;
 export type NativeMigrationRecoveryInput = Omit<NativeMigrationCommitInput, 'mode'> & Readonly<{ mode: 'migrate-recover' }>;
 export interface MigrationRecoveryReceipt {
   readonly epoch: string; readonly attempt: string; readonly profileInstance: string; readonly profilePathHash: string;
@@ -282,6 +283,8 @@ export interface PlatformPort {
     input: NativeMigrationInput, deadline: number, data?: HeldLock | MaintenanceGuard): Promise<MigrationInspectionReceipt>;
   commitMigration(custody: MaintenanceCustody, registry: HeldLock, owner: HeldLock, build: HeldLock | MaintenanceGuard,
     input: NativeMigrationCommitInput, deadline: number, data?: HeldLock | MaintenanceGuard): Promise<MigrationCommitReceipt>;
+  validateMigrationProgress(custody: MaintenanceCustody, registry: HeldLock, owner: HeldLock, build: MaintenanceGuard,
+    input: NativeMigrationProgressInput, deadline: number): Promise<MigrationCommitReceipt>;
   prepareMigrationRecovery(custody: MaintenanceCustody, registry: HeldLock, owner: HeldLock, build: HeldLock | MaintenanceGuard,
     input: NativeMigrationRecoveryInput, deadline: number, data?: HeldLock | MaintenanceGuard): Promise<MigrationRecoveryPermit>;
   /** One-use fixed-exec native adoption. No numeric FD or role is accepted. */
@@ -756,6 +759,45 @@ export function loadPlatform(): PlatformPort {
             const value = JSON.parse(raw) as MigrationCommitReceipt & { format: number; kind: string };
             if (!value || Object.keys(value).sort().join(',') !== 'attempt,epoch,format,kind,profileInstance,profilePathHash,receipt' ||
                 value.format !== 1 || value.kind !== 'migration-committed' || value.epoch !== custody.facts.epoch ||
+                value.attempt !== input.migration.attempt || value.profileInstance !== input.profileInstance ||
+                value.profilePathHash !== input.profilePathHash || !validator('migration.File')(value.receipt)) throw unavailable('profile');
+            assert(); if (performance.now() >= deadline || call(() => native.continuousTime()) >= nativeDeadline) throw unavailable('profile');
+            Object.freeze(value.receipt.identity); Object.freeze(value.receipt);
+            const receipt: MigrationCommitReceipt = Object.freeze({ epoch: value.epoch, attempt: value.attempt,
+              profileInstance: value.profileInstance, profilePathHash: value.profilePathHash, receipt: value.receipt });
+            migrationCommitReceipts.add(receipt); return receipt;
+          }
+          await setTimeout(Math.min(5, Math.max(1, deadline - performance.now())));
+        }
+        throw unavailable('profile');
+      } finally { call(() => native.cancelExitInspection(handle)); }
+    },
+    async validateMigrationProgress(custody: MaintenanceCustody, registry: HeldLock, owner: HeldLock, build: MaintenanceGuard,
+      input: NativeMigrationProgressInput, deadline: number): Promise<MigrationCommitReceipt> {
+      assertMaintenanceCustody(custody);
+      const guardHandle = (value: HeldLock | MaintenanceGuard) => locks.get(value as HeldLock) ?? maintenanceBuildHandles.get(value as MaintenanceGuard);
+      const actualCustody = maintenanceHandles.get(custody), actualRegistry = locks.get(registry), actualOwner = locks.get(owner);
+      const actualBuild = guardHandle(build), actualData = null;
+      if (!actualCustody || !actualRegistry || !actualOwner || !actualBuild ||
+          input.mode !== 'receipt-progress' || !Number.isFinite(deadline) || !input.migration ||
+          Object.keys(input.migration).sort().join(',') !== 'attempt,transactionSha256' ||
+          !/^[0-9a-f]{32}$/.test(input.migration.attempt) || !/^[0-9a-f]{64}$/.test(input.migration.transactionSha256)) throw unavailable('profile');
+      const assert = () => { assertMaintenanceCustody(custody); registry.assertIdentity(); owner.assertIdentity(); build.assertIdentity(); };
+      assert();
+      const nativeNow = call(() => native.continuousTime()), sampled = performance.now();
+      if (sampled >= deadline) throw unavailable('profile');
+      const nativeDeadline = nativeNow + Math.min(10000, deadline - sampled);
+      const handle = call(() => native.beginExitInspection(actualOwner, actualBuild,
+        JSON.stringify({ ...input, dataAttempt: input.dataAttempt ?? null, pending: null }), nativeDeadline,
+        actualData ?? null, null, actualRegistry, actualCustody));
+      try {
+        while (performance.now() < deadline && call(() => native.continuousTime()) < nativeDeadline) {
+          const raw = call(() => native.pollExitInspection(handle));
+          if (raw !== null) {
+            if (typeof raw !== 'string' || !raw.length || Buffer.byteLength(raw) > 16384) throw unavailable('profile');
+            const value = JSON.parse(raw) as MigrationCommitReceipt & { format: number; kind: string };
+            if (!value || Object.keys(value).sort().join(',') !== 'attempt,epoch,format,kind,profileInstance,profilePathHash,receipt' ||
+                value.format !== 1 || value.kind !== 'migration-receipt-progress' || value.epoch !== custody.facts.epoch ||
                 value.attempt !== input.migration.attempt || value.profileInstance !== input.profileInstance ||
                 value.profilePathHash !== input.profilePathHash || !validator('migration.File')(value.receipt)) throw unavailable('profile');
             assert(); if (performance.now() >= deadline || call(() => native.continuousTime()) >= nativeDeadline) throw unavailable('profile');
