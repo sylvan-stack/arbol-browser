@@ -1,0 +1,213 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:arbol-browser:profile:2",
+  "title": "Browser profile management format 2",
+  "$comment": "Normative BRW-1 definition bundle. Select a named definition. The signed Browser format-2 amendment defines custody, writer fencing and recovery.",
+  "$defs": {
+    "ProfileRecord": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "const": 2
+        },
+        "id": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ProfileId"
+        },
+        "instance": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^prf_[A-Za-z0-9_-]{22}$"
+        },
+        "creationRequest": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^create_[A-Za-z0-9_-]{22}$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "maxLength": 40
+        }
+      },
+      "required": [
+        "format",
+        "id",
+        "instance",
+        "creationRequest",
+        "createdAt"
+      ],
+      "additionalProperties": false
+    },
+    "ProfileListItem": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "const": 2
+        },
+        "id": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ProfileId"
+        },
+        "instance": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^prf_[A-Za-z0-9_-]{22}$"
+        },
+        "creationRequest": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^create_[A-Za-z0-9_-]{22}$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "maxLength": 40
+        },
+        "running": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "format",
+        "id",
+        "instance",
+        "creationRequest",
+        "createdAt",
+        "running"
+      ],
+      "additionalProperties": false
+    },
+    "ProfileList": {
+      "type": "object",
+      "properties": {
+        "profiles": {
+          "type": "array",
+          "items": {
+            "$ref": "urn:arbol-browser:profile:2#/$defs/ProfileListItem"
+          },
+          "maxItems": 4096
+        }
+      },
+      "required": [
+        "profiles"
+      ],
+      "additionalProperties": false
+    },
+    "ProfileCreated": {
+      "type": "object",
+      "properties": {
+        "profile": {
+          "$ref": "urn:arbol-browser:profile:2#/$defs/ProfileRecord"
+        },
+        "created": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "profile",
+        "created"
+      ],
+      "additionalProperties": false
+    },
+    "ProfileRemoved": {
+      "type": "object",
+      "properties": {
+        "profile": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ProfileId"
+        },
+        "dataRemoved": {
+          "const": true
+        }
+      },
+      "required": [
+        "profile",
+        "dataRemoved"
+      ],
+      "additionalProperties": false
+    },
+    "EngineMarker": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "const": 2
+        },
+        "profileInstance": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^prf_[A-Za-z0-9_-]{22}$"
+        },
+        "engine": {
+          "const": "chromium"
+        },
+        "dataEpoch": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "lastWriterBuild": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Build"
+        },
+        "lastWriterChromium": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "lastWriterElectron": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "requiredReader": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "cleanExit": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "format",
+        "profileInstance",
+        "engine",
+        "dataEpoch",
+        "lastWriterBuild",
+        "lastWriterChromium",
+        "lastWriterElectron",
+        "requiredReader",
+        "cleanExit"
+      ],
+      "additionalProperties": false
+    },
+    "ComponentInfo": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "const": "arbol-browser"
+        },
+        "version": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "build": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Build"
+        },
+        "contract": {
+          "const": 1
+        },
+        "profileFormat": {
+          "const": 2
+        },
+        "stateDirectory": {
+          "type": "string",
+          "maxLength": 4096
+        }
+      },
+      "required": [
+        "name",
+        "version",
+        "build",
+        "contract",
+        "profileFormat",
+        "stateDirectory"
+      ],
+      "additionalProperties": false
+    }
+  }
+}
