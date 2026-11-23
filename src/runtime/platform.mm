@@ -1818,6 +1818,24 @@ static napi_value abortHostMarkerMutation(napi_env env,napi_callback_info info) 
 // Independent exit inspection never borrows a disappearing holder's JS state.
 // Actual owner/old-Build descriptions and code lifetime survive a bounded
 // caller's departure; blocking read-only kernel/FS work is off its event loop.
+static bool migrationInspectionMode(id mode) {
+  return arbol_attempt::profileFormat == 2 && [@[@"migrate-verify",@"migrate-commit",@"migrate-recover",@"migrate-receipt-progress"] containsObject:mode];
+}
+static bool originalMaintenanceBuild(const arbol_boundary::Lock& lock) {
+  if (arbol_attempt::profileFormat != 2 || !maintenanceCustody || !maintenanceCustody->accepted ||
+      !maintenanceStateRoot || !maintenanceStateRoot->current() || lock.heldMode != LOCK_EX ||
+      !arbol_boundary::lockIdentity(lock)) return false;
+  for (const auto* original : {maintenanceCustody->oldBuild,maintenanceCustody->newBuild})
+    if (original && original->retained && original->mode == LOCK_EX && lock.path == original->path &&
+        lock.device == uint64_t(original->dev) && lock.inode == original->ino && lock.uid == geteuid() && lock.mode == 0600)
+      return true;
+  return false;
+}
+static bool originalMaintenanceBuildHandle(HeldLock* value) {
+  return maintenanceCustody && maintenanceCustody->accepted && value && value->retained && value->mode == LOCK_EX &&
+    (value == maintenanceCustody->oldBuild || value == maintenanceCustody->newBuild) &&
+    maintenanceStateRoot && maintenanceStateRoot->current();
+}
 struct ExitInspection {
   std::atomic<int> state{0}; std::atomic<bool> cancelled{false};
   arbol_boundary::Lock owner,build,dataBuild,nextBuild; NSDictionary* input=nil; std::string result; double deadline=0;
@@ -1826,10 +1844,23 @@ struct ExitInspection {
   // or global nativeCustodies container.
   arbol_boundary::Context hostContext; arbol_exit::SharedState* hostState=nullptr;
   NSDictionary* hostCapability=nil;
+  bool maintenance = false;
   std::thread* thread=nullptr;
   bool within() const { return !cancelled.load(std::memory_order_acquire)&&arbol_boundary::clockMs()<deadline&&
     arbol_boundary::lockIdentity(owner)&&arbol_boundary::lockIdentity(build)&&
-    (dataBuild.fd<0||arbol_boundary::lockIdentity(dataBuild))&&(nextBuild.fd<0||arbol_boundary::lockIdentity(nextBuild)); }
+    (dataBuild.fd<0||arbol_boundary::lockIdentity(dataBuild))&&(nextBuild.fd<0||arbol_boundary::lockIdentity(nextBuild))&&
+    (!maintenance || (maintenanceStateRoot && maintenanceStateRoot->current())) &&
+    (build.heldMode==LOCK_SH||(maintenance&&originalMaintenanceBuild(build)))&&
+    (dataBuild.fd<0||dataBuild.heldMode==LOCK_SH||(maintenance&&originalMaintenanceBuild(dataBuild)))&&
+    (nextBuild.fd<0||nextBuild.heldMode==LOCK_SH||(maintenance&&originalMaintenanceBuild(nextBuild))); }
+  bool historicalBuildLock(id record, const arbol_boundary::Lock& actual) const {
+    if (actual.heldMode == LOCK_SH) return [record isEqual:arbol_boundary::capsuleLock(actual)];
+    if (!maintenance || !originalMaintenanceBuild(actual)) return false;
+    // Normalize only the historical record comparison. The actual retained
+    // description stays exclusive; no flock downgrade or unlock is issued.
+    auto historical = actual; historical.heldMode = LOCK_SH;
+    return [record isEqual:arbol_boundary::capsuleLock(historical)];
+  }
 };
 static std::set<ExitInspection*> exitInspections;
 static bool receiptIdentity(id value,arbol_boundary::Identity& out,bool withSession=false) {
@@ -2057,7 +2088,7 @@ static bool verifyClosedReceipt(NSDictionary* closed,NSDictionary* __strong& cap
      ![capability[@"attemptPath"] isEqual:[job.input[@"runtimeLeaf"] stringByAppendingPathComponent:@"claim.json"]]||
      ![capability[@"bundle"] isEqual:bundle]||![capability[@"markerPath"] isEqual:[profile stringByAppendingPathComponent:@"engine.json"]]||
      ![capability[@"locks"][@"owner"] isEqual:arbol_boundary::capsuleLock(job.owner)]||
-     ![capability[@"locks"][@"build"] isEqual:arbol_boundary::capsuleLock(proofBuild)]||
+     !job.historicalBuildLock(capability[@"locks"][@"build"],proofBuild)||
      ![receipt[@"format"] isEqual:@1]||![receipt[@"bootSession"] isEqual:capability[@"bootSession"]]||
      ![receipt[@"profileDirectory"] isEqual:capability[@"profileDirectory"]]||
      ![receipt[@"capabilityDigest"] isEqual:arbol_attempt::digest(arbol_attempt::bytes(capability))]) return false;
@@ -2100,7 +2131,7 @@ static bool verifyUnusedReceipt(NSDictionary* closed,NSDictionary* __strong& rec
      ![receipt[@"bundle"] isEqual:[NSString stringWithUTF8String:layout.bundle.c_str()]]||
      ![receipt[@"bundle"] isEqual:job.input[@"bundle"]]||
      !keys(receipt[@"locks"],@[@"build",@"owner"])||
-     ![receipt[@"locks"][@"build"] isEqual:arbol_boundary::capsuleLock(job.build)]||
+     !job.historicalBuildLock(receipt[@"locks"][@"build"],job.build)||
      ![receipt[@"marker"] isEqual:@{@"kind":@"unobserved"}]) return false;
   NSDictionary* attempt=receipt[@"attempt"],*baseline=receipt[@"baseline"],*actor=receipt[@"actor"],*facts=receipt[@"nativeFacts"];
   if(!record(attempt)||!record(baseline)||!immutable(attempt,closed)||!immutable(baseline,closed)||
@@ -2355,7 +2386,13 @@ static napi_value beginExitInspection(napi_env env,napi_callback_info info) {
      napi_get_value_double(env,args[3],&deadline)!=napi_ok||!std::isfinite(deadline)||deadline<=arbol_boundary::clockMs()||
      deadline>arbol_boundary::clockMs()+10000||!arbol_boundary::retainNativeImage()) return fail(env);
   auto* owner=static_cast<HeldLock*>(ownerValue); auto* build=static_cast<HeldLock*>(buildValue);
-  if(!liveLocks.count(owner)||!liveLocks.count(build)||owner->mode!=LOCK_EX||build->mode!=LOCK_SH) return fail(env);
+  NSData* command=[NSData dataWithBytes:input.data() length:input.size()];
+  id parsed=[NSJSONSerialization JSONObjectWithData:command options:0 error:nil];
+  if (![parsed isKindOfClass:NSDictionary.class]) return fail(env);
+  bool migration = migrationInspectionMode(parsed[@"mode"]);
+  if (migration && (!maintenanceStateRoot || !maintenanceStateRoot->current())) return fail(env);
+  if(!liveLocks.count(owner)||!liveLocks.count(build)||owner->mode!=LOCK_EX||
+     (build->mode!=LOCK_SH&&!(migration&&originalMaintenanceBuildHandle(build)))) return fail(env);
   HeldLock* additional[2]={nullptr,nullptr};
   for(unsigned i=0;i<2;++i) {
     napi_valuetype type; void* value=nullptr;
@@ -2363,15 +2400,14 @@ static napi_value beginExitInspection(napi_env env,napi_callback_info info) {
     if(type==napi_null) continue;
     if(napi_get_value_external(env,args[i+4],&value)!=napi_ok) return fail(env);
     additional[i]=static_cast<HeldLock*>(value);
-    if(!liveLocks.count(additional[i])||additional[i]->mode!=LOCK_SH) return fail(env);
+    if(!liveLocks.count(additional[i])||(additional[i]->mode!=LOCK_SH&&!(migration&&originalMaintenanceBuildHandle(additional[i])))) return fail(env);
   }
   auto* job=new ExitInspection; job->owner=duplicateHeld(owner); job->build=duplicateHeld(build); job->deadline=deadline;
   // In-process command bytes are ordinary JSON, not a durable canonical exit
   // certificate. Parse immutable data, then enforce exact envelope keys and
   // each complete 16 KiB native attempt grammar independently below.
-  NSData* command=[NSData dataWithBytes:input.data() length:input.size()];
-  id parsed=[NSJSONSerialization JSONObjectWithData:command options:0 error:nil];
   job->input=[parsed isKindOfClass:NSDictionary.class]?parsed:nil;
+  job->maintenance=migration;
   if(additional[0]) job->dataBuild=duplicateHeld(additional[0]);
   if(additional[1]) job->nextBuild=duplicateHeld(additional[1]);
   auto closeInputs=[&] { for(auto* lock:{&job->owner,&job->build,&job->dataBuild,&job->nextBuild}) if(lock->fd>=0) close(lock->fd); };
