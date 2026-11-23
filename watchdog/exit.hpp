@@ -738,7 +738,7 @@ inline bool publishNativeReceipt(int directory,const std::string& name,const std
 inline bool terminalEngineMarker(NSDictionary* value) {
   uint64_t epoch;
   return arbol_attempt::keys(value,@[@"format",@"profileInstance",@"engine",@"dataEpoch",@"lastWriterBuild",@"lastWriterChromium",@"lastWriterElectron",@"requiredReader",@"cleanExit"])&&
-    [value[@"format"] isEqual:@1]&&[value[@"engine"] isEqual:@"chromium"]&&
+    [value[@"format"] isEqual:@(arbol_attempt::profileFormat)]&&[value[@"engine"] isEqual:@"chromium"]&&
     arbol_attempt::pattern(value[@"profileInstance"],@"^prf_[A-Za-z0-9_-]{22}$")&&arbol_attempt::uintNumber(value[@"dataEpoch"],epoch)&&epoch>0&&
     arbol_attempt::pattern(value[@"lastWriterBuild"],@"^[1-9a-f][0-9a-f]{0,15}$")&&
     [value[@"lastWriterChromium"] isKindOfClass:NSString.class]&&[value[@"lastWriterChromium"] length]>0&&
@@ -899,7 +899,7 @@ public:
       !fstatat(directory,"profile.json",&record,AT_SYMLINK_NOFOLLOW);
     NSDictionary* profileRecord=arbol_attempt::json(profileRaw);
     valid=valid&&arbol_attempt::keys(profileRecord,@[@"format",@"id",@"instance",@"creationRequest",@"createdAt"])&&
-      [profileRecord[@"format"] isEqual:@1]&&[profileRecord[@"id"] isEqual:profile.lastPathComponent]&&
+      [profileRecord[@"format"] isEqual:@(arbol_attempt::profileFormat)]&&[profileRecord[@"id"] isEqual:profile.lastPathComponent]&&
       [profileRecord[@"instance"] isEqual:attempt[@"profileInstance"]]&&
       !fstatat(directory,"data",&data,AT_SYMLINK_NOFOLLOW)&&!fstatat(directory,"userData",&userData,AT_SYMLINK_NOFOLLOW);
     for(const struct stat* st : {&data,&userData}) valid=valid&&S_ISDIR(st->st_mode)&&st->st_uid==geteuid()&&

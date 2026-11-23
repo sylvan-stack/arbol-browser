@@ -8,6 +8,11 @@
 namespace arbol_attempt {
 using arbol_boundary::Identity;
 constexpr size_t limit = 16384;
+#ifndef ARBOL_BROWSER_PROFILE_FORMAT
+#define ARBOL_BROWSER_PROFILE_FORMAT 1
+#endif
+static_assert(ARBOL_BROWSER_PROFILE_FORMAT == 1 || ARBOL_BROWSER_PROFILE_FORMAT == 2);
+constexpr int profileFormat = ARBOL_BROWSER_PROFILE_FORMAT;
 inline bool keys(NSDictionary* object, NSArray* expected) {
   return [object isKindOfClass:NSDictionary.class] && [[NSSet setWithArray:object.allKeys] isEqual:[NSSet setWithArray:expected]];
 }

@@ -1077,10 +1077,11 @@ static MarkerPermit* markerArgument(napi_env env,napi_value value) {
   void* data=nullptr; if(napi_get_value_external(env,value,&data)!=napi_ok) return nullptr;
   auto* p=static_cast<MarkerPermit*>(data); return markerPermits.count(p)?p:nullptr;
 }
-static bool nativeMarker(NSDictionary* value) {
+static bool nativeMarker(NSDictionary* value, bool evidence = false) {
   uint64_t epoch;
   return arbol_attempt::keys(value,@[@"format",@"profileInstance",@"engine",@"dataEpoch",@"lastWriterBuild",@"lastWriterChromium",@"lastWriterElectron",@"requiredReader",@"cleanExit"])&&
-    [value[@"format"] isEqual:@1]&&[value[@"engine"] isEqual:@"chromium"]&&
+    (evidence ? ([value[@"format"] isEqual:@1] || (arbol_attempt::profileFormat == 2 && [value[@"format"] isEqual:@2])) :
+      [value[@"format"] isEqual:@(arbol_attempt::profileFormat)])&&[value[@"engine"] isEqual:@"chromium"]&&
     arbol_attempt::pattern(value[@"profileInstance"],@"^prf_[A-Za-z0-9_-]{22}$")&&
     arbol_attempt::uintNumber(value[@"dataEpoch"],epoch)&&epoch>0&&
     arbol_attempt::pattern(value[@"lastWriterBuild"],@"^[1-9a-f][0-9a-f]{0,15}$")&&
@@ -1899,8 +1900,8 @@ static bool verifyClosedReceipt(NSDictionary* closed,NSDictionary* __strong& cap
      ![capability[@"main"][@"group"] isEqual:closed[@"engine"][@"group"]]) return false;
   if(clean) {
     NSDictionary* dirty=journal[@"ordinary"][@"marker"],*marker=receipt[@"marker"];
-    if(!arbol_attempt::keys(dirty,@[@"identity",@"digest",@"value"])||!nativeMarker(dirty[@"value"])||![dirty[@"value"][@"cleanExit"] isEqual:@NO]||
-       !arbol_attempt::keys(marker,@[@"identity",@"digest",@"value"])||!nativeMarker(marker[@"value"])||![marker[@"value"][@"cleanExit"] isEqual:@YES]||
+    if(!arbol_attempt::keys(dirty,@[@"identity",@"digest",@"value"])||!nativeMarker(dirty[@"value"],true)||![dirty[@"value"][@"cleanExit"] isEqual:@NO]||
+       !arbol_attempt::keys(marker,@[@"identity",@"digest",@"value"])||!nativeMarker(marker[@"value"],true)||![marker[@"value"][@"cleanExit"] isEqual:@YES]||
        !ordinaryReceipt(journal[@"ordinary"],journal[@"storage"],capability,receipt)) return false;
     NSMutableDictionary* expected=[dirty[@"value"] mutableCopy]; expected[@"cleanExit"]=@YES;
     arbol_boundary::Identity last,primary;
