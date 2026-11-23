@@ -682,7 +682,11 @@ static napi_value adoptMaintenanceCustody(napi_env env, napi_callback_info info)
         getppid() != parentPid || !arbol_attempt::currentProcess(parent) || !arbol_attempt::currentProcess(self,true) ||
         !custody->current()) return fail(env);
     custody->parent = parent;
-    custody->epoch = arbol_attempt::digest(arbol_attempt::bytes(packet));
+    // Recovery re-adopts new process descriptions under the same durable
+    // admission. Parent identity and deadline remain independently enforced;
+    // the durable epoch binds exact journal bytes and original lock records.
+    custody->epoch = arbol_attempt::digest(custody->journal().content + arbol_attempt::bytes(
+      @{@"selectionLock":packet[@"selectionLock"],@"oldBuildLock":packet[@"oldBuildLock"],@"newBuildLock":packet[@"newBuildLock"]}));
     auto handleFor = [&](arbol_attempt::MaintenanceGuard& guard, HeldLock*& retained) -> napi_value {
       napi_value result;
       if (guard.lock.fd < 0) { if (napi_get_null(env,&result) != napi_ok) return nullptr; return result; }
