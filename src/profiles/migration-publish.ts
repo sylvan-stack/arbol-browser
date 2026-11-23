@@ -1,4 +1,5 @@
-import { lstat, opendir, rename, rmdir } from 'node:fs/promises';
+import { constants, type BigIntStats } from 'node:fs';
+import { lstat, open, opendir, rename, rmdir, unlink, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import type { Contract } from '../contracts/generated.js';
@@ -6,11 +7,11 @@ import { validator } from '../contracts/schema.js';
 import { assertMigrationCommitReceipt, assertMigrationCompletionEvidence, assertMigrationInspectionReceipt, assertMigrationRecoveryReceipt,
   type HeldLock, type MigrationCommitReceipt, type MigrationCompletionEvidence, type MigrationInspectionReceipt } from '../runtime/platform.js';
 import { withMigrationInspection } from '../runtime/migration-exit.js';
-import { migrationDirectory, migrationValue, readMigrationFile, sameMigrationFile, sameMigrationIdentity,
+import { migrationDirectory, migrationIdentity, migrationValue, readMigrationFile, sameMigrationFile, sameMigrationIdentity,
   withMigrationOwner, type MigrationOwner, type MigrationContent } from './migration-owner.js';
 import { assertMigrationTransaction, ensureMigrationDirectory, migrationAbsent, migrationTime,
   publishMigrationFile, type MigrationTransaction } from './migration-transaction.js';
-import { missing, profileUnavailable, syncDirectory } from './paths.js';
+import { missing, ownerUid, profileUnavailable, syncDirectory } from './paths.js';
 
 type Entry = Readonly<Contract<'migration.ProfileEntry'>>;
 type Staged = Readonly<Contract<'migration.Staged'>>;
@@ -53,23 +54,98 @@ function originalVerification(transaction: MigrationTransaction, entry: Entry, p
       !isDeepStrictEqual(proof.evidence, entry.evidence) ||
       (entry.originalMarker ? !proof.marker || !sameMigrationFile(proof.marker, entry.originalMarker) : proof.marker !== null)) throw profileUnavailable();
 }
+/** Raw scratch inspection is deliberately separate from the strict management
+ * reader: a killed writer can leave zero bytes or an incomplete JSON prefix.
+ * Such bytes grant only disposal of this unpublished temporary, never proof. */
+async function reconcileStaging(transaction: MigrationTransaction, owner: MigrationOwner, entry: Entry, staging: string,
+  assert: () => Promise<void>): Promise<void> {
+  const expected = new Map<string, Buffer>([['profile.json', Buffer.from(entry.targetRecord.base64, 'base64')]]);
+  if (entry.targetMarker) expected.set('engine.json', Buffer.from(entry.targetMarker.base64, 'base64'));
+  const maximum = Math.max(...[...expected.values()].map(bytes => bytes.length));
+  const parent = await open(staging, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  const temporaries: { path: string; fd: FileHandle; stat: BigIntStats; bytes: Buffer }[] = [];
+  const same = (a: BigIntStats, b: BigIntStats) => ['dev', 'ino', 'mode', 'uid', 'gid', 'nlink', 'size', 'mtimeNs', 'ctimeNs', 'birthtimeNs']
+    .every(key => a[key as keyof BigIntStats] === b[key as keyof BigIntStats]);
+  try {
+    const original = migrationIdentity(await parent.stat({ bigint: true }));
+    const originalPair = async () => {
+      await assert();
+      if (!sameMigrationIdentity(original, migrationIdentity(await parent.stat({ bigint: true }))) ||
+          !sameMigrationIdentity(original, await migrationDirectory(staging)) || original.device !== entry.directory.device ||
+          !sameMigrationFile(await readMigrationFile(join(owner.path, 'profile.json')), entry.originalRecord)) throw profileUnavailable();
+      if (entry.originalMarker) {
+        if (!sameMigrationFile(await readMigrationFile(join(owner.path, 'engine.json')), entry.originalMarker)) throw profileUnavailable();
+      } else await migrationAbsent(join(owner.path, 'engine.json'));
+      await migrationAbsent(join(transaction.attempt, 'progress', `${entry.pathSha256}.staged.json`));
+    };
+    await originalPair();
+    const read = async (fd: FileHandle, path: string): Promise<{ stat: BigIntStats; bytes: Buffer }> => {
+      const stat = await fd.stat({ bigint: true });
+      if (!stat.isFile() || stat.uid !== BigInt(ownerUid()) || (stat.mode & 0o7777n) !== 0o600n || stat.nlink !== 1n ||
+          String(stat.dev) !== original.device || stat.size < 0n || stat.size > BigInt(maximum)) throw profileUnavailable();
+      const bytes = Buffer.alloc(Number(stat.size) + 1); let count = 0;
+      while (count < bytes.length) {
+        const value = await fd.read(bytes, count, bytes.length - count, count);
+        if (!value.bytesRead) break; count += value.bytesRead;
+      }
+      if (count !== Number(stat.size) || !same(stat, await fd.stat({ bigint: true })) ||
+          !same(stat, await lstat(path, { bigint: true }))) throw profileUnavailable();
+      const raw = bytes.subarray(0, count);
+      if (![...expected.values()].some(target => raw.length <= target.length && raw.equals(target.subarray(0, raw.length))))
+        throw profileUnavailable();
+      return { stat, bytes: raw };
+    };
+    const directory = await opendir(staging); let count = 0;
+    try {
+      for (;;) {
+        const item = await directory.read(); if (!item) break;
+        if (++count > 4096) throw profileUnavailable();
+        const path = join(staging, item.name), target = expected.get(item.name);
+        if (target) {
+          const file = await readMigrationFile(path);
+          if (file.base64 !== target.toString('base64') || file.identity.device !== original.device) throw profileUnavailable();
+        } else {
+          if (!/^\.migration-[0-9a-f]{32}$/.test(item.name)) throw profileUnavailable();
+          const fd = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+          try { temporaries.push({ path, fd, ...await read(fd, path) }); }
+          catch (error) { await fd.close(); throw error; }
+        }
+      }
+    } finally { await directory.close(); }
+    // Validate the complete bounded inventory before removing any scratch.
+    for (const temporary of temporaries) {
+      await originalPair(); const current = await read(temporary.fd, temporary.path);
+      if (!same(current.stat, temporary.stat) || !current.bytes.equals(temporary.bytes)) throw profileUnavailable();
+      await unlink(temporary.path);
+      const removed = await temporary.fd.stat({ bigint: true });
+      if (removed.nlink !== 0n || removed.dev !== temporary.stat.dev || removed.ino !== temporary.stat.ino) throw profileUnavailable();
+      await syncDirectory(staging); await originalPair();
+    }
+    await originalPair();
+  } finally {
+    const closed = await Promise.allSettled(temporaries.map(temporary => temporary.fd.close()));
+    await parent.close();
+    const failed = closed.find(value => value.status === 'rejected');
+    if (failed?.status === 'rejected') throw failed.reason;
+  }
+}
 async function stageProfile(transaction: MigrationTransaction, registry: HeldLock, owner: MigrationOwner, entry: Entry,
-  proof: MigrationInspectionReceipt, deadline: number): Promise<Staged> {
-  originalVerification(transaction, entry, proof);
-  const assert = () => assertMigrationProfile(transaction, registry, owner, entry, deadline);
+  verify: () => Promise<MigrationInspectionReceipt>, deadline: number): Promise<Staged> {
+  originalVerification(transaction, entry, await verify());
+  const profileAssert = () => assertMigrationProfile(transaction, registry, owner, entry, deadline);
   const base = join(owner.state, 'migration-staged'), attempt = join(base, transaction.value.attempt), staging = join(attempt, entry.pathSha256);
-  await ensureMigrationDirectory(base, assert); await ensureMigrationDirectory(attempt, assert);
-  await ensureMigrationDirectory(staging, assert);
+  const baseIdentity = await ensureMigrationDirectory(base, profileAssert), attemptIdentity = await ensureMigrationDirectory(attempt, profileAssert);
+  const stagingIdentity = await ensureMigrationDirectory(staging, profileAssert);
+  const assert = async () => {
+    await profileAssert();
+    for (const [path, identity] of [[base, baseIdentity], [attempt, attemptIdentity], [staging, stagingIdentity]] as const)
+      if (!sameMigrationIdentity(identity, await migrationDirectory(path))) throw profileUnavailable();
+  };
   // A crash may leave a fully fsynced target before the staged entry. Only
   // exact predetermined target bytes on private single-link files may be
   // recorded now, after fresh native ORIGINAL proof; unknown remnants refuse.
-  const directory = await opendir(staging); let count = 0;
-  try {
-    for (;;) {
-      const item = await directory.read(); if (!item) break;
-      if (++count > 2 || (item.name !== 'profile.json' && !(entry.targetMarker && item.name === 'engine.json'))) throw profileUnavailable();
-    }
-  } finally { await directory.close(); }
+  await reconcileStaging(transaction, owner, entry, staging, assert);
+  originalVerification(transaction, entry, await verify());
   const target = async (name: string, expected: Contract<'migration.Target'>): Promise<MigrationContent> => {
     const path = join(staging, name); let exists = true;
     try { await lstat(path); } catch (error) { if (!missing(error)) throw error; exists = false; }
@@ -136,7 +212,7 @@ export async function publishMigrationProfile(transaction: MigrationTransaction,
     let staged = await readMigrationStage(transaction, entry, deadline);
     if (!staged) {
       if (continuation !== 'original') throw profileUnavailable();
-      staged = await stageProfile(transaction, registry, owner, entry, await inspection.verify(), deadline);
+      staged = await stageProfile(transaction, registry, owner, entry, () => inspection.verify(), deadline);
     }
     await owner.admitStaged(staged.record);
     const staging = migrationStagePath(transaction, entry.pathSha256);
