@@ -1,9 +1,12 @@
 /** Signed disposable migration images. Importing never signs, mounts, launches
  * or changes an installation. Production admission is deliberately separate. */
 import { spawnSync } from 'node:child_process';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { writeSync } from 'node:fs';
 import { chmod, lstat, mkdir, mkdtemp, readdir, realpath, rmdir } from 'node:fs/promises';
 import { tmpdir, userInfo } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { inventory, inventoryDigest, root } from './package-base.mjs';
 import { acceptedHostProduct, assertHostIsolation, assertPhysicalCap, canonical, currentHostCompilation,
   exactFile, hash, hostRuntime, maintenanceFixtureLayout, privateDirectory, profileMigrationPredecessor,
@@ -21,9 +24,18 @@ const equal = (left, right) => canonical(left) === canonical(right);
 const fail = () => { throw new Error('Exact signed isolated migration release differs; preserve this attempt'); };
 const digest = value => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
 const commit = value => typeof value === 'string' && /^[0-9a-f]{40}$/.test(value);
+const verificationDeadline = new AsyncLocalStorage();
+/** Internal fixed-entry deadline; it can only shorten the existing child bound. */
+export function withIsolatedVerificationDeadline(deadline, operation) {
+  if (!Number.isFinite(deadline) || deadline <= performance.now() || deadline > performance.now() + 600000) fail();
+  return verificationDeadline.run(deadline, operation);
+}
 
-function command(program, args, input) {
-  const result = spawnSync(program, args, { cwd: root, input, encoding: 'utf8', timeout: 120000,
+function command(program, args, input, cleanup = false) {
+  const deadline = verificationDeadline.getStore();
+  const remaining = Math.floor((deadline === undefined ? Infinity : deadline + (cleanup ? 120000 : 0)) - performance.now());
+  if (remaining <= 0) fail();
+  const result = spawnSync(program, args, { cwd: root, input, encoding: 'utf8', timeout: Math.min(120000, remaining),
     maxBuffer: documentLimit, env: { PATH: '/usr/bin:/bin', LC_ALL: 'C' } });
   if (result.error || result.status !== 0) fail();
   return result.stdout;
@@ -87,6 +99,11 @@ function ancestry(ancestor, descendant) {
 }
 async function admitted(review) {
   if (process.platform !== 'darwin' || process.arch !== 'arm64') fail();
+  if (verificationDeadline.getStore() !== undefined) {
+    const { boundedQualificationCompilation } = await import('./qualification-authority.mjs');
+    const result = await boundedQualificationCompilation(review, null, verificationDeadline.getStore());
+    return { compiled: result.compiled, accepted: result.isolated };
+  }
   const compiled = await currentHostCompilation();
   return { compiled, accepted: await acceptedHostProduct(review, compiled) };
 }
@@ -195,7 +212,7 @@ export async function verifyIsolatedRelease({ image, signedReceiptPath, review }
   if (original.sha256 !== signed.imageSha256) fail();
   signature(image);
   const mappings = plist('/usr/bin/hdiutil', ['info', '-plist']).images.filter(row => row['image-path'] === image);
-  let mount, mapping, temporary = false, attached = false;
+  let mount, mapping, temporary = false, attached = false, attachAttempted = false;
   if (mappings.length) {
     if (mappings.length !== 1) fail();
     const mounted = mappings[0]['system-entities']?.filter(row => typeof row['mount-point'] === 'string');
@@ -208,6 +225,8 @@ export async function verifyIsolatedRelease({ image, signedReceiptPath, review }
   try {
     await privateDirectory(mount, !temporary);
     if (temporary) {
+      attachAttempted = true;
+      if (verificationDeadline.getStore() !== undefined) writeSync(2, JSON.stringify({ phase: 'owned-image-attach', image, mount }) + '\n');
       mapping = plist('/usr/bin/hdiutil', ['attach', image, '-readonly', '-nokernel', '-mountpoint', mount,
         '-noautoopen', '-nobrowse', '-plist']); attached = true;
     }
@@ -227,8 +246,26 @@ export async function verifyIsolatedRelease({ image, signedReceiptPath, review }
     return { ...release, imageSha256: signed.imageSha256, receiptSha256: receipt.sha256 };
   } finally {
     if (temporary) {
-      if (attached) command('/usr/bin/hdiutil', ['detach', mount]);
-      await rmdir(mount);
+      try {
+        // An attach child may time out after attaching but before returning its
+        // plist. Query only this invocation's freshly created temporary mount.
+        if (!attached && attachAttempted) {
+          const info = JSON.parse(command('/usr/bin/plutil', ['-convert', 'json', '-o', '-', '--', '-'],
+            command('/usr/bin/hdiutil', ['info', '-plist'], undefined, true), true));
+          const rows = info.images.filter(row => row['system-entities']?.some(entity => entity['mount-point'] === mount));
+          if (rows.length) {
+            if (rows.length !== 1 || rows[0]['image-path'] !== image) fail();
+            mapping = rows[0]; attached = true;
+          }
+        }
+        if (attached) command('/usr/bin/hdiutil', ['detach', mount], undefined, true);
+        await rmdir(mount);
+        if (verificationDeadline.getStore() !== undefined) writeSync(2, JSON.stringify({ phase: 'owned-image-cleaned', image, mount }) + '\n');
+      } catch (error) {
+        if (verificationDeadline.getStore() !== undefined) writeSync(2, JSON.stringify({ phase: 'owned-image-retained', image, mount,
+          device: mapping?.['system-entities']?.find(row => row['mount-point'] === mount)?.['dev-entry'] ?? null }) + '\n');
+        throw error;
+      }
     }
   }
 }
@@ -295,4 +332,19 @@ export async function sealIsolatedRelease({ bundle, out, review }) {
   await verifyIsolatedRelease({ image, signedReceiptPath, review });
   return { image, signedReceiptPath, imageSha256: signed.imageSha256, payloadDigest: signed.payloadDigest,
     qualification: 'unexecuted' };
+}
+
+// Imports stay inert. Only the exact private child entry reads stdin; it never
+// creates installer context, selection, guards, catalog or a native result.
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  // Complete this module's evaluation before loading the fixed-entry module,
+  // which imports this verifier. Never create a top-level-await cycle.
+  void import('./qualification-authority.mjs').then(async wire => {
+    try {
+      wire.qualificationRequire(process.argv.length === 3 && process.argv[2] === 'qualification-verify-v1', 'Invalid qualification entry', 2);
+      const { value } = await wire.qualificationInput(['schema', 'action', 'authoritySha256']);
+      wire.qualificationRequire(value.schema === 1 && value.action === 'verify', 'Invalid verification request', 2);
+      wire.qualificationOutput((await wire.authenticateQualification(value.authoritySha256)).observation);
+    } catch (error) { wire.qualificationFailure(error); }
+  }).catch(() => { process.stderr.write('Qualification entry unavailable.\n'); process.exitCode = 3; });
 }
