@@ -167,7 +167,7 @@ async function mountedBundle(image, mount, attached) {
   const device = entities?.[0]?.['dev-entry'];
   if (entities?.length !== 1 || !/^\/dev\/disk[0-9]+s[0-9]+$/.test(device)) fail();
   const mappings = plist('/usr/bin/hdiutil', ['info', '-plist']).images
-    .filter(row => row['system-entities']?.some(entity => entity['mount-point'] === mount));
+    .filter(row => row['image-path'] === image || row['system-entities']?.some(entity => entity['mount-point'] === mount));
   const volume = plist('/usr/sbin/diskutil', ['info', '-plist', device]);
   const node = await lstat(device, { bigint: true }), mounted = await lstat(mount, { bigint: true });
   if (mappings.length !== 1 || mappings[0]['image-path'] !== image || mappings[0]['owner-uid'] !== userInfo().uid ||
@@ -181,7 +181,8 @@ async function mountedBundle(image, mount, attached) {
 }
 
 /** Verify an original signed isolated image without publishing any selection,
- * launcher, guard or native result. Temporary attachment is always readonly. */
+ * launcher, guard or native result. Existing installed mounts are observations,
+ * never caller-supplied authority; only our own temporary mount is detached. */
 export async function verifyIsolatedRelease({ image, signedReceiptPath, review }) {
   const admission = await admitted(review), receipt = await document(signedReceiptPath), signed = receipt.value;
   if (signed.format !== 1 || signed.kind !== 'signed-isolated-migration-release' ||
@@ -193,23 +194,42 @@ export async function verifyIsolatedRelease({ image, signedReceiptPath, review }
   const original = await exactFile(image, imageLimit);
   if (original.sha256 !== signed.imageSha256) fail();
   signature(image);
-  const mount = await mkdtemp(join(await realpath(tmpdir()), 'arbol-browser-isolated-release-'));
-  await privateDirectory(mount); let attached = false;
+  const mappings = plist('/usr/bin/hdiutil', ['info', '-plist']).images.filter(row => row['image-path'] === image);
+  let mount, mapping, temporary = false, attached = false;
+  if (mappings.length) {
+    if (mappings.length !== 1) fail();
+    const mounted = mappings[0]['system-entities']?.filter(row => typeof row['mount-point'] === 'string');
+    if (mounted?.length !== 1) fail();
+    mount = mounted[0]['mount-point']; mapping = mappings[0];
+  } else {
+    mount = await mkdtemp(join(await realpath(tmpdir()), 'arbol-browser-isolated-release-'));
+    temporary = true;
+  }
   try {
-    const data = plist('/usr/bin/hdiutil', ['attach', image, '-readonly', '-nokernel', '-mountpoint', mount,
-      '-noautoopen', '-nobrowse', '-plist']); attached = true;
-    const bundle = await mountedBundle(image, mount, data);
+    await privateDirectory(mount, !temporary);
+    if (temporary) {
+      mapping = plist('/usr/bin/hdiutil', ['attach', image, '-readonly', '-nokernel', '-mountpoint', mount,
+        '-noautoopen', '-nobrowse', '-plist']); attached = true;
+    }
+    const bundle = await mountedBundle(image, mount, mapping);
+    const mountIdentity = await privateDirectory(mount, !temporary);
     const release = await inspectBundle(bundle, audit, review, admission);
+    if (!temporary && (mount !== dirname(release.fixture.bundle) ||
+        image !== join(release.fixture.fixture, 'support/images', `${release.build}.dmg`))) fail();
     const observed = await exactFile(image, imageLimit);
     if (release.build !== signed.build || release.source !== signed.source || release.productDigest !== signed.productDigest ||
         release.payloadDigest !== signed.payloadDigest || release.launcher.sha256 !== signed.launcherSha256 ||
         release.profileFormat !== signed.profileFormat || !equal(release.fixture, signed.fixture) ||
         observed.sha256 !== original.sha256 || !equal(observed.identity, original.identity) ||
-        (await document(signedReceiptPath)).sha256 !== receipt.sha256) fail();
+        (await document(signedReceiptPath)).sha256 !== receipt.sha256 ||
+        await mountedBundle(image, mount, mapping) !== bundle ||
+        !equal(await privateDirectory(mount, !temporary), mountIdentity)) fail();
     return { ...release, imageSha256: signed.imageSha256, receiptSha256: receipt.sha256 };
   } finally {
-    if (attached) command('/usr/bin/hdiutil', ['detach', mount]);
-    await rmdir(mount);
+    if (temporary) {
+      if (attached) command('/usr/bin/hdiutil', ['detach', mount]);
+      await rmdir(mount);
+    }
   }
 }
 
