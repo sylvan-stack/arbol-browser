@@ -150,7 +150,8 @@ async function mountedApplication(image, mount, attached) {
   const device = rows?.[0]?.['dev-entry'];
   if (rows?.length !== 1 || !/^\/dev\/disk[0-9]+s[0-9]+$/.test(device)) throw new Error('Image mount mapping is incomplete');
   const images = plist('/usr/bin/hdiutil', ['info', '-plist']).images;
-  const mappings = images.filter(row => row['system-entities']?.some(entity => entity['mount-point'] === mount));
+  const mappings = images.filter(row => row['image-path'] === image ||
+    row['system-entities']?.some(entity => entity['mount-point'] === mount));
   const volume = plist('/usr/sbin/diskutil', ['info', '-plist', device]);
   const node = await lstat(device, { bigint: true }), actual = await lstat(mount, { bigint: true });
   if (mappings.length !== 1 || mappings[0]['image-path'] !== image || mappings[0]['owner-uid'] !== userInfo().uid ||
@@ -163,22 +164,86 @@ async function mountedApplication(image, mount, attached) {
   return join(mount, 'ArbolBrowser.app');
 }
 
+/** Retain the opened object and its physical name. This is read-only continuity
+ * evidence, not installed selection or native custody. */
+async function retainReadIdentity(path, directory = false) {
+  if (resolve(path) !== path || await realpath(path) !== path) throw new Error('Nonphysical release input');
+  const fd = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK |
+    (directory ? constants.O_DIRECTORY : 0));
+  try {
+    const first = await fd.stat({ bigint: true });
+    const same = value => value.dev === first.dev && value.ino === first.ino && value.mode === first.mode &&
+      value.uid === first.uid && value.size === first.size && value.mtimeNs === first.mtimeNs &&
+      value.ctimeNs === first.ctimeNs && (directory || value.nlink === 1n);
+    const assert = async () => {
+      if (!(directory ? first.isDirectory() : first.isFile()) || (first.mode & 0o022n) ||
+          ![0n, BigInt(userInfo().uid)].includes(first.uid) || !same(await fd.stat({ bigint: true })) ||
+          !same(await lstat(path, { bigint: true })) || await realpath(path) !== path)
+        throw new Error('Original release descriptor or path changed');
+    };
+    await assert();
+    return { assert, close: () => fd.close() };
+  } catch (error) { await fd.close(); throw error; }
+}
+
+/** Pre-lock callers get only authenticated byte observations. Installed format
+ * readers additionally hold their original selection/Build/mount locks at the
+ * call site. This helper creates no installed path, guard or context. */
+async function withProductionImage(image, build, expectedSha256, inspect) {
+  if (!buildNumber(build) || !digest(expectedSha256)) throw new Error('Invalid production image identity');
+  const home = userInfo().homedir;
+  if (await realpath(home) !== home) throw new Error('Account home must be physical');
+  const canonicalMount = join(home, ...installation.stableBuilds, build, 'app');
+  const canonicalImage = join(home, ...installation.stableUses.slice(0, -1), 'images', `${build}.dmg`);
+  const original = await retainReadIdentity(image);
+  let mount, directory, attached = false, temporary = false;
+  try {
+    const before = await exactFile(image, imageLimit);
+    if (before.sha256 !== expectedSha256) throw new Error('Signed image digest differs');
+    checkSignature(image); await original.assert();
+    const mappings = plist('/usr/bin/hdiutil', ['info', '-plist']).images.filter(row =>
+      row['image-path'] === image || (image === canonicalImage &&
+        row['system-entities']?.some(entity => entity['mount-point'] === canonicalMount)));
+    let mapping;
+    if (mappings.length) {
+      const volumes = mappings[0]['system-entities']?.filter(row => typeof row['mount-point'] === 'string');
+      if (image !== canonicalImage || mappings.length !== 1 || mappings[0]['image-path'] !== image ||
+          volumes?.length !== 1 || volumes[0]['mount-point'] !== canonicalMount)
+        throw new Error('Existing image is not its unique canonical installed mount');
+      mount = canonicalMount; mapping = mappings[0];
+      await privateDirectory(mount, true);
+    } else {
+      mount = await mkdtemp(join(await realpath(tmpdir()), 'arbol-browser-release-')); temporary = true;
+      await privateDirectory(mount);
+      mapping = plist('/usr/bin/hdiutil', ['attach', image, '-readonly', '-nokernel', '-mountpoint', mount,
+        '-noautoopen', '-nobrowse', '-plist']); attached = true;
+    }
+    directory = await retainReadIdentity(mount, true);
+    const app = await mountedApplication(image, mount, mapping);
+    const result = await inspect(app);
+    if (await mountedApplication(image, mount, mapping) !== app || !sameFile(await exactFile(image, imageLimit), before))
+      throw new Error('Production image or mount changed during inspection');
+    await directory.assert(); await original.assert();
+    return result;
+  } finally {
+    try { if (directory) await directory.close(); }
+    finally {
+      try {
+        if (temporary) {
+          if (attached) run('/usr/bin/hdiutil', ['detach', mount]);
+          await rmdir(mount);
+        }
+      } finally { await original.close(); }
+    }
+  }
+}
+
 /** Verify the original signed image and its sealed app before local activation. */
 export async function verifySignedRelease({ image, signedReceiptPath }) {
   if (process.platform !== 'darwin' || process.arch !== 'arm64') throw new Error('Release installation requires Darwin arm64');
   const signed = await signedReceipt(signedReceiptPath), expected = signed.value;
-  if ((await exactFile(image, imageLimit)).sha256 !== expected.imageSha256) throw new Error('Signed image digest differs');
-  checkSignature(image);
-
-  const mount = await mkdtemp(join(await realpath(tmpdir()), 'arbol-browser-release-'));
-  await privateDirectory(mount);
-  let attached;
   let launcher, platform, metadata;
-  try {
-    attached = run('/usr/bin/hdiutil', ['attach', image, '-readonly', '-nokernel', '-mountpoint', mount,
-      '-noautoopen', '-nobrowse', '-plist']).stdout;
-    const data = JSON.parse(run('/usr/bin/plutil', ['-convert', 'json', '-o', '-', '--', '-'], attached).stdout);
-    const app = await mountedApplication(image, mount, data);
+  await withProductionImage(image, expected.build, expected.imageSha256, async app => {
     checkSignature(app, publisher.bundleIdentifier, true);
     await assertPhysicalCap(app);
     const files = await inventory(app);
@@ -202,12 +267,8 @@ export async function verifySignedRelease({ image, signedReceiptPath }) {
     checkSignature(addon);
     platform = await exactFile(addon, launcherLimit);
     if (platform.sha256 !== expected.files[relativePlatform]) throw new Error('Signed installer lock provider differs');
-    if ((await exactFile(image, imageLimit)).sha256 !== expected.imageSha256 ||
-        (await json(signedReceiptPath)).sha256 !== signed.sha256) throw new Error('Release inputs changed during verification');
-  } finally {
-    if (attached) run('/usr/bin/hdiutil', ['detach', mount]);
-    await rmdir(mount);
-  }
+    if (!sameFile(await json(signedReceiptPath), signed)) throw new Error('Release receipt changed during verification');
+  });
   return { build: expected.build, source: expected.source, imageSha256: expected.imageSha256,
     payloadDigest: expected.payloadDigest, sourceDigest: metadata.value.sourceDigest,
     productDigest: expected.productDigest, profileFormat: 2, launcher, platform };
@@ -450,38 +511,41 @@ async function recoverInstall(context, provider) {
 
 /** Read the predecessor format from its exact signed installed image, never
  * from a Build number, rehearsal selection or editable format hint. */
-async function installedProfileFormat(support, selected) {
+async function installedProfileFormat(context, selected, custody) {
+  const { support } = context;
+  await custody.assertBuild(selected.build);
+  const receiptPath = join(support, 'releases', `${selected.build}.json`);
+  const originalReceipt = await privateJson(receiptPath, 4096);
   const receipt = await installedImageReceipt(support, selected);
+  requireEqual(receipt, originalReceipt.value);
   if (!keys(receipt, ['format', 'build', 'imageSha256', 'source', 'payloadDigest', 'launcherSha256']) ||
       !/^[0-9a-f]{40}$/.test(receipt.source)) throw new Error('Installed release receipt is incomplete');
   const image = join(support, 'images', `${selected.build}.dmg`);
-  if ((await exactFile(image, imageLimit)).sha256 !== selected.imageSha256) throw new Error('Installed predecessor image differs');
-  checkSignature(image);
-  const mount = await mkdtemp(join(await realpath(tmpdir()), 'arbol-browser-predecessor-'));
-  await privateDirectory(mount); let attached = false;
-  try {
-    const data = plist('/usr/bin/hdiutil', ['attach', image, '-readonly', '-nokernel', '-mountpoint', mount,
-      '-noautoopen', '-nobrowse', '-plist']); attached = true;
-    const app = await mountedApplication(image, mount, data);
-    checkSignature(app, publisher.bundleIdentifier, true);
-    if (inventoryDigest(await inventory(app)) !== receipt.payloadDigest) throw new Error('Installed predecessor inventory differs');
-    const metadata = await json(join(app, 'Contents/Resources/browser/metadata.json'));
-    const policy = await json(join(app, relativePolicy));
-    const component = metadata.value.component;
-    if (!keys(component, ['name', 'version', 'build', 'contract', 'profileFormat']) ||
-        !valid('wire.ComponentInfo', { ...component, stateDirectory: policy.value.stateRoot }) ||
-        component.build !== selected.build || policy.value.purpose !== 'production' ||
-        policy.value.build !== selected.build || policy.value.buildRoot !== join(...installation.stableBuilds, selected.build) ||
-        policy.value.stateRoot !== join(installation.root, installation.browser) ||
-        policy.value.metadataDigest !== metadata.sha256 || policy.value.sourceDigest !== metadata.value.sourceDigest ||
-        policy.value.productDigest !== metadata.value.host?.productDigest ||
-        metadata.value.sourceIdentity?.commit !== receipt.source) throw new Error('Installed predecessor metadata differs');
-    if ((await exactFile(image, imageLimit)).sha256 !== selected.imageSha256) throw new Error('Installed predecessor changed');
-    return component.profileFormat;
-  } finally {
-    if (attached) run('/usr/bin/hdiutil', ['detach', mount]);
-    await rmdir(mount);
-  }
+  const provider = custody.publication.provider, mountGuard = join(context.uses, `${selected.build}.mount`);
+  return withLock(provider, mountGuard, async held => {
+    const originalMountGuard = await guardRecord(provider, mountGuard, held);
+    await custody.assertBuild(selected.build);
+    const format = await withProductionImage(image, selected.build, selected.imageSha256, async app => {
+      checkSignature(app, publisher.bundleIdentifier, true);
+      if (inventoryDigest(await inventory(app)) !== receipt.payloadDigest) throw new Error('Installed predecessor inventory differs');
+      const metadata = await json(join(app, 'Contents/Resources/browser/metadata.json'));
+      const policy = await json(join(app, relativePolicy));
+      const component = metadata.value.component;
+      if (!keys(component, ['name', 'version', 'build', 'contract', 'profileFormat']) ||
+          !valid('wire.ComponentInfo', { ...component, stateDirectory: policy.value.stateRoot }) ||
+          component.build !== selected.build || policy.value.purpose !== 'production' ||
+          policy.value.build !== selected.build || policy.value.buildRoot !== join(...installation.stableBuilds, selected.build) ||
+          policy.value.stateRoot !== join(installation.root, installation.browser) ||
+          policy.value.metadataDigest !== metadata.sha256 || policy.value.sourceDigest !== metadata.value.sourceDigest ||
+          policy.value.productDigest !== metadata.value.host?.productDigest ||
+          metadata.value.sourceIdentity?.commit !== receipt.source) throw new Error('Installed predecessor metadata differs');
+      if (!sameFile(await privateJson(receiptPath, 4096), originalReceipt)) throw new Error('Installed predecessor receipt changed');
+      return component.profileFormat;
+    });
+    requireEqual(await guardRecord(provider, mountGuard, held), originalMountGuard);
+    await custody.assertBuild(selected.build);
+    return format;
+  }, false);
 }
 async function installationJournal(support) {
   const path = join(support, 'install-transaction.json');
@@ -492,7 +556,7 @@ async function installationJournal(support) {
   if (![1, 2, 3].includes(file.value.format)) throw new Error('Unknown installation journal');
   return file;
 }
-async function installationRoute(context, release) {
+async function installationRoute(context, release, custody) {
   if (release.profileFormat !== 2) throw new Error('Current release must operate profile format2');
   const pending = await installationJournal(context.support);
   const selected = await optionalSelection(context.selectionPath);
@@ -507,7 +571,7 @@ async function installationRoute(context, release) {
   }
   if (canonical(selected) === canonical(after.selection)) return { kind: 'same', previous: selected };
   if (selected && BigInt(`0x${selected.build}`) >= BigInt(`0x${release.build}`)) throw new Error('Release number cannot move backwards');
-  const format = selected ? await contextProfileFormat(context, selected) : null;
+  const format = selected ? await contextProfileFormat(context, selected, custody) : null;
   if (format === 2) return { kind: 'ordinary', previous: selected };
   // Completed migration evidence is immutable, not reusable for a new
   // candidate or permission to select an old writer again.
@@ -566,9 +630,9 @@ function contextPredecessor(context) {
   const release = authority.releases.get(profileMigrationPredecessor.build);
   return release?.profileFormat === 1 ? { ...release, launcherSha256: release.launcher.sha256 } : null;
 }
-async function contextProfileFormat(context, selected) {
+async function contextProfileFormat(context, selected, custody) {
   const authority = isolatedAuthorities.get(context);
-  if (!authority) return installedProfileFormat(context.support, selected);
+  if (!authority) return installedProfileFormat(context, selected, custody);
   await assertContext(context);
   const input = authority.inputs.get(selected.build), expected = authority.releases.get(selected.build);
   if (!input || expected.imageSha256 !== selected.imageSha256) throw new Error('Selected isolated release is outside the cohort');
@@ -656,8 +720,14 @@ async function withInstallationGuards(context, provider, previous, build, work, 
           newBuild: await guardRecord(provider, guards.newBuild.path, next) };
         if (canonical(current) !== canonical(guards)) throw new Error('Installation custody changed');
       };
+      const assertBuild = async build => {
+        await assert();
+        const path = join(context.uses, build);
+        if (!buildNumber(build) || ![guards.oldBuild, guards.newBuild].some(guard => guard?.path === path))
+          throw new Error('Installed image reader lacks original matching Build custody');
+      };
       await assert();
-      return work({ guards, assert, publication: { provider, selection } });
+      return work({ guards, assert, assertBuild, publication: { provider, selection } });
     }, createNew);
     return previous && previous.build !== build
       ? withLock(provider, join(context.uses, previous.build), candidate, false) : candidate(null);
@@ -1083,7 +1153,7 @@ async function optionalDirectory(path) {
   try { await lstat(path); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   return privateDirectory(path, true);
 }
-async function rollbackInventory(context, name, identity) {
+async function rollbackInventory(context, name, identity, custody) {
   const path = join(context.support, name);
   requireEqual(await privateDirectory(path, true), identity);
   const names = (await readdir(path)).sort();
@@ -1097,7 +1167,7 @@ async function rollbackInventory(context, name, identity) {
     const pinned = contextPredecessor(context);
     if (!pinned || build !== pinned.build || receipt.source !== pinned.source || receipt.imageSha256 !== pinned.imageSha256 ||
         receipt.payloadDigest !== pinned.payloadDigest || receipt.launcherSha256 !== pinned.launcherSha256 ||
-        launcher.sha256 !== pinned.launcherSha256 || await contextProfileFormat(context, selected) !== 1)
+        launcher.sha256 !== pinned.launcherSha256 || await contextProfileFormat(context, selected, custody) !== 1)
       throw new Error('Rollback archive is not the supported authentic predecessor');
     checkContextLauncher(context, launcherPath, launcher.sha256);
     const image = await exactFile(join(context.images, `${build}.dmg`), imageLimit);
@@ -1114,7 +1184,7 @@ async function observeRollback(context, custody) {
   const active = await optionalDirectory(join(context.support, 'rollback-launchers'));
   await absent(join(context.support, 'pre-format-2-rollback-launchers'));
   if (active && active.device !== parent.device) throw new Error('Rollback namespace crossed filesystems');
-  const observation = { parent, active, entries: active ? await rollbackInventory(context, 'rollback-launchers', active) : [] };
+  const observation = { parent, active, entries: active ? await rollbackInventory(context, 'rollback-launchers', active, custody) : [] };
   requireEqual(await privateDirectory(context.support, true), parent); await custody.assert(); return observation;
 }
 async function recheckRollback(context, observation, custody, requireRetired = false) {
@@ -1129,7 +1199,7 @@ async function recheckRollback(context, observation, custody, requireRetired = f
   }
   if (Boolean(active) === Boolean(retired) || (requireRetired && !retired)) throw new Error('Unknown rollback retirement state');
   requireEqual(active ?? retired, observation.active);
-  requireEqual(await rollbackInventory(context, active ? 'rollback-launchers' : 'pre-format-2-rollback-launchers', observation.active), observation.entries);
+  requireEqual(await rollbackInventory(context, active ? 'rollback-launchers' : 'pre-format-2-rollback-launchers', observation.active, custody), observation.entries);
   await custody.assert(); return active ? 'active' : 'retired';
 }
 async function retireRollback(context, proof, custody, afterSelection) {
@@ -1182,7 +1252,7 @@ async function ordinaryInstall(context, release, options, route, custody) {
   if (current.sha256 !== old.launcherSha256 || current.identity.mode !== contextLauncherMode(context, old.launcherSha256)) throw new Error('Selected launcher changed');
   checkContextLauncher(context, context.executable, old.launcherSha256);
   if (route.kind === 'same') {
-    if (await contextProfileFormat(context, route.previous) !== 2 || current.sha256 !== release.launcher.sha256)
+    if (await contextProfileFormat(context, route.previous, custody) !== 2 || current.sha256 !== release.launcher.sha256)
       throw new Error('Same candidate is not selected format2');
     await ensureAlias(context.alias, context.executable); await custody.assert();
     return installationResult(context, release);
@@ -1237,7 +1307,7 @@ async function installVerifiedRelease(context, release, options) {
     let prepared, route;
     try {
       const completed = await withInstallationGuards(context, provider, previous, release.build, async custody => {
-        route = await installationRoute(context, release);
+        route = await installationRoute(context, release, custody);
         requireEqual(route.previous, previous);
         if (route.kind === 'legacy') throw new Error('Installation changed while taking original guards');
         if (route.kind === 'same' || route.kind === 'ordinary') return ordinaryInstall(context, release, options, route, custody);
