@@ -120,11 +120,17 @@ export interface ExitInspectionReceipt {
   readonly kind: 'never-opened' | 'activated' | 'terminal' | 'withdrawn'; readonly clean: boolean;
   readonly prior: PriorMarkerExpectation; readonly request: string | null;
 }
-export type NativeMigrationInput = Omit<NativeExitInput, 'mode' | 'pending'> & Readonly<{ mode: 'migrate-verify' }>;
+export interface MigrationSourceObservation {
+  readonly bundle: MaintenanceFileEvidence['identity']; readonly bundleStamp: string;
+  readonly policy: MaintenanceFileEvidence; readonly policyStamp: string;
+}
+export type NativeMigrationInput = Omit<NativeExitInput, 'mode' | 'pending'> & Readonly<{
+  mode: 'migrate-verify'; sources: Readonly<{ closed: MigrationSourceObservation | null; data: MigrationSourceObservation | null }>;
+}>;
 export type NativeMigrationCommitInput = Omit<NativeMigrationInput, 'mode'> & Readonly<{
   mode: 'migrate-commit'; migration: Readonly<{ attempt: string; transactionSha256: string }>;
 }>;
-export type NativeMigrationProgressInput = Omit<NativeMigrationCommitInput, 'mode'> & Readonly<{ mode: 'migrate-receipt-progress' }>;
+export type NativeMigrationProgressInput = Omit<NativeMigrationCommitInput, 'mode' | 'sources'> & Readonly<{ mode: 'migrate-receipt-progress' }>;
 export type NativeMigrationRecoveryInput = Omit<NativeMigrationCommitInput, 'mode'> & Readonly<{ mode: 'migrate-recover' }>;
 export interface MigrationRecoveryReceipt {
   readonly epoch: string; readonly attempt: string; readonly profileInstance: string; readonly profilePathHash: string;

@@ -1953,16 +1953,9 @@ static bool stableSnapshotNode(const struct stat& a,const struct stat& b) {
     a.st_ctimespec.tv_sec==b.st_ctimespec.tv_sec&&a.st_ctimespec.tv_nsec==b.st_ctimespec.tv_nsec&&
     a.st_birthtimespec.tv_sec==b.st_birthtimespec.tv_sec&&a.st_birthtimespec.tv_nsec==b.st_birthtimespec.tv_nsec;
 }
-static NSString* maintenanceCandidateDigest(double deadline) {
+static NSString* nativeCandidateDigest(const std::string& root,double deadline,const std::function<bool()>& current) {
   using namespace arbol_attempt; using namespace arbol_exit;
-  static std::mutex mutex; static bool attempted=false; static NSString* retained=nil;
-  while(!mutex.try_lock()) { if(arbol_boundary::clockMs()>=deadline) return nil; usleep(1000); }
-  std::unique_lock<std::mutex> held(mutex,std::adopt_lock);
-  auto current=[&] { return maintenanceCustody&&maintenanceCustody->accepted&&
-    arbol_boundary::clockMs()<deadline&&maintenanceCustody->current(); };
   if(!current()) return nil;
-  if(attempted) return retained; attempted=true;
-  const std::string root=maintenanceCustody->layout().bundle;
   std::vector<std::pair<NSString*,NSString*>> entries; size_t count=0;
   auto string=[](const char* bytes,size_t length) -> NSString* {
     NSData* data=[NSData dataWithBytes:bytes length:length];
@@ -2071,7 +2064,17 @@ static NSString* maintenanceCandidateDigest(double deadline) {
   std::string encoded="{"; bool first=true;
   for(const auto& entry:entries) { if(!first) encoded+=','; first=false; encoded+=quote(entry.first)+":"+quote(entry.second); }
   encoded+='}'; if(!current()) return nil;
-  retained=digest(encoded); return retained;
+  return digest(encoded);
+}
+static NSString* maintenanceCandidateDigest(double deadline) {
+  static std::mutex mutex; static bool attempted=false; static NSString* retained=nil;
+  while(!mutex.try_lock()) { if(arbol_boundary::clockMs()>=deadline) return nil; usleep(1000); }
+  std::unique_lock<std::mutex> held(mutex,std::adopt_lock);
+  auto current=[&] { return maintenanceCustody&&maintenanceCustody->accepted&&
+    arbol_boundary::clockMs()<deadline&&maintenanceCustody->current(); };
+  if(!current()) return nil;
+  if(attempted) return retained; attempted=true;
+  retained=nativeCandidateDigest(maintenanceCustody->layout().bundle,deadline,current); return retained;
 }
 
 struct MigrationPublication {
@@ -2243,6 +2246,30 @@ struct OrdinaryMigrationAuthority {
     return current();
   }
 };
+struct ExitInspection;
+static NSString* migrationSourceStamp(const struct stat& value) {
+  return [NSString stringWithFormat:@"%llu:%llu:%u:%u:%u:%llu:%lld:%lld:%lld:%lld",
+    (unsigned long long)value.st_dev,(unsigned long long)value.st_ino,(unsigned)value.st_mode,(unsigned)value.st_uid,
+    (unsigned)value.st_gid,(unsigned long long)value.st_nlink,(long long)value.st_size,
+    (long long)value.st_mtimespec.tv_sec*1000000000LL+value.st_mtimespec.tv_nsec,
+    (long long)value.st_ctimespec.tv_sec*1000000000LL+value.st_ctimespec.tv_nsec,
+    (long long)value.st_birthtimespec.tv_sec*1000000000LL+value.st_birthtimespec.tv_nsec];
+}
+struct MigrationSourceCapture {
+  arbol_exit::NativeFile bundle;
+  arbol_attempt::MaintenanceFile policy,image;
+  arbol_attempt::MaintenancePayload payload;
+  arbol_attempt::MaintenanceBacking backing;
+  struct stat identity{}; std::string path;
+  arbol_boundary::Lock guard; NSDictionary* value=nil;
+  bool current() const {
+    struct stat held{},named{}; char actual[PATH_MAX]{};
+    return value&&bundle.fd>=0&&!fstat(bundle.fd,&held)&&!lstat(path.c_str(),&named)&&!fcntl(bundle.fd,F_GETPATH,actual)&&
+      path==actual&&arbol_boundary::canonical(path)&&stableSnapshotNode(identity,held)&&stableSnapshotNode(held,named)&&
+      policy.current()&&payload.current()&&backing.current(image)&&arbol_boundary::lockIdentity(guard);
+  }
+  bool take(NSDictionary* claim,const arbol_boundary::Lock& held,NSDictionary* expected,ExitInspection& job);
+};
 struct ExitInspection {
   std::atomic<int> state{0}; std::atomic<bool> cancelled{false};
   std::atomic<int> recoveryPermit{0}; std::string recoveryReady;
@@ -2256,6 +2283,7 @@ struct ExitInspection {
   RetainedMigrationProof* migrated = nullptr; // stack-owned native validator only; never a JS option
   MigrationPublication* publication = nullptr;
   OrdinaryMigrationAuthority* receiptAuthority = nullptr;
+  MigrationSourceCapture* originalClosed=nullptr; MigrationSourceCapture* originalData=nullptr;
   NSDictionary* appliedMigration = nil;
   std::thread* thread=nullptr;
   bool within() const { return !cancelled.load(std::memory_order_acquire)&&arbol_boundary::clockMs()<deadline&&
@@ -2266,7 +2294,8 @@ struct ExitInspection {
     (dataBuild.fd<0||dataBuild.heldMode==LOCK_SH||(maintenance&&originalMaintenanceBuild(dataBuild)))&&
     (nextBuild.fd<0||nextBuild.heldMode==LOCK_SH||(maintenance&&originalMaintenanceBuild(nextBuild)))&&
     (activeBuild.fd<0||arbol_boundary::lockIdentity(activeBuild))&&
-    (!migrated||migrated->current())&&(!publication||publication->current())&&(!receiptAuthority||receiptAuthority->current()); }
+    (!migrated||migrated->current())&&(!publication||publication->current())&&(!receiptAuthority||receiptAuthority->current())&&
+    (!originalClosed||originalClosed->current())&&(!originalData||originalData->current()); }
   bool historicalBuildLock(id record, const arbol_boundary::Lock& actual, NSDictionary* claim=nil) const {
     if(migrated) return migrated->buildRecord(record,claim);
     if (actual.heldMode == LOCK_SH) return [record isEqual:arbol_boundary::capsuleLock(actual)];
@@ -2785,21 +2814,11 @@ static bool writeExitHistory(int directory,const char* name,NSDictionary* object
 // verification and immutable capture. Historical candidate identity comes
 // from the canonical native Claim/terminal capability; the current signed
 // policy independently binds its source/product and physical state root.
-struct MigrationSourceCapture {
-  arbol_exit::NativeFile bundle;
-  arbol_attempt::MaintenanceFile policy;
-  struct stat identity{}; std::string path;
-  arbol_boundary::Lock guard; NSDictionary* value=nil;
-  bool current() const {
-    struct stat held{},named{}; char actual[PATH_MAX]{};
-    return value&&bundle.fd>=0&&!fstat(bundle.fd,&held)&&!lstat(path.c_str(),&named)&&!fcntl(bundle.fd,F_GETPATH,actual)&&
-      path==actual&&arbol_boundary::canonical(path)&&stableSnapshotNode(identity,held)&&stableSnapshotNode(held,named)&&
-      policy.current()&&arbol_boundary::lockIdentity(guard)&&arbol_boundary::signature(path,false);
-  }
-  bool take(NSDictionary* claim,const arbol_boundary::Lock& held,ExitInspection& job) {
+bool MigrationSourceCapture::take(NSDictionary* claim,const arbol_boundary::Lock& held,NSDictionary* expected,ExitInspection& job) {
     using namespace arbol_attempt;
     PackagedLayout layout;
-    if(!job.maintenance||job.migrated||!job.within()||!record(claim)||!claimedLayout(claim,layout)||
+    if(!job.maintenance||job.migrated||!job.within()||!keys(expected,@[@"bundle",@"bundleStamp",@"policy",@"policyStamp"])||
+       !record(claim)||!claimedLayout(claim,layout)||
        layout.guard!=held.path||!arbol_boundary::lockIdentity(held)||
        (held.heldMode!=LOCK_SH&&!originalMaintenanceBuild(held))||!arbol_boundary::signature(layout.bundle,false)) return false;
     path=layout.bundle; guard=held;
@@ -2809,16 +2828,29 @@ struct MigrationSourceCapture {
     const std::string policyPath=path+"/Contents/Resources/host-policy.json"; struct stat policyIdentity{};
     if(lstat(policyPath.c_str(),&policyIdentity)||((policyIdentity.st_mode&07777)!=0600&&
        (policyIdentity.st_mode&07777)!=0644&&(policyIdentity.st_mode&07777)!=0444)||
-       !policy.openPath(policyPath,policyIdentity.st_mode&07777,limit,true)) return false;
+       !policy.openPath(policyPath,policyIdentity.st_mode&07777,limit,true)||
+       ![expected[@"bundle"] isEqual:maintenanceIdentity(identity)]||![expected[@"bundleStamp"] isEqual:migrationSourceStamp(identity)]||
+       ![expected[@"policy"] isEqual:policy.record()]||![expected[@"policyStamp"] isEqual:migrationSourceStamp(policy.identity)]) return false;
+    auto parent=[](const std::string& path) { return path.substr(0,path.rfind('/')); };
+    const std::string support=layout.installed?parent(parent(layout.guard)):parent(parent(layout.buildRoot))+"/support";
+    payload.mount=layout.buildRoot+"/app";
+    payload.root=open(payload.mount.c_str(),O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if(payload.root<0||fstat(payload.root,&payload.identity)||fstatfs(payload.root,&payload.filesystem)||!payload.current()||
+       !image.openPath(support+"/images/"+layout.build+".dmg",0600,1024LL*1024*1024)||
+       !maintenanceMount(payload.mount,image,job.deadline,backing)) return false;
     NSData* content=[NSData dataWithBytes:policy.content.data() length:policy.content.size()];
     auto historical=guard; historical.heldMode=LOCK_SH;
     value=@{@"claimSha256":digest(bytes(claim)),@"guard":arbol_boundary::capsuleLock(historical),
       @"bundle":@{@"path":[NSString stringWithUTF8String:path.c_str()],@"identity":maintenanceIdentity(identity),
         @"policy":@{@"identity":maintenanceIdentity(policy.identity),@"sha256":digest(policy.content),@"base64":[content base64EncodedStringWithOptions:0]},
         @"sourceDigest":claim[@"sourceDigest"],@"productDigest":claim[@"productDigest"],@"candidateDigest":claim[@"candidateDigest"]}};
-    return RetainedMigrationProof::source(value,claim)&&current()&&job.within();
+    // Independently authenticate the actual original signed tree against the
+    // Claim's snapshot digest while its exact readonly image is pinned. A new
+    // pathname or later signature can never become the captured baseline.
+    auto continuous=[&] { return current()&&job.within(); };
+    return RetainedMigrationProof::source(value,claim)&&continuous()&&
+      [nativeCandidateDigest(path,job.deadline,continuous) isEqual:claim[@"candidateDigest"]]&&continuous();
   }
-};
 
 static bool migrationNeverOpened(NSDictionary* receipt,ExitInspection& job) {
   using namespace arbol_attempt;
@@ -2892,10 +2924,10 @@ static bool publishMigration(ExitInspection& job,NSDictionary* closed,NSDictiona
   if(!job.maintenance||job.migrated||!publication||!job.within()||!publication->current()||
      !claimsCurrent()||![derived isEqual:publication->entry[@"evidence"]]||!rewrittenMigrationMetadata(job)||
      (!data&&!migrationNeverOpened(publication->receipt,job))) return false;
-  MigrationSourceCapture closedSource,dataSource;
   const bool same=closed&&data&&[closed isEqual:data];
-  if((closed&&!closedSource.take(closed,job.build,job))||
-     (data&&!same&&!dataSource.take(data,job.dataBuild,job))) return false;
+  auto* closedSource=job.originalClosed; auto* dataSource=same?closedSource:job.originalData;
+  if((closed&&(!closedSource||!closedSource->current()||![closedSource->value[@"claimSha256"] isEqual:digest(bytes(closed))]))||
+     (data&&(!dataSource||!dataSource->current()||![dataSource->value[@"claimSha256"] isEqual:digest(bytes(data))]))) return false;
   NSMutableDictionary* receipt=[publication->receipt mutableCopy]; receipt[@"evidence"]=derived;
   if(!migrationReceipt(receipt)) return false;
   std::string raw=exitReceiptBytes(receipt); if(raw.empty()) return false;
@@ -2903,9 +2935,9 @@ static bool publishMigration(ExitInspection& job,NSDictionary* closed,NSDictiona
   NSDictionary* capture=@{@"format":@1,@"kind":@"native-migration-evidence",@"receiptSha256":hash,
     @"transactionSha256":receipt[@"transactionSha256"],@"attempt":receipt[@"attempt"],@"epoch":maintenanceCustody->epoch,
     @"profileSha256":receipt[@"profileSha256"],@"instance":receipt[@"instance"],@"directory":receipt[@"directory"],
-    @"closed":closed?closedSource.value:(id)NSNull.null,@"data":data?(same?closedSource.value:dataSource.value):(id)NSNull.null};
+    @"closed":closed?closedSource->value:(id)NSNull.null,@"data":data?dataSource->value:(id)NSNull.null};
   auto current=[&] { return job.within()&&claimsCurrent()&&publication->current()&&rewrittenMigrationMetadata(job)&&
-    (!closed||closedSource.current())&&(!data||same||dataSource.current()); };
+    (!closed||closedSource->current())&&(!data||dataSource->current()); };
   if(!current()) return false;
   MaintenanceDirectory state,exits,history,claims,captures,receipts; struct stat identity{};
   auto directory=[&](MaintenanceDirectory& parent,const std::string& name,MaintenanceDirectory& child,bool historyNode=false) {
@@ -2955,6 +2987,7 @@ static bool inspectExit(ExitInspection& job) {
     commit=[input[@"mode"] isEqual:@"migrate-commit"],migration=progress||recover||commit||[input[@"mode"] isEqual:@"migrate-verify"];
   NSArray* inputKeys=@[@"format",@"mode",@"profile",@"profileInstance",@"profilePathHash",@"runtimeLeaf",@"bundle",@"attempt",@"previous",@"dataAttempt",@"pending"];
   if(commit||recover||progress) inputKeys=[inputKeys arrayByAddingObject:@"migration"];
+  if(migration&&!progress) inputKeys=[inputKeys arrayByAddingObject:@"sources"];
   if(!job.within()||!keys(input,inputKeys)||
      ![input[@"format"] isEqual:@1]||(![@[@"prior",@"host",@"full",@"retire",@"reserve",@"withdraw"] containsObject:input[@"mode"]]&&!migration)||
      (migration&&!job.maintenance)||
@@ -2965,6 +2998,19 @@ static bool inspectExit(ExitInspection& job) {
      (reserve?(job.nextBuild.fd<0||!record(input[@"pending"])):input[@"pending"]!=NSNull.null)) return false;
   PackagedLayout inputLayout;
   if(!packagedLayout([input[@"bundle"] UTF8String],inputLayout)||inputLayout.guard!=job.build.path) return false;
+  MigrationSourceCapture originalClosed,originalData;
+  struct SourceScope { ExitInspection& job; ~SourceScope() { job.originalClosed=nullptr; job.originalData=nullptr; } } sourceScope{job};
+  if(migration&&!progress) {
+    id sources=input[@"sources"];
+    if(!keys(sources,@[@"closed",@"data"])) return false;
+    for(NSString* key in @[@"closed",@"data"]) {
+      bool data=[key isEqual:@"data"]; id claim=data?input[@"dataAttempt"]:expected;
+      if(claim==NSNull.null) { if(sources[key]!=NSNull.null) return false; continue; }
+      auto& source=data?originalData:originalClosed;
+      if(!source.take(claim,data?job.dataBuild:job.build,sources[key],job)) return false;
+      if(data) job.originalData=&source; else job.originalClosed=&source;
+    }
+  }
   MigrationObservation migrationSource;
   MigrationPublication publication;
   struct PublicationScope { ExitInspection& job; ~PublicationScope() { job.publication=nullptr; } } publicationScope{job};

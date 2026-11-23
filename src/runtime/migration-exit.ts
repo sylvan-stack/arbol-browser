@@ -5,10 +5,10 @@ import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { missing, ownerUid, profileUnavailable } from '../profiles/paths.js';
 import { parseStrictJson } from '../profiles/strict-json.js';
-import { readMigrationFile, migrationValue, withMigrationOwner, type MigrationOwner } from '../profiles/migration-owner.js';
+import { readMigrationFile, migrationIdentity, migrationValue, withMigrationOwner, type MigrationOwner } from '../profiles/migration-owner.js';
 import { assertMaintenanceCustody, assertPlatform, type HeldLock, type MaintenanceGuard, type NativeMigrationInput,
-  type MigrationInspectionReceipt, type MigrationCommitReceipt, type MigrationRecoveryPermit, type PlatformPort } from './platform.js';
-import { assertVerifiedMaintenanceHost, verifyPackagedHost, type VerifiedMaintenanceHost } from './authorities.js';
+  type MigrationInspectionReceipt, type MigrationCommitReceipt, type MigrationRecoveryPermit, type MigrationSourceObservation, type PlatformPort } from './platform.js';
+import { assertVerifiedMaintenanceHost, verifyPackagedHost, type VerifiedHost, type VerifiedMaintenanceHost } from './authorities.js';
 import { acquireBuildLease, maintenanceBuildLease, withBuildLockForCustody, withMaintenanceBuildLock,
   type BuildLease, type MaintenanceBuildLease } from './build-lease.js';
 import { claimedLayout, type BuildSelection } from './selection.js';
@@ -96,7 +96,8 @@ export async function withMigrationInspection<T>(host: VerifiedMaintenanceHost, 
     if (data && basename(data.terminal!.path) === 'unused.json') throw profileUnavailable();
   }
   const releasable: BuildLease[] = [];
-  type Proof = { lease: BuildLease | MaintenanceBuildLease; maintenance: boolean; bundle: string };
+  type Proof = { lease: BuildLease | MaintenanceBuildLease; maintenance: boolean; bundle: string;
+    host: VerifiedHost; source: MigrationSourceObservation; assert(): Promise<void> };
   const proof = async (attempt?: LaunchAttempt): Promise<Proof> => {
     const layout = attempt ? claimedLayout(attempt) : host.identity.layout;
     const selection: BuildSelection = Object.freeze({ build: layout.build, directory: layout.buildRoot, guard: layout.guard, explicit: true });
@@ -104,43 +105,77 @@ export async function withMigrationInspection<T>(host: VerifiedMaintenanceHost, 
     const lease = maintenance ? maintenanceBuildLease(custody, platform, selection) : await acquireBuildLease(selection, platform);
     if (!maintenance) releasable.push(lease as BuildLease);
     await lease.assert(); await check();
+    let verified: VerifiedHost;
     if (layout.bundle === custody.facts.bundle) {
+      verified = host;
       assertVerifiedMaintenanceHost(host); await host.assertTrusted(deadline);
       if (attempt && (host.signed.snapshotDigest !== attempt.candidateDigest || host.identity.sourceDigest !== attempt.sourceDigest ||
           host.identity.productDigest !== attempt.productDigest)) throw profileUnavailable();
     } else {
       if (!attempt) throw profileUnavailable();
       await mountRetainedImage(layout, lease, platform, deadline);
-      const previous = await verifyPackagedHost(selection, layout.payload, deadline);
+      const previous = await verifyPackagedHost(selection, layout.payload, deadline); verified = previous;
       if (previous.policy.stateRoot !== owner.state || previous.signed.snapshotDigest !== attempt.candidateDigest ||
           previous.identity.sourceDigest !== attempt.sourceDigest || previous.identity.productDigest !== attempt.productDigest) throw profileUnavailable();
       await previous.assertTrusted(deadline);
     }
-    await lease.assert(); await check(); return { lease, maintenance, bundle: layout.bundle };
+    const observe = async (): Promise<MigrationSourceObservation> => {
+      const bundle = await lstat(layout.bundle, { bigint: true });
+      const policy = await lstat(join(layout.bundle, 'Contents/Resources/host-policy.json'), { bigint: true });
+      return Object.freeze({ bundle: migrationIdentity(bundle), bundleStamp: stamp(bundle),
+        policy: Object.freeze({ identity: migrationIdentity(policy), sha256: verified.policyDigest }), policyStamp: stamp(policy) });
+    };
+    const source = await observe();
+    const assert = async (): Promise<void> => {
+      await lease.assert(); await check();
+      if (JSON.stringify(await observe()) !== JSON.stringify(source)) throw profileUnavailable();
+      // Retain and check the ORIGINAL signed snapshot and storage descriptors,
+      // never a fresh host whose observations could adopt a replacement tree.
+      await verified.assertTrusted(deadline);
+      if (JSON.stringify(await observe()) !== JSON.stringify(source)) throw profileUnavailable();
+      await lease.assert(); await check();
+    };
+    await assert(); return { lease, maintenance, bundle: layout.bundle, host: verified, source, assert };
   };
   try {
     const closed = await proof(candidate), writer = data ? await proof(data) : undefined;
     await location.assert(); await check();
     const input: NativeMigrationInput = Object.freeze({ format: 1, mode: 'migrate-verify', profile: owner.path,
       profileInstance: owner.instance, profilePathHash: location.hash, runtimeLeaf: location.leaf, bundle: closed.bundle,
-      attempt: candidate ?? null, dataAttempt: data ?? null, previous: null });
+      attempt: candidate ?? null, dataAttempt: data ?? null, previous: null,
+      sources: Object.freeze({ closed: candidate ? closed.source : null, data: data ? writer!.source : null }) });
     let active = true;
+    const permits = new Set<MigrationRecoveryPermit>();
     const withProof = <R>(selected: Proof, callback: (lock: HeldLock | MaintenanceGuard) => R): Promise<R> => selected.maintenance ?
       withMaintenanceBuildLock(selected.lease, platform, custody, callback) : withBuildLockForCustody(selected.lease as BuildLease, platform, callback);
     const invoke = async <R>(native: (held: HeldLock, build: HeldLock | MaintenanceGuard, data?: HeldLock | MaintenanceGuard) => Promise<R>): Promise<R> => {
       if (!active) throw profileUnavailable();
-      await check(); await location.assert();
+      await check(); await location.assert(); await closed.assert(); await writer?.assert();
       const result = await withMigrationOwner(owner, platform, custody, held => withProof(closed, build =>
         writer ? withProof(writer, data => native(held, build, data)) : native(held, build)));
-      await check(); await location.assert(); if (!active) throw profileUnavailable(); return result;
+      await closed.assert(); await writer?.assert(); await check(); await location.assert(); if (!active) throw profileUnavailable(); return result;
     };
     const inspection: MigrationInspection = Object.freeze({ input,
       verify: () => invoke((held, build, data) => platform.inspectMigration(custody, registry, held, build, input, deadline, data)),
       commit: (attempt: string, transactionSha256: string) => invoke((held, build, data) => platform.commitMigration(custody, registry,
         held, build, { ...input, mode: 'migrate-commit', migration: { attempt, transactionSha256 } }, deadline, data)),
-      recover: (attempt: string, transactionSha256: string) => invoke((held, build, data) => platform.prepareMigrationRecovery(custody, registry,
-        held, build, { ...input, mode: 'migrate-recover', migration: { attempt, transactionSha256 } }, deadline, data)),
+      async recover(attempt: string, transactionSha256: string) {
+        const permit = await invoke((held, build, data) => platform.prepareMigrationRecovery(custody, registry,
+          held, build, { ...input, mode: 'migrate-recover', migration: { attempt, transactionSha256 } }, deadline, data));
+        permits.add(permit);
+        return Object.freeze({ ...permit,
+          cancel() { permits.delete(permit); permit.cancel(); },
+          async commit() {
+            if (!active || !permits.delete(permit)) throw profileUnavailable();
+            try {
+              await closed.assert(); await writer?.assert(); await check(); await location.assert();
+              const result = await permit.commit();
+              await closed.assert(); await writer?.assert(); await check(); await location.assert(); return result;
+            } finally { permit.cancel(); }
+          },
+        });
+      },
     });
-    try { return await operation(inspection); } finally { active = false; }
+    try { return await operation(inspection); } finally { active = false; for (const permit of permits) permit.cancel(); }
   } finally { for (const lease of releasable.reverse()) lease.release(); }
 }
