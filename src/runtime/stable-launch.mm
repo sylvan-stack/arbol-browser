@@ -211,6 +211,7 @@ int launch(int argc, const char* argv[], double deadline) {
     if (argc < 4 || strcmp(argv[2], build.UTF8String)) return 4;
     first = 3;
   }
+  if (arbol_attempt::profileFormat == 2 && rehearsal) return 4;
   if (rehearsal && !admitRehearsal(receipt, argc - first, argv + first)) return 4;
   NSString* root = [[home stringByAppendingPathComponent:@ARBOL_INSTALLATION_STABLE_BUILDS] stringByAppendingPathComponent:build];
   const std::string mount = [root stringByAppendingPathComponent:@"app"].fileSystemRepresentation;
@@ -249,6 +250,16 @@ int launch(int argc, const char* argv[], double deadline) {
       !arbol_boundary::lockIdentity(lock) || !fileIdentity(mountGuard.get(), mountGuardPath, mountGuardStat) ||
       readSelection(selectionPath) != selected || clockMs() >= deadline || flock(mountGuard.get(), LOCK_UN)) return 4;
 
+  if (arbol_attempt::profileFormat == 2) {
+    arbol_attempt::MaintenanceFile metadata;
+    if (!metadata.openPath(layout.payload + "/metadata.json",0600,1048576,true)) return 4;
+    NSDictionary* value=arbol_attempt::json(metadata.content),*component=value[@"component"];
+    uint64_t contract=0,profile=0;
+    if (!arbol_attempt::keys(component,@[@"name",@"version",@"build",@"contract",@"profileFormat"]) ||
+        ![component[@"name"] isEqual:@"arbol-browser"] || ![component[@"build"] isEqual:build] ||
+        !arbol_attempt::uintNumber(component[@"contract"],contract) || contract!=1 ||
+        !arbol_attempt::uintNumber(component[@"profileFormat"],profile) || profile!=2 || !metadata.current()) return 4;
+  }
   NSDictionary* parent = arbol_attempt::processRecord(getpid());
   if (!parent) return 4;
   FD capsule(arbol_boundary::capsuleDescriptor(arbol_attempt::bytes(@{@"format":@1, @"parent":parent,
