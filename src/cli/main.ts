@@ -7,7 +7,7 @@ import { parse } from './parse.js';
 import { runAgentSession } from './agent-session.js';
 import { describeAgentTools } from './agent-tools.js';
 import { publicFailure, unavailable, type ExitCode } from '../contracts/errors.js';
-import { validator } from '../contracts/schema.js';
+import { validator, managementResults } from '../contracts/schema.js';
 import type { Contract } from '../contracts/generated.js';
 import type { CommandPorts, Stdio, PackageMetadata } from '../runtime/ports.js';
 import { buildLocation, consumePackagedSelection, packagedLayout, type BuildSelection } from '../runtime/selection.js';
@@ -129,7 +129,7 @@ async function productionPorts(selection: BuildSelection, observation?: ColdObse
 }
 
 /** Metadata only: no Electron import, native load, profile read, socket or child. */
-export async function componentInfo(): Promise<Contract<'wire.ComponentInfo'>> {
+export async function componentInfo(): Promise<Contract<'profile2.ComponentInfo'>> {
   const payload = resolve(fileURLToPath(new URL('../../', import.meta.url)));
   const fixedHost = basename(payload) === 'browser' && basename(dirname(payload)) === 'Resources' &&
     basename(dirname(dirname(payload))) === 'Contents' && basename(dirname(dirname(dirname(payload)))) === 'ArbolBrowser.app';
@@ -141,7 +141,7 @@ export async function componentInfo(): Promise<Contract<'wire.ComponentInfo'>> {
   const metadata: PackageMetadata = JSON.parse(await readFile(new URL('../../metadata.json', import.meta.url), 'utf8'));
   if (Object.prototype.hasOwnProperty.call(metadata, 'host')) throw unavailable('browser');
   const info = { ...metadata.component, stateDirectory: stateDirectory() };
-  if (!validator('wire.ComponentInfo')(info)) throw new Error('Invalid packaged component metadata');
+  if (!validator(managementResults.info)(info)) throw new Error('Invalid packaged component metadata');
   return info;
 }
 
@@ -196,16 +196,16 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
     let check: (value: unknown) => boolean;
     noteCold(observation, 'command-dispatch');
     switch (command.kind) {
-      case 'info': result = installed?.host.identity.component ?? await componentInfo(); check = validator('wire.ComponentInfo'); break;
+      case 'info': result = installed?.host.identity.component ?? await componentInfo(); check = validator(managementResults.info); break;
       case 'open': result = await activePorts.process.open(command); check = validator('wire.OpenResult'); break;
       case 'close': result = await activePorts.process.close(command.profile); check = validator('wire.CloseResult'); break;
-      case 'profiles-list': result = await activePorts.profiles.list(); check = validator('profile.ProfileList'); break;
+      case 'profiles-list': result = await activePorts.profiles.list(); check = validator(managementResults.list); break;
       case 'profiles-create':
         result = await activePorts.profiles.create(command.profile, command.creationRequest);
-        check = validator('profile.ProfileCreated'); break;
+        check = validator(managementResults.create); break;
       case 'profiles-remove':
         result = await activePorts.profiles.remove(command.profile);
-        check = validator('profile.ProfileRemoved'); break;
+        check = validator(managementResults.remove); break;
     }
     if (observation) delete observation.open;
     noteCold(observation, 'result-schema');

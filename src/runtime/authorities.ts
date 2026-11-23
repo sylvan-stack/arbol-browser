@@ -486,7 +486,7 @@ async function verifySelectedHost(selection: BuildSelection, payload: string, de
 /** Metadata-only host-layout correlation. It reads only fixed neighboring
  * package files, never state/profile, a native addon, a socket or a subprocess.
  * No VerifiedHost/admission capability is minted from this information. */
-export async function readPackagedComponentInfo(payload: string, deadline = performance.now() + 5000): Promise<Contract<'wire.ComponentInfo'>> {
+export async function readPackagedComponentInfo(payload: string, deadline = performance.now() + 5000): Promise<Contract<'profile2.ComponentInfo'>> {
   assertBudget(deadline);
   const metadata = await physicalJson(join(payload, 'metadata.json'), 1048576, deadline);
   const value = metadata.value as Record<string, unknown>;
@@ -506,7 +506,9 @@ export async function readPackagedComponentInfo(payload: string, deadline = perf
   // launcher hint. Runtime/compatibility/signature admission remains separate.
   if ((await physicalJson(policyFile, 16383, deadline)).digest !== rawPolicy.digest ||
       (await physicalJson(join(payload, 'metadata.json'), 1048576, deadline)).digest !== metadata.digest) throw unavailable('browser');
-  assertBudget(deadline); return identity.component;
+  assertBudget(deadline);
+  if (!validator('profile2.ComponentInfo')(identity.component)) throw unavailable('browser');
+  return identity.component;
 }
 /** Canonical actual signed host engine authority. No version inference, selected
  * Foundation metadata or user/environment compatibility input is accepted. */

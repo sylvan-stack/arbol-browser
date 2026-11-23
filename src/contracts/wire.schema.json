@@ -561,7 +561,8 @@
           "const": 1
         },
         "profileFormat": {
-          "const": 1
+          "enum": [1, 2],
+          "$comment": "The selected signed Build emits its exact supported management format. Format-2 Builds also satisfy urn:arbol-browser:profile:2#/$defs/ComponentInfo."
         },
         "stateDirectory": {
           "type": "string",

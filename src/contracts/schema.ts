@@ -41,6 +41,11 @@ export function validator<K extends keyof ContractTypes>(name: K): ValidateFunct
   return validate;
 }
 
+/** Build-specific administrative replies; the wire bundle advertises both
+ * historical and current formats, while this Build emits only profile2. */
+export const managementResults = Object.freeze({ info: 'profile2.ComponentInfo',
+  list: 'profile2.ProfileList', create: 'profile2.ProfileCreated', remove: 'profile2.ProfileRemoved' } as const);
+
 /** Compile all named roots. This is a schema/reference check, not a behavior suite. */
 export function compileContracts(): number {
   let count = 0;
