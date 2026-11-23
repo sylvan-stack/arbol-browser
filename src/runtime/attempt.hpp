@@ -628,6 +628,85 @@ struct IsolatedMaintenanceAdmission {
       arbol_boundary::clockMs() < deadline && current();
   }
 };
+struct InstalledMaintenanceAdmission {
+  PackagedLayout layout;
+  MaintenanceDirectory support, uses;
+  MaintenanceGuard selection, oldBuild, newBuild, mounting;
+  MaintenanceFile launcher, journal, release, image, hostPolicy;
+  MaintenanceSelectionSnapshot selected;
+  NSDictionary* journalObject = nil;
+  NSString* launcherDigest = nil;
+  struct statfs imageMount{};
+  bool current() const {
+    MaintenanceSelectionSnapshot now; struct statfs mount{};
+    return support.current() && uses.current() && selection.current() && newBuild.current() &&
+      (oldBuild.lock.fd < 0 || oldBuild.current()) && (mounting.lock.fd < 0 || mounting.current()) &&
+      launcher.current() && journal.current() && release.current() && image.current() && hostPolicy.current() &&
+      maintenanceSelectionSnapshot(support.fd,support.path,now) && sameMaintenanceSelection(selected,now) &&
+      maintenanceSelectionMatches(now,journalObject[@"before"]) &&
+      !statfs((layout.buildRoot + "/app").c_str(),&mount) && (mount.f_flags & MNT_RDONLY) &&
+      !memcmp(&imageMount.f_fsid,&mount.f_fsid,sizeof(mount.f_fsid)) &&
+      !strcmp(imageMount.f_mntonname,mount.f_mntonname) && !strcmp(imageMount.f_mntfromname,mount.f_mntfromname);
+  }
+  bool admit(double deadline, NSDictionary* capsule = nil, bool attach = false) {
+    NSString* home = physicalAccountHome();
+    NSString* usesPath = [home stringByAppendingPathComponent:@ARBOL_INSTALLATION_STABLE_USES];
+    if (profileFormat != 2 || !home || !support.openPath(usesPath.stringByDeletingLastPathComponent.fileSystemRepresentation) ||
+        !uses.openPath(usesPath.fileSystemRepresentation) ||
+        !launcher.openPath(stableLauncherPath(home),0755,1024LL*1024*1024) ||
+        !signedIdentity(launcher.path,@"com.sylvan-stack.arbol-browser.launcher") ||
+        !selection.take(support.path + "/selection.lock",capsule ? maintenanceSelectionDescriptor : -1,
+          capsule ? capsule[@"selectionLock"] : nil) ||
+        !journal.openPath(support.path + "/install-transaction.json",0600,limit,true)) return false;
+    journalObject = json(journal.content); launcherDigest = launcher.sha256(deadline);
+    if (!maintenanceJournal(journalObject) || !launcherDigest || ![journalObject[@"after"][@"launcherSha256"] isEqual:launcherDigest] ||
+        !maintenanceSelectionSnapshot(support.fd,support.path,selected) ||
+        !maintenanceSelectionMatches(selected,journalObject[@"before"])) return false;
+    NSString* build = journalObject[@"after"][@"selection"][@"build"];
+    std::string root = [[home stringByAppendingPathComponent:@ARBOL_INSTALLATION_STABLE_BUILDS] stringByAppendingPathComponent:build].fileSystemRepresentation;
+    if (!packagedLayout(root + "/app/ArbolBrowser.app",layout) || !layout.installed ||
+        !release.openPath(support.path + "/releases/" + layout.build + ".json",0600,limit,true)) return false;
+    NSDictionary* receipt = json(release.content);
+    if (!keys(receipt,@[@"format",@"build",@"imageSha256",@"source",@"payloadDigest",@"launcherSha256"]) ||
+        ![receipt[@"format"] isEqual:@1] || ![receipt[@"build"] isEqual:build] ||
+        ![receipt[@"imageSha256"] isEqual:journalObject[@"after"][@"selection"][@"imageSha256"]] ||
+        ![receipt[@"launcherSha256"] isEqual:launcherDigest] || !pattern(receipt[@"payloadDigest"],@"^[0-9a-f]{64}$") ||
+        !pattern(receipt[@"source"],@"^[0-9a-f]{40}$")) return false;
+    if (capsule && (![capsule[@"journalPath"] isEqual:[NSString stringWithUTF8String:journal.path.c_str()]] ||
+        ![capsule[@"journal"] isEqual:journal.record()] ||
+        ![capsule[@"bundle"] isEqual:[NSString stringWithUTF8String:layout.bundle.c_str()]])) return false;
+    if (journalObject[@"before"] != NSNull.null) {
+      const std::string old = [journalObject[@"before"][@"selection"][@"build"] UTF8String];
+      if (old == layout.build || !oldBuild.take(uses.path + "/" + old,capsule ? maintenanceOldDescriptor : -1,
+          capsule ? capsule[@"oldBuildLock"] : nil)) return false;
+    } else if (capsule && capsule[@"oldBuildLock"] != NSNull.null) return false;
+    if (!newBuild.take(layout.guard,capsule ? maintenanceNewDescriptor : -1,capsule ? capsule[@"newBuildLock"] : nil)) return false;
+    std::set<std::pair<uint64_t,uint64_t>> guards;
+    for (auto* g : {&selection,&oldBuild,&newBuild})
+      if (g->lock.fd >= 0 && !guards.insert({g->lock.device,g->lock.inode}).second) return false;
+    MaintenanceSelectionSnapshot again;
+    if (!journal.current() || !maintenanceSelectionSnapshot(support.fd,support.path,again) || !sameMaintenanceSelection(selected,again) ||
+        !image.openPath(support.path + "/images/" + layout.build + ".dmg",0600,1024LL*1024*1024) ||
+        ![image.sha256(deadline) isEqual:receipt[@"imageSha256"]]) return false;
+    const std::string mount = root + "/app";
+    if (!arbol_boundary::canonical(mount) || !arbol_boundary::privateAncestors(mount)) return false;
+    if (attach) {
+      if (capsule || !mounting.take(layout.guard + ".mount")) return false;
+      struct statfs fs{}; if (statfs(mount.c_str(),&fs)) return false;
+      if (mount != fs.f_mntonname) {
+        NSString* point = [NSString stringWithUTF8String:mount.c_str()];
+        NSArray* entries = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:point error:nil];
+        if (!entries || entries.count || !diskImageTool(@[@"attach",[NSString stringWithUTF8String:image.path.c_str()],
+            @"-readonly",@"-nokernel",@"-mountpoint",point,@"-noautoopen",@"-nobrowse",@"-plist"],deadline)) return false;
+      }
+    }
+    if (!mountedImage(mount,[NSString stringWithUTF8String:image.path.c_str()],deadline) || statfs(mount.c_str(),&imageMount) ||
+        !arbol_boundary::canonical(layout.bundle) || !signedIdentity(layout.bundle,@"com.sylvan-stack.arbol-browser",true) ||
+        !hostPolicy.openPath(layout.bundle + "/Contents/Resources/host-policy.json",0600,limit,true) ||
+        !policyStateRoot(json(hostPolicy.content),layout)) return false;
+    return arbol_boundary::clockMs() < deadline && current();
+  }
+};
 inline NSDictionary* readMaintenanceCapsule() {
   const int fd = maintenanceCapsuleDescriptor; struct stat before{}, after{};
   const int flags = fcntl(fd,F_GETFL);

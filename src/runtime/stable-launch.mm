@@ -112,19 +112,13 @@ NSString* imageDigest(int fd, const std::string& path, const struct stat& image,
 using arbol_attempt::diskImageTool;
 using arbol_attempt::mountedImage;
 
-// Qualification supplies a sealed policy in an already mounted, independently
-// signed isolated candidate. No installed path, policy override or ordinary
-// CLI argument is forwarded. The maintenance module adopts the original FDs.
-int isolatedMaintenance(int argc, const char* argv[], double deadline) {
-  if (arbol_attempt::profileFormat != 2 || argc != 8 || strcmp(argv[2],"--policy") ||
-      strcmp(argv[4],"--runtime") || strcmp(argv[6],"--bundle")) return 4;
-  const std::string policy = argv[3], runtime = argv[5], bundle = argv[7];
-  arbol_attempt::IsolatedMaintenanceAdmission admission;
-  if (!admission.admit(policy,runtime,bundle,deadline)) return 4;
+template<class Admission>
+int maintenanceChild(Admission& admission, const PackagedLayout& layout, const std::string& launcher,
+                     const std::string& homePath, const std::vector<std::string>& arguments, double deadline) {
+  const std::string& bundle = layout.bundle;
   NSDictionary* self = arbol_attempt::processRecord(getpid());
-  if (!self || ![self[@"executable"] isEqual:[NSString stringWithUTF8String:admission.authority.launcherPath.c_str()]] ||
+  if (!self || ![self[@"executable"] isEqual:[NSString stringWithUTF8String:launcher.c_str()]] ||
       !arbol_attempt::currentProcess(self,true)) return 4;
-  const auto& layout = admission.authority.layout;
   NSDictionary* packet = @{@"format":@1,@"kind":@"maintenance",@"parent":self,@"deadline":@(deadline),
     @"selectionLock":arbol_boundary::capsuleLock(admission.selection.lock),
     @"oldBuildLock":admission.oldBuild.lock.fd < 0 ? (id)NSNull.null : arbol_boundary::capsuleLock(admission.oldBuild.lock),
@@ -144,12 +138,13 @@ int isolatedMaintenance(int argc, const char* argv[], double deadline) {
     posix_spawn_file_actions_destroy(&actions); return 4;
   }
   const std::string entry = layout.payload + "/lib/cli/maintenance.js";
-  std::string home = "HOME=" + admission.authority.fixture.path;
+  std::string home = "HOME=" + homePath;
   char* environment[] = {home.data(),(char*)"PATH=/usr/bin:/bin",(char*)"ELECTRON_RUN_AS_NODE=1",(char*)"TMPDIR=/private/tmp",nullptr};
-  char* args[] = {(char*)layout.engine.c_str(),(char*)entry.c_str(),(char*)"--isolated-policy",(char*)policy.c_str(),
-    (char*)"--runtime",(char*)runtime.c_str(),nullptr};
+  std::vector<char*> args{(char*)layout.engine.c_str(),(char*)entry.c_str()};
+  for (const auto& value : arguments) args.push_back((char*)value.c_str());
+  args.push_back(nullptr);
   pid_t child = 0;
-  int result = posix_spawn(&child,layout.engine.c_str(),&actions,nullptr,args,environment);
+  int result = posix_spawn(&child,layout.engine.c_str(),&actions,nullptr,args.data(),environment);
   posix_spawn_file_actions_destroy(&actions); copies.closeCopies();
   if (result) return 4;
   // Original exclusive descriptions remain held across every child outcome.
@@ -158,6 +153,29 @@ int isolatedMaintenance(int argc, const char* argv[], double deadline) {
   do { waited = waitpid(child,&status,0); } while (waited < 0 && errno == EINTR);
   if (waited != child) return 4;
   return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+}
+
+// Qualification supplies a sealed policy in an already mounted, independently
+// signed isolated candidate. Only explicit maintenance arguments are passed.
+int isolatedMaintenance(int argc, const char* argv[], double deadline) {
+  if (arbol_attempt::profileFormat != 2 || argc != 8 || strcmp(argv[2],"--policy") ||
+      strcmp(argv[4],"--runtime") || strcmp(argv[6],"--bundle")) return 4;
+  const std::string policy = argv[3], runtime = argv[5], bundle = argv[7];
+  arbol_attempt::IsolatedMaintenanceAdmission admission;
+  if (!admission.admit(policy,runtime,bundle,deadline)) return 4;
+  return maintenanceChild(admission,admission.authority.layout,admission.authority.launcherPath,
+    admission.authority.fixture.path,{"--isolated-policy",policy,"--runtime",runtime},deadline);
+}
+int installedMaintenance(int argc, double deadline) {
+  if (arbol_attempt::profileFormat != 2 || argc != 2) return 4;
+  NSString* home = arbol_attempt::physicalAccountHome();
+  const std::string launcher = arbol_attempt::stableLauncherPath(home);
+  NSDictionary* self = arbol_attempt::processRecord(getpid());
+  if (!home || !self || ![self[@"executable"] isEqual:[NSString stringWithUTF8String:launcher.c_str()]] ||
+      !arbol_attempt::currentProcess(self,true)) return 4;
+  arbol_attempt::InstalledMaintenanceAdmission admission;
+  if (!admission.admit(deadline,nil,true)) return 4;
+  return maintenanceChild(admission,admission.layout,launcher,home.fileSystemRepresentation,{"--installed"},deadline);
 }
 
 int launch(int argc, const char* argv[], double deadline) {
@@ -272,6 +290,8 @@ int main(int argc, const char* argv[]) {
   @autoreleasepool { @try {
     if (argc > 1 && !strcmp(argv[1],"--isolated-maintenance-migrate-profiles"))
       return isolatedMaintenance(argc,argv,clockMs() + 60000);
+    if (argc > 1 && !strcmp(argv[1],"--maintenance-migrate-profiles"))
+      return installedMaintenance(argc,clockMs() + 60000);
     return launch(argc, argv, clockMs() + 60000);
   } @catch (NSException*) { return 4; } }
 }
