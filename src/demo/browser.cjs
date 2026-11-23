@@ -2,7 +2,7 @@ const { app, BaseWindow, WebContentsView, ipcMain, protocol, session } = require
 const { readFile } = require('node:fs/promises');
 const { basename, dirname, join } = require('node:path');
 const { createInterface } = require('node:readline');
-const { privateDirectory, validAccount, profileId, partitionKey, existingPartition, createPartition,
+const { privateDirectory, validAccount, profileId, partitionKey, existingPartition, createPartition, finishPartitionCreation,
   readProfiles, writeProfiles } = require('./profile-storage.cjs');
 const { dragInPage } = require('./drag.cjs');
 
@@ -206,7 +206,10 @@ async function main(config, clipboard) {
     if (!current) createPartition(profilesRoot, record, [...records.values()]);
     writeProfiles(privateDirectory(profilesRoot), [...records.values()]);
     if (current) current.name = record.name;
-    else loginProfiles.set(id, { ...record, id, website: null, tabs: new Map(), selected: null });
+    else {
+      loginProfiles.set(id, { ...record, id, website: null, tabs: new Map(), selected: null });
+      finishPartitionCreation(profilesRoot, record);
+    }
     publish();
     return loginProfiles.get(id);
   }

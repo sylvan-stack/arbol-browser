@@ -96,7 +96,8 @@ function recoverLinkedBackup(directory, backup, original) {
   if (info.nlink !== 2) return;
   if (!readPrivateFile(backup, legacyLimit, 2).equals(original))
     throw new Error('The preview profile before-image conflicts with the current index.');
-  const matches = readdirSync(directory).filter(name => name.startsWith('.profiles-')).filter(name => {
+  const matches = readdirSync(directory).filter(name =>
+    /^\.profiles-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(name)).filter(name => {
     const candidate = lstatSync(join(directory, name));
     return candidate.isFile() && candidate.dev === info.dev && candidate.ino === info.ino;
   });
@@ -144,6 +145,8 @@ function readProfiles(directory) {
   try { data = readPrivateFile(join(directory, 'profiles.json'), format2Limit); }
   catch (error) {
     if (error.code !== 'ENOENT') throw error;
+    if (readdirSync(directory).length !== 0)
+      throw new Error('The preview profile index is missing from a nonempty store; recovery is required.');
     writeProfiles(directory, []);
     return [];
   }
@@ -153,12 +156,64 @@ function readProfiles(directory) {
   return validateFormat2(directory, value.profiles);
 }
 
+function createMarker(path, token) {
+  const handle = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  try { writeFileSync(handle, token); fsyncSync(handle); } finally { closeSync(handle); }
+}
+
 function createPartition(directory, record, records) {
   validateProfiles(records);
-  const path = join(directory, partitionKey(record));
-  mkdirSync(path, { mode: 0o700 });
+  const key = partitionKey(record);
+  const path = join(directory, key);
+  const intent = join(directory, '.creating-' + key);
+  const marker = join(path, '.arbol-preview-creation');
+  let token;
+  try { token = readPrivateFile(intent, 128).toString('utf8'); }
+  catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    try { lstatSync(path); throw new Error('An unexplained preview partition requires recovery.'); }
+    catch (missing) { if (missing.code !== 'ENOENT') throw missing; }
+    token = randomUUID();
+    createMarker(intent, token);
+    syncDirectory(directory);
+  }
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(token))
+    throw new Error('The preview creation record is unsafe.');
+  try { lstatSync(path); }
+  catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    const staged = join(directory, '.new-partition-' + randomUUID());
+    mkdirSync(staged, { mode: 0o700 });
+    createMarker(join(staged, '.arbol-preview-creation'), token);
+    syncDirectory(staged);
+    syncDirectory(directory);
+    // The exclusive preview store lock serializes all legitimate writers.
+    // Refuse an existing target instead of adopting it.
+    try { lstatSync(path); throw new Error('An unexplained preview partition requires recovery.'); }
+    catch (missing) { if (missing.code !== 'ENOENT') throw missing; }
+    renameSync(staged, path);
+    syncDirectory(directory);
+  }
+  existingPartition(directory, record);
+  const entries = readdirSync(path);
+  if (entries.length !== 1 || entries[0] !== '.arbol-preview-creation' ||
+      readPrivateFile(marker, 128).toString('utf8') !== token)
+    throw new Error('The interrupted preview partition is unexplained or not empty; recovery is required.');
+  return path;
+}
+
+function finishPartitionCreation(directory, record) {
+  const key = partitionKey(record);
+  const path = existingPartition(directory, record);
+  const intent = join(directory, '.creating-' + key);
+  const marker = join(path, '.arbol-preview-creation');
+  const token = readPrivateFile(intent, 128);
+  if (!readPrivateFile(marker, 128).equals(token))
+    throw new Error('The preview creation record does not match its partition.');
+  unlinkSync(marker);
+  syncDirectory(path);
+  unlinkSync(intent);
   syncDirectory(directory);
-  return existingPartition(directory, record);
 }
 
 function writeProfiles(directory, records) {
@@ -171,4 +226,4 @@ function writeProfiles(directory, records) {
 }
 
 module.exports = { privateDirectory, validAccount, profileId, partitionKey, existingPartition,
-  validateFormat2, readPrivateFile, convertProfiles, createPartition, readProfiles, writeProfiles };
+  validateFormat2, readPrivateFile, convertProfiles, createPartition, finishPartitionCreation, readProfiles, writeProfiles };
