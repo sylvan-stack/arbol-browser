@@ -233,13 +233,20 @@ static napi_value publishDirectory(napi_env env, napi_callback_info info) {
   if (!valid || result != 0) return fail(env);
   napi_value out; napi_get_undefined(env, &out); return out;
 }
+static bool boundedText(napi_env env, napi_value value, std::string& out, size_t maximum=arbol_attempt::limit) {
+  size_t length = 0, written = 0;
+  if (napi_get_value_string_utf8(env,value,nullptr,0,&length) != napi_ok || !length || length > maximum) return false;
+  out.resize(length+1);
+  if (napi_get_value_string_utf8(env,value,out.data(),out.size(),&written) != napi_ok || written != length) return false;
+  out.resize(length); return out.find('\0') == std::string::npos;
+}
 // Installer-only no-replace publication. The raw EX capability is not exposed
 // by PlatformPort and cannot publish profile/state or native custody evidence.
 static napi_value publishInstallerFile(napi_env env,napi_callback_info info) {
   using namespace arbol_attempt;
   napi_value args[2]; size_t count=2; void* pointer=nullptr; std::string raw;
   if(profileFormat!=2||napi_get_cb_info(env,info,&count,args,nullptr,nullptr)!=napi_ok||count!=2||
-     napi_get_value_external(env,args[0],&pointer)!=napi_ok||!pointer||!string(env,args[1],raw)) return fail(env);
+     napi_get_value_external(env,args[0],&pointer)!=napi_ok||!pointer||!boundedText(env,args[1],raw)) return fail(env);
   auto* selection=static_cast<HeldLock*>(pointer); struct stat held{};
   if(!liveLocks.count(selection)||selection->retained||selection->mode!=LOCK_EX||!matches(selection,&held)||
      !arbol_boundary::canonical(selection->path)||!arbol_boundary::privateAncestors(selection->path)) return fail(env);
@@ -295,7 +302,7 @@ static napi_value retireInstallerRollback(napi_env env,napi_callback_info info) 
   using namespace arbol_attempt;
   napi_value args[2]; size_t count=2; void* pointer=nullptr; std::string raw;
   if(profileFormat!=2||napi_get_cb_info(env,info,&count,args,nullptr,nullptr)!=napi_ok||count!=2||
-     napi_get_value_external(env,args[0],&pointer)!=napi_ok||!pointer||!string(env,args[1],raw)) return fail(env);
+     napi_get_value_external(env,args[0],&pointer)!=napi_ok||!pointer||!boundedText(env,args[1],raw)) return fail(env);
   auto* selection=static_cast<HeldLock*>(pointer); struct stat held{};
   if(!liveLocks.count(selection)||selection->retained||selection->mode!=LOCK_EX||!matches(selection,&held)||
      !arbol_boundary::canonical(selection->path)||!arbol_boundary::privateAncestors(selection->path)) return fail(env);
@@ -324,13 +331,6 @@ static napi_value retireInstallerRollback(napi_env env,napi_callback_info info) 
   napi_value result; napi_get_undefined(env,&result); return result;
 }
 
-static bool boundedText(napi_env env, napi_value value, std::string& out, size_t maximum=arbol_attempt::limit) {
-  size_t length = 0, written = 0;
-  if (napi_get_value_string_utf8(env,value,nullptr,0,&length) != napi_ok || !length || length > maximum) return false;
-  out.resize(length+1);
-  if (napi_get_value_string_utf8(env,value,out.data(),out.size(),&written) != napi_ok || written != length) return false;
-  out.resize(length); return out.find('\0') == std::string::npos;
-}
 // Command receipt has no caller-selected clock/issuer. A single detached
 // native I/O job can block without keeping the CLI event loop alive past its
 // original cutoff; actual module/input/socket lifetime remains native-owned.
