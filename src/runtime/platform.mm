@@ -2433,8 +2433,8 @@ static bool inspectExit(ExitInspection& job) {
       id closed=expected==(id)NSNull.null?nil:expected;
       NSDictionary* evidence=@{@"classification":data?(clean?@"clean":@"dirty"):@"never-opened",@"clean":@(clean),
         @"closedClaimSha256":closed?(id)digest(bytes(closed)):NSNull.null,@"dataClaimSha256":data?(id)digest(bytes(data)):NSNull.null,
-        @"terminalPath":closed?closed[@"terminal"][@"path"]:(id)NSNull.null,
-        @"terminalSha256":closed?closed[@"terminal"][@"digest"]:(id)NSNull.null};
+        @"terminalPath":data?data[@"terminal"][@"path"]:(id)NSNull.null,
+        @"terminalSha256":data?data[@"terminal"][@"digest"]:(id)NSNull.null};
       job.result=bytes(@{@"format":@1,@"kind":@"migration-verification",@"epoch":maintenanceCustody->epoch,
         @"profileInstance":input[@"profileInstance"],@"profilePathHash":input[@"profilePathHash"],@"evidence":evidence,
         @"profileDirectory":maintenanceIdentity(migrationSource.directory.identity),@"record":migrationSource.record.record(),
