@@ -750,8 +750,15 @@ async function preparedBindings(context, release, prepared, custody, after = fal
   else requireEqual(selected, prepared.selection);
   requireEqual(await privateDirectory(context.runtime, true), prepared.state.runtime);
   requireEqual(await privateDirectory(dirname(context.state), true), prepared.state.parent);
+  const before = prepared.journal.value.before;
+  if (Boolean(prepared.oldAssets) !== Boolean(before)) throw new Error('Original predecessor references are incomplete');
   if (prepared.oldAssets) {
-    const build = prepared.journal.value.before.selection.build;
+    if (!keys(prepared.oldAssets, ['image', 'release', 'launcher']) ||
+        prepared.oldAssets.image.sha256 !== before.selection.imageSha256 || prepared.oldAssets.launcher.sha256 !== before.launcherSha256)
+      throw new Error('Original predecessor references differ from journal');
+    const build = before.selection.build;
+    const receipt = await installedImageReceipt(context.support, before.selection);
+    if (receipt.launcherSha256 !== before.launcherSha256) throw new Error('Original predecessor release differs from journal');
     if (!sameFile(await exactFile(join(context.images, `${build}.dmg`), imageLimit), prepared.oldAssets.image) ||
         !sameFile(await privateJson(join(context.receipts, `${build}.json`)), prepared.oldAssets.release) ||
         !sameFile(await exactFile(context.backup, launcherLimit), prepared.oldAssets.launcher))
