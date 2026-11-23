@@ -121,7 +121,7 @@ export type NativeMigrationInput = Omit<NativeExitInput, 'mode' | 'pending'> & R
 export type NativeMigrationCommitInput = Omit<NativeMigrationInput, 'mode'> & Readonly<{
   mode: 'migrate-commit'; migration: Readonly<{ attempt: string; transactionSha256: string }>;
 }>;
-export type NativeMigrationProgressInput = Omit<NativeMigrationCommitInput, 'mode'> & Readonly<{ mode: 'receipt-progress' }>;
+export type NativeMigrationProgressInput = Omit<NativeMigrationCommitInput, 'mode'> & Readonly<{ mode: 'migrate-receipt-progress' }>;
 export type NativeMigrationRecoveryInput = Omit<NativeMigrationCommitInput, 'mode'> & Readonly<{ mode: 'migrate-recover' }>;
 export interface MigrationRecoveryReceipt {
   readonly epoch: string; readonly attempt: string; readonly profileInstance: string; readonly profilePathHash: string;
@@ -779,7 +779,7 @@ export function loadPlatform(): PlatformPort {
       const actualCustody = maintenanceHandles.get(custody), actualRegistry = locks.get(registry), actualOwner = locks.get(owner);
       const actualBuild = guardHandle(build), actualData = null;
       if (!actualCustody || !actualRegistry || !actualOwner || !actualBuild ||
-          input.mode !== 'receipt-progress' || !Number.isFinite(deadline) || !input.migration ||
+          input.mode !== 'migrate-receipt-progress' || !Number.isFinite(deadline) || !input.migration ||
           Object.keys(input.migration).sort().join(',') !== 'attempt,transactionSha256' ||
           !/^[0-9a-f]{32}$/.test(input.migration.attempt) || !/^[0-9a-f]{64}$/.test(input.migration.transactionSha256)) throw unavailable('profile');
       const assert = () => { assertMaintenanceCustody(custody); registry.assertIdentity(); owner.assertIdentity(); build.assertIdentity(); };

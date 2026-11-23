@@ -2879,7 +2879,7 @@ static bool inspectExit(ExitInspection& job) {
   NSDictionary* input=job.input,*expected=input[@"attempt"]; NSString* leaf=input[@"runtimeLeaf"],*profile=input[@"profile"];
   bool prior=[input[@"mode"] isEqual:@"prior"],hostMode=[input[@"mode"] isEqual:@"host"],
     retire=[input[@"mode"] isEqual:@"retire"],reserve=[input[@"mode"] isEqual:@"reserve"],withdraw=[input[@"mode"] isEqual:@"withdraw"];
-  bool progress=[input[@"mode"] isEqual:@"receipt-progress"],recover=[input[@"mode"] isEqual:@"migrate-recover"],
+  bool progress=[input[@"mode"] isEqual:@"migrate-receipt-progress"],recover=[input[@"mode"] isEqual:@"migrate-recover"],
     commit=[input[@"mode"] isEqual:@"migrate-commit"],migration=progress||recover||commit||[input[@"mode"] isEqual:@"migrate-verify"];
   NSArray* inputKeys=@[@"format",@"mode",@"profile",@"profileInstance",@"profilePathHash",@"runtimeLeaf",@"bundle",@"attempt",@"previous",@"dataAttempt",@"pending"];
   if(commit||recover||progress) inputKeys=[inputKeys arrayByAddingObject:@"migration"];
