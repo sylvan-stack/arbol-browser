@@ -233,6 +233,62 @@ static napi_value publishDirectory(napi_env env, napi_callback_info info) {
   if (!valid || result != 0) return fail(env);
   napi_value out; napi_get_undefined(env, &out); return out;
 }
+// Installer-only no-replace publication. The raw EX capability is not exposed
+// by PlatformPort and cannot publish profile/state or native custody evidence.
+static napi_value publishInstallerFile(napi_env env,napi_callback_info info) {
+  using namespace arbol_attempt;
+  napi_value args[2]; size_t count=2; void* pointer=nullptr; std::string raw;
+  if(profileFormat!=2||napi_get_cb_info(env,info,&count,args,nullptr,nullptr)!=napi_ok||count!=2||
+     napi_get_value_external(env,args[0],&pointer)!=napi_ok||!pointer||!string(env,args[1],raw)) return fail(env);
+  auto* selection=static_cast<HeldLock*>(pointer); struct stat held{};
+  if(!liveLocks.count(selection)||selection->retained||selection->mode!=LOCK_EX||!matches(selection,&held)||
+     !arbol_boundary::canonical(selection->path)||!arbol_boundary::privateAncestors(selection->path)) return fail(env);
+  NSDictionary* request=json(raw);
+  if(!keys(request,@[@"source",@"destination",@"identity",@"sha256"])||!path(request[@"source"])||
+     !path(request[@"destination"])||!pattern(request[@"sha256"],@"^[0-9a-f]{64}$")) return fail(env);
+  const std::string source=[request[@"source"] UTF8String],destination=[request[@"destination"] UTF8String];
+  const auto parent=[](const std::string& value) { return value.substr(0,value.rfind('/')); };
+  const std::string support=parent(selection->path);
+  NSString* home=physicalAccountHome(); if(!home) return fail(env);
+  const std::string installedUses=[home stringByAppendingPathComponent:@ARBOL_INSTALLATION_STABLE_USES].fileSystemRepresentation;
+  const bool installed=support==parent(installedUses);
+  if(selection->path!=support+"/selection.lock") return fail(env);
+  if(!installed) {
+    const std::string fixture=parent(support);
+    MaintenanceDirectory root;
+    if(support!=fixture+"/support"||!isolatedFromInstallation(fixture)||!root.openPath(fixture)) return fail(env);
+  }
+  if(parent(source)!=parent(destination)||source==destination||
+     !pattern([NSString stringWithUTF8String:source.substr(source.rfind('/')+1).c_str()],@"^\\.(install|replace)-[0-9a-f]{24}$")) return fail(env);
+  const std::string leaf=destination.substr(destination.rfind('/')+1),folder=parent(destination);
+  const bool backup=destination==support+"/install-previous-launcher"||
+    (folder==support+"/releases"&&pattern([NSString stringWithUTF8String:leaf.c_str()],@"^[1-9a-f][0-9a-f]{0,15}\\.launcher$"));
+  const bool allowed=destination==support+"/install-transaction.json"||backup||
+    (folder==support+"/images"&&pattern([NSString stringWithUTF8String:leaf.c_str()],@"^[1-9a-f][0-9a-f]{0,15}\\.dmg$"))||
+    (folder==support+"/releases"&&pattern([NSString stringWithUTF8String:leaf.c_str()],@"^[1-9a-f][0-9a-f]{0,15}(\\.migration)?\\.json$"));
+  if(!allowed) return fail(env);
+  MaintenanceDirectory directory; MaintenanceFile input;
+  const mode_t mode=backup?0755:0600; const double deadline=arbol_boundary::clockMs()+120000;
+  if(!directory.openPath(folder)||!input.openPath(source,mode,1024LL*1024*1024)||
+     input.identity.st_dev!=directory.identity.st_dev||
+     ![maintenanceIdentity(input.identity) isEqual:request[@"identity"]]||
+     ![input.sha256(deadline) isEqual:request[@"sha256"]]||fsync(input.fd)||!directory.current()||
+     !input.current()||!matches(selection,&held)) return fail(env);
+  const std::string from=source.substr(source.rfind('/')+1);
+  if(renameatx_np(directory.fd,from.c_str(),directory.fd,leaf.c_str(),RENAME_EXCL)) return fail(env);
+  struct stat published{},named{}; errno=0;
+  if(fstat(input.fd,&published)||fstatat(directory.fd,leaf.c_str(),&named,AT_SYMLINK_NOFOLLOW)||
+     !sameFile(published,named)||published.st_dev!=input.identity.st_dev||published.st_ino!=input.identity.st_ino||
+     published.st_uid!=geteuid()||(published.st_mode&07777)!=mode||published.st_nlink!=1||
+     !S_ISREG(published.st_mode)) return fail(env);
+  input.path=destination; input.identity=published;
+  errno=0;
+  if(!fstatat(directory.fd,from.c_str(),&named,AT_SYMLINK_NOFOLLOW)||errno!=ENOENT||
+     !input.current()||![input.sha256(deadline) isEqual:request[@"sha256"]]||fsync(input.fd)||fsync(directory.fd)||
+     !directory.current()||!input.current()||!matches(selection,&held)) return fail(env);
+  napi_value result; napi_get_undefined(env,&result); return result;
+}
+
 
 static bool boundedText(napi_env env, napi_value value, std::string& out, size_t maximum=arbol_attempt::limit) {
   size_t length = 0, written = 0;
@@ -3615,6 +3671,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"watchdogBind",nullptr,watchdogBind,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"watchdogAssert",nullptr,watchdogAssert,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"publishDirectory", nullptr, publishDirectory, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"publishInstallerFile", nullptr, publishInstallerFile, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"trySharedLock", nullptr, trySharedLock, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"groupCensus", nullptr, groupCensus, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"tryLock", nullptr, tryLock, nullptr, nullptr, nullptr, napi_default, nullptr},
