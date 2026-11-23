@@ -20,7 +20,22 @@ export const stockElectronArchive = Object.freeze({ name: 'electron-v45.3.2-darw
   sha256: '8bdf5d55fbcc2c348b5d34b9e87a364cd2947d00b7c8bfadc6cc50233cd79ac6' });
 // These are source policy. A packaging argument cannot invent an old reader or
 // epoch. Compatible recovery of this exact product uses its explicit reader.
-const priorReaderKeys = Object.freeze([]), readableDataEpochs = Object.freeze([1]);
+// Exact released Build1 product, read from its sealed production policy and
+// retained verified release receipt. This declares a compatibility candidate;
+// AFM-9 must qualify it with actual native closure and data continuity.
+export const profileMigrationPredecessor = Object.freeze({
+  build: '1', source: '9bbfd76d4926309d151897a28396af4e2e1fe0d7',
+  sourceDigest: '66b6144d07a583dd3667fb6dbb006477f7f2f259d6f96229c25fd15c8aa7ae80',
+  productDigest: '5ef6453874bcb930c746fdb802c206ed9c3e4c2c48b7789fe6756507f5ea445a',
+  imageSha256: 'fe91ff2db13a5d2399e33eddf640de95b7142274d6642d41926d6a6c4d71748a',
+  payloadDigest: 'cb0548905bed76e8ec203dbc9679b142996123212601c5c8dcd8757017014b61',
+  launcherSha256: '1cb4b88f12fe7f8c157c272cf284f0effa798fa74ad1338e9826851304501bcf',
+});
+const readableDataEpochs = Object.freeze([1]);
+function predecessorReaderKeys(scope) {
+  return ['production', 'isolated'].includes(scope)
+    ? [`host-${scope}:1:${profileMigrationPredecessor.productDigest}`] : [];
+}
 export const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 export const canonical = value => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
   ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b, 'en'))) : item);
@@ -351,7 +366,7 @@ export async function refreshHostRecords(bundle, staged) {
   const compatibility = { abi: 1, runtime: hostRuntime, nativeABI, publisherTeam: publisher.team, bundleIdentifier: publisher.bundleIdentifier,
     featureConfiguration: { sitePerProcess: true, disabledFeatures: ['MacAccessibilityTextOperation'], extraChromiumArguments: [] },
     files: Object.fromEntries(Object.entries(await inventory(payload)).map(([path, digest]) => [`Contents/Resources/browser/${path}`, digest])),
-    dataEpoch: 1, compatibleReaderKeys: [readerKey, ...priorReaderKeys], writerKey: readerKey, readableDataEpochs: [...readableDataEpochs], qualification: readerKey };
+    dataEpoch: 1, compatibleReaderKeys: [readerKey, ...predecessorReaderKeys(scope)], writerKey: readerKey, readableDataEpochs: [...readableDataEpochs], qualification: readerKey };
   const compatibilityBytes = JSON.stringify(compatibility, null, 2) + '\n';
   if (Buffer.byteLength(compatibilityBytes) > 1048576 || Object.keys(compatibility.files).length > 4096) fail('Host manifest exceeds actual verifier bounds');
   await writeFile(join(bundle, 'Contents/Resources/native-compatibility.json'), compatibilityBytes, { mode: 0o600 });
