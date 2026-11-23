@@ -8,12 +8,14 @@ import { join, basename, dirname, resolve } from 'node:path';
 import { lstat, open, readdir, realpath } from 'node:fs/promises';
 import { setTimeout } from 'node:timers/promises';
 import { promisify } from 'node:util';
+import { userInfo } from 'node:os';
 import { unavailable } from '../contracts/errors.js';
+import { validator } from '../contracts/schema.js';
 import { assertProfile, readJson, type ProfileSnapshot } from '../profiles/records.js';
 import { directory, identity, privateFile, sameIdentity, statOrAbsent } from '../profiles/paths.js';
 import { ownerLock, withOwnerLockForCustody, type OwnerLease } from '../profiles/locking.js';
 import { acquireBuildLease, withBuildLockForCustody, type BuildLease } from './build-lease.js';
-import { assertHostCloseContinuity, assertHostStartupContinuity, assertTrustedHost, assertVerifiedHostMetadata, verifyPackagedHost, type VerifiedHost } from './authorities.js';
+import { assertHostCloseContinuity, assertHostStartupContinuity, assertTrustedHost, assertVerifiedHostMetadata, physicalJson, verifyPackagedHost, type VerifiedHost } from './authorities.js';
 import { assertPlatform, assertExitInspectionReceipt, type PlatformPort, type ExitInspectionReceipt, type PriorMarkerExpectation } from './platform.js';
 import { withLaunchAttempt, type LaunchAttempt } from './process.js';
 import { now, assertTime, runtimeLocation, type RuntimeRecord } from './instance.js';
@@ -21,6 +23,7 @@ import { buildLocation, claimedLayout, selectedLayout, type BuildSelection, type
 import type { HostPreviousExit } from './host-entry.js';
 import type { ExitAuthority } from './lifecycle.js';
 import type { EngineExitEvidence } from '../profiles/compatibility.js';
+import installation from './installation-paths.json' with { type: 'json' };
 
 export interface ProductionExitAuthority extends ExitAuthority, HostPreviousExit, EngineExitEvidence {
   /** Only this poll treats protection contention/in-flight closure as pending.
@@ -146,6 +149,49 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
       if (receipt.priorDataClaim !== null) dataAttempt = closedCandidate(receipt.priorDataClaim, profile, location.hash);
       if (dataAttempt && basename(dataAttempt.terminal!.path) === 'unused.json') throw unavailable('profile');
     }
+    // Read the receipt before oldProof can touch a retired Build. These are
+    // selection hints only; native independently reads strict receipt bytes,
+    // derives the same Claim digests and validates the complete retained proof.
+    let receiptWhole = false, receiptData = false;
+    const payload = resolve(fileURLToPath(new URL('../../', import.meta.url)));
+    if (mode !== 'withdraw') {
+      const ownFormat = startingHost ? Number(startingHost.identity.component.profileFormat) :
+        ((await physicalJson(join(payload, 'metadata.json'), 1048576, deadline)).value as { component?: { profileFormat?: unknown } })?.component?.profileFormat;
+      if (ownFormat === 2) {
+        const host = startingHost ?? await verifyPackagedHost(selection, payload, deadline);
+        assertVerifiedHostMetadata(host, deadline);
+        if (Number(host.identity.component.profileFormat) !== 2 || host.policy.stateRoot !== profile.paths.state) throw unavailable('profile');
+        const layout = host.identity.layout;
+        let runtime: string | undefined;
+        if (layout.scope === 'installed') {
+          const account = userInfo();
+          if (account.uid !== process.geteuid?.()) throw unavailable('profile');
+          runtime = join(await realpath(account.homedir), installation.root, 'runtime');
+        } else {
+          const policy = join(layout.bundle, 'Contents/Resources/maintenance-fixture.json');
+          if (await statOrAbsent(policy)) {
+            const fixture = (await physicalJson(policy, 16384, deadline)).value as Record<string, unknown>;
+            if (!fixture || fixture.bundle !== layout.bundle || fixture.stateRoot !== profile.paths.state ||
+                typeof fixture.runtime !== 'string' || !fixture.runtime.startsWith('/') || resolve(fixture.runtime) !== fixture.runtime)
+              throw unavailable('profile');
+            runtime = fixture.runtime;
+          }
+        }
+        if (runtime) {
+          const path = join(runtime, 'browser-profile-migration', 'receipts', `${location.hash}.json`);
+          if (await statOrAbsent(path)) {
+            const receipt = (await readJson(path, 262144)).value;
+            if (!validator('migration.Receipt')(receipt) || receipt.profilePath !== profile.paths.root || receipt.profileSha256 !== location.hash)
+              throw unavailable('profile');
+            if (receipt.instance === profile.record.instance) {
+              receiptWhole = candidate ? platform.canonicalMigrationClaimDigest(candidate) === receipt.evidence.closedClaimSha256 :
+                receipt.evidence.closedClaimSha256 === null && receipt.evidence.dataClaimSha256 === null;
+              receiptData = receiptWhole || !!dataAttempt && platform.canonicalMigrationClaimDigest(dataAttempt) === receipt.evidence.dataClaimSha256;
+            }
+          }
+        }
+      } else if (ownFormat !== 1) throw unavailable('profile');
+    }
     const release: BuildLease[] = [];
     const oldProof = async (attempt: LaunchAttempt): Promise<OldProof> => {
       const key = JSON.stringify(attempt), retained = priorProofs.get(owner)?.get(key);
@@ -213,15 +259,15 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
       return { host, build };
     };
     try {
-      const build = candidate ? (await oldProof(candidate)).build : currentBuild ?? await acquireBuildLease(selection, platform);
-      if (!candidate && !currentBuild) release.push(build);
-      const dataBuild = dataAttempt ? (await oldProof(dataAttempt)).build : undefined;
+      const build = candidate && !receiptWhole ? (await oldProof(candidate)).build : currentBuild ?? await acquireBuildLease(selection, platform);
+      if ((!candidate || receiptWhole) && !currentBuild) release.push(build);
+      const dataBuild = dataAttempt && !receiptData ? (await oldProof(dataAttempt)).build : undefined;
       const physicalLeaf = await realpath(location.leaf);
       const result = await withOwnerLockForCustody(owner, platform, heldOwner =>
         withBuildLockForCustody(build, platform, async heldBuild => {
           const invoke = (data?: import('./platform.js').HeldLock, next?: import('./platform.js').HeldLock) => platform.inspectExit(heldOwner, heldBuild, {
             format: 1, mode: actualMode, profile: profile.paths.root, profileInstance: profile.record.instance,
-            profilePathHash: location.hash, runtimeLeaf: physicalLeaf, bundle: candidate ? claimedLayout(candidate).bundle :
+            profilePathHash: location.hash, runtimeLeaf: physicalLeaf, bundle: candidate && !receiptWhole ? claimedLayout(candidate).bundle :
               pending ? claimedLayout(pending).bundle : selectedLayout(build.selection, resolve(fileURLToPath(new URL('../../', import.meta.url)))).bundle,
             attempt: candidate ?? null, previous: previous ?? null, dataAttempt: dataAttempt ?? null, pending: pending ?? null,
           }, deadline, { ...(data ? { data } : {}), ...(next ? { next } : {}) });

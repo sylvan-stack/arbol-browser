@@ -307,6 +307,8 @@ export interface PlatformPort {
   /** Private fixed claim.json transaction, only under the genuine claim.lock.
    * No caller-supplied destination or engine/profile payload read is exposed. */
   readLaunchAttempt(lock: HeldLock): string | null;
+  /** Format-2 selection hint only; native inspection still validates proof. */
+  canonicalMigrationClaimDigest(claim: import('./process.js').LaunchAttempt): string;
   writeLaunchAttempt(lock: HeldLock, expected: string | null, next: string): void;
   /** Prepare once from genuine original leases, then the existing canonical
    * bootstrap.arm consumes this exact custody/tuple; it never creates another.
@@ -373,6 +375,7 @@ interface NativeSupport {
   continuousTime(): number;
   processProvenance(pid: number): ProcessProvenance | null;
   readLaunchAttempt(handle: object): string | null;
+  canonicalMigrationClaimDigest?(claim: string): string;
   writeLaunchAttempt(handle: object, expected: string | null, next: string): void;
   prepareWatchdogCustody(owner: object, build: object, bundle: string, digest: string): object;
   custodyDescriptors(handle: object): [number, number, number];
@@ -938,6 +941,13 @@ export function loadPlatform(): PlatformPort {
       const value = call(() => native.readLaunchAttempt(handle));
       if (value !== null && (typeof value !== 'string' || !value.length || Buffer.byteLength(value) > 16384)) throw unavailable('profile');
       lock.assertIdentity(); return value;
+    },
+    canonicalMigrationClaimDigest(claim: import('./process.js').LaunchAttempt): string {
+      const raw = JSON.stringify(claim);
+      if (!raw || Buffer.byteLength(raw) >= 16384 || typeof native.canonicalMigrationClaimDigest !== 'function') throw unavailable('profile');
+      const value = call(() => native.canonicalMigrationClaimDigest!(raw));
+      if (typeof value !== 'string' || !/^[0-9a-f]{64}$/.test(value)) throw unavailable('profile');
+      return value;
     },
     writeLaunchAttempt(lock: HeldLock, expected: string | null, next: string): void {
       const handle = locks.get(lock); if (!handle || typeof next !== 'string' || !next.length || Buffer.byteLength(next) > 16384 ||

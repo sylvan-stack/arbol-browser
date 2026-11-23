@@ -456,6 +456,19 @@ static napi_value readLaunchAttempt(napi_env env, napi_callback_info info) {
     return text(env,raw);
   } @catch (NSException*) { return fail(env); } }
 }
+// Pure selection hint. No file, guard, receipt or predecessor is trusted here;
+// the later native inspection independently rederives applicability and proof.
+static napi_value canonicalMigrationClaimDigest(napi_env env,napi_callback_info info) {
+  napi_value arg; std::string raw;
+  if(arbol_attempt::profileFormat!=2||!argument(env,info,&arg)||!boundedText(env,arg,raw)) return fail(env);
+  @autoreleasepool { @try {
+    NSDictionary* value=arbol_attempt::json(raw);
+    if(!arbol_attempt::record(value)||![value[@"phase"] isEqual:@"closed"]) return fail(env);
+    std::string canonical=arbol_attempt::bytes(value);
+    if(canonical.empty()) return fail(env);
+    return text(env,[arbol_attempt::digest(canonical) UTF8String]);
+  } @catch(NSException*) { return fail(env); } }
+}
 static napi_value writeLaunchAttempt(napi_env env, napi_callback_info info) {
   napi_value args[3]; size_t n = 3; std::string expected,next; napi_valuetype kind;
   if (napi_get_cb_info(env,info,&n,args,nullptr,nullptr) != napi_ok || n != 3 ||
@@ -3482,6 +3495,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"continuousTime",nullptr,continuousTime,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"processProvenance",nullptr,processProvenance,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"readLaunchAttempt",nullptr,readLaunchAttempt,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"canonicalMigrationClaimDigest",nullptr,canonicalMigrationClaimDigest,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"writeLaunchAttempt",nullptr,writeLaunchAttempt,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"terminateProfileNow",nullptr,terminateProfileNow,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"prepareWatchdogCustody",nullptr,prepareWatchdogCustody,nullptr,nullptr,nullptr,napi_default,nullptr},
