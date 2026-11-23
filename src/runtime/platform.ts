@@ -4,6 +4,8 @@ import { isAbsolute } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
 import { performance } from 'node:perf_hooks';
 import { unavailable } from '../contracts/errors.js';
+import { validator } from '../contracts/schema.js';
+import type { Contract } from '../contracts/generated.js';
 import { assertActualSessionFactory, consumeActualSessionSeal, type ActualSessionFactory, type ActualSessionSeal } from '../profiles/session.js';
 import { assertHostCustody, type HostCustody } from './custody.js';
 
@@ -114,6 +116,18 @@ export interface NativeExitInput {
 export interface ExitInspectionReceipt {
   readonly kind: 'never-opened' | 'activated' | 'terminal' | 'withdrawn'; readonly clean: boolean;
   readonly prior: PriorMarkerExpectation; readonly request: string | null;
+}
+export type NativeMigrationInput = Omit<NativeExitInput, 'mode' | 'pending'> & Readonly<{ mode: 'migrate-verify' }>;
+export interface MigrationInspectionReceipt {
+  readonly epoch: string; readonly profileInstance: string; readonly profilePathHash: string;
+  readonly evidence: Readonly<Contract<'migration.Evidence'>>;
+  readonly profileDirectory: Readonly<Contract<'migration.Identity'>>;
+  readonly record: MaintenanceFileEvidence; readonly marker: MaintenanceFileEvidence | null;
+}
+const migrationInspectionReceipts = new WeakSet<object>();
+export function assertMigrationInspectionReceipt(value: MigrationInspectionReceipt, custody: MaintenanceCustody): void {
+  assertMaintenanceCustody(custody);
+  if (!migrationInspectionReceipts.has(value) || value.epoch !== custody.facts.epoch) throw unavailable('profile');
 }
 const exitInspectionReceipts = new WeakSet<object>();
 export function assertExitInspectionReceipt(value: ExitInspectionReceipt): void {
@@ -238,6 +252,8 @@ export interface PlatformPort {
    * complete receipts, physical metadata/marker/frontiers and full original
    * absence are verified off the caller event loop under the original bound. */
   inspectExit(owner: HeldLock, build: HeldLock, input: NativeExitInput, deadline: number, guards?: Readonly<{ data?: HeldLock; next?: HeldLock }>): Promise<ExitInspectionReceipt>;
+  inspectMigration(custody: MaintenanceCustody, registry: HeldLock, owner: HeldLock, build: HeldLock | MaintenanceGuard,
+    input: NativeMigrationInput, deadline: number, data?: HeldLock | MaintenanceGuard): Promise<MigrationInspectionReceipt>;
   /** One-use fixed-exec native adoption. No numeric FD or role is accepted. */
   adoptHostBuild(requestPath: string, guard: string, bundle: string): HeldLock;
   adoptInstalledLaunch(bundle: string): { lock: HeldLock; deadline: number };
@@ -279,7 +295,8 @@ interface NativeSupport {
   beginHostClipboard(custody: object): object;
   finishHostClipboard(custody: object, preparation: object): boolean;
   assertHostClipboard(custody: object, preparation: object): void;
-  beginExitInspection(owner: object, build: object, input: string, nativeDeadline: number, data: object | null, next: object | null): object;
+  beginExitInspection(owner: object, build: object, input: string, nativeDeadline: number, data: object | null, next: object | null,
+    registry?: object, maintenance?: object): object;
   pollExitInspection(handle: object): string | null;
   cancelExitInspection(handle: object): void;
   beginHostSessionUse(handle: object): object;
@@ -362,6 +379,7 @@ export function loadPlatform(): PlatformPort {
   const consumedBudgets = new WeakMap<CloseBudget, object>();
   const custodyHandles = new WeakMap<WatchdogCustody, object>();
   const maintenanceHandles = new WeakMap<MaintenanceCustody, object>();
+  const maintenanceBuildHandles = new WeakMap<MaintenanceGuard, object>();
   let clipboardAttempted = false;
   const clockBudget = (value: CloseBudget): CloseBudget => {
     if (!value || ![value.received, value.grace, value.overall].every(n => Number.isFinite(n) && n > 0) ||
@@ -560,9 +578,12 @@ export function loadPlatform(): PlatformPort {
           (facts.oldBuildPath !== null && (typeof facts.oldBuildPath !== 'string' || !isAbsolute(facts.oldBuildPath))))
         throw unavailable('browser');
       const assert = () => call(() => check(value.handle));
-      const guard = (handle: object, path: string): MaintenanceGuard => Object.freeze({ path,
-        assertIdentity: () => { assert(); return call(() => native.assertLock(handle)); },
-      });
+      const guard = (handle: object, path: string): MaintenanceGuard => {
+        const value: MaintenanceGuard = Object.freeze({ path,
+          assertIdentity: () => { assert(); return call(() => native.assertLock(handle)); },
+        });
+        maintenanceBuildHandles.set(value, handle); return value;
+      };
       Object.freeze(facts.runtimeIdentity); Object.freeze(facts.journal.identity); Object.freeze(facts.journal);
       if (facts.selection) { Object.freeze(facts.selection.identity); Object.freeze(facts.selection); }
       const custody: MaintenanceCustody = Object.freeze({ facts: Object.freeze(facts),
@@ -635,6 +656,47 @@ export function loadPlatform(): PlatformPort {
       const actual = locks.get(build), actualOwner = owner ? locks.get(owner) : null;
       if (!actual || (owner && !actualOwner)) throw unavailable('browser');
       build.assertIdentity(); owner?.assertIdentity(); return call(() => native.terminateAdoptedHost(actual, actualOwner ?? null));
+    },
+    async inspectMigration(custody: MaintenanceCustody, registry: HeldLock, owner: HeldLock, build: HeldLock | MaintenanceGuard,
+      input: NativeMigrationInput, deadline: number, data?: HeldLock | MaintenanceGuard): Promise<MigrationInspectionReceipt> {
+      assertMaintenanceCustody(custody);
+      const guardHandle = (value: HeldLock | MaintenanceGuard) => locks.get(value as HeldLock) ?? maintenanceBuildHandles.get(value as MaintenanceGuard);
+      const actualCustody = maintenanceHandles.get(custody), actualRegistry = locks.get(registry), actualOwner = locks.get(owner);
+      const actualBuild = guardHandle(build), actualData = data ? guardHandle(data) : null;
+      if (!actualCustody || !actualRegistry || !actualOwner || !actualBuild || (data && !actualData) ||
+          input.mode !== 'migrate-verify' || !Number.isFinite(deadline)) throw unavailable('profile');
+      const assert = () => { assertMaintenanceCustody(custody); registry.assertIdentity(); owner.assertIdentity(); build.assertIdentity(); data?.assertIdentity(); };
+      assert();
+      const nativeNow = call(() => native.continuousTime()), sampled = performance.now();
+      if (sampled >= deadline) throw unavailable('profile');
+      const nativeDeadline = nativeNow + Math.min(10000, deadline - sampled);
+      const handle = call(() => native.beginExitInspection(actualOwner, actualBuild,
+        JSON.stringify({ ...input, dataAttempt: input.dataAttempt ?? null, pending: null }), nativeDeadline,
+        actualData ?? null, null, actualRegistry, actualCustody));
+      try {
+        while (performance.now() < deadline && call(() => native.continuousTime()) < nativeDeadline) {
+          const raw = call(() => native.pollExitInspection(handle));
+          if (raw !== null) {
+            if (typeof raw !== 'string' || !raw.length || Buffer.byteLength(raw) > 16384) throw unavailable('profile');
+            const value = JSON.parse(raw) as MigrationInspectionReceipt & { format: number; kind: string };
+            if (!value || Object.keys(value).sort().join(',') !== 'epoch,evidence,format,kind,marker,profileDirectory,profileInstance,profilePathHash,record' ||
+                value.format !== 1 || value.kind !== 'migration-verification' || value.epoch !== custody.facts.epoch ||
+                value.profileInstance !== input.profileInstance || value.profilePathHash !== input.profilePathHash ||
+                !validator('migration.Evidence')(value.evidence) || !validator('migration.Identity')(value.profileDirectory) ||
+                !validator('migration.File')(value.record) || (value.marker !== null && !validator('migration.File')(value.marker)) ||
+                value.evidence.clean !== (value.evidence.classification === 'clean')) throw unavailable('profile');
+            assert(); if (performance.now() >= deadline || call(() => native.continuousTime()) >= nativeDeadline) throw unavailable('profile');
+            Object.freeze(value.record.identity); Object.freeze(value.record);
+            if (value.marker) { Object.freeze(value.marker.identity); Object.freeze(value.marker); }
+            const receipt: MigrationInspectionReceipt = Object.freeze({ epoch: value.epoch, profileInstance: value.profileInstance,
+              profilePathHash: value.profilePathHash, evidence: Object.freeze(value.evidence), profileDirectory: Object.freeze(value.profileDirectory),
+              record: value.record, marker: value.marker });
+            migrationInspectionReceipts.add(receipt); return receipt;
+          }
+          await setTimeout(Math.min(5, Math.max(1, deadline - performance.now())));
+        }
+        throw unavailable('profile');
+      } finally { call(() => native.cancelExitInspection(handle)); }
     },
     async inspectExit(owner: HeldLock, build: HeldLock, input: NativeExitInput, deadline: number, guards?: Readonly<{ data?: HeldLock; next?: HeldLock }>): Promise<ExitInspectionReceipt> {
       const actualOwner = locks.get(owner), actualBuild = locks.get(build);

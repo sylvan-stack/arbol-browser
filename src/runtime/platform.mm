@@ -1838,7 +1838,7 @@ static bool originalMaintenanceBuildHandle(HeldLock* value) {
 }
 struct ExitInspection {
   std::atomic<int> state{0}; std::atomic<bool> cancelled{false};
-  arbol_boundary::Lock owner,build,dataBuild,nextBuild; NSDictionary* input=nil; std::string result; double deadline=0;
+  arbol_boundary::Lock owner,build,dataBuild,nextBuild,registry; NSDictionary* input=nil; std::string result; double deadline=0;
   // Captured only on the owning N-API thread. Worker uses its private Context
   // fields and genuinely shared atomic state, never the live mutable Context
   // or global nativeCustodies container.
@@ -1849,7 +1849,7 @@ struct ExitInspection {
   bool within() const { return !cancelled.load(std::memory_order_acquire)&&arbol_boundary::clockMs()<deadline&&
     arbol_boundary::lockIdentity(owner)&&arbol_boundary::lockIdentity(build)&&
     (dataBuild.fd<0||arbol_boundary::lockIdentity(dataBuild))&&(nextBuild.fd<0||arbol_boundary::lockIdentity(nextBuild))&&
-    (!maintenance || (maintenanceStateRoot && maintenanceStateRoot->current())) &&
+    (!maintenance || (maintenanceStateRoot && maintenanceStateRoot->current() && registry.heldMode==LOCK_EX && arbol_boundary::lockIdentity(registry))) &&
     (build.heldMode==LOCK_SH||(maintenance&&originalMaintenanceBuild(build)))&&
     (dataBuild.fd<0||dataBuild.heldMode==LOCK_SH||(maintenance&&originalMaintenanceBuild(dataBuild)))&&
     (nextBuild.fd<0||nextBuild.heldMode==LOCK_SH||(maintenance&&originalMaintenanceBuild(nextBuild))); }
@@ -1863,6 +1863,181 @@ struct ExitInspection {
   }
 };
 static std::set<ExitInspection*> exitInspections;
+// Migration reads management bytes independently of JavaScript. Foundation's
+// decoder alone accepts duplicate object keys, so first check the complete
+// UTF-8 grammar and decoded keys, with bounded nesting and no side effects.
+static NSDictionary* strictMigrationObject(const std::string& raw) {
+  if (raw.empty() || raw.size() > arbol_attempt::limit || raw.find('\0') != std::string::npos) return nil;
+  NSData* data = [NSData dataWithBytes:raw.data() length:raw.size()];
+  if (![[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]) return nil;
+  size_t at = 0;
+  auto space = [&] { while (at < raw.size() && (raw[at]==' '||raw[at]=='\t'||raw[at]=='\r'||raw[at]=='\n')) ++at; };
+  auto string = [&]() -> NSString* {
+    if (at >= raw.size() || raw[at] != '"') return nil;
+    size_t begin = at++;
+    while (at < raw.size()) {
+      unsigned char c = raw[at++];
+      if (c == '"') {
+        std::string wrapped = "[" + raw.substr(begin,at-begin) + "]";
+        id value = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:wrapped.data() length:wrapped.size()] options:0 error:nil];
+        return [value isKindOfClass:NSArray.class] && [value count] == 1 && [value[0] isKindOfClass:NSString.class] ? value[0] : nil;
+      }
+      if (c < 0x20) return nil;
+      if (c == '\\') {
+        if (at >= raw.size()) return nil;
+        char escape = raw[at++];
+        if (escape == 'u') {
+          for (int i=0;i<4;++i) { if (at >= raw.size() || !isxdigit((unsigned char)raw[at])) return nil; ++at; }
+        } else if (std::string("\"\\/bfnrt").find(escape) == std::string::npos) return nil;
+      }
+    }
+    return nil;
+  };
+  std::function<bool(unsigned)> value;
+  value = [&](unsigned depth) {
+    if (depth > 64) return false; space(); if (at >= raw.size()) return false;
+    if (raw[at] == '"') return string() != nil;
+    if (raw[at] == '{') {
+      ++at; space(); NSMutableSet* keys = [NSMutableSet new];
+      if (at < raw.size() && raw[at] == '}') { ++at; return true; }
+      for (;;) {
+        space(); NSString* key = string(); if (!key || [keys containsObject:key]) return false; [keys addObject:key];
+        space(); if (at >= raw.size() || raw[at++] != ':' || !value(depth+1)) return false;
+        space(); if (at >= raw.size()) return false; char next = raw[at++];
+        if (next == '}') return true; if (next != ',') return false;
+      }
+    }
+    if (raw[at] == '[') {
+      ++at; space(); if (at < raw.size() && raw[at] == ']') { ++at; return true; }
+      for (;;) {
+        if (!value(depth+1)) return false; space(); if (at >= raw.size()) return false;
+        char next = raw[at++]; if (next == ']') return true; if (next != ',') return false;
+      }
+    }
+    for (const char* literal : {"true","false","null"}) {
+      size_t size = strlen(literal); if (raw.compare(at,size,literal) == 0) { at += size; return true; }
+    }
+    if (raw[at] == '-') ++at; if (at >= raw.size()) return false;
+    if (raw[at] == '0') ++at;
+    else { if (raw[at] < '1' || raw[at] > '9') return false; while (at < raw.size() && isdigit((unsigned char)raw[at])) ++at; }
+    if (at < raw.size() && raw[at] == '.') {
+      ++at; size_t begin = at; while (at < raw.size() && isdigit((unsigned char)raw[at])) ++at; if (begin == at) return false;
+    }
+    if (at < raw.size() && (raw[at]=='e'||raw[at]=='E')) {
+      ++at; if (at < raw.size() && (raw[at]=='+'||raw[at]=='-')) ++at;
+      size_t begin = at; while (at < raw.size() && isdigit((unsigned char)raw[at])) ++at; if (begin == at) return false;
+    }
+    return true;
+  };
+  if (!value(0)) return nil; space(); return at == raw.size() ? arbol_attempt::json(raw) : nil;
+}
+struct MigrationObservation {
+  arbol_attempt::MaintenanceDirectory directory;
+  arbol_attempt::MaintenanceFile record, marker;
+  bool markerAbsent = false;
+  NSDictionary* profileRecord = nil;
+  NSDictionary* engineMarker = nil;
+  bool current() const {
+    if (!directory.current() || !record.current()) return false;
+    struct stat st{}; errno = 0;
+    return markerAbsent ? fstatat(directory.fd,"engine.json",&st,AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT : marker.current();
+  }
+  bool capture(ExitInspection& job) {
+    using namespace arbol_attempt;
+    NSString* profile = job.input[@"profile"];
+    NSString* state = maintenanceCustody ? maintenanceCustody->stateRoot() : nil;
+    if (!job.maintenance || !job.within() || !state || !maintenanceStateRoot || maintenanceStateRoot->absent ||
+        maintenanceCustody->journalObject()[@"before"] == NSNull.null ||
+        ![profile.stringByDeletingLastPathComponent isEqual:[state stringByAppendingPathComponent:@"profiles"]] ||
+        !pattern(profile.lastPathComponent,@"^[a-z](?:[a-z0-9-]{0,62}[a-z0-9])?$") ||
+        !directory.openPath(profile.fileSystemRepresentation) ||
+        !record.openPath(directory.path + "/profile.json",0600,limit,true)) return false;
+    profileRecord = strictMigrationObject(record.content);
+    uint64_t format = 0;
+    if (!keys(profileRecord,@[@"format",@"id",@"instance",@"creationRequest",@"createdAt"]) ||
+        !uintNumber(profileRecord[@"format"],format) || format != 1 || ![profileRecord[@"id"] isEqual:profile.lastPathComponent] ||
+        ![profileRecord[@"instance"] isEqual:job.input[@"profileInstance"]] ||
+        !pattern(profileRecord[@"creationRequest"],@"^req_[A-Za-z0-9_-]{22}$") ||
+        !pattern(profileRecord[@"createdAt"],@"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z$")) return false;
+    NSISO8601DateFormatter* dates = [NSISO8601DateFormatter new];
+    dates.formatOptions = NSISO8601DateFormatWithInternetDateTime |
+      ([profileRecord[@"createdAt"] containsString:@"."] ? NSISO8601DateFormatWithFractionalSeconds : 0);
+    if (![dates dateFromString:profileRecord[@"createdAt"]]) return false;
+    struct stat st{}; errno = 0;
+    if (fstatat(directory.fd,"engine.json",&st,AT_SYMLINK_NOFOLLOW)) { if (errno != ENOENT) return false; markerAbsent = true; }
+    else {
+      if (!marker.openPath(directory.path + "/engine.json",0600,limit,true)) return false;
+      engineMarker = strictMigrationObject(marker.content);
+      if (!nativeMarker(engineMarker,true) || !uintNumber(engineMarker[@"format"],format) || format != 1 ||
+          ![engineMarker[@"profileInstance"] isEqual:profileRecord[@"instance"]]) return false;
+      NSDictionary* policy = json(maintenanceCustody->hostPolicy().content);
+      if (![policy[@"readableReaderKeys"] isKindOfClass:NSArray.class] || ![policy[@"readableDataEpochs"] isKindOfClass:NSArray.class] ||
+          ![policy[@"readableReaderKeys"] containsObject:engineMarker[@"requiredReader"]] ||
+          ![policy[@"readableDataEpochs"] containsObject:engineMarker[@"dataEpoch"]]) return false;
+    }
+    return current() && job.within();
+  }
+  bool neverOpened(ExitInspection& job) const {
+    if (!markerAbsent || !current()) return false;
+    int duplicate = openat(directory.fd,".",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC); if (duplicate < 0) return false;
+    DIR* entries = fdopendir(duplicate); if (!entries) { close(duplicate); return false; }
+    bool valid = true; size_t count = 0; errno = 0;
+    while (auto* entry = readdir(entries)) {
+      std::string name = entry->d_name;
+      if (name == "." || name == "..") continue;
+      if (++count > 131072 || !job.within()) { valid = false; break; }
+      // A missing marker cannot adopt native storage. This is the existing
+      // compatibility.ts fresh-marker rule, not an inference from empty data.
+      if (name != "profile.json" && name != "owner.lock" && name != "logs" && name != "data" && name != "userData") { valid = false; break; }
+      struct stat st{};
+      if (fstatat(directory.fd,name.c_str(),&st,AT_SYMLINK_NOFOLLOW) || st.st_dev != directory.identity.st_dev || st.st_uid != geteuid() ||
+          ((name == "profile.json" || name == "owner.lock") ? !arbol_attempt::privateFile(st) :
+            (!S_ISDIR(st.st_mode) || (st.st_mode & 07777) != 0700))) { valid = false; break; }
+      errno = 0;
+    }
+    if (errno || closedir(entries)) valid = false;
+    return valid && emptyNativeDirectory([job.input[@"profile"] stringByAppendingPathComponent:@"data"]) &&
+      emptyNativeDirectory([job.input[@"profile"] stringByAppendingPathComponent:@"userData"]) && current() && job.within();
+  }
+};
+struct MissingMigrationRuntime {
+  int temporary = -1, parent = -1; struct stat temporaryIdentity{}, parentIdentity{};
+  std::string rootName, leafName;
+  bool parentAbsent = false;
+  ~MissingMigrationRuntime() { if (parent >= 0) close(parent); if (temporary >= 0) close(temporary); }
+  bool current() const {
+    struct stat value{};
+    struct stat named{};
+    if (temporary<0 || fstat(temporary,&value) || lstat("/private/tmp",&named) || !S_ISDIR(value.st_mode) ||
+        value.st_uid!=0 || (value.st_mode&07777)!=01777 || value.st_dev!=temporaryIdentity.st_dev ||
+        value.st_ino!=temporaryIdentity.st_ino || value.st_dev!=named.st_dev || value.st_ino!=named.st_ino ||
+        value.st_uid!=named.st_uid || value.st_mode!=named.st_mode) return false;
+    errno=0;
+    if (parentAbsent) return fstatat(temporary,rootName.c_str(),&value,AT_SYMLINK_NOFOLLOW)<0 && errno==ENOENT;
+    char actual[PATH_MAX]{};
+    if (parent<0 || fstat(parent,&value) || fstatat(temporary,rootName.c_str(),&named,AT_SYMLINK_NOFOLLOW) ||
+        !S_ISDIR(value.st_mode) || !S_ISDIR(named.st_mode) || value.st_uid!=geteuid() || (value.st_mode&07777)!=0700 ||
+        value.st_dev!=parentIdentity.st_dev || value.st_ino!=parentIdentity.st_ino || value.st_dev!=named.st_dev || value.st_ino!=named.st_ino ||
+        value.st_mode!=named.st_mode || value.st_uid!=named.st_uid ||
+        fcntl(parent,F_GETPATH,actual) || std::string(actual)!="/private/tmp/"+rootName) return false;
+    errno=0; return fstatat(parent,leafName.c_str(),&value,AT_SYMLINK_NOFOLLOW)<0 && errno==ENOENT;
+  }
+  bool capture(NSString* leaf, NSString* hash) {
+    rootName="ab-"+std::to_string(geteuid()); leafName=[[hash substringToIndex:32] UTF8String];
+    const std::string expected="/private/tmp/"+rootName+"/"+leafName;
+    if (![leaf isEqual:[NSString stringWithUTF8String:expected.c_str()]]) return false;
+    temporary=open("/private/tmp",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    struct stat root{};
+    if (temporary<0 || fstat(temporary,&temporaryIdentity) || !arbol_boundary::canonical("/private/tmp")) return false;
+    errno=0;
+    if (fstatat(temporary,rootName.c_str(),&root,AT_SYMLINK_NOFOLLOW)) { if(errno!=ENOENT) return false; parentAbsent=true; }
+    else {
+      parent=openat(temporary,rootName.c_str(),O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+      if (parent<0 || fstat(parent,&parentIdentity)) return false;
+    }
+    return current();
+  }
+};
 static bool receiptIdentity(id value,arbol_boundary::Identity& out,bool withSession=false) {
   uint64_t pid,start,version,uid,group,session=0;
   if(!arbol_attempt::keys(value,withSession?@[@"pid",@"startId",@"pidVersion",@"uid",@"group",@"session"]:
@@ -1954,7 +2129,7 @@ static bool receiptMarker(NSDictionary* capability,id expected,ExitInspection& j
   if(root.fd<0||fstat(root.fd,&directory)||![arbol_exit::fileIdentity(directory) isEqual:capability[@"profileDirectory"]]||
      !markerAt(root.fd,raw,identity,absent)) return false;
   if(expected==(id)NSNull.null) { errno=0; return absent&&fstatat(root.fd,"engine.json",&named,AT_SYMLINK_NOFOLLOW)<0&&errno==ENOENT&&root.finish()&&job.within(); }
-  return !absent&&arbol_attempt::keys(expected,@[@"identity",@"digest",@"value"])&&nativeMarker(arbol_attempt::json(raw))&&
+  return !absent&&arbol_attempt::keys(expected,@[@"identity",@"digest",@"value"])&&nativeMarker(arbol_attempt::json(raw),job.maintenance)&&
     [arbol_exit::fileIdentity(identity) isEqual:expected[@"identity"]]&&[arbol_attempt::digest(raw) isEqual:expected[@"digest"]]&&
     [arbol_attempt::json(raw) isEqual:expected[@"value"]]&&
     [arbol_attempt::json(raw)[@"profileInstance"] isEqual:job.input[@"profileInstance"]]&&root.finish()&&job.within();
@@ -2201,8 +2376,10 @@ static bool inspectExit(ExitInspection& job) {
   NSDictionary* input=job.input,*expected=input[@"attempt"]; NSString* leaf=input[@"runtimeLeaf"],*profile=input[@"profile"];
   bool prior=[input[@"mode"] isEqual:@"prior"],hostMode=[input[@"mode"] isEqual:@"host"],
     retire=[input[@"mode"] isEqual:@"retire"],reserve=[input[@"mode"] isEqual:@"reserve"],withdraw=[input[@"mode"] isEqual:@"withdraw"];
+  bool migration=[input[@"mode"] isEqual:@"migrate-verify"];
   if(!job.within()||!keys(input,@[@"format",@"mode",@"profile",@"profileInstance",@"profilePathHash",@"runtimeLeaf",@"bundle",@"attempt",@"previous",@"dataAttempt",@"pending"])||
-     ![input[@"format"] isEqual:@1]||![@[@"prior",@"host",@"full",@"retire",@"reserve",@"withdraw"] containsObject:input[@"mode"]]||
+     ![input[@"format"] isEqual:@1]||(![@[@"prior",@"host",@"full",@"retire",@"reserve",@"withdraw"] containsObject:input[@"mode"]]&&!migration)||
+     (migration&&!job.maintenance)||
      !path(profile)||!path(leaf)||!path(input[@"bundle"])||!pattern(input[@"profileInstance"],@"^prf_[A-Za-z0-9_-]{22}$")||
      ![input[@"profilePathHash"] isEqual:digest(profile.UTF8String)]||
      ![leaf.lastPathComponent isEqual:[input[@"profilePathHash"] substringToIndex:32]]||
@@ -2210,6 +2387,8 @@ static bool inspectExit(ExitInspection& job) {
      (reserve?(job.nextBuild.fd<0||!record(input[@"pending"])):input[@"pending"]!=NSNull.null)) return false;
   PackagedLayout inputLayout;
   if(!packagedLayout([input[@"bundle"] UTF8String],inputLayout)||inputLayout.guard!=job.build.path) return false;
+  MigrationObservation migrationSource;
+  if(migration&&!migrationSource.capture(job)) return false;
   arbol_exit::NativeFile history; struct stat historyIdentity{};
   NSString* state=profile.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent;
   NSString* historyPath=[[state stringByAppendingPathComponent:@"exit-evidence"] stringByAppendingPathComponent:input[@"profilePathHash"]];
@@ -2229,12 +2408,19 @@ static bool inspectExit(ExitInspection& job) {
   bool historyMissing=history.fd<0&&errno==ENOENT;
   if(!historyMissing&&(history.fd<0||!arbol_boundary::canonical(historyPath.fileSystemRepresentation)||
     fstat(history.fd,&historyIdentity)||!S_ISDIR(historyIdentity.st_mode)||historyIdentity.st_uid!=geteuid()||(historyIdentity.st_mode&07777)!=0700)) return false;
-  Claim claim; std::string currentRaw,headRaw,pointerRaw; bool absent,headAbsent=true,pointerAbsent=true;
-  if(!claim.acquire(std::string(leaf.fileSystemRepresentation)+"/claim.json",job.deadline)||
-     !readAt(claim.at.directory,"claim.json",currentRaw,absent)||
+  Claim claim; std::string currentRaw,headRaw,pointerRaw; bool absent=true,headAbsent=true,pointerAbsent=true;
+  MissingMigrationRuntime missingRuntime; bool runtimeMissing=false; struct stat runtimeIdentity{};
+  if(migration&&lstat(leaf.fileSystemRepresentation,&runtimeIdentity)) {
+    if(errno!=ENOENT||!missingRuntime.capture(leaf,input[@"profilePathHash"])) return false; runtimeMissing=true;
+  }
+  if((!runtimeMissing&&(!claim.acquire(std::string(leaf.fileSystemRepresentation)+"/claim.json",job.deadline)||
+     !readAt(claim.at.directory,"claim.json",currentRaw,absent)))||
      (!historyMissing&&(!readAt(history.fd,"previous-claim.json",headRaw,headAbsent)||
        !readAt(history.fd,"current-attempt.json",pointerRaw,pointerAbsent)))||!job.within()) return false;
-  NSDictionary* current=absent?nil:json(currentRaw),*head=headAbsent?nil:json(headRaw),*pointer=pointerAbsent?nil:json(pointerRaw);
+  NSDictionary* current=absent?nil:(migration?strictMigrationObject(currentRaw):json(currentRaw)),
+    *head=headAbsent?nil:(migration?strictMigrationObject(headRaw):json(headRaw)),
+    *pointer=pointerAbsent?nil:(migration?strictMigrationObject(pointerRaw):json(pointerRaw));
+  if(migration&&((!absent&&!current)||(!headAbsent&&!head)||(!pointerAbsent&&!pointer))) return false;
   auto sameProfile=[&](NSDictionary* value) { return record(value)&&[value[@"profile"] isEqual:profile]&&
     [value[@"profileInstance"] isEqual:input[@"profileInstance"]]&&[value[@"profilePathHash"] isEqual:input[@"profilePathHash"]]; };
   if((current&&!sameProfile(current))||(head&&(!sameProfile(head)||![head[@"phase"] isEqual:@"closed"]))||
@@ -2242,6 +2428,19 @@ static bool inspectExit(ExitInspection& job) {
      ((current||head)&&!pointer)||(pointer&&!immutable(pointer,current?:head))) return false;
   auto result=[&](NSString* kind,NSDictionary* data,NSString* request) {
     bool clean=[kind isEqual:@"activated"];
+    if(migration) {
+      if(!migrationSource.current()||(!data&&!migrationSource.neverOpened(job))) return false;
+      id closed=expected==(id)NSNull.null?nil:expected;
+      NSDictionary* evidence=@{@"classification":data?(clean?@"clean":@"dirty"):@"never-opened",@"clean":@(clean),
+        @"closedClaimSha256":closed?(id)digest(bytes(closed)):NSNull.null,@"dataClaimSha256":data?(id)digest(bytes(data)):NSNull.null,
+        @"terminalPath":closed?closed[@"terminal"][@"path"]:(id)NSNull.null,
+        @"terminalSha256":closed?closed[@"terminal"][@"digest"]:(id)NSNull.null};
+      job.result=bytes(@{@"format":@1,@"kind":@"migration-verification",@"epoch":maintenanceCustody->epoch,
+        @"profileInstance":input[@"profileInstance"],@"profilePathHash":input[@"profilePathHash"],@"evidence":evidence,
+        @"profileDirectory":maintenanceIdentity(migrationSource.directory.identity),@"record":migrationSource.record.record(),
+        @"marker":migrationSource.markerAbsent?(id)NSNull.null:migrationSource.marker.record()});
+      return !job.result.empty()&&job.within()&&migrationSource.current()&&(!runtimeMissing||missingRuntime.current());
+    }
     NSDictionary* expectation=data?@{@"kind":clean?@"activated":@"terminal",@"path":data[@"terminal"][@"path"],@"digest":data[@"terminal"][@"digest"]}:@{@"kind":@"absent"};
     job.result=bytes(@{@"format":@1,@"kind":kind,@"clean":@(clean),@"prior":expectation,@"request":request?:(id)NSNull.null});
     return !job.result.empty()&&job.within();
@@ -2261,9 +2460,9 @@ static bool inspectExit(ExitInspection& job) {
   }
   // Long read-only verification yields this same stable short Claim while
   // preserving actual Owner and every old/data/new Build open description.
-  if(flock(claim.fd,LOCK_UN)) return false;
+  if(!runtimeMissing&&!migration&&flock(claim.fd,LOCK_UN)) return false;
   auto reclaim=[&] {
-    while(flock(claim.fd,LOCK_EX|LOCK_NB)) {
+    while(!runtimeMissing&&!migration&&flock(claim.fd,LOCK_EX|LOCK_NB)) {
       if((errno!=EWOULDBLOCK&&errno!=EAGAIN)||!job.within()) return false; usleep(1000);
     }
     std::string checked; bool missing; struct stat heldHistory{},namedHistory{};
@@ -2272,8 +2471,9 @@ static bool inspectExit(ExitInspection& job) {
       heldHistory.st_dev==namedHistory.st_dev&&heldHistory.st_ino==namedHistory.st_ino&&
       S_ISDIR(namedHistory.st_mode)&&namedHistory.st_uid==geteuid()&&(namedHistory.st_mode&07777)==0700);
     if(historyMissing) { errno=0; stableHistory=lstat(historyPath.fileSystemRepresentation,&namedHistory)<0&&errno==ENOENT; }
-    return job.within()&&stableHistory&&unchanged(claim.at)&&
-      readAt(claim.at.directory,"claim.json",checked,missing)&&missing==absent&&checked==currentRaw&&
+    return job.within()&&stableHistory&&
+      (runtimeMissing?missingRuntime.current():(unchanged(claim.at)&&
+        readAt(claim.at.directory,"claim.json",checked,missing)&&missing==absent&&checked==currentRaw))&&
       (historyMissing||(readAt(history.fd,"previous-claim.json",checked,missing)&&missing==headAbsent&&checked==headRaw&&
         readAt(history.fd,"current-attempt.json",checked,missing)&&missing==pointerAbsent&&checked==pointerRaw))&&
       (!job.hostState||job.hostState->fatal.load(std::memory_order_acquire)==0);
@@ -2355,7 +2555,7 @@ static bool inspectExit(ExitInspection& job) {
     }
     return job.within();
   };
-  if(!verify()||!physical()||!unchanged(claim.at)||!reclaim()) return false;
+  if(!verify()||!physical()||(!runtimeMissing&&!unchanged(claim.at))||!reclaim()) return false;
   if(reserve) {
     NSDictionary* next=input[@"pending"]; PackagedLayout nextLayout;
     // This privileged transition is distinct from generic Role::starter. Repeat
@@ -2380,8 +2580,8 @@ static bool inspectExit(ExitInspection& job) {
   return result(kind,data,closed?closed[@"request"]:nil)&&(historyMissing||history.finish());
 }
 static napi_value beginExitInspection(napi_env env,napi_callback_info info) {
-  napi_value args[6]; size_t n=6; void *ownerValue=nullptr,*buildValue=nullptr; std::string input; double deadline;
-  if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok||n!=6||napi_get_value_external(env,args[0],&ownerValue)!=napi_ok||
+  napi_value args[8]; size_t n=8; void *ownerValue=nullptr,*buildValue=nullptr; std::string input; double deadline;
+  if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok||(n!=6&&n!=8)||napi_get_value_external(env,args[0],&ownerValue)!=napi_ok||
      napi_get_value_external(env,args[1],&buildValue)!=napi_ok||!boundedText(env,args[2],input,65536)||
      napi_get_value_double(env,args[3],&deadline)!=napi_ok||!std::isfinite(deadline)||deadline<=arbol_boundary::clockMs()||
      deadline>arbol_boundary::clockMs()+10000||!arbol_boundary::retainNativeImage()) return fail(env);
@@ -2390,7 +2590,16 @@ static napi_value beginExitInspection(napi_env env,napi_callback_info info) {
   id parsed=[NSJSONSerialization JSONObjectWithData:command options:0 error:nil];
   if (![parsed isKindOfClass:NSDictionary.class]) return fail(env);
   bool migration = migrationInspectionMode(parsed[@"mode"]);
-  if (migration && (!maintenanceStateRoot || !maintenanceStateRoot->current())) return fail(env);
+  HeldLock* registry=nullptr;
+  if (migration) {
+    void *registryValue=nullptr,*custodyValue=nullptr;
+    if(n!=8||!maintenanceStateRoot||!maintenanceStateRoot->current()||
+       napi_get_value_external(env,args[6],&registryValue)!=napi_ok||napi_get_value_external(env,args[7],&custodyValue)!=napi_ok||
+       custodyValue!=maintenanceCustody) return fail(env);
+    registry=static_cast<HeldLock*>(registryValue);
+    if(!liveLocks.count(registry)||registry->mode!=LOCK_EX||
+       registry->path!=std::string([maintenanceCustody->stateRoot() UTF8String])+"/registry.lock") return fail(env);
+  } else if(n!=6) return fail(env);
   if(!liveLocks.count(owner)||!liveLocks.count(build)||owner->mode!=LOCK_EX||
      (build->mode!=LOCK_SH&&!(migration&&originalMaintenanceBuildHandle(build)))) return fail(env);
   HeldLock* additional[2]={nullptr,nullptr};
@@ -2408,9 +2617,10 @@ static napi_value beginExitInspection(napi_env env,napi_callback_info info) {
   // each complete 16 KiB native attempt grammar independently below.
   job->input=[parsed isKindOfClass:NSDictionary.class]?parsed:nil;
   job->maintenance=migration;
+  if(registry) job->registry=duplicateHeld(registry);
   if(additional[0]) job->dataBuild=duplicateHeld(additional[0]);
   if(additional[1]) job->nextBuild=duplicateHeld(additional[1]);
-  auto closeInputs=[&] { for(auto* lock:{&job->owner,&job->build,&job->dataBuild,&job->nextBuild}) if(lock->fd>=0) close(lock->fd); };
+  auto closeInputs=[&] { for(auto* lock:{&job->owner,&job->build,&job->dataBuild,&job->nextBuild,&job->registry}) if(lock->fd>=0) close(lock->fd); };
   if(!job->input||!job->within()||(additional[0]&&job->dataBuild.fd<0)||(additional[1]&&job->nextBuild.fd<0)) {
     closeInputs(); delete job; return fail(env);
   }
@@ -2437,7 +2647,7 @@ static napi_value beginExitInspection(napi_env env,napi_callback_info info) {
     job->thread=new std::thread([job] {
       bool ok=false;
       @autoreleasepool { @try { try { ok=inspectExit(*job); } catch(...) {} } @catch(NSException*) {} }
-      for(auto* lock:{&job->owner,&job->build,&job->dataBuild,&job->nextBuild}) if(lock->fd>=0&&close(lock->fd)) ok=false;
+      for(auto* lock:{&job->owner,&job->build,&job->dataBuild,&job->nextBuild,&job->registry}) if(lock->fd>=0&&close(lock->fd)) ok=false;
       job->state.store(ok&&!job->cancelled.load(std::memory_order_acquire)&&arbol_boundary::clockMs()<job->deadline?1:-1,std::memory_order_release);
     });
     try { job->thread->detach(); } catch(...) {}
