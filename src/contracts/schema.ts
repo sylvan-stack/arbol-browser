@@ -4,11 +4,12 @@ import addFormats from 'ajv-formats';
 import browser from './browser.schema.json' with { type: 'json' };
 import wire from './wire.schema.json' with { type: 'json' };
 import profile from './profile.schema.json' with { type: 'json' };
+import profile2 from './profile-format-2.schema.json' with { type: 'json' };
 import native from './native.schema.json' with { type: 'json' };
 import type { ContractTypes } from './generated.js';
 
 type Schema = Record<string, any>; // JSON Schema is recursive, not application input.
-export const bundles = { browser, wire, profile, native };
+export const bundles = { browser, wire, profile, native, profile2 };
 export type Bundle = keyof typeof bundles;
 const byId = new Map<string, Schema>(Object.values(bundles).map(b => [b.$id, b]));
 const prefix = new Map(Object.entries(bundles).map(([name, b]) => [b.$id, name]));
@@ -141,7 +142,7 @@ export function generatedTypes(): string {
   }
   const lines = Object.entries(bundles).flatMap(([bundle, schema]) => Object.entries(schema.$defs).map(
     ([name, definition]) => `  ${JSON.stringify(`${bundle}.${name}`)}: ${type(definition)};`));
-  return '// Generated from the four checked schema assets by schema.ts. Do not edit.\n' +
+  return '// Generated from the checked schema assets by schema.ts. Do not edit.\n' +
     '// Conditional requirements and value constraints are enforced by validator().\n' +
     `export interface ContractTypes {\n${lines.join('\n')}\n}\n` +
     'export type Contract<K extends keyof ContractTypes> = ContractTypes[K];\n';

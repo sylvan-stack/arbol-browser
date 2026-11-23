@@ -1,4 +1,4 @@
-// Generated from the four checked schema assets by schema.ts. Do not edit.
+// Generated from the checked schema assets by schema.ts. Do not edit.
 // Conditional requirements and value constraints are enforced by validator().
 export interface ContractTypes {
   "browser.InstanceId": string;
@@ -93,5 +93,12 @@ export interface ContractTypes {
   "native.Runtime": { "electron": string; "chromium": string; "node": string; "napi": string; "modules": string; "platform": "darwin"; "arch": "arm64"; "macOS": string; };
   "native.BuildCompatibility": { "abi": 1; "runtime": ContractTypes["native.Runtime"]; "nativeABI": ContractTypes["native.Inventory"]; "publisherTeam": string; "bundleIdentifier": string; "featureConfiguration": { "sitePerProcess": true; "disabledFeatures": Array<string>; "extraChromiumArguments": Array<unknown>; }; "files": { [key: string]: string; }; "dataEpoch": number; "compatibleReaderKeys": Array<string>; "qualification": string; "writerKey": string; "readableDataEpochs": Array<number>; };
   "native.BindingKey": { "id": number; "nonce": string; "webContentsId": number; "revision": number; };
+  "profile2.ProfileRecord": { "format": 2; "id": ContractTypes["browser.ProfileId"]; "instance": string; "creationRequest": string; "createdAt": string; };
+  "profile2.ProfileListItem": { "format": 2; "id": ContractTypes["browser.ProfileId"]; "instance": string; "creationRequest": string; "createdAt": string; "running": boolean; };
+  "profile2.ProfileList": { "profiles": Array<ContractTypes["profile2.ProfileListItem"]>; };
+  "profile2.ProfileCreated": { "profile": ContractTypes["profile2.ProfileRecord"]; "created": boolean; };
+  "profile2.ProfileRemoved": { "profile": ContractTypes["browser.ProfileId"]; "dataRemoved": true; };
+  "profile2.EngineMarker": { "format": 2; "profileInstance": string; "engine": "chromium"; "dataEpoch": number; "lastWriterBuild": ContractTypes["browser.Build"]; "lastWriterChromium": string; "lastWriterElectron": string; "requiredReader": string; "cleanExit": boolean; };
+  "profile2.ComponentInfo": { "name": "arbol-browser"; "version": string; "build": ContractTypes["browser.Build"]; "contract": 1; "profileFormat": 2; "stateDirectory": string; };
 }
 export type Contract<K extends keyof ContractTypes> = ContractTypes[K];
