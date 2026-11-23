@@ -1863,74 +1863,7 @@ struct ExitInspection {
   }
 };
 static std::set<ExitInspection*> exitInspections;
-// Migration reads management bytes independently of JavaScript. Foundation's
-// decoder alone accepts duplicate object keys, so first check the complete
-// UTF-8 grammar and decoded keys, with bounded nesting and no side effects.
-static NSDictionary* strictMigrationObject(const std::string& raw) {
-  if (raw.empty() || raw.size() > arbol_attempt::limit || raw.find('\0') != std::string::npos) return nil;
-  NSData* data = [NSData dataWithBytes:raw.data() length:raw.size()];
-  if (![[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]) return nil;
-  size_t at = 0;
-  auto space = [&] { while (at < raw.size() && (raw[at]==' '||raw[at]=='\t'||raw[at]=='\r'||raw[at]=='\n')) ++at; };
-  auto string = [&]() -> NSString* {
-    if (at >= raw.size() || raw[at] != '"') return nil;
-    size_t begin = at++;
-    while (at < raw.size()) {
-      unsigned char c = raw[at++];
-      if (c == '"') {
-        std::string wrapped = "[" + raw.substr(begin,at-begin) + "]";
-        id value = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:wrapped.data() length:wrapped.size()] options:0 error:nil];
-        return [value isKindOfClass:NSArray.class] && [value count] == 1 && [value[0] isKindOfClass:NSString.class] ? value[0] : nil;
-      }
-      if (c < 0x20) return nil;
-      if (c == '\\') {
-        if (at >= raw.size()) return nil;
-        char escape = raw[at++];
-        if (escape == 'u') {
-          for (int i=0;i<4;++i) { if (at >= raw.size() || !isxdigit((unsigned char)raw[at])) return nil; ++at; }
-        } else if (std::string("\"\\/bfnrt").find(escape) == std::string::npos) return nil;
-      }
-    }
-    return nil;
-  };
-  std::function<bool(unsigned)> value;
-  value = [&](unsigned depth) {
-    if (depth > 64) return false; space(); if (at >= raw.size()) return false;
-    if (raw[at] == '"') return string() != nil;
-    if (raw[at] == '{') {
-      ++at; space(); NSMutableSet* keys = [NSMutableSet new];
-      if (at < raw.size() && raw[at] == '}') { ++at; return true; }
-      for (;;) {
-        space(); NSString* key = string(); if (!key || [keys containsObject:key]) return false; [keys addObject:key];
-        space(); if (at >= raw.size() || raw[at++] != ':' || !value(depth+1)) return false;
-        space(); if (at >= raw.size()) return false; char next = raw[at++];
-        if (next == '}') return true; if (next != ',') return false;
-      }
-    }
-    if (raw[at] == '[') {
-      ++at; space(); if (at < raw.size() && raw[at] == ']') { ++at; return true; }
-      for (;;) {
-        if (!value(depth+1)) return false; space(); if (at >= raw.size()) return false;
-        char next = raw[at++]; if (next == ']') return true; if (next != ',') return false;
-      }
-    }
-    for (const char* literal : {"true","false","null"}) {
-      size_t size = strlen(literal); if (raw.compare(at,size,literal) == 0) { at += size; return true; }
-    }
-    if (raw[at] == '-') ++at; if (at >= raw.size()) return false;
-    if (raw[at] == '0') ++at;
-    else { if (raw[at] < '1' || raw[at] > '9') return false; while (at < raw.size() && isdigit((unsigned char)raw[at])) ++at; }
-    if (at < raw.size() && raw[at] == '.') {
-      ++at; size_t begin = at; while (at < raw.size() && isdigit((unsigned char)raw[at])) ++at; if (begin == at) return false;
-    }
-    if (at < raw.size() && (raw[at]=='e'||raw[at]=='E')) {
-      ++at; if (at < raw.size() && (raw[at]=='+'||raw[at]=='-')) ++at;
-      size_t begin = at; while (at < raw.size() && isdigit((unsigned char)raw[at])) ++at; if (begin == at) return false;
-    }
-    return true;
-  };
-  if (!value(0)) return nil; space(); return at == raw.size() ? arbol_attempt::json(raw) : nil;
-}
+using arbol_exit::strictManagementObject;
 struct MigrationObservation {
   arbol_attempt::MaintenanceDirectory directory;
   arbol_attempt::MaintenanceFile record, marker;
@@ -1952,7 +1885,7 @@ struct MigrationObservation {
         !pattern(profile.lastPathComponent,@"^[a-z](?:[a-z0-9-]{0,62}[a-z0-9])?$") ||
         !directory.openPath(profile.fileSystemRepresentation) ||
         !record.openPath(directory.path + "/profile.json",0600,limit,true)) return false;
-    profileRecord = strictMigrationObject(record.content);
+    profileRecord = strictManagementObject(record.content);
     uint64_t format = 0;
     if (!keys(profileRecord,@[@"format",@"id",@"instance",@"creationRequest",@"createdAt"]) ||
         !uintNumber(profileRecord[@"format"],format) || format != 1 || ![profileRecord[@"id"] isEqual:profile.lastPathComponent] ||
@@ -1967,7 +1900,7 @@ struct MigrationObservation {
     if (fstatat(directory.fd,"engine.json",&st,AT_SYMLINK_NOFOLLOW)) { if (errno != ENOENT) return false; markerAbsent = true; }
     else {
       if (!marker.openPath(directory.path + "/engine.json",0600,limit,true)) return false;
-      engineMarker = strictMigrationObject(marker.content);
+      engineMarker = strictManagementObject(marker.content);
       if (!nativeMarker(engineMarker,true) || !uintNumber(engineMarker[@"format"],format) || format != 1 ||
           ![engineMarker[@"profileInstance"] isEqual:profileRecord[@"instance"]]) return false;
       NSDictionary* policy = json(maintenanceCustody->hostPolicy().content);
@@ -2417,9 +2350,9 @@ static bool inspectExit(ExitInspection& job) {
      !readAt(claim.at.directory,"claim.json",currentRaw,absent)))||
      (!historyMissing&&(!readAt(history.fd,"previous-claim.json",headRaw,headAbsent)||
        !readAt(history.fd,"current-attempt.json",pointerRaw,pointerAbsent)))||!job.within()) return false;
-  NSDictionary* current=absent?nil:(migration?strictMigrationObject(currentRaw):json(currentRaw)),
-    *head=headAbsent?nil:(migration?strictMigrationObject(headRaw):json(headRaw)),
-    *pointer=pointerAbsent?nil:(migration?strictMigrationObject(pointerRaw):json(pointerRaw));
+  NSDictionary* current=absent?nil:(migration?strictManagementObject(currentRaw):json(currentRaw)),
+    *head=headAbsent?nil:(migration?strictManagementObject(headRaw):json(headRaw)),
+    *pointer=pointerAbsent?nil:(migration?strictManagementObject(pointerRaw):json(pointerRaw));
   if(migration&&((!absent&&!current)||(!headAbsent&&!head)||(!pointerAbsent&&!pointer))) return false;
   auto sameProfile=[&](NSDictionary* value) { return record(value)&&[value[@"profile"] isEqual:profile]&&
     [value[@"profileInstance"] isEqual:input[@"profileInstance"]]&&[value[@"profilePathHash"] isEqual:input[@"profilePathHash"]]; };

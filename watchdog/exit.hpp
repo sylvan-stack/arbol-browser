@@ -42,6 +42,74 @@ inline std::string exitReceiptBytes(NSDictionary* value) {
   NSDictionary* complete=parseExitReceipt(raw);
   return complete&&[complete isEqual:value]?raw:std::string{};
 }
+// Migration reads management bytes independently of JavaScript. Foundation's
+// decoder alone accepts duplicate object keys, so first check the complete
+// UTF-8 grammar and decoded keys, with bounded nesting and no side effects.
+inline NSDictionary* strictManagementObject(const std::string& raw, size_t maximum = arbol_attempt::limit) {
+  if (raw.empty() || raw.size() > maximum || raw.find('\0') != std::string::npos) return nil;
+  NSData* data = [NSData dataWithBytes:raw.data() length:raw.size()];
+  if (![[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]) return nil;
+  size_t at = 0;
+  auto space = [&] { while (at < raw.size() && (raw[at]==' '||raw[at]=='\t'||raw[at]=='\r'||raw[at]=='\n')) ++at; };
+  auto string = [&]() -> NSString* {
+    if (at >= raw.size() || raw[at] != '"') return nil;
+    size_t begin = at++;
+    while (at < raw.size()) {
+      unsigned char c = raw[at++];
+      if (c == '"') {
+        std::string wrapped = "[" + raw.substr(begin,at-begin) + "]";
+        id value = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:wrapped.data() length:wrapped.size()] options:0 error:nil];
+        return [value isKindOfClass:NSArray.class] && [value count] == 1 && [value[0] isKindOfClass:NSString.class] ? value[0] : nil;
+      }
+      if (c < 0x20) return nil;
+      if (c == '\\') {
+        if (at >= raw.size()) return nil;
+        char escape = raw[at++];
+        if (escape == 'u') {
+          for (int i=0;i<4;++i) { if (at >= raw.size() || !isxdigit((unsigned char)raw[at])) return nil; ++at; }
+        } else if (std::string("\"\\/bfnrt").find(escape) == std::string::npos) return nil;
+      }
+    }
+    return nil;
+  };
+  std::function<bool(unsigned)> value;
+  value = [&](unsigned depth) {
+    if (depth > 64) return false; space(); if (at >= raw.size()) return false;
+    if (raw[at] == '"') return string() != nil;
+    if (raw[at] == '{') {
+      ++at; space(); NSMutableSet* keys = [NSMutableSet new];
+      if (at < raw.size() && raw[at] == '}') { ++at; return true; }
+      for (;;) {
+        space(); NSString* key = string(); if (!key || [keys containsObject:key]) return false; [keys addObject:key];
+        space(); if (at >= raw.size() || raw[at++] != ':' || !value(depth+1)) return false;
+        space(); if (at >= raw.size()) return false; char next = raw[at++];
+        if (next == '}') return true; if (next != ',') return false;
+      }
+    }
+    if (raw[at] == '[') {
+      ++at; space(); if (at < raw.size() && raw[at] == ']') { ++at; return true; }
+      for (;;) {
+        if (!value(depth+1)) return false; space(); if (at >= raw.size()) return false;
+        char next = raw[at++]; if (next == ']') return true; if (next != ',') return false;
+      }
+    }
+    for (const char* literal : {"true","false","null"}) {
+      size_t size = strlen(literal); if (raw.compare(at,size,literal) == 0) { at += size; return true; }
+    }
+    if (raw[at] == '-') ++at; if (at >= raw.size()) return false;
+    if (raw[at] == '0') ++at;
+    else { if (raw[at] < '1' || raw[at] > '9') return false; while (at < raw.size() && isdigit((unsigned char)raw[at])) ++at; }
+    if (at < raw.size() && raw[at] == '.') {
+      ++at; size_t begin = at; while (at < raw.size() && isdigit((unsigned char)raw[at])) ++at; if (begin == at) return false;
+    }
+    if (at < raw.size() && (raw[at]=='e'||raw[at]=='E')) {
+      ++at; if (at < raw.size() && (raw[at]=='+'||raw[at]=='-')) ++at;
+      size_t begin = at; while (at < raw.size() && isdigit((unsigned char)raw[at])) ++at; if (begin == at) return false;
+    }
+    return true;
+  };
+  if (!value(0)) return nil; space(); return at == raw.size() ? arbol_attempt::json(raw) : nil;
+}
 class ExitWatch {
   int queue_=-1; Identity original_{}; bool attempted_=false, enrolled_=false, uncertain_=false, seen_=false;
   int status_=-1; double observed_=0;
@@ -1689,6 +1757,184 @@ public:
       // ambiguous transfer/publication retains the existing original OFDs.
       usleep(10000);
     }
+  }
+};
+
+// Migration records carry metadata, never Chromium storage. These checks are
+// shared with the host/watchdog marker consumer; grammar alone grants no exit
+// authority. The platform must rederive the retained native proof afterwards.
+inline bool migrationDigest(id value) { return arbol_attempt::pattern(value,@"^[0-9a-f]{64}$"); }
+inline bool migrationIdentity(id value, unsigned mode) {
+  uint64_t uid, permissions;
+  return arbol_attempt::keys(value,@[@"device",@"inode",@"uid",@"mode"])&&
+    arbol_attempt::pattern(value[@"device"],@"^[0-9]{1,20}$")&&arbol_attempt::pattern(value[@"inode"],@"^[0-9]{1,20}$")&&
+    arbol_attempt::uintNumber(value[@"uid"],uid)&&uid==geteuid()&&
+    arbol_attempt::uintNumber(value[@"mode"],permissions)&&permissions==mode;
+}
+inline bool migrationFile(id value) {
+  return arbol_attempt::keys(value,@[@"identity",@"sha256"])&&migrationIdentity(value[@"identity"],0600)&&migrationDigest(value[@"sha256"]);
+}
+inline NSDictionary* migrationContent(id value, bool identity) {
+  if(!arbol_attempt::keys(value,identity?@[@"identity",@"sha256",@"base64"]:@[@"sha256",@"base64"])||
+     (identity&&!migrationIdentity(value[@"identity"],0600))||!migrationDigest(value[@"sha256"])||
+     ![value[@"base64"] isKindOfClass:NSString.class]||[value[@"base64"] length]>87384) return nil;
+  NSData* decoded=[[NSData alloc] initWithBase64EncodedString:value[@"base64"] options:0];
+  if(!decoded||!decoded.length||decoded.length>65536||![[decoded base64EncodedStringWithOptions:0] isEqual:value[@"base64"]]) return nil;
+  std::string raw((const char*)decoded.bytes,decoded.length);
+  return [arbol_attempt::digest(raw) isEqual:value[@"sha256"]]?strictManagementObject(raw,65536):nil;
+}
+inline bool migrationEvidence(id value) {
+  using namespace arbol_attempt;
+  if(!keys(value,@[@"classification",@"clean",@"closedClaimSha256",@"dataClaimSha256",@"terminalPath",@"terminalSha256"])||
+     !value[@"clean"]||CFGetTypeID((__bridge CFTypeRef)value[@"clean"])!=CFBooleanGetTypeID()||
+     (value[@"closedClaimSha256"]!=NSNull.null&&!migrationDigest(value[@"closedClaimSha256"]))) return false;
+  if([value[@"classification"] isEqual:@"never-opened"])
+    return [value[@"clean"] isEqual:@NO]&&value[@"dataClaimSha256"]==NSNull.null&&
+      value[@"terminalPath"]==NSNull.null&&value[@"terminalSha256"]==NSNull.null;
+  return [@[@"clean",@"dirty"] containsObject:value[@"classification"]]&&
+    [value[@"clean"] isEqual:@([value[@"classification"] isEqual:@"clean"])]&&migrationDigest(value[@"closedClaimSha256"])&&
+    migrationDigest(value[@"dataClaimSha256"])&&path(value[@"terminalPath"])&&migrationDigest(value[@"terminalSha256"]);
+}
+inline bool migrationRecord(id value, NSString* identifier, NSString* instance, unsigned format) {
+  using namespace arbol_attempt;
+  if(!keys(value,@[@"format",@"id",@"instance",@"creationRequest",@"createdAt"])||![value[@"format"] isEqual:@(format)]||
+     !pattern(identifier,@"^[a-z](?:[a-z0-9-]{0,62}[a-z0-9])?$")||![value[@"id"] isEqual:identifier]||
+     !pattern(instance,@"^prf_[A-Za-z0-9_-]{22}$")||![value[@"instance"] isEqual:instance]||
+     !pattern(value[@"creationRequest"],@"^create_[A-Za-z0-9_-]{22}$")||
+     !pattern(value[@"createdAt"],@"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z$")) return false;
+  NSISO8601DateFormatter* dates=[NSISO8601DateFormatter new];
+  dates.formatOptions=NSISO8601DateFormatWithInternetDateTime|
+    ([value[@"createdAt"] containsString:@"."]?NSISO8601DateFormatWithFractionalSeconds:0);
+  return [dates dateFromString:value[@"createdAt"]]!=nil;
+}
+inline bool migrationOnlyFormat(id before,id after) {
+  if(![before isKindOfClass:NSDictionary.class]||![after isKindOfClass:NSDictionary.class]||
+     ![before[@"format"] isEqual:@1]||![after[@"format"] isEqual:@2]) return false;
+  NSMutableDictionary* converted=[before mutableCopy]; converted[@"format"]=@2; return [converted isEqual:after];
+}
+inline bool migrationMarkerPair(id before,id after,bool convertedIdentity,NSString* instance) {
+  if(before==NSNull.null) return after==NSNull.null;
+  NSDictionary* original=migrationContent(before,true),*converted=migrationContent(after,convertedIdentity);
+  if(!original||!converted||!migrationOnlyFormat(original,converted)||![original[@"profileInstance"] isEqual:instance]) return false;
+  // Reuse the complete marker grammar without selecting a different Build
+  // format. Only the local grammar copy is normalized to the compiled value.
+  NSMutableDictionary* grammar=[original mutableCopy]; grammar[@"format"]=@(arbol_attempt::profileFormat);
+  return terminalEngineMarker(grammar);
+}
+inline bool migrationProfileEntry(id value) {
+  using namespace arbol_attempt;
+  if(!keys(value,@[@"id",@"instance",@"pathSha256",@"directory",@"dataDirectory",@"userDataDirectory",@"ownerLock",
+      @"originalRecord",@"originalMarker",@"targetRecord",@"targetMarker",@"evidence"])||
+     !migrationDigest(value[@"pathSha256"])||!migrationIdentity(value[@"directory"],0700)||
+     !migrationIdentity(value[@"dataDirectory"],0700)||!migrationIdentity(value[@"userDataDirectory"],0700)||
+     !migrationIdentity(value[@"ownerLock"],0600)||!migrationEvidence(value[@"evidence"])) return false;
+  NSDictionary* before=migrationContent(value[@"originalRecord"],true),*after=migrationContent(value[@"targetRecord"],false);
+  return migrationRecord(before,value[@"id"],value[@"instance"],1)&&migrationRecord(after,value[@"id"],value[@"instance"],2)&&
+    migrationOnlyFormat(before,after)&&migrationMarkerPair(value[@"originalMarker"],value[@"targetMarker"],false,value[@"instance"]);
+}
+inline bool migrationReceipt(id value) {
+  using namespace arbol_attempt;
+  return profileFormat==2&&keys(value,@[@"format",@"kind",@"attempt",@"transactionSha256",@"profilePath",@"profileSha256",@"instance",
+    @"directory",@"evidence",@"originalRecord",@"convertedRecord",@"originalMarker",@"convertedMarker",@"bootSession",@"writer",
+    @"sourceSha256",@"productSha256",@"candidateSha256"])&&[value[@"format"] isEqual:@1]&&
+    [value[@"kind"] isEqual:@"browser-profile-migration-receipt"]&&pattern(value[@"attempt"],@"^[0-9a-f]{32}$")&&
+    migrationDigest(value[@"transactionSha256"])&&path(value[@"profilePath"])&&migrationDigest(value[@"profileSha256"])&&
+    [digest([value[@"profilePath"] UTF8String]) isEqual:value[@"profileSha256"]]&&pattern(value[@"instance"],@"^prf_[A-Za-z0-9_-]{22}$")&&
+    migrationIdentity(value[@"directory"],0700)&&migrationEvidence(value[@"evidence"])&&migrationFile(value[@"originalRecord"])&&
+    migrationFile(value[@"convertedRecord"])&&migrationMarkerPair(value[@"originalMarker"],value[@"convertedMarker"],true,value[@"instance"])&&
+    pattern(value[@"bootSession"],@"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")&&process(value[@"writer"])&&
+    migrationDigest(value[@"sourceSha256"])&&migrationDigest(value[@"productSha256"])&&migrationDigest(value[@"candidateSha256"]);
+}
+inline bool migrationRelease(id value) {
+  return arbol_attempt::keys(value,@[@"selection",@"launcherSha256"])&&
+    arbol_attempt::maintenanceSelection(value[@"selection"])&&migrationDigest(value[@"launcherSha256"]);
+}
+inline bool migrationTransaction(id value) {
+  using namespace arbol_attempt;
+  if(!keys(value,@[@"format",@"kind",@"attempt",@"root",@"runtime",@"selection",@"selectionFile",@"journal",@"epoch",@"oldBuild",@"newBuild",
+      @"sourceSha256",@"productSha256",@"candidateSha256",@"profiles"])||![value[@"format"] isEqual:@1]||
+     ![value[@"kind"] isEqual:@"browser-profile-migration"]||!pattern(value[@"attempt"],@"^[0-9a-f]{32}$")||
+     !migrationIdentity(value[@"runtime"],0700)||!migrationFile(value[@"journal"])||!migrationDigest(value[@"epoch"])||
+     !migrationRelease(value[@"newBuild"])||!migrationDigest(value[@"sourceSha256"])||!migrationDigest(value[@"productSha256"])||
+     !migrationDigest(value[@"candidateSha256"])||![value[@"profiles"] isKindOfClass:NSArray.class]||[value[@"profiles"] count]>4096) return false;
+  if(value[@"selection"]==NSNull.null) {
+    if(value[@"selectionFile"]!=NSNull.null||value[@"oldBuild"]!=NSNull.null||[value[@"profiles"] count]) return false;
+  } else if(!maintenanceSelection(value[@"selection"])||!migrationFile(value[@"selectionFile"])||!migrationRelease(value[@"oldBuild"])||
+      ![value[@"oldBuild"][@"selection"] isEqual:value[@"selection"]]) return false;
+  id root=value[@"root"];
+  if(!keys(root,@[@"path",@"initial",@"identity",@"profiles",@"registry"])||!path(root[@"path"])) return false;
+  if([root[@"initial"] isEqual:@"absent"]) {
+    if(root[@"identity"]!=NSNull.null||root[@"profiles"]!=NSNull.null||root[@"registry"]!=NSNull.null||[value[@"profiles"] count]) return false;
+  } else if(![root[@"initial"] isEqual:@"present"]||!migrationIdentity(root[@"identity"],0700)||
+      !migrationIdentity(root[@"profiles"],0700)||!migrationIdentity(root[@"registry"],0600)) return false;
+  NSMutableSet* hashes=[NSMutableSet new],*ids=[NSMutableSet new],*instances=[NSMutableSet new];
+  for(id profile in value[@"profiles"]) {
+    if(!migrationProfileEntry(profile)||[hashes containsObject:profile[@"pathSha256"]]||[ids containsObject:profile[@"id"]]||
+       [instances containsObject:profile[@"instance"]]) return false;
+    NSString* path=[[root[@"path"] stringByAppendingPathComponent:@"profiles"] stringByAppendingPathComponent:profile[@"id"]];
+    if(![digest(path.UTF8String) isEqual:profile[@"pathSha256"]]) return false;
+    [hashes addObject:profile[@"pathSha256"]]; [ids addObject:profile[@"id"]]; [instances addObject:profile[@"instance"]];
+  }
+  return true;
+}
+inline bool migrationCompletion(id value,id transaction,NSString* transactionDigest,NSString* profileHash,NSString* receiptDigest) {
+  using namespace arbol_attempt;
+  if(!keys(value,@[@"format",@"attempt",@"transactionSha256",@"profiles"])||![value[@"format"] isEqual:@1]||
+     ![value[@"attempt"] isEqual:transaction[@"attempt"]]||![value[@"transactionSha256"] isEqual:transactionDigest]||
+     ![value[@"profiles"] isKindOfClass:NSArray.class]||[value[@"profiles"] count]!=[transaction[@"profiles"] count]) return false;
+  NSMutableDictionary* expected=[NSMutableDictionary new];
+  for(id entry in transaction[@"profiles"]) expected[entry[@"pathSha256"]]=@YES;
+  bool found=false;
+  for(id entry in value[@"profiles"]) {
+    if(!keys(entry,@[@"profileSha256",@"receiptSha256"])||!migrationDigest(entry[@"profileSha256"])||
+       !migrationDigest(entry[@"receiptSha256"])||!expected[entry[@"profileSha256"]]) return false;
+    [expected removeObjectForKey:entry[@"profileSha256"]];
+    if([entry[@"profileSha256"] isEqual:profileHash]) { if(![entry[@"receiptSha256"] isEqual:receiptDigest]) return false; found=true; }
+  }
+  return found&&!expected.count;
+}
+// Caller supplies the independently verified policy runtime and state root,
+// never a directory inferred from an untrusted receipt or a shared sibling.
+struct MigrationChain {
+  arbol_attempt::MaintenanceDirectory runtime,root,attempt;
+  arbol_attempt::MaintenanceFile receiptFile,transactionFile,completionFile;
+  NSDictionary* receipt=nil,*transaction=nil,*entry=nil;
+  bool completed=false;
+  bool current() const { return runtime.current()&&root.current()&&attempt.current()&&receiptFile.current()&&
+    transactionFile.current()&&(!completed||completionFile.current()); }
+  bool open(NSString* runtimePath,NSString* stateRoot,NSString* profileHash,NSString* instance,bool requireCompletion=true) {
+    using namespace arbol_attempt;
+    if(profileFormat!=2||!migrationDigest(profileHash)||!path(stateRoot)||!runtime.openPath(runtimePath.fileSystemRepresentation)||
+       !root.openPath(runtime.path+"/browser-profile-migration")||
+       !receiptFile.openPath(root.path+"/receipts/"+profileHash.UTF8String+".json",0600,exitReceiptLimit,true)) return false;
+    receipt=strictManagementObject(receiptFile.content,exitReceiptLimit);
+    if(!migrationReceipt(receipt)||![receipt[@"profileSha256"] isEqual:profileHash]||![receipt[@"instance"] isEqual:instance]||
+       ![[receipt[@"profilePath"] stringByDeletingLastPathComponent] isEqual:[stateRoot stringByAppendingPathComponent:@"profiles"]]||
+       !attempt.openPath(root.path+"/"+[receipt[@"attempt"] UTF8String])) return false;
+    // The accepted schema caps 4096 entries, each with four <=64KiB encoded
+    // contents; this bound covers that schema without an unbounded read.
+    constexpr off_t transactionLimit=4096LL*(4*87384+8192)+65536;
+    if(!transactionFile.openPath(attempt.path+"/transaction.json",0600,transactionLimit,true)||
+       ![digest(transactionFile.content) isEqual:receipt[@"transactionSha256"]]) return false;
+    transaction=strictManagementObject(transactionFile.content,transactionLimit);
+    if(!migrationTransaction(transaction)||![transaction[@"attempt"] isEqual:receipt[@"attempt"]]||
+       ![transaction[@"root"][@"path"] isEqual:stateRoot]||![maintenanceIdentity(runtime.identity) isEqual:transaction[@"runtime"]]) return false;
+    for(id candidate in transaction[@"profiles"]) if([candidate[@"pathSha256"] isEqual:profileHash]) entry=candidate;
+    if(!entry||![entry[@"instance"] isEqual:instance]||![entry[@"directory"] isEqual:receipt[@"directory"]]||
+       ![entry[@"evidence"] isEqual:receipt[@"evidence"]]||![entry[@"originalMarker"] isEqual:receipt[@"originalMarker"]]||
+       ![entry[@"targetRecord"][@"sha256"] isEqual:receipt[@"convertedRecord"][@"sha256"]]||
+       ![entry[@"originalRecord"][@"sha256"] isEqual:receipt[@"originalRecord"][@"sha256"]]||
+       ![entry[@"originalRecord"][@"identity"] isEqual:receipt[@"originalRecord"][@"identity"]]) return false;
+    for(NSString* key in @[@"sourceSha256",@"productSha256",@"candidateSha256"]) if(![transaction[key] isEqual:receipt[key]]) return false;
+    if(entry[@"targetMarker"]==NSNull.null) { if(receipt[@"convertedMarker"]!=NSNull.null) return false; }
+    else for(NSString* key in @[@"sha256",@"base64"]) if(![entry[@"targetMarker"][key] isEqual:receipt[@"convertedMarker"][key]]) return false;
+    if(requireCompletion) {
+      if(!completionFile.openPath(attempt.path+"/completed.json",0600,1048576,true)||
+         !migrationCompletion(strictManagementObject(completionFile.content,1048576),transaction,receipt[@"transactionSha256"],
+           profileHash,digest(receiptFile.content))) return false;
+      completed=true;
+    }
+    return current();
   }
 };
 
