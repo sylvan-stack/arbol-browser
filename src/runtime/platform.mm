@@ -1836,6 +1836,93 @@ static bool originalMaintenanceBuildHandle(HeldLock* value) {
     (value == maintenanceCustody->oldBuild || value == maintenanceCustody->newBuild) &&
     maintenanceStateRoot && maintenanceStateRoot->current();
 }
+// Native capture lives in the existing private exit-evidence authority. Its
+// immutable name is the exact receipt digest, and its body binds the attempt,
+// transaction, profile and original physical source observations. This is the
+// accepted signed-native/owner-private trust model, not a new cryptographic
+// signature or a substitute for rederiving the original terminal proof.
+struct RetainedMigrationProof {
+  arbol_exit::MigrationChain chain;
+  arbol_attempt::MaintenanceFile captureFile,closedFile,dataFile;
+  NSDictionary* capture=nil,*closed=nil,*data=nil;
+  bool current() const {
+    return chain.current()&&captureFile.current()&&(!closed||closedFile.current())&&
+      (!data||data==closed||dataFile.current());
+  }
+  static NSDictionary* policyContent(id value) {
+    uint64_t mode;
+    if(!arbol_attempt::keys(value,@[@"identity",@"sha256",@"base64"])||
+       !arbol_attempt::uintNumber(value[@"identity"][@"mode"],mode)||(mode!=0444&&mode!=0644)||
+       !arbol_exit::migrationIdentity(value[@"identity"],(unsigned)mode)) return nil;
+    NSMutableDictionary* normalized=[value mutableCopy],*identity=[value[@"identity"] mutableCopy];
+    identity[@"mode"]=@0600; normalized[@"identity"]=identity;
+    return arbol_exit::migrationContent(normalized,true);
+  }
+  static bool source(id value,NSDictionary* claim) {
+    using namespace arbol_attempt; using namespace arbol_exit;
+    if(!claim) return value==NSNull.null;
+    PackagedLayout layout; uint64_t uid,mode,held;
+    if(!record(claim)||!claimedLayout(claim,layout)||!keys(value,@[@"claimSha256",@"bundle",@"guard"])||
+       ![value[@"claimSha256"] isEqual:digest(bytes(claim))]) return false;
+    id bundle=value[@"bundle"],guard=value[@"guard"];
+    if(!keys(bundle,@[@"path",@"identity",@"policy",@"sourceDigest",@"productDigest",@"candidateDigest"])||
+       ![bundle[@"path"] isEqual:[NSString stringWithUTF8String:layout.bundle.c_str()]]||
+       !keys(bundle[@"identity"],@[@"device",@"inode",@"uid",@"mode"])||
+       !uintNumber(bundle[@"identity"][@"mode"],mode)||(mode&0022)||!(mode&0100)||mode>0777||
+       !migrationIdentity(bundle[@"identity"],(unsigned)mode)||!policyContent(bundle[@"policy"])||
+       !keys(guard,@[@"path",@"device",@"inode",@"uid",@"mode",@"heldMode"])||
+       ![guard[@"path"] isEqual:claim[@"buildGuard"]]||
+       !pattern(guard[@"device"],@"^[0-9]{1,20}$")||!pattern(guard[@"inode"],@"^[1-9][0-9]{0,19}$")||
+       !uintNumber(guard[@"uid"],uid)||uid!=geteuid()||!uintNumber(guard[@"mode"],mode)||mode!=0600||
+       !uintNumber(guard[@"heldMode"],held)||held!=LOCK_SH) return false;
+    NSDictionary* policy=policyContent(bundle[@"policy"]);
+    if(![policyStateRoot(policy,layout) isEqual:[claim[@"profile"] stringByDeletingLastPathComponent].stringByDeletingLastPathComponent]||
+       ![policy[@"sourceDigest"] isEqual:claim[@"sourceDigest"]]||![policy[@"productDigest"] isEqual:claim[@"productDigest"]]) return false;
+    for(NSString* key in @[@"sourceDigest",@"productDigest",@"candidateDigest"])
+      if(![bundle[key] isEqual:claim[key]]) return false;
+    return true;
+  }
+  bool readClaim(id hash,arbol_attempt::MaintenanceFile& file,NSDictionary* __strong& out) {
+    using namespace arbol_attempt;
+    if(hash==NSNull.null) { out=nil; return true; }
+    NSString* state=chain.transaction[@"root"][@"path"];
+    std::string path=std::string(state.fileSystemRepresentation)+"/exit-evidence/"+
+      [chain.receipt[@"profileSha256"] UTF8String]+"/claims/"+[hash UTF8String]+".json";
+    if(!file.openPath(path,0600,limit,true)) return false;
+    out=arbol_exit::strictManagementObject(file.content);
+    return record(out)&&[out[@"phase"] isEqual:@"closed"]&&out[@"terminal"]!=NSNull.null&&bytes(out)==file.content&&
+      [digest(file.content) isEqual:hash]&&[out[@"profile"] isEqual:chain.receipt[@"profilePath"]]&&
+      [out[@"profileInstance"] isEqual:chain.receipt[@"instance"]]&&[out[@"profilePathHash"] isEqual:chain.receipt[@"profileSha256"]];
+  }
+  bool open(NSString* runtime,NSString* state,NSString* hash,NSString* instance,bool completed=true) {
+    using namespace arbol_attempt;
+    if(!chain.open(runtime,state,hash,instance,completed)) return false;
+    NSString* receiptDigest=digest(chain.receiptFile.content);
+    if(!captureFile.openPath(std::string(state.fileSystemRepresentation)+"/exit-evidence/"+hash.UTF8String+
+       "/migration/"+receiptDigest.UTF8String+".json",0600,arbol_exit::exitReceiptLimit,true)) return false;
+    capture=arbol_exit::parseExitReceipt(captureFile.content);
+    if(!keys(capture,@[@"format",@"kind",@"receiptSha256",@"transactionSha256",@"attempt",@"epoch",@"profileSha256",@"instance",@"directory",@"closed",@"data"])||
+       ![capture[@"format"] isEqual:@1]||![capture[@"kind"] isEqual:@"native-migration-evidence"]||
+       ![capture[@"receiptSha256"] isEqual:receiptDigest]||![capture[@"epoch"] isEqual:chain.transaction[@"epoch"]]) return false;
+    for(NSString* key in @[@"transactionSha256",@"attempt",@"profileSha256",@"instance",@"directory"])
+      if(![capture[key] isEqual:chain.receipt[key]]) return false;
+    id evidence=chain.receipt[@"evidence"];
+    if(!readClaim(evidence[@"closedClaimSha256"],closedFile,closed)) return false;
+    if([evidence[@"dataClaimSha256"] isEqual:evidence[@"closedClaimSha256"]]) data=closed;
+    else if(!readClaim(evidence[@"dataClaimSha256"],dataFile,data)) return false;
+    if(!source(capture[@"closed"],closed)||!source(capture[@"data"],data)) return false;
+    if(closed&&data&&[closed isEqual:data]&&![capture[@"closed"] isEqual:capture[@"data"]]) return false;
+    if(data&&(![data[@"terminal"][@"path"] isEqual:evidence[@"terminalPath"]]||
+       ![data[@"terminal"][@"digest"] isEqual:evidence[@"terminalSha256"]])) return false;
+    return current();
+  }
+  bool buildRecord(id recorded,NSDictionary* claim) const {
+    if(!claim||!current()) return false;
+    if(closed&&[claim isEqual:closed]) return [recorded isEqual:capture[@"closed"][@"guard"]];
+    if(data&&[claim isEqual:data]) return [recorded isEqual:capture[@"data"][@"guard"]];
+    return false;
+  }
+};
 struct ExitInspection {
   std::atomic<int> state{0}; std::atomic<bool> cancelled{false};
   arbol_boundary::Lock owner,build,dataBuild,nextBuild,registry; NSDictionary* input=nil; std::string result; double deadline=0;
@@ -1845,6 +1932,7 @@ struct ExitInspection {
   arbol_boundary::Context hostContext; arbol_exit::SharedState* hostState=nullptr;
   NSDictionary* hostCapability=nil;
   bool maintenance = false;
+  RetainedMigrationProof* migrated = nullptr; // stack-owned native validator only; never a JS option
   std::thread* thread=nullptr;
   bool within() const { return !cancelled.load(std::memory_order_acquire)&&arbol_boundary::clockMs()<deadline&&
     arbol_boundary::lockIdentity(owner)&&arbol_boundary::lockIdentity(build)&&
@@ -1852,8 +1940,10 @@ struct ExitInspection {
     (!maintenance || (maintenanceStateRoot && maintenanceStateRoot->current() && registry.heldMode==LOCK_EX && arbol_boundary::lockIdentity(registry))) &&
     (build.heldMode==LOCK_SH||(maintenance&&originalMaintenanceBuild(build)))&&
     (dataBuild.fd<0||dataBuild.heldMode==LOCK_SH||(maintenance&&originalMaintenanceBuild(dataBuild)))&&
-    (nextBuild.fd<0||nextBuild.heldMode==LOCK_SH||(maintenance&&originalMaintenanceBuild(nextBuild))); }
-  bool historicalBuildLock(id record, const arbol_boundary::Lock& actual) const {
+    (nextBuild.fd<0||nextBuild.heldMode==LOCK_SH||(maintenance&&originalMaintenanceBuild(nextBuild)))&&
+    (!migrated||migrated->current()); }
+  bool historicalBuildLock(id record, const arbol_boundary::Lock& actual, NSDictionary* claim=nil) const {
+    if(migrated) return migrated->buildRecord(record,claim);
     if (actual.heldMode == LOCK_SH) return [record isEqual:arbol_boundary::capsuleLock(actual)];
     if (!maintenance || !originalMaintenanceBuild(actual)) return false;
     // Normalize only the historical record comparison. The actual retained
@@ -2037,6 +2127,37 @@ static bool receiptFrontier(NSDictionary* capability,NSDictionary* frontier,NSSt
   }
   return job.within();
 }
+static bool migrationPublishedMetadata(RetainedMigrationProof& proof,ExitInspection& job) {
+  using namespace arbol_attempt; using namespace arbol_exit;
+  const auto& chain=proof.chain; NSDictionary* receipt=chain.receipt,*entry=chain.entry,*rootRecord=chain.transaction[@"root"];
+  MaintenanceDirectory state,profiles,profile; MaintenanceFile record,marker;
+  NSString* path=receipt[@"profilePath"];
+  if(!job.within()||![rootRecord[@"initial"] isEqual:@"present"]||
+     !state.openPath([rootRecord[@"path"] UTF8String],rootRecord[@"identity"])||
+     !profiles.openPath(state.path+"/profiles",rootRecord[@"profiles"])||
+     !profile.openPath(path.UTF8String,receipt[@"directory"])||
+     !record.openPath(profile.path+"/profile.json",0600,65536,true)||
+     ![record.record() isEqual:receipt[@"convertedRecord"]]||
+     ![strictManagementObject(record.content,65536) isEqual:migrationContent(entry[@"targetRecord"],false)]||
+     job.owner.path!=profile.path+"/owner.lock") return false;
+  struct stat registry{},owner{},child{};
+  if(fstatat(state.fd,"registry.lock",&registry,AT_SYMLINK_NOFOLLOW)||!privateFile(registry)||
+     ![maintenanceIdentity(registry) isEqual:rootRecord[@"registry"]]||
+     fstat(job.owner.fd,&owner)||![maintenanceIdentity(owner) isEqual:entry[@"ownerLock"]]) return false;
+  for(NSString* name in @[@"data",@"userData"]) {
+    NSString* key=[name isEqual:@"data"]?@"dataDirectory":@"userDataDirectory";
+    if(fstatat(profile.fd,name.UTF8String,&child,AT_SYMLINK_NOFOLLOW)||!S_ISDIR(child.st_mode)||
+       child.st_dev!=profile.identity.st_dev||![maintenanceIdentity(child) isEqual:entry[key]]) return false;
+  }
+  if(receipt[@"convertedMarker"]==NSNull.null) {
+    errno=0; if(!fstatat(profile.fd,"engine.json",&child,AT_SYMLINK_NOFOLLOW)||errno!=ENOENT) return false;
+  } else if(!marker.openPath(profile.path+"/engine.json",0600,65536,true)||
+      ![maintenanceIdentity(marker.identity) isEqual:receipt[@"convertedMarker"][@"identity"]]||
+      ![digest(marker.content) isEqual:receipt[@"convertedMarker"][@"sha256"]]||
+      ![strictManagementObject(marker.content,65536) isEqual:migrationContent(receipt[@"convertedMarker"],true)]) return false;
+  return state.current()&&profiles.current()&&profile.current()&&record.current()&&
+    (receipt[@"convertedMarker"]==NSNull.null||marker.current())&&proof.current()&&job.within();
+}
 static bool receiptMetadata(NSDictionary* capability,NSDictionary* attempt,ExitInspection& job) {
   NSString* profile=attempt[@"profile"],*state=profile.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent;
   NSString* receipt=[[[state stringByAppendingPathComponent:@"exit-evidence"] stringByAppendingPathComponent:attempt[@"profilePathHash"]] stringByAppendingPathComponent:attempt[@"request"]];
@@ -2047,7 +2168,11 @@ static bool receiptMetadata(NSDictionary* capability,NSDictionary* attempt,ExitI
   if(root.fd<0||fstat(root.fd,&directory)||lstat(profile.fileSystemRepresentation,&named)||directory.st_dev!=named.st_dev||directory.st_ino!=named.st_ino||
      ![arbol_exit::fileIdentity(directory) isEqual:capability[@"profileDirectory"]]||
      !arbol_exit::readNativeFile(root.fd,"profile.json",raw,record,arbol_attempt::limit)||
-     ![arbol_exit::fileIdentity(record) isEqual:capability[@"profileRecord"]]||![arbol_attempt::digest(raw) isEqual:capability[@"profileRecordDigest"]]||
+     (job.migrated?
+       (!migrationPublishedMetadata(*job.migrated,job)||
+        ![job.migrated->chain.receipt[@"originalRecord"][@"identity"] isEqual:capability[@"profileRecord"]]||
+        ![job.migrated->chain.receipt[@"originalRecord"][@"sha256"] isEqual:capability[@"profileRecordDigest"]]):
+       (![arbol_exit::fileIdentity(record) isEqual:capability[@"profileRecord"]]||![arbol_attempt::digest(raw) isEqual:capability[@"profileRecordDigest"]]))||
      ![arbol_attempt::json(raw)[@"instance"] isEqual:attempt[@"profileInstance"]]) return false;
   for(NSString* name in @[@"data",@"userData"]) if(fstatat(root.fd,name.UTF8String,&child,AT_SYMLINK_NOFOLLOW)||
     !S_ISDIR(child.st_mode)||child.st_dev!=directory.st_dev||![arbol_exit::fileIdentity(child) isEqual:capability[@"directories"][name]]) return false;
@@ -2056,6 +2181,16 @@ static bool receiptMetadata(NSDictionary* capability,NSDictionary* attempt,ExitI
   return root.finish()&&job.within();
 }
 static bool receiptMarker(NSDictionary* capability,id expected,ExitInspection& job) {
+  if(job.migrated) {
+    id original=job.migrated->chain.receipt[@"originalMarker"];
+    if(original==NSNull.null) { if(expected!=(id)NSNull.null) return false; }
+    else if(!arbol_attempt::keys(expected,@[@"identity",@"digest",@"value"])||
+        ![original[@"identity"] isEqual:expected[@"identity"]]||![original[@"sha256"] isEqual:expected[@"digest"]]||
+        ![arbol_exit::migrationContent(original,true) isEqual:expected[@"value"]]) return false;
+    id converted=job.migrated->chain.receipt[@"convertedMarker"];
+    expected=converted==NSNull.null?(id)NSNull.null:@{@"identity":converted[@"identity"],@"digest":converted[@"sha256"],
+      @"value":arbol_exit::migrationContent(converted,true)};
+  }
   NSString* profile=capability[@"attempt"][@"profile"]; arbol_exit::NativeFile root;
   root.fd=open(profile.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
   struct stat directory{},identity{},named{}; std::string raw; bool absent;
@@ -2137,7 +2272,7 @@ static bool verifyClosedReceipt(NSDictionary* closed,NSDictionary* __strong& cap
   NSDictionary* __strong& frontier,ExitInspection& job,const arbol_boundary::Lock& proofBuild,NSString* bundle) {
   arbol_attempt::PackagedLayout layout;
   if(!arbol_attempt::record(closed)||!arbol_attempt::claimedLayout(closed,layout)||layout.bundle!=bundle.UTF8String||
-     layout.guard!=proofBuild.path||![closed[@"phase"] isEqual:@"closed"]||closed[@"terminal"]==NSNull.null||closed[@"engine"]==NSNull.null) return false;
+     (!job.migrated&&layout.guard!=proofBuild.path)||![closed[@"phase"] isEqual:@"closed"]||closed[@"terminal"]==NSNull.null||closed[@"engine"]==NSNull.null) return false;
   NSString* path=closed[@"terminal"][@"path"],*profile=closed[@"profile"];
   NSString* state=profile.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent;
   NSString* parent=[[[state stringByAppendingPathComponent:@"exit-evidence"] stringByAppendingPathComponent:closed[@"profilePathHash"]] stringByAppendingPathComponent:closed[@"request"]];
@@ -2196,7 +2331,7 @@ static bool verifyClosedReceipt(NSDictionary* closed,NSDictionary* __strong& cap
      ![capability[@"attemptPath"] isEqual:[job.input[@"runtimeLeaf"] stringByAppendingPathComponent:@"claim.json"]]||
      ![capability[@"bundle"] isEqual:bundle]||![capability[@"markerPath"] isEqual:[profile stringByAppendingPathComponent:@"engine.json"]]||
      ![capability[@"locks"][@"owner"] isEqual:arbol_boundary::capsuleLock(job.owner)]||
-     !job.historicalBuildLock(capability[@"locks"][@"build"],proofBuild)||
+     !job.historicalBuildLock(capability[@"locks"][@"build"],proofBuild,closed)||
      ![receipt[@"format"] isEqual:@1]||![receipt[@"bootSession"] isEqual:capability[@"bootSession"]]||
      ![receipt[@"profileDirectory"] isEqual:capability[@"profileDirectory"]]||
      ![receipt[@"capabilityDigest"] isEqual:arbol_attempt::digest(arbol_attempt::bytes(capability))]) return false;
@@ -2237,9 +2372,9 @@ static bool verifyUnusedReceipt(NSDictionary* closed,NSDictionary* __strong& rec
      ![receipt[@"format"] isEqual:@1]||![receipt[@"kind"] isEqual:@"unused-host-terminal"]||
      !pattern(receipt[@"bootSession"],@"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")||
      ![receipt[@"bundle"] isEqual:[NSString stringWithUTF8String:layout.bundle.c_str()]]||
-     ![receipt[@"bundle"] isEqual:job.input[@"bundle"]]||
+     (!job.migrated&&![receipt[@"bundle"] isEqual:job.input[@"bundle"]])||
      !keys(receipt[@"locks"],@[@"build",@"owner"])||
-     !job.historicalBuildLock(receipt[@"locks"][@"build"],job.build)||
+     !job.historicalBuildLock(receipt[@"locks"][@"build"],job.build,closed)||
      ![receipt[@"marker"] isEqual:@{@"kind":@"unobserved"}]) return false;
   NSDictionary* attempt=receipt[@"attempt"],*baseline=receipt[@"baseline"],*actor=receipt[@"actor"],*facts=receipt[@"nativeFacts"];
   if(!record(attempt)||!record(baseline)||!immutable(attempt,closed)||!immutable(baseline,closed)||
@@ -2281,7 +2416,8 @@ static bool verifyUnusedReceipt(NSDictionary* closed,NSDictionary* __strong& rec
   if(attempt[@"runtime"]!=NSNull.null&&(![attempt[@"runtime"][@"phase"] isEqual:@"starting"]||
      ![attempt[@"runtime"][@"pid"] isEqual:actor[@"pid"]]||![attempt[@"runtime"][@"processStartId"] isEqual:actor[@"startId"]])) return false;
   id data=receipt[@"priorDataClaim"];
-  if(!data||![data isEqual:job.input[@"dataAttempt"]]||(data!=NSNull.null&&
+  id expectedData=job.migrated?(job.migrated->data?:(id)NSNull.null):job.input[@"dataAttempt"];
+  if(!data||![data isEqual:expectedData]||(data!=NSNull.null&&
      (!record(data)||![data[@"phase"] isEqual:@"closed"]||![data[@"profile"] isEqual:closed[@"profile"]]||
       ![data[@"profileInstance"] isEqual:closed[@"profileInstance"]]||![data[@"profilePathHash"] isEqual:closed[@"profilePathHash"]]||
       ![@[@"activation.json",@"terminal.json"] containsObject:[data[@"terminal"][@"path"] lastPathComponent]]))) return false;
@@ -2302,6 +2438,102 @@ static bool writeExitHistory(int directory,const char* name,NSDictionary* object
   return !raw.empty()&&job.within()&&arbol_exit::writeNativeFile(directory,temporary,raw,job.deadline,file)&&job.within()&&
     !renameat(directory,temporary.c_str(),directory,name)&&
     arbol_exit::publishedNativeFile(directory,name,raw,file,published,job.deadline)&&file.finish()&&job.within();
+}
+
+// Keep original signed bundle and guard observations alive through native
+// verification and immutable capture. Historical candidate identity comes
+// from the canonical native Claim/terminal capability; the current signed
+// policy independently binds its source/product and physical state root.
+struct MigrationSourceCapture {
+  arbol_exit::NativeFile bundle;
+  arbol_attempt::MaintenanceFile policy;
+  struct stat identity{}; std::string path;
+  arbol_boundary::Lock guard; NSDictionary* value=nil;
+  bool current() const {
+    struct stat held{},named{}; char actual[PATH_MAX]{};
+    return value&&bundle.fd>=0&&!fstat(bundle.fd,&held)&&!lstat(path.c_str(),&named)&&!fcntl(bundle.fd,F_GETPATH,actual)&&
+      path==actual&&arbol_boundary::canonical(path)&&arbol_attempt::sameFile(identity,held)&&arbol_attempt::sameFile(held,named)&&
+      policy.current()&&arbol_boundary::lockIdentity(guard)&&arbol_boundary::signature(path,false);
+  }
+  bool take(NSDictionary* claim,const arbol_boundary::Lock& held,ExitInspection& job) {
+    using namespace arbol_attempt;
+    PackagedLayout layout;
+    if(!job.maintenance||job.migrated||!job.within()||!record(claim)||!claimedLayout(claim,layout)||
+       layout.guard!=held.path||!arbol_boundary::lockIdentity(held)||
+       (held.heldMode!=LOCK_SH&&!originalMaintenanceBuild(held))||!arbol_boundary::signature(layout.bundle,false)) return false;
+    path=layout.bundle; guard=held;
+    bundle.fd=open(path.c_str(),O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if(bundle.fd<0||fstat(bundle.fd,&identity)||!S_ISDIR(identity.st_mode)||identity.st_uid!=geteuid()||
+       (identity.st_mode&0022)||!(identity.st_mode&0100)) return false;
+    const std::string policyPath=path+"/Contents/Resources/host-policy.json"; struct stat policyIdentity{};
+    if(lstat(policyPath.c_str(),&policyIdentity)||((policyIdentity.st_mode&07777)!=0644&&(policyIdentity.st_mode&07777)!=0444)||
+       !policy.openPath(policyPath,policyIdentity.st_mode&07777,limit,true)) return false;
+    NSData* content=[NSData dataWithBytes:policy.content.data() length:policy.content.size()];
+    auto historical=guard; historical.heldMode=LOCK_SH;
+    value=@{@"claimSha256":digest(bytes(claim)),@"guard":arbol_boundary::capsuleLock(historical),
+      @"bundle":@{@"path":[NSString stringWithUTF8String:path.c_str()],@"identity":maintenanceIdentity(identity),
+        @"policy":@{@"identity":maintenanceIdentity(policy.identity),@"sha256":digest(policy.content),@"base64":[content base64EncodedStringWithOptions:0]},
+        @"sourceDigest":claim[@"sourceDigest"],@"productDigest":claim[@"productDigest"],@"candidateDigest":claim[@"candidateDigest"]}};
+    return RetainedMigrationProof::source(value,claim)&&current()&&job.within();
+  }
+};
+
+// Internal only: callers in subsequent native receipt modes must open the
+// chain from their independently verified policy runtime. A parsed receipt or
+// a JavaScript classification cannot construct this temporary authority.
+[[maybe_unused]] static bool verifyRetainedMigration(RetainedMigrationProof& proof,ExitInspection& job) {
+  using namespace arbol_attempt;
+  if(profileFormat!=2||job.migrated||(!proof.chain.completed&&!job.maintenance)||!job.within()||!proof.current()||
+     ![proof.chain.receipt[@"profilePath"] isEqual:job.input[@"profile"]]||
+     ![proof.chain.receipt[@"profileSha256"] isEqual:job.input[@"profilePathHash"]]||
+     ![proof.chain.receipt[@"instance"] isEqual:job.input[@"profileInstance"]]) return false;
+  struct Scope {
+    ExitInspection& job;
+    Scope(ExitInspection& job,RetainedMigrationProof& proof):job(job) { job.migrated=&proof; }
+    ~Scope() { job.migrated=nullptr; }
+  } scope(job,proof);
+  if(!migrationPublishedMetadata(proof,job)) return false;
+  NSDictionary* closed=proof.closed,*data=proof.data,*receipt=nil,*capability=nil,*frontier=nil;
+  bool unused=closed&&[[closed[@"terminal"][@"path"] lastPathComponent] isEqual:@"unused.json"];
+  if(unused) {
+    if(!verifyUnusedReceipt(closed,receipt,job)) return false;
+    id previous=data?:(id)NSNull.null;
+    if(![receipt[@"priorDataClaim"] isEqual:previous]||
+       (data&&![digest(bytes(receipt[@"priorDataClaim"])) isEqual:proof.chain.receipt[@"evidence"][@"dataClaimSha256"]])) return false;
+  } else if(closed?!data||![closed isEqual:data]:data!=nil) return false;
+  bool clean=false;
+  if(data) {
+    PackagedLayout layout; if(!claimedLayout(data,layout)) return false;
+    NSString* bundle=[NSString stringWithUTF8String:layout.bundle.c_str()];
+    if(!verifyClosedReceipt(data,capability,receipt,frontier,job,job.build,bundle)||
+       !receiptMarker(capability,receipt[@"marker"],job)) return false;
+    clean=[[data[@"terminal"][@"path"] lastPathComponent] isEqual:@"activation.json"];
+  } else {
+    // A no-use witness is not evidence of empty storage. Repeat the exact
+    // missing-marker management inventory and empty data-directory checks.
+    if(proof.chain.receipt[@"originalMarker"]!=NSNull.null||proof.chain.receipt[@"convertedMarker"]!=NSNull.null) return false;
+    MaintenanceDirectory profile;
+    if(!profile.openPath([job.input[@"profile"] UTF8String],proof.chain.receipt[@"directory"])) return false;
+    int duplicate=openat(profile.fd,".",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if(duplicate<0) return false; DIR* entries=fdopendir(duplicate); if(!entries) { close(duplicate); return false; }
+    bool valid=true; size_t count=0; errno=0;
+    while(auto* entry=readdir(entries)) {
+      std::string name=entry->d_name; if(name=="."||name=="..") continue;
+      if(++count>131072||!job.within()||
+         (name!="profile.json"&&name!="owner.lock"&&name!="logs"&&name!="data"&&name!="userData")) { valid=false; break; }
+      struct stat st{};
+      if(fstatat(profile.fd,name.c_str(),&st,AT_SYMLINK_NOFOLLOW)||st.st_dev!=profile.identity.st_dev||st.st_uid!=geteuid()||
+         ((name=="profile.json"||name=="owner.lock")?!privateFile(st):(!S_ISDIR(st.st_mode)||(st.st_mode&07777)!=0700))) { valid=false; break; }
+      errno=0;
+    }
+    if(errno||closedir(entries)) valid=false;
+    if(!valid||!emptyNativeDirectory([job.input[@"profile"] stringByAppendingPathComponent:@"data"])||
+       !emptyNativeDirectory([job.input[@"profile"] stringByAppendingPathComponent:@"userData"])||!profile.current()) return false;
+  }
+  NSDictionary* derived=@{@"classification":data?(clean?@"clean":@"dirty"):@"never-opened",@"clean":@(clean),
+    @"closedClaimSha256":closed?(id)digest(bytes(closed)):NSNull.null,@"dataClaimSha256":data?(id)digest(bytes(data)):NSNull.null,
+    @"terminalPath":data?data[@"terminal"][@"path"]:(id)NSNull.null,@"terminalSha256":data?data[@"terminal"][@"digest"]:(id)NSNull.null};
+  return [derived isEqual:proof.chain.receipt[@"evidence"]]&&migrationPublishedMetadata(proof,job)&&proof.current()&&job.within();
 }
 
 static bool inspectExit(ExitInspection& job) {
