@@ -5,11 +5,12 @@ import browser from './browser.schema.json' with { type: 'json' };
 import wire from './wire.schema.json' with { type: 'json' };
 import profile from './profile.schema.json' with { type: 'json' };
 import profile2 from './profile-format-2.schema.json' with { type: 'json' };
+import migration from './migration.schema.json' with { type: 'json' };
 import native from './native.schema.json' with { type: 'json' };
 import type { ContractTypes } from './generated.js';
 
 type Schema = Record<string, any>; // JSON Schema is recursive, not application input.
-export const bundles = { browser, wire, profile, native, profile2 };
+export const bundles = { browser, wire, profile, native, profile2, migration };
 export type Bundle = keyof typeof bundles;
 const byId = new Map<string, Schema>(Object.values(bundles).map(b => [b.$id, b]));
 const prefix = new Map(Object.entries(bundles).map(([name, b]) => [b.$id, name]));

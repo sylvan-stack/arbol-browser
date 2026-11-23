@@ -1,0 +1,867 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:arbol-browser:migration:1",
+  "title": "Browser profile migration records",
+  "$defs": {
+    "Digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "maxLength": 64
+    },
+    "Attempt": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$",
+      "maxLength": 32
+    },
+    "Path": {
+      "type": "string",
+      "pattern": "^/",
+      "maxLength": 4096
+    },
+    "Unsigned": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "Identity": {
+      "type": "object",
+      "properties": {
+        "device": {
+          "type": "string",
+          "pattern": "^[0-9]+$",
+          "maxLength": 20
+        },
+        "inode": {
+          "type": "string",
+          "pattern": "^[0-9]+$",
+          "maxLength": 20
+        },
+        "uid": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Unsigned"
+        },
+        "mode": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Unsigned"
+        }
+      },
+      "required": [
+        "device",
+        "inode",
+        "uid",
+        "mode"
+      ],
+      "additionalProperties": false
+    },
+    "File": {
+      "type": "object",
+      "properties": {
+        "identity": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Identity"
+        },
+        "sha256": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Digest"
+        }
+      },
+      "required": [
+        "identity",
+        "sha256"
+      ],
+      "additionalProperties": false
+    },
+    "Lock": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Path"
+        },
+        "device": {
+          "type": "string",
+          "pattern": "^[0-9]+$",
+          "maxLength": 20
+        },
+        "inode": {
+          "type": "string",
+          "pattern": "^[0-9]+$",
+          "maxLength": 20
+        },
+        "uid": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Unsigned"
+        },
+        "mode": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Unsigned"
+        },
+        "heldMode": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Unsigned"
+        }
+      },
+      "required": [
+        "path",
+        "device",
+        "inode",
+        "uid",
+        "mode",
+        "heldMode"
+      ],
+      "additionalProperties": false
+    },
+    "Process": {
+      "type": "object",
+      "properties": {
+        "pid": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Unsigned"
+        },
+        "uid": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Unsigned"
+        },
+        "startId": {
+          "type": "string",
+          "pattern": "^[0-9]+$",
+          "maxLength": 20
+        },
+        "pidVersion": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Unsigned"
+        },
+        "group": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Unsigned"
+        },
+        "session": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Unsigned"
+        },
+        "parentStartId": {
+          "type": "string",
+          "pattern": "^[0-9]+$",
+          "maxLength": 20
+        },
+        "parentPidVersion": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Unsigned"
+        },
+        "executable": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Path"
+        }
+      },
+      "required": [
+        "pid",
+        "uid",
+        "startId",
+        "pidVersion",
+        "group",
+        "session",
+        "parentStartId",
+        "parentPidVersion",
+        "executable"
+      ],
+      "additionalProperties": false
+    },
+    "Selection": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "const": 1
+        },
+        "build": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/Build"
+        },
+        "imageSha256": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Digest"
+        }
+      },
+      "required": [
+        "format",
+        "build",
+        "imageSha256"
+      ],
+      "additionalProperties": false
+    },
+    "Release": {
+      "type": "object",
+      "properties": {
+        "selection": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Selection"
+        },
+        "launcherSha256": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Digest"
+        }
+      },
+      "required": [
+        "selection",
+        "launcherSha256"
+      ],
+      "additionalProperties": false
+    },
+    "Journal": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "const": 3
+        },
+        "aliasBefore": {
+          "type": "boolean"
+        },
+        "before": {
+          "anyOf": [
+            {
+              "$ref": "urn:arbol-browser:migration:1#/$defs/Release"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "after": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Release"
+        },
+        "migration": {
+          "type": "object",
+          "properties": {
+            "fromProfileFormat": {
+              "const": 1
+            },
+            "toProfileFormat": {
+              "const": 2
+            }
+          },
+          "required": [
+            "fromProfileFormat",
+            "toProfileFormat"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "format",
+        "aliasBefore",
+        "before",
+        "after",
+        "migration"
+      ],
+      "additionalProperties": false
+    },
+    "Capsule": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "const": 1
+        },
+        "kind": {
+          "const": "maintenance"
+        },
+        "parent": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Process"
+        },
+        "deadline": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "selectionLock": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Lock"
+        },
+        "oldBuildLock": {
+          "anyOf": [
+            {
+              "$ref": "urn:arbol-browser:migration:1#/$defs/Lock"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "newBuildLock": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Lock"
+        },
+        "journalPath": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Path"
+        },
+        "journal": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/File"
+        },
+        "bundle": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Path"
+        }
+      },
+      "required": [
+        "format",
+        "kind",
+        "parent",
+        "deadline",
+        "selectionLock",
+        "oldBuildLock",
+        "newBuildLock",
+        "journalPath",
+        "journal",
+        "bundle"
+      ],
+      "additionalProperties": false
+    },
+    "Root": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Path"
+        },
+        "initial": {
+          "enum": [
+            "absent",
+            "present"
+          ]
+        },
+        "identity": {
+          "anyOf": [
+            {
+              "$ref": "urn:arbol-browser:migration:1#/$defs/Identity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "profiles": {
+          "anyOf": [
+            {
+              "$ref": "urn:arbol-browser:migration:1#/$defs/Identity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "registry": {
+          "anyOf": [
+            {
+              "$ref": "urn:arbol-browser:migration:1#/$defs/Identity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "initial",
+        "identity",
+        "profiles",
+        "registry"
+      ],
+      "additionalProperties": false
+    },
+    "Content": {
+      "type": "object",
+      "properties": {
+        "identity": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Identity"
+        },
+        "sha256": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Digest"
+        },
+        "base64": {
+          "type": "string",
+          "maxLength": 87384,
+          "pattern": "^[A-Za-z0-9+/]*={0,2}$"
+        }
+      },
+      "required": [
+        "identity",
+        "sha256",
+        "base64"
+      ],
+      "additionalProperties": false
+    },
+    "Target": {
+      "type": "object",
+      "properties": {
+        "sha256": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Digest"
+        },
+        "base64": {
+          "type": "string",
+          "maxLength": 87384,
+          "pattern": "^[A-Za-z0-9+/]*={0,2}$"
+        }
+      },
+      "required": [
+        "sha256",
+        "base64"
+      ],
+      "additionalProperties": false
+    },
+    "Evidence": {
+      "type": "object",
+      "properties": {
+        "classification": {
+          "enum": [
+            "never-opened",
+            "clean",
+            "dirty"
+          ]
+        },
+        "clean": {
+          "type": "boolean"
+        },
+        "closedClaimSha256": {
+          "anyOf": [
+            {
+              "$ref": "urn:arbol-browser:migration:1#/$defs/Digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dataClaimSha256": {
+          "anyOf": [
+            {
+              "$ref": "urn:arbol-browser:migration:1#/$defs/Digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "terminalPath": {
+          "anyOf": [
+            {
+              "$ref": "urn:arbol-browser:migration:1#/$defs/Path"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "terminalSha256": {
+          "anyOf": [
+            {
+              "$ref": "urn:arbol-browser:migration:1#/$defs/Digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "classification",
+        "clean",
+        "closedClaimSha256",
+        "dataClaimSha256",
+        "terminalPath",
+        "terminalSha256"
+      ],
+      "additionalProperties": false
+    },
+    "ProfileEntry": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "urn:arbol-browser:contract:1#/$defs/ProfileId"
+        },
+        "instance": {
+          "type": "string",
+          "pattern": "^prf_[A-Za-z0-9_-]{22}$",
+          "maxLength": 64
+        },
+        "pathSha256": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Digest"
+        },
+        "directory": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Identity"
+        },
+        "dataDirectory": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Identity"
+        },
+        "userDataDirectory": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Identity"
+        },
+        "ownerLock": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Identity"
+        },
+        "originalRecord": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Content"
+        },
+        "originalMarker": {
+          "anyOf": [
+            {
+              "$ref": "urn:arbol-browser:migration:1#/$defs/Content"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "targetRecord": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Target"
+        },
+        "targetMarker": {
+          "anyOf": [
+            {
+              "$ref": "urn:arbol-browser:migration:1#/$defs/Target"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "evidence": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Evidence"
+        }
+      },
+      "required": [
+        "id",
+        "instance",
+        "pathSha256",
+        "directory",
+        "dataDirectory",
+        "userDataDirectory",
+        "ownerLock",
+        "originalRecord",
+        "originalMarker",
+        "targetRecord",
+        "targetMarker",
+        "evidence"
+      ],
+      "additionalProperties": false
+    },
+    "Transaction": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "const": 1
+        },
+        "kind": {
+          "const": "browser-profile-migration"
+        },
+        "attempt": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Attempt"
+        },
+        "root": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Root"
+        },
+        "runtime": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Identity"
+        },
+        "selection": {
+          "anyOf": [
+            {
+              "$ref": "urn:arbol-browser:migration:1#/$defs/Selection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "selectionFile": {
+          "anyOf": [
+            {
+              "$ref": "urn:arbol-browser:migration:1#/$defs/File"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "journal": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/File"
+        },
+        "epoch": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Digest"
+        },
+        "oldBuild": {
+          "anyOf": [
+            {
+              "$ref": "urn:arbol-browser:migration:1#/$defs/Release"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "newBuild": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Release"
+        },
+        "sourceSha256": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Digest"
+        },
+        "productSha256": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Digest"
+        },
+        "candidateSha256": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Digest"
+        },
+        "profiles": {
+          "type": "array",
+          "items": {
+            "$ref": "urn:arbol-browser:migration:1#/$defs/ProfileEntry"
+          },
+          "maxItems": 4096
+        }
+      },
+      "required": [
+        "format",
+        "kind",
+        "attempt",
+        "root",
+        "runtime",
+        "selection",
+        "selectionFile",
+        "journal",
+        "epoch",
+        "oldBuild",
+        "newBuild",
+        "sourceSha256",
+        "productSha256",
+        "candidateSha256",
+        "profiles"
+      ],
+      "additionalProperties": false
+    },
+    "Staged": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "const": 1
+        },
+        "attempt": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Attempt"
+        },
+        "profileSha256": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Digest"
+        },
+        "record": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/File"
+        },
+        "marker": {
+          "anyOf": [
+            {
+              "$ref": "urn:arbol-browser:migration:1#/$defs/File"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "format",
+        "attempt",
+        "profileSha256",
+        "record",
+        "marker"
+      ],
+      "additionalProperties": false
+    },
+    "Committed": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "const": 1
+        },
+        "attempt": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Attempt"
+        },
+        "profileSha256": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Digest"
+        },
+        "receipt": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/File"
+        }
+      },
+      "required": [
+        "format",
+        "attempt",
+        "profileSha256",
+        "receipt"
+      ],
+      "additionalProperties": false
+    },
+    "Receipt": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "const": 1
+        },
+        "kind": {
+          "const": "browser-profile-migration-receipt"
+        },
+        "attempt": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Attempt"
+        },
+        "transactionSha256": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Digest"
+        },
+        "profilePath": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Path"
+        },
+        "profileSha256": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Digest"
+        },
+        "instance": {
+          "type": "string",
+          "pattern": "^prf_[A-Za-z0-9_-]{22}$",
+          "maxLength": 64
+        },
+        "directory": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Identity"
+        },
+        "evidence": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Evidence"
+        },
+        "originalRecord": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/File"
+        },
+        "convertedRecord": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/File"
+        },
+        "originalMarker": {
+          "anyOf": [
+            {
+              "$ref": "urn:arbol-browser:migration:1#/$defs/Content"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "convertedMarker": {
+          "anyOf": [
+            {
+              "$ref": "urn:arbol-browser:migration:1#/$defs/Content"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "bootSession": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "writer": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Process"
+        },
+        "sourceSha256": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Digest"
+        },
+        "productSha256": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Digest"
+        },
+        "candidateSha256": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Digest"
+        }
+      },
+      "required": [
+        "format",
+        "kind",
+        "attempt",
+        "transactionSha256",
+        "profilePath",
+        "profileSha256",
+        "instance",
+        "directory",
+        "evidence",
+        "originalRecord",
+        "convertedRecord",
+        "originalMarker",
+        "convertedMarker",
+        "bootSession",
+        "writer",
+        "sourceSha256",
+        "productSha256",
+        "candidateSha256"
+      ],
+      "additionalProperties": false
+    },
+    "CompletionItem": {
+      "type": "object",
+      "properties": {
+        "profileSha256": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Digest"
+        },
+        "receiptSha256": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Digest"
+        }
+      },
+      "required": [
+        "profileSha256",
+        "receiptSha256"
+      ],
+      "additionalProperties": false
+    },
+    "Completion": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "const": 1
+        },
+        "attempt": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Attempt"
+        },
+        "transactionSha256": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Digest"
+        },
+        "profiles": {
+          "type": "array",
+          "items": {
+            "$ref": "urn:arbol-browser:migration:1#/$defs/CompletionItem"
+          },
+          "maxItems": 4096
+        }
+      },
+      "required": [
+        "format",
+        "attempt",
+        "transactionSha256",
+        "profiles"
+      ],
+      "additionalProperties": false
+    },
+    "Result": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "const": 1
+        },
+        "converted": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Unsigned"
+        },
+        "neverOpened": {
+          "$ref": "urn:arbol-browser:migration:1#/$defs/Unsigned"
+        },
+        "busy": {
+          "type": "array",
+          "items": {
+            "$ref": "urn:arbol-browser:contract:1#/$defs/ProfileId"
+          },
+          "maxItems": 4096
+        },
+        "completionSha256": {
+          "anyOf": [
+            {
+              "$ref": "urn:arbol-browser:migration:1#/$defs/Digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "diagnostic": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 512
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "format",
+        "converted",
+        "neverOpened",
+        "busy",
+        "completionSha256",
+        "diagnostic"
+      ],
+      "additionalProperties": false
+    }
+  }
+}
