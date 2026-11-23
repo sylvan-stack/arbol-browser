@@ -3,7 +3,7 @@
   "installationLayout": 2,
   "entry": "bin/arbol-browser",
   "contract": 1,
-  "dataFormat": 1,
+  "dataFormat": 2,
   "build": [
     "npm ci --ignore-scripts --no-audit --no-fund",
     "node node_modules/electron/install.js",

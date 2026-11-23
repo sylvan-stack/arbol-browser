@@ -90,6 +90,8 @@ export async function prepareReleasePayload({ out, buildRoot, runtimeArchive }) 
 
   const bundle = join(out, 'ArbolBrowser.app');
   const staged = await prepareUnsignedHost({ out: bundle, buildRoot, stateRoot, runtimeArchive, purpose: 'blocked' });
+  if (staged.record.component.contract !== 1 || staged.record.component.profileFormat !== 2)
+    throw new Error('Release payload must select profile format2');
   const compilerFiles = Object.keys(staged.record.files).filter(compilationOnly);
   const excluded = new Set([...compilerFiles, ...await removeVendorDevelopmentFiles(bundle, staged.record)]);
   for (const file of compilerFiles) await unlink(join(bundle, file));

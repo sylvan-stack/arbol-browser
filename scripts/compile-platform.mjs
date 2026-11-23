@@ -18,7 +18,7 @@ const installationConsumers = new Set([...names, 'watchdog/main.mm']);
 const installationSource = 'src/runtime/installation-paths.json';
 const productionPublisherSource = 'native/production-publisher-requirement.json';
 const closure = [...names, 'src/runtime/platform.ts', 'src/runtime/system-clipboard.hpp', 'src/runtime/attempt.hpp', 'watchdog/boundary.hpp', 'watchdog/exit.hpp',
-  installationSource, 'native/publisher-requirement.json', productionPublisherSource, 'scripts/compile-platform.mjs'];
+  'package.json', 'arbol-build.json', installationSource, 'native/publisher-requirement.json', productionPublisherSource, 'scripts/compile-platform.mjs'];
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 async function installationInput() {
   const bytes = await readFile(join(root, installationSource));
@@ -32,6 +32,17 @@ async function installationInput() {
     return `-DARBOL_INSTALLATION_${macro}=${JSON.stringify(parts.join('/'))}`;
   });
   return { sha256: hash(bytes), flags };
+}
+/** One package-owned management format, also bound into every native record.
+ * Manual compiler defaults cannot masquerade as this selected package. */
+export async function profileFormatInput() {
+  const packageBytes = await readFile(join(root, 'package.json'));
+  const buildBytes = await readFile(join(root, 'arbol-build.json'));
+  const pkg = JSON.parse(packageBytes), build = JSON.parse(buildBytes);
+  if (pkg.arbolBrowser?.profileFormat !== 2 || build.dataFormat !== 2 ||
+      pkg.arbolBrowser.contract !== 1 || build.contract !== 1) throw new Error('Browser package and Build formats differ');
+  return { value: 2, packageSha256: hash(packageBytes), buildSha256: hash(buildBytes),
+    flags: ['-DARBOL_BROWSER_PROFILE_FORMAT=2'] };
 }
 async function productionPublisherInput() {
   const file = await readFile(join(root, productionPublisherSource));
@@ -86,12 +97,13 @@ export async function captureCompilerInputs(sourceNames, headers = officialHeade
       staticCommand('/usr/bin/xcrun', ['clang++', '--version']).split('\n')[0] !== platformCompilerPolicy.compiler)
     throw new Error('Unsupported pinned compiler or SDK');
   const installationPaths = sourceNames.some(name => installationConsumers.has(name)) ? await installationInput() : undefined;
+  const profileFormat = installationPaths ? await profileFormatInput() : undefined;
   const usesProductionPublisher = name => name === names[2] || name === names[3];
   const productionPublisher = sourceNames.some(usesProductionPublisher) ? await productionPublisherInput() : undefined;
   const paths = new Map();
   for (const name of sourceNames) {
     const flags = [
-      ...(installationConsumers.has(name) ? installationPaths.flags : []),
+      ...(installationConsumers.has(name) ? [...installationPaths.flags, ...profileFormat.flags] : []),
       ...(usesProductionPublisher(name) ? productionPublisher.flags : []),
     ];
     const output = staticCommand('/usr/bin/xcrun', ['clang++', '-std=c++17', '-fobjc-arc', '-fblocks', '-DNAPI_VERSION=8',
@@ -115,7 +127,7 @@ export async function captureCompilerInputs(sourceNames, headers = officialHeade
     'usr/lib/libbsm.tbd', 'usr/lib/libc++.tbd', 'usr/lib/libSystem.tbd'])
     linkerInputs[path] = hash(await readFile(join(sdk, path)));
   return { policy: platformCompilerPolicy, providers: { sdkAlias, sdk, compilerAlias, compilerPath, linkerAlias, linkerPath },
-    ...(installationPaths ? { installationPaths } : {}),
+    ...(installationPaths ? { installationPaths, profileFormat } : {}),
     ...(productionPublisher ? { productionPublisher } : {}),
     compiler: hash(await readFile(compilerPath)), linker: hash(await readFile(linkerPath)), linkerInputs,
     frameworks: { 'platform.node': ['Foundation', 'Security', 'AppKit'], 'host-launch': ['AppKit'],
@@ -142,7 +154,7 @@ export async function compilePlatform(headers = officialHeaders) {
   const sdk = await realpath(staticCommand('/usr/bin/xcrun', ['--show-sdk-path']));
   await mkdir(join(root, 'dist/native'), { recursive: true });
   const common = ['clang++', '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror', '-fobjc-arc', '-fblocks', '-arch', 'arm64',
-    '-mmacosx-version-min=27.0', '-isysroot', sdk];
+    '-mmacosx-version-min=27.0', '-isysroot', sdk, ...input.profileFormat.flags];
   staticCommand('/usr/bin/xcrun', [...common, '-DNAPI_VERSION=8', '-DNODE_GYP_MODULE_NAME=arbol_browser_platform',
     '-bundle', '-undefined', 'dynamic_lookup', '-I', headers, ...input.installationPaths.flags, names[0],
     '-lbsm', '-framework', 'Foundation', '-framework', 'Security', '-framework', 'AppKit',

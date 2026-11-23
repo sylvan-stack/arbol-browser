@@ -31,7 +31,7 @@
   },
   "arbolBrowser": {
     "contract": 1,
-    "profileFormat": 1,
+    "profileFormat": 2,
     "runtime": {
       "electron": "45.3.2",
       "chromium": "156.0.8078.100",

@@ -207,6 +207,7 @@ export async function verifyReleaseAllocation(buildRoot, compiled, review) {
   if (allocation.identity.uid !== account.uid || allocation.identity.mode !== 0o600 ||
       proof.identity.uid !== account.uid || proof.identity.mode !== 0o600 ||
       record.component !== 'arbol-browser' || record.build !== build || record.status !== 'building' ||
+      record.contract !== 1 || record.dataFormat !== 2 ||
       !Array.isArray(record.checks) || record.checks.length || canonical(record.source) !== canonical(source) ||
       release?.review !== review || !/^[0-9a-f]{32}$/.test(release?.reservation) ||
       canonical(proof.value) !== canonical({ format: 1, component: 'arbol-browser', build, folder: buildRoot,
@@ -337,6 +338,7 @@ export function outerPlist(policy) {
 }
 export async function refreshHostRecords(bundle, staged) {
   const payload = join(bundle, 'Contents/Resources/browser');
+  if (staged.component.contract !== 1 || staged.component.profileFormat !== 2) fail('Current host metadata must select profile format2');
   const scope = staged.purpose === 'isolated-qualification' ? 'isolated' : staged.purpose;
   const readerKey = `host-${scope}:1:${staged.productDigest}`;
   const metadata = { format: 1, component: staged.component, runtime: hostRuntime, sourceDigest: staged.sourceDigest,
@@ -702,7 +704,7 @@ export async function prepareAllocatedHost(environment = process.env) {
   const allocation = await json(join(buildRoot, 'build.json')), record = allocation.value;
   const pkg = (await json(join(root, 'package.json'))).value, compiled = await currentHostCompilation();
   if (record.component !== 'arbol-browser' || record.build !== build || record.status !== 'building' || record.entry !== 'bin/arbol-browser' ||
-      record.packageVersion !== pkg.version || record.contract !== 1 || record.dataFormat !== 1 || !Array.isArray(record.checks) || record.checks.length ||
+      record.packageVersion !== pkg.version || record.contract !== 1 || record.dataFormat !== pkg.arbolBrowser.profileFormat || pkg.arbolBrowser.profileFormat !== 2 || !Array.isArray(record.checks) || record.checks.length ||
       !record.source || Object.keys(record.source).sort().join(',') !== 'branch,commit,repository,uncommittedChanges' ||
       record.source.repository !== await realpath(root) || record.source.branch !== compiled.sourceIdentity.branch ||
       record.source.commit !== compiled.sourceIdentity.commit || record.source.uncommittedChanges !== false || compiled.sourceIdentity.uncommittedChanges)
