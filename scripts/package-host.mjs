@@ -95,6 +95,38 @@ function protectedLocations(home) {
   return [join(home, ...installation.builds), join(home, ...installation.payloads),
     join(home, installation.root, installation.browser)];
 }
+/** Exact AFM isolated authority. The caller prepares directories; this only
+ * observes them and never creates state or supplies native custody. */
+export async function maintenanceFixtureLayout(buildRoot, stateRoot) {
+  const fixture = dirname(dirname(buildRoot));
+  if (stateRoot !== join(fixture, 'state/browser')) return null;
+  if (resolve(fixture) !== fixture || dirname(buildRoot) !== join(fixture, 'arbol-browser') ||
+      !/^[1-9a-f][0-9a-f]{0,15}$/.test(basename(buildRoot))) fail('Invalid maintenance fixture layout');
+  const home = await realpath(userInfo().homedir);
+  for (const path of [...protectedLocations(home), join(home, installation.root),
+    join(home, ...installation.stableBuilds), join(home, ...installation.stableUses)]) {
+    const protectedRoot = (await protectedPath(path)).normalize('NFC').toLowerCase();
+    const actual = fixture.normalize('NFC').toLowerCase();
+    if (inside(actual, protectedRoot) || inside(protectedRoot, actual)) fail('Maintenance fixture overlaps installed authority');
+  }
+  const paths = { fixture, support: join(fixture, 'support'), registry: join(fixture, 'arbol-browser'),
+    uses: join(fixture, 'arbol-browser/.uses'), runtime: join(fixture, 'runtime'), stateParent: join(fixture, 'state') };
+  const directories = {}, seen = new Set();
+  for (const [key, path] of Object.entries(paths)) {
+    const id = await privateDirectory(path, true), name = `${id.device}:${id.inode}`;
+    if (seen.has(name) || (key !== 'fixture' && id.device !== directories.fixture.device)) fail('Fixture directory identity overlaps');
+    seen.add(name); directories[key] = id;
+  }
+  const bin = await privateDirectory(join(fixture, 'bin'), true);
+  if (seen.has(`${bin.device}:${bin.inode}`) || bin.device !== directories.fixture.device) fail('Fixture bin identity differs');
+  try {
+    await lstat(stateRoot); const state = await privateDirectory(stateRoot, true);
+    if (state.device !== directories.fixture.device || seen.has(`${state.device}:${state.inode}`)) fail('Fixture state identity differs');
+  } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  return { fixture, directories, stateRoot, runtime: paths.runtime, registry: paths.registry,
+    launcher: join(fixture, 'bin/arbol-browser'), bundle: join(buildRoot, 'app/ArbolBrowser.app'), build: basename(buildRoot) };
+}
+
 export async function assertHostIsolation(buildRoot, stateRoot, output) {
   if (resolve(buildRoot) !== buildRoot || resolve(stateRoot) !== stateRoot || basename(dirname(buildRoot)) !== 'arbol-browser' ||
       !/^[1-9a-f][0-9a-f]{0,15}$/.test(basename(buildRoot))) fail('Invalid isolated Build layout');
@@ -119,11 +151,12 @@ export async function assertHostIsolation(buildRoot, stateRoot, output) {
       if (inside(candidate, protectedRoot) || inside(protectedRoot, candidate)) fail('Staging output overlaps protected Browser files');
     }
   }
-  for (const path of [dirname(buildRoot), buildRoot, stateRoot]) await privateDirectory(path, true);
+  const maintenance = await maintenanceFixtureLayout(buildRoot, stateRoot);
+  for (const path of [dirname(buildRoot), buildRoot, ...(maintenance ? [] : [stateRoot])]) await privateDirectory(path, true);
   if (inside(stateRoot, buildRoot) || inside(buildRoot, stateRoot)) fail('Qualification state overlaps product');
   // One separately prepared disposable state per isolated registry scope. It
   // can survive same-scope compatible Build changes without copying profiles.
-  if (stateRoot !== join(dirname(dirname(dirname(buildRoot))), 'browser-state')) fail('State is outside the isolated registry scope');
+  if (!maintenance && stateRoot !== join(dirname(dirname(dirname(buildRoot))), 'browser-state')) fail('State is outside the isolated registry scope');
 }
 export async function currentHostCompilation() {
   const compiled = await json(join(root, 'dist/compile-record.json'));
@@ -388,6 +421,8 @@ export async function prepareUnsignedHost({ out, buildRoot, stateRoot, runtimeAr
   const bundle = resolve(out);
   if (bundle !== out || !(basename(bundle) === 'ArbolBrowser.app' || (dirname(bundle) === buildRoot && /^\.host-preparation-[A-Za-z0-9_-]{22}\.app$/.test(basename(bundle)))) || inside(bundle, root) || inside(bundle, stateRoot) || inside(stateRoot, bundle)) fail('Invalid fresh outer destination');
   await privateDirectory(dirname(bundle));
+  const maintenanceFixture = await maintenanceFixtureLayout(buildRoot, stateRoot);
+  if (maintenanceFixture && purpose !== 'isolated-qualification') fail('Maintenance fixture requires isolated source admission');
   const compiled = await currentHostCompilation();
   const accepted = purpose === 'isolated-qualification' ? await acceptedHostProduct(review, compiled) : undefined;
   const publisher = (await json(join(root, 'native/publisher-requirement.json'))).value;
@@ -400,7 +435,7 @@ export async function prepareUnsignedHost({ out, buildRoot, stateRoot, runtimeAr
   const copy = { recursive: true, force: false, errorOnExist: true, verbatimSymlinks: true };
   await cp(join(root, 'dist/lib'), join(payload, 'lib'), copy);
   await cp(join(root, 'dist/native'), join(payload, 'native'), {
-    ...copy, filter: path => path !== join(root, 'dist/native/stable-launch'),
+    ...copy, filter: path => Boolean(maintenanceFixture) || path !== join(root, 'dist/native/stable-launch'),
   });
   for (const name of ['cli', 'host']) await cp(join(root, 'dist', name, 'main.mjs'), join(payload, 'lib', name, 'main.mjs'), copy);
   await mkdir(join(payload, 'runtime')); await cp(join(stock, 'Electron.app'), join(payload, 'runtime/Electron.app'), copy);
@@ -414,7 +449,7 @@ export async function prepareUnsignedHost({ out, buildRoot, stateRoot, runtimeAr
   await mkdir(join(bundle, 'Contents/MacOS')); await cp(join(root, 'dist/native/host-bootstrap'), join(bundle, 'Contents/MacOS/arbol-browser-native'), copy);
   await writeExclusive(join(bundle, 'Contents/Info.plist'), outerPlist(publisher));
   await writeExclusive(join(bundle, 'Contents/Resources/publisher-requirement.json'), JSON.stringify(publisher, null, 2) + '\n');
-  const staged = { format: 1, kind: 'unsigned-current-host', purpose, buildRoot, stateRoot,
+  const staged = { format: 1, kind: 'unsigned-current-host', purpose, buildRoot, stateRoot, maintenanceFixture,
     component: { name: 'arbol-browser', version: pkg.version, build: basename(buildRoot), contract: pkg.arbolBrowser.contract, profileFormat: pkg.arbolBrowser.profileFormat },
     sourceDigest: compiled.record.sourceDigest, sourceIdentity: compiled.sourceIdentity, productDigest: compiled.record.productDigest,
     productSources: compiled.productSources, productOutputs: compiled.productOutputs, compilerInputs: compiled.record.compilerInputs, compileDigest: compiled.digest,
