@@ -49,6 +49,31 @@ inline bool uintNumber(id value, uint64_t& out) {
   double n = [value doubleValue]; if (!std::isfinite(n) || n < 0 || n > 9007199254740991.0 || n != floor(n)) return false;
   out = (uint64_t)n; return true;
 }
+// Shape checks only. Callers must independently authenticate the source and
+// hold the installation custody while comparing the observed selection.
+inline bool maintenanceSelection(id value) {
+  uint64_t format = 0;
+  return keys(value, @[@"format", @"build", @"imageSha256"]) &&
+    uintNumber(value[@"format"], format) && format == 1 &&
+    pattern(value[@"build"], @"^[1-9a-f][0-9a-f]{0,15}$") &&
+    pattern(value[@"imageSha256"], @"^[0-9a-f]{64}$");
+}
+inline bool maintenanceRelease(id value) {
+  return keys(value, @[@"selection", @"launcherSha256"]) &&
+    maintenanceSelection(value[@"selection"]) && pattern(value[@"launcherSha256"], @"^[0-9a-f]{64}$");
+}
+inline bool maintenanceJournal(id value) {
+  uint64_t format = 0, from = 0, to = 0;
+  if (!keys(value, @[@"format", @"aliasBefore", @"before", @"after", @"migration"]) ||
+      !uintNumber(value[@"format"], format) || format != 3 ||
+      ![value[@"aliasBefore"] isKindOfClass:NSNumber.class] ||
+      CFGetTypeID((__bridge CFTypeRef)value[@"aliasBefore"]) != CFBooleanGetTypeID() ||
+      !(value[@"before"] == NSNull.null || maintenanceRelease(value[@"before"])) ||
+      !maintenanceRelease(value[@"after"]) ||
+      !keys(value[@"migration"], @[@"fromProfileFormat", @"toProfileFormat"])) return false;
+  return uintNumber(value[@"migration"][@"fromProfileFormat"], from) && from == 1 &&
+    uintNumber(value[@"migration"][@"toProfileFormat"], to) && to == 2;
+}
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 inline NSString* digest(const std::string& bytes) {
