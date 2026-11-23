@@ -290,6 +290,40 @@ static napi_value publishInstallerFile(napi_env env,napi_callback_info info) {
 }
 
 
+// The fixed retirement namespace is never a general directory-move API.
+static napi_value retireInstallerRollback(napi_env env,napi_callback_info info) {
+  using namespace arbol_attempt;
+  napi_value args[2]; size_t count=2; void* pointer=nullptr; std::string raw;
+  if(profileFormat!=2||napi_get_cb_info(env,info,&count,args,nullptr,nullptr)!=napi_ok||count!=2||
+     napi_get_value_external(env,args[0],&pointer)!=napi_ok||!pointer||!string(env,args[1],raw)) return fail(env);
+  auto* selection=static_cast<HeldLock*>(pointer); struct stat held{};
+  if(!liveLocks.count(selection)||selection->retained||selection->mode!=LOCK_EX||!matches(selection,&held)||
+     !arbol_boundary::canonical(selection->path)||!arbol_boundary::privateAncestors(selection->path)) return fail(env);
+  NSDictionary* request=json(raw);
+  if(!keys(request,@[@"parent",@"directory"])) return fail(env);
+  const auto parent=[](const std::string& p) { return p.substr(0,p.rfind('/')); };
+  const std::string support=parent(selection->path);
+  NSString* home=physicalAccountHome(); if(!home||selection->path!=support+"/selection.lock") return fail(env);
+  const std::string uses=[home stringByAppendingPathComponent:@ARBOL_INSTALLATION_STABLE_USES].fileSystemRepresentation;
+  if(support!=parent(uses)) {
+    const std::string fixture=parent(support); MaintenanceDirectory root;
+    if(support!=fixture+"/support"||!isolatedFromInstallation(fixture)||!root.openPath(fixture)) return fail(env);
+  }
+  MaintenanceDirectory directory,source;
+  if(!directory.openPath(support,request[@"parent"])||
+     !source.openPath(support+"/rollback-launchers",request[@"directory"])||
+     directory.identity.st_dev!=source.identity.st_dev||!matches(selection,&held)) return fail(env);
+  struct stat named{}; errno=0;
+  if(!fstatat(directory.fd,"pre-format-2-rollback-launchers",&named,AT_SYMLINK_NOFOLLOW)||errno!=ENOENT||
+     !directory.current()||!source.current()||
+     renameatx_np(directory.fd,"rollback-launchers",directory.fd,"pre-format-2-rollback-launchers",RENAME_EXCL)) return fail(env);
+  source.path=support+"/pre-format-2-rollback-launchers";
+  errno=0;
+  if(!fstatat(directory.fd,"rollback-launchers",&named,AT_SYMLINK_NOFOLLOW)||errno!=ENOENT||
+     !source.current()||fsync(directory.fd)||!directory.current()||!source.current()||!matches(selection,&held)) return fail(env);
+  napi_value result; napi_get_undefined(env,&result); return result;
+}
+
 static bool boundedText(napi_env env, napi_value value, std::string& out, size_t maximum=arbol_attempt::limit) {
   size_t length = 0, written = 0;
   if (napi_get_value_string_utf8(env,value,nullptr,0,&length) != napi_ok || !length || length > maximum) return false;
@@ -3671,6 +3705,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"watchdogBind",nullptr,watchdogBind,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"watchdogAssert",nullptr,watchdogAssert,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"publishDirectory", nullptr, publishDirectory, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"retireInstallerRollback", nullptr, retireInstallerRollback, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"publishInstallerFile", nullptr, publishInstallerFile, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"trySharedLock", nullptr, trySharedLock, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"groupCensus", nullptr, groupCensus, nullptr, nullptr, nullptr, napi_default, nullptr},
