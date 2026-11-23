@@ -1932,6 +1932,13 @@ struct RetainedMigrationProof {
 // supplies authority. English collation and JSON string escaping are the
 // established snapshot encoding; files, modes, directories and internal links
 // all participate, including the outer signature seal.
+static bool stableSnapshotNode(const struct stat& a,const struct stat& b) {
+  return a.st_dev==b.st_dev&&a.st_ino==b.st_ino&&a.st_mode==b.st_mode&&a.st_uid==b.st_uid&&a.st_gid==b.st_gid&&
+    a.st_nlink==b.st_nlink&&a.st_size==b.st_size&&
+    a.st_mtimespec.tv_sec==b.st_mtimespec.tv_sec&&a.st_mtimespec.tv_nsec==b.st_mtimespec.tv_nsec&&
+    a.st_ctimespec.tv_sec==b.st_ctimespec.tv_sec&&a.st_ctimespec.tv_nsec==b.st_ctimespec.tv_nsec&&
+    a.st_birthtimespec.tv_sec==b.st_birthtimespec.tv_sec&&a.st_birthtimespec.tv_nsec==b.st_birthtimespec.tv_nsec;
+}
 static NSString* maintenanceCandidateDigest(double deadline) {
   using namespace arbol_attempt; using namespace arbol_exit;
   static std::mutex mutex; static bool attempted=false; static NSString* retained=nil;
@@ -1970,7 +1977,7 @@ static NSString* maintenanceCandidateDigest(double deadline) {
   auto fileDigest=[&](int parent,const std::string& name,const std::string& path,const struct stat& original) -> NSString* {
     NativeFile file; file.fd=openat(parent,name.c_str(),O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
     struct stat first{},last{},named{};
-    if(file.fd<0||fstat(file.fd,&first)||!sameFile(first,original)||!S_ISREG(first.st_mode)||first.st_nlink!=1||
+    if(file.fd<0||fstat(file.fd,&first)||!stableSnapshotNode(first,original)||!S_ISREG(first.st_mode)||first.st_nlink!=1||
        first.st_size<0||!arbol_boundary::canonical(path)) return nil;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -1982,7 +1989,7 @@ static NSString* maintenanceCandidateDigest(double deadline) {
       else if(n<0&&errno==EINTR) continue; else return nil;
     }
     char overflow; if(pread(file.fd,&overflow,1,offset)!=0||fstat(file.fd,&last)||
-       fstatat(parent,name.c_str(),&named,AT_SYMLINK_NOFOLLOW)||!sameFile(first,last)||!sameFile(last,named)||!file.finish()) return nil;
+       fstatat(parent,name.c_str(),&named,AT_SYMLINK_NOFOLLOW)||!stableSnapshotNode(first,last)||!stableSnapshotNode(last,named)||!file.finish()) return nil;
     unsigned char output[CC_SHA256_DIGEST_LENGTH]; CC_SHA256_Final(output,&hash);
 #pragma clang diagnostic pop
     NSMutableString* value=[NSMutableString new]; for(unsigned char byte:output) [value appendFormat:@"%02x",byte]; return value;
@@ -1992,7 +1999,7 @@ static NSString* maintenanceCandidateDigest(double deadline) {
     if(path.size()>=PATH_MAX||arbol_boundary::clockMs()>=deadline||!arbol_boundary::canonical(path)) return false;
     NativeFile directory; directory.fd=open(path.c_str(),O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
     struct stat before{},after{},named{}; std::vector<std::string> first,last;
-    if(directory.fd<0||fstat(directory.fd,&before)||lstat(path.c_str(),&named)||!sameFile(before,named)||
+    if(directory.fd<0||fstat(directory.fd,&before)||lstat(path.c_str(),&named)||!stableSnapshotNode(before,named)||
        !S_ISDIR(before.st_mode)||!names(directory.fd,first)||count+first.size()>4096) return false;
     count+=first.size();
     for(const auto& name:first) {
@@ -2025,10 +2032,10 @@ static NSString* maintenanceCandidateDigest(double deadline) {
         if(!within(normalized,root)) return false;
         value=[@"symlink:" stringByAppendingString:link]; entries.emplace_back(string(key.data(),key.size()),value);
       } else return false;
-      if(fstatat(directory.fd,name.c_str(),&checked,AT_SYMLINK_NOFOLLOW)||!sameFile(initial,checked)) return false;
+      if(fstatat(directory.fd,name.c_str(),&checked,AT_SYMLINK_NOFOLLOW)||!stableSnapshotNode(initial,checked)) return false;
     }
     return names(directory.fd,last)&&first==last&&!fstat(directory.fd,&after)&&!lstat(path.c_str(),&named)&&
-      sameFile(before,after)&&sameFile(after,named)&&directory.finish();
+      stableSnapshotNode(before,after)&&stableSnapshotNode(after,named)&&directory.finish();
   };
   if(!walk(root)||!current()) return nil;
   NSLocale* english=[[NSLocale alloc] initWithLocaleIdentifier:@"en"];
@@ -2714,7 +2721,7 @@ struct MigrationSourceCapture {
   bool current() const {
     struct stat held{},named{}; char actual[PATH_MAX]{};
     return value&&bundle.fd>=0&&!fstat(bundle.fd,&held)&&!lstat(path.c_str(),&named)&&!fcntl(bundle.fd,F_GETPATH,actual)&&
-      path==actual&&arbol_boundary::canonical(path)&&arbol_attempt::sameFile(identity,held)&&arbol_attempt::sameFile(held,named)&&
+      path==actual&&arbol_boundary::canonical(path)&&stableSnapshotNode(identity,held)&&stableSnapshotNode(held,named)&&
       policy.current()&&arbol_boundary::lockIdentity(guard)&&arbol_boundary::signature(path,false);
   }
   bool take(NSDictionary* claim,const arbol_boundary::Lock& held,ExitInspection& job) {
