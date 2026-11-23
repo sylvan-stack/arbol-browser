@@ -121,6 +121,20 @@ export type NativeMigrationInput = Omit<NativeExitInput, 'mode' | 'pending'> & R
 export type NativeMigrationCommitInput = Omit<NativeMigrationInput, 'mode'> & Readonly<{
   mode: 'migrate-commit'; migration: Readonly<{ attempt: string; transactionSha256: string }>;
 }>;
+export type NativeMigrationRecoveryInput = Omit<NativeMigrationCommitInput, 'mode'> & Readonly<{ mode: 'migrate-recover' }>;
+export interface MigrationRecoveryReceipt {
+  readonly epoch: string; readonly attempt: string; readonly profileInstance: string; readonly profilePathHash: string;
+  readonly record: MaintenanceFileEvidence;
+}
+export interface MigrationRecoveryPermit extends MigrationRecoveryReceipt {
+  commit(): Promise<MigrationRecoveryReceipt>;
+  cancel(): void;
+}
+const migrationRecoveryReceipts = new WeakSet<object>();
+export function assertMigrationRecoveryReceipt(value: MigrationRecoveryReceipt, custody: MaintenanceCustody): void {
+  assertMaintenanceCustody(custody);
+  if (!migrationRecoveryReceipts.has(value) || value.epoch !== custody.facts.epoch) throw unavailable('profile');
+}
 export interface MigrationCommitReceipt {
   readonly epoch: string; readonly attempt: string; readonly profileInstance: string; readonly profilePathHash: string;
   readonly receipt: MaintenanceFileEvidence;
@@ -268,6 +282,8 @@ export interface PlatformPort {
     input: NativeMigrationInput, deadline: number, data?: HeldLock | MaintenanceGuard): Promise<MigrationInspectionReceipt>;
   commitMigration(custody: MaintenanceCustody, registry: HeldLock, owner: HeldLock, build: HeldLock | MaintenanceGuard,
     input: NativeMigrationCommitInput, deadline: number, data?: HeldLock | MaintenanceGuard): Promise<MigrationCommitReceipt>;
+  prepareMigrationRecovery(custody: MaintenanceCustody, registry: HeldLock, owner: HeldLock, build: HeldLock | MaintenanceGuard,
+    input: NativeMigrationRecoveryInput, deadline: number, data?: HeldLock | MaintenanceGuard): Promise<MigrationRecoveryPermit>;
   /** One-use fixed-exec native adoption. No numeric FD or role is accepted. */
   adoptHostBuild(requestPath: string, guard: string, bundle: string): HeldLock;
   adoptInstalledLaunch(bundle: string): { lock: HeldLock; deadline: number };
@@ -312,6 +328,8 @@ interface NativeSupport {
   beginExitInspection(owner: object, build: object, input: string, nativeDeadline: number, data: object | null, next: object | null,
     registry?: object, maintenance?: object): object;
   pollExitInspection(handle: object): string | null;
+  pollMigrationRecovery(handle: object): string | null;
+  consumeMigrationRecovery(handle: object): void;
   cancelExitInspection(handle: object): void;
   beginHostSessionUse(handle: object): object;
   acceptHostSessionUse(handle: object, facts: string): object;
@@ -750,6 +768,70 @@ export function loadPlatform(): PlatformPort {
         }
         throw unavailable('profile');
       } finally { call(() => native.cancelExitInspection(handle)); }
+    },
+    async prepareMigrationRecovery(custody: MaintenanceCustody, registry: HeldLock, owner: HeldLock, build: HeldLock | MaintenanceGuard,
+      input: NativeMigrationRecoveryInput, deadline: number, data?: HeldLock | MaintenanceGuard): Promise<MigrationRecoveryPermit> {
+      assertMaintenanceCustody(custody);
+      const guardHandle = (value: HeldLock | MaintenanceGuard) => locks.get(value as HeldLock) ?? maintenanceBuildHandles.get(value as MaintenanceGuard);
+      const actualCustody = maintenanceHandles.get(custody), actualRegistry = locks.get(registry), actualOwner = locks.get(owner);
+      const actualBuild = guardHandle(build), actualData = data ? guardHandle(data) : null;
+      if (!actualCustody || !actualRegistry || !actualOwner || !actualBuild || (data && !actualData) ||
+          typeof native.pollMigrationRecovery !== 'function' || typeof native.consumeMigrationRecovery !== 'function' ||
+          input.mode !== 'migrate-recover' || !Number.isFinite(deadline) || !input.migration ||
+          Object.keys(input.migration).sort().join(',') !== 'attempt,transactionSha256' ||
+          !/^[0-9a-f]{32}$/.test(input.migration.attempt) || !/^[0-9a-f]{64}$/.test(input.migration.transactionSha256)) throw unavailable('profile');
+      const assert = () => { assertMaintenanceCustody(custody); registry.assertIdentity(); owner.assertIdentity(); build.assertIdentity(); data?.assertIdentity(); };
+      assert();
+      const nativeNow = call(() => native.continuousTime()), sampled = performance.now();
+      if (sampled >= deadline) throw unavailable('profile');
+      const nativeDeadline = nativeNow + Math.min(10000, deadline - sampled);
+      const handle = call(() => native.beginExitInspection(actualOwner, actualBuild,
+        JSON.stringify({ ...input, dataAttempt: input.dataAttempt ?? null, pending: null }), nativeDeadline,
+        actualData ?? null, null, actualRegistry, actualCustody));
+      const read = (raw: string, kind: string): MigrationRecoveryReceipt => {
+        if (!raw || Buffer.byteLength(raw) > 16384) throw unavailable('profile');
+        const value = JSON.parse(raw) as MigrationRecoveryReceipt & { format: number; kind: string };
+        if (!value || Object.keys(value).sort().join(',') !== 'attempt,epoch,format,kind,profileInstance,profilePathHash,record' ||
+            value.format !== 1 || value.kind !== kind || value.epoch !== custody.facts.epoch || value.attempt !== input.migration.attempt ||
+            value.profileInstance !== input.profileInstance || value.profilePathHash !== input.profilePathHash ||
+            !validator('migration.File')(value.record)) throw unavailable('profile');
+        assert();
+        if (performance.now() >= deadline || call(() => native.continuousTime()) >= nativeDeadline) throw unavailable('profile');
+        Object.freeze(value.record.identity); Object.freeze(value.record);
+        return Object.freeze({ epoch: value.epoch, attempt: value.attempt, profileInstance: value.profileInstance,
+          profilePathHash: value.profilePathHash, record: value.record });
+      };
+      let transferred = false;
+      try {
+        while (performance.now() < deadline && call(() => native.continuousTime()) < nativeDeadline) {
+          const raw = call(() => native.pollMigrationRecovery(handle));
+          if (raw !== null) {
+            const ready = read(raw, 'migration-record-permit'); let used = false;
+            const permit: MigrationRecoveryPermit = Object.freeze({ ...ready,
+              cancel(): void { if (!used) { used = true; call(() => native.cancelExitInspection(handle)); } },
+              async commit(): Promise<MigrationRecoveryReceipt> {
+                if (used) throw unavailable('profile'); used = true;
+                try {
+                  assert(); call(() => native.consumeMigrationRecovery(handle));
+                  while (performance.now() < deadline && call(() => native.continuousTime()) < nativeDeadline) {
+                    const completed = call(() => native.pollExitInspection(handle));
+                    if (completed !== null) {
+                      const receipt = read(completed, 'migration-record-recovered');
+                      if (JSON.stringify(receipt.record) !== JSON.stringify(ready.record)) throw unavailable('profile');
+                      migrationRecoveryReceipts.add(receipt); return receipt;
+                    }
+                    await setTimeout(Math.min(5, Math.max(1, deadline - performance.now())));
+                  }
+                  throw unavailable('profile');
+                } finally { call(() => native.cancelExitInspection(handle)); }
+              }
+            });
+            transferred = true; return permit;
+          }
+          await setTimeout(Math.min(5, Math.max(1, deadline - performance.now())));
+        }
+        throw unavailable('profile');
+      } finally { if (!transferred) call(() => native.cancelExitInspection(handle)); }
     },
     async inspectExit(owner: HeldLock, build: HeldLock, input: NativeExitInput, deadline: number, guards?: Readonly<{ data?: HeldLock; next?: HeldLock }>): Promise<ExitInspectionReceipt> {
       const actualOwner = locks.get(owner), actualBuild = locks.get(build);

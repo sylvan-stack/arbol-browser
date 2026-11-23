@@ -1928,18 +1928,22 @@ struct RetainedMigrationProof {
   }
 };
 struct MigrationPublication {
-  arbol_attempt::MaintenanceDirectory root,attempt,profile;
-  arbol_attempt::MaintenanceFile currentFile,transactionFile,stagedFile,recordFile,markerFile;
+  arbol_attempt::MaintenanceDirectory root,attempt,profile,staging;
+  arbol_attempt::MaintenanceFile currentFile,transactionFile,stagedFile,recordFile,markerFile,stagedRecord;
   NSDictionary* transaction=nil,*entry=nil,*staged=nil,*receipt=nil;
+  bool recovery=false,replaced=false;
+  arbol_attempt::MaintenanceFile& targetRecord() { return recovery?stagedRecord:recordFile; }
   bool current() const {
     struct stat st{};
     if(!receipt||!maintenanceStateRoot||!maintenanceStateRoot->current()||!root.current()||!attempt.current()||
-       !profile.current()||!currentFile.current()||!transactionFile.current()||!stagedFile.current()||!recordFile.current()) return false;
+       !profile.current()||!currentFile.current()||!transactionFile.current()||!stagedFile.current()||
+       (recovery?(!staging.current()||!stagedRecord.current()||(!replaced&&!recordFile.current())):!recordFile.current())) return false;
     if(receipt[@"convertedMarker"]!=NSNull.null) return markerFile.current();
     errno=0; return fstatat(profile.fd,"engine.json",&st,AT_SYMLINK_NOFOLLOW)<0&&errno==ENOENT;
   }
-  bool open(NSDictionary* input) {
+  bool open(NSDictionary* input,bool recover=false) {
     using namespace arbol_attempt; using namespace arbol_exit;
+    recovery=recover;
     id request=input[@"migration"];
     if(profileFormat!=2||!maintenanceStateRoot||!maintenanceStateRoot->current()||maintenanceStateRoot->absent||
        !keys(request,@[@"attempt",@"transactionSha256"])||!pattern(request[@"attempt"],@"^[0-9a-f]{32}$")||
@@ -1978,8 +1982,18 @@ struct MigrationPublication {
     if(!keys(staged,@[@"format",@"attempt",@"profileSha256",@"record",@"marker"])||!migrationFormat(staged[@"format"],1)||
        ![staged[@"attempt"] isEqual:request[@"attempt"]]||![staged[@"profileSha256"] isEqual:input[@"profilePathHash"]]||
        !migrationFile(staged[@"record"])||![staged[@"record"][@"sha256"] isEqual:entry[@"targetRecord"][@"sha256"]]||
-       !recordFile.openPath(profile.path+"/profile.json",0600,65536,true)||![recordFile.record() isEqual:staged[@"record"]]||
-       ![strictManagementObject(recordFile.content,65536) isEqual:migrationContent(entry[@"targetRecord"],false)]) return false;
+       !recordFile.openPath(profile.path+"/profile.json",0600,65536,true)) return false;
+    if(recovery) {
+      if(![maintenanceIdentity(recordFile.identity) isEqual:entry[@"originalRecord"][@"identity"]]||
+         ![digest(recordFile.content) isEqual:entry[@"originalRecord"][@"sha256"]]||
+         ![strictManagementObject(recordFile.content,65536) isEqual:migrationContent(entry[@"originalRecord"],true)]||
+         !staging.openPath(std::string([maintenanceCustody->stateRoot() UTF8String])+"/migration-staged/"+
+           [request[@"attempt"] UTF8String]+"/"+[input[@"profilePathHash"] UTF8String])||
+         staging.identity.st_dev!=profile.identity.st_dev||
+         !stagedRecord.openPath(staging.path+"/profile.json",0600,65536,true)) return false;
+    }
+    if(![targetRecord().record() isEqual:staged[@"record"]]||
+       ![strictManagementObject(targetRecord().content,65536) isEqual:migrationContent(entry[@"targetRecord"],false)]) return false;
     id convertedMarker=NSNull.null;
     if(entry[@"targetMarker"]==NSNull.null) {
       struct stat st{}; errno=0;
@@ -1996,14 +2010,39 @@ struct MigrationPublication {
       @"transactionSha256":request[@"transactionSha256"],@"profilePath":input[@"profile"],@"profileSha256":input[@"profilePathHash"],
       @"instance":entry[@"instance"],@"directory":entry[@"directory"],@"evidence":entry[@"evidence"],
       @"originalRecord":@{@"identity":entry[@"originalRecord"][@"identity"],@"sha256":entry[@"originalRecord"][@"sha256"]},
-      @"convertedRecord":recordFile.record(),@"originalMarker":entry[@"originalMarker"],@"convertedMarker":convertedMarker,
+      @"convertedRecord":targetRecord().record(),@"originalMarker":entry[@"originalMarker"],@"convertedMarker":convertedMarker,
       @"bootSession":boot,@"writer":writer,@"sourceSha256":transaction[@"sourceSha256"],@"productSha256":transaction[@"productSha256"],
       @"candidateSha256":transaction[@"candidateSha256"]};
     return migrationReceipt(receipt)&&current();
   }
+  bool replaceRecord() {
+    using namespace arbol_attempt;
+    if(!recovery||replaced||!current()) return false;
+    // Both exact source and destination were checked with their held native
+    // descriptions under the same owner/registry/Claim custody. No caller path
+    // or file contents enter this one permitted atomic operation.
+    if(renameat(staging.fd,"profile.json",profile.fd,"profile.json")) return false;
+    replaced=true;
+    struct stat held{},named{};
+    if(fstat(stagedRecord.fd,&held)||fstatat(profile.fd,"profile.json",&named,AT_SYMLINK_NOFOLLOW)||
+       !privateFile(held)||!sameFile(held,named)||
+       ![maintenanceIdentity(held) isEqual:staged[@"record"][@"identity"]]||
+       held.st_size!=(off_t)stagedRecord.content.size()) return false;
+    std::string actual(stagedRecord.content.size()+1,'\0'); size_t count=0;
+    while(count<actual.size()) {
+      ssize_t n=pread(stagedRecord.fd,actual.data()+count,actual.size()-count,count);
+      if(n>0) count+=n; else if(n<0&&errno==EINTR) continue; else if(!n) break; else return false;
+    }
+    actual.resize(count); if(actual!=stagedRecord.content) return false;
+    // A successful rename can change ctime. Rebase only this retained original
+    // staged description after checking its exact staged inode and bytes.
+    stagedRecord.path=profile.path+"/profile.json"; stagedRecord.identity=held;
+    return !fsync(profile.fd)&&!fsync(staging.fd)&&current();
+  }
 };
 struct ExitInspection {
   std::atomic<int> state{0}; std::atomic<bool> cancelled{false};
+  std::atomic<int> recoveryPermit{0}; std::string recoveryReady;
   arbol_boundary::Lock owner,build,dataBuild,nextBuild,registry; NSDictionary* input=nil; std::string result; double deadline=0;
   // Captured only on the owning N-API thread. Worker uses its private Context
   // fields and genuinely shared atomic state, never the live mutable Context
@@ -2210,6 +2249,7 @@ static bool receiptFrontier(NSDictionary* capability,NSDictionary* frontier,NSSt
 static bool migrationPublishedMetadata(NSDictionary* receipt,NSDictionary* entry,NSDictionary* transaction,ExitInspection& job) {
   using namespace arbol_attempt; using namespace arbol_exit;
   NSDictionary* rootRecord=transaction[@"root"];
+  const bool original=job.publication&&!job.migrated&&job.publication->recovery&&!job.publication->replaced;
   MaintenanceDirectory state,profiles,profile; MaintenanceFile record,marker;
   NSString* path=receipt[@"profilePath"];
   if(!job.within()||![rootRecord[@"initial"] isEqual:@"present"]||
@@ -2217,10 +2257,10 @@ static bool migrationPublishedMetadata(NSDictionary* receipt,NSDictionary* entry
      !profiles.openPath(state.path+"/profiles",rootRecord[@"profiles"])||
      !profile.openPath(path.UTF8String,receipt[@"directory"])||
      !record.openPath(profile.path+"/profile.json",0600,65536,true)||
-     ![record.record() isEqual:receipt[@"convertedRecord"]]||
+     ![record.record() isEqual:receipt[original?@"originalRecord":@"convertedRecord"]]||
      ([receipt[@"originalRecord"][@"identity"][@"device"] isEqual:receipt[@"convertedRecord"][@"identity"][@"device"]]&&
       [receipt[@"originalRecord"][@"identity"][@"inode"] isEqual:receipt[@"convertedRecord"][@"identity"][@"inode"]])||
-     ![strictManagementObject(record.content,65536) isEqual:migrationContent(entry[@"targetRecord"],false)]||
+     ![strictManagementObject(record.content,65536) isEqual:migrationContent(entry[original?@"originalRecord":@"targetRecord"],original)]||
      job.owner.path!=profile.path+"/owner.lock") return false;
   struct stat registry{},owner{},child{};
   if(fstatat(state.fd,"registry.lock",&registry,AT_SYMLINK_NOFOLLOW)||!privateFile(registry)||
@@ -2702,9 +2742,10 @@ static bool inspectExit(ExitInspection& job) {
   NSDictionary* input=job.input,*expected=input[@"attempt"]; NSString* leaf=input[@"runtimeLeaf"],*profile=input[@"profile"];
   bool prior=[input[@"mode"] isEqual:@"prior"],hostMode=[input[@"mode"] isEqual:@"host"],
     retire=[input[@"mode"] isEqual:@"retire"],reserve=[input[@"mode"] isEqual:@"reserve"],withdraw=[input[@"mode"] isEqual:@"withdraw"];
-  bool commit=[input[@"mode"] isEqual:@"migrate-commit"],migration=commit||[input[@"mode"] isEqual:@"migrate-verify"];
+  bool recover=[input[@"mode"] isEqual:@"migrate-recover"],commit=[input[@"mode"] isEqual:@"migrate-commit"],
+    migration=recover||commit||[input[@"mode"] isEqual:@"migrate-verify"];
   NSArray* inputKeys=@[@"format",@"mode",@"profile",@"profileInstance",@"profilePathHash",@"runtimeLeaf",@"bundle",@"attempt",@"previous",@"dataAttempt",@"pending"];
-  if(commit) inputKeys=[inputKeys arrayByAddingObject:@"migration"];
+  if(commit||recover) inputKeys=[inputKeys arrayByAddingObject:@"migration"];
   if(!job.within()||!keys(input,inputKeys)||
      ![input[@"format"] isEqual:@1]||(![@[@"prior",@"host",@"full",@"retire",@"reserve",@"withdraw"] containsObject:input[@"mode"]]&&!migration)||
      (migration&&!job.maintenance)||
@@ -2718,8 +2759,8 @@ static bool inspectExit(ExitInspection& job) {
   MigrationObservation migrationSource;
   MigrationPublication publication;
   struct PublicationScope { ExitInspection& job; ~PublicationScope() { job.publication=nullptr; } } publicationScope{job};
-  if(commit) {
-    if(!publication.open(input)) return false; job.publication=&publication;
+  if(commit||recover) {
+    if(!publication.open(input,recover)) return false; job.publication=&publication;
     if(!rewrittenMigrationMetadata(job)) return false;
   } else if(migration&&!migrationSource.capture(job)) return false;
   arbol_exit::NativeFile history; struct stat historyIdentity{};
@@ -2759,16 +2800,17 @@ static bool inspectExit(ExitInspection& job) {
   if((current&&!sameProfile(current))||(head&&(!sameProfile(head)||![head[@"phase"] isEqual:@"closed"]))||
      (pointer&&(!sameProfile(pointer)||![pointer[@"phase"] isEqual:@"pending"]))||
      ((current||head)&&!pointer)||(pointer&&!immutable(pointer,current?:head))) return false;
+  std::function<bool()> reverify;
   auto result=[&](NSString* kind,NSDictionary* data,NSString* request) {
     bool clean=[kind isEqual:@"activated"];
     if(migration) {
-      if(!commit&&(!migrationSource.current()||(!data&&!migrationSource.neverOpened(job)))) return false;
+      if(!commit&&!recover&&(!migrationSource.current()||(!data&&!migrationSource.neverOpened(job)))) return false;
       id closed=expected==(id)NSNull.null?nil:expected;
       NSDictionary* evidence=@{@"classification":data?(clean?@"clean":@"dirty"):@"never-opened",@"clean":@(clean),
         @"closedClaimSha256":closed?(id)digest(bytes(closed)):NSNull.null,@"dataClaimSha256":data?(id)digest(bytes(data)):NSNull.null,
         @"terminalPath":data?data[@"terminal"][@"path"]:(id)NSNull.null,
         @"terminalSha256":data?data[@"terminal"][@"digest"]:(id)NSNull.null};
-      if(commit) {
+      if(commit||recover) {
         auto claimsCurrent=[&] {
           std::string actual; bool missing=true;
           if(runtimeMissing) { if(!missingRuntime.current()) return false; }
@@ -2785,6 +2827,27 @@ static bool inspectExit(ExitInspection& job) {
              !readAt(historyFd,"current-attempt.json",actual,missing)||missing!=pointerAbsent||actual!=pointerRaw) return false;
           return historyMissing?createdHistory.current():true;
         };
+        if(recover) {
+          if(!reverify||!claimsCurrent()||![evidence isEqual:publication.entry[@"evidence"]]||
+             !rewrittenMigrationMetadata(job)||(!data&&!migrationNeverOpened(publication.receipt,job))) return false;
+          job.recoveryReady=bytes(@{@"format":@1,@"kind":@"migration-record-permit",@"epoch":maintenanceCustody->epoch,
+            @"attempt":publication.receipt[@"attempt"],@"profileInstance":input[@"profileInstance"],@"profilePathHash":input[@"profilePathHash"],
+            @"record":publication.targetRecord().record()});
+          if(job.recoveryReady.empty()||!job.within()) return false;
+          job.recoveryPermit.store(1,std::memory_order_release);
+          while(job.recoveryPermit.load(std::memory_order_acquire)==1) {
+            if(!job.within()||!claimsCurrent()) return false; usleep(10000);
+          }
+          int requested=2;
+          if(!job.recoveryPermit.compare_exchange_strong(requested,3,std::memory_order_acq_rel)||
+             !job.within()||!claimsCurrent()||!reverify()||!publication.replaceRecord()||
+             !claimsCurrent()||!reverify()||!rewrittenMigrationMetadata(job)||
+             (!data&&!migrationNeverOpened(publication.receipt,job))) return false;
+          job.result=bytes(@{@"format":@1,@"kind":@"migration-record-recovered",@"epoch":maintenanceCustody->epoch,
+            @"attempt":publication.receipt[@"attempt"],@"profileInstance":input[@"profileInstance"],@"profilePathHash":input[@"profilePathHash"],
+            @"record":publication.targetRecord().record()});
+          return !job.result.empty()&&job.within()&&claimsCurrent();
+        }
         return publishMigration(job,closed,data,evidence,claimsCurrent)&&claimsCurrent();
       }
       job.result=bytes(@{@"format":@1,@"kind":@"migration-verification",@"epoch":maintenanceCustody->epoch,
@@ -2908,6 +2971,7 @@ static bool inspectExit(ExitInspection& job) {
     return job.within();
   };
   if(!verify()||!physical()||(!runtimeMissing&&!unchanged(claim.at))||!reclaim()) return false;
+  reverify=[&] { return verify()&&physical()&&(!runtimeMissing?unchanged(claim.at):missingRuntime.current()); };
   if(reserve) {
     NSDictionary* next=input[@"pending"]; PackagedLayout nextLayout;
     // This privileged transition is distinct from generic Role::starter. Repeat
@@ -3018,6 +3082,22 @@ static napi_value pollExitInspection(napi_env env,napi_callback_info info) {
   if(!state) { napi_value out; napi_get_null(env,&out); return out; }
   return text(env,job->result);
 }
+static napi_value pollMigrationRecovery(napi_env env,napi_callback_info info) {
+  auto* job=exitInspectionArgument(env,info);
+  if(!job||!job->maintenance||![job->input[@"mode"] isEqual:@"migrate-recover"]||
+     job->state.load(std::memory_order_acquire)<0||job->cancelled.load(std::memory_order_acquire)||
+     arbol_boundary::clockMs()>=job->deadline) return fail(env);
+  int permission=job->recoveryPermit.load(std::memory_order_acquire);
+  if(!permission) { napi_value out; napi_get_null(env,&out); return out; }
+  return permission==1?text(env,job->recoveryReady):fail(env);
+}
+static napi_value consumeMigrationRecovery(napi_env env,napi_callback_info info) {
+  auto* job=exitInspectionArgument(env,info); int ready=1;
+  if(!job||!job->maintenance||![job->input[@"mode"] isEqual:@"migrate-recover"]||
+     job->state.load(std::memory_order_acquire)!=0||job->cancelled.load(std::memory_order_acquire)||
+     arbol_boundary::clockMs()>=job->deadline||!job->recoveryPermit.compare_exchange_strong(ready,2,std::memory_order_acq_rel)) return fail(env);
+  napi_value out; napi_get_undefined(env,&out); return out;
+}
 static napi_value cancelExitInspection(napi_env env,napi_callback_info info) {
   auto* job=exitInspectionArgument(env,info); if(!job) return fail(env);
   job->cancelled.store(true,std::memory_order_release); napi_value out; napi_get_undefined(env,&out); return out;
@@ -3030,6 +3110,8 @@ static napi_value init(napi_env env, napi_value exports) {
     {"terminateAdoptedHost",nullptr,terminateAdoptedHost,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"beginExitInspection",nullptr,beginExitInspection,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"pollExitInspection",nullptr,pollExitInspection,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"pollMigrationRecovery",nullptr,pollMigrationRecovery,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"consumeMigrationRecovery",nullptr,consumeMigrationRecovery,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"cancelExitInspection",nullptr,cancelExitInspection,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"beginHostSessionUse",nullptr,beginHostSessionUse,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"acceptHostSessionUse",nullptr,acceptHostSessionUse,nullptr,nullptr,nullptr,napi_default,nullptr},
