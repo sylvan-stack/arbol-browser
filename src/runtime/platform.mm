@@ -2174,10 +2174,65 @@ struct MigrationPublication {
     return !fsync(profile.fd)&&!fsync(staging.fd)&&current();
   }
 };
+struct OrdinaryMigrationAuthority {
+  arbol_attempt::PackagedLayout layout;
+  arbol_attempt::MaintenanceFile policy,fixture;
+  arbol_attempt::MaintenanceDirectory runtime;
+  arbol_attempt::IsolatedMaintenance isolated;
+  arbol_exit::NativeFile bundle;
+  arbol_boundary::Lock guard;
+  struct stat identity{}; struct statfs filesystem{};
+  NSString* state=nil; bool available=false;
+  std::string runtimePath;
+  bool current() const {
+    struct stat held{},named{}; struct statfs fs{}; char path[PATH_MAX]{};
+    return bundle.fd>=0&&arbol_boundary::lockIdentity(guard)&&guard.heldMode==LOCK_SH&&
+      !fstat(bundle.fd,&held)&&!lstat(layout.bundle.c_str(),&named)&&!fcntl(bundle.fd,F_GETPATH,path)&&layout.bundle==path&&
+      stableSnapshotNode(identity,held)&&stableSnapshotNode(held,named)&&!fstatfs(bundle.fd,&fs)&&
+      (fs.f_flags&MNT_RDONLY)&&(fs.f_flags&MNT_LOCAL)&&fs.f_fsid.val[0]==filesystem.f_fsid.val[0]&&fs.f_fsid.val[1]==filesystem.f_fsid.val[1]&&
+      policy.current()&&(!available||(layout.installed?runtime.current():isolated.current()));
+  }
+  bool open(const std::string& ownBundle,NSString* profile,const arbol_boundary::Lock& ownGuard,double deadline) {
+    using namespace arbol_attempt;
+    if(profileFormat!=2||!packagedLayout(ownBundle,layout)||layout.guard!=ownGuard.path||ownGuard.heldMode!=LOCK_SH||
+       !arbol_boundary::lockIdentity(ownGuard)||!arbol_boundary::canonical(ownBundle)||
+       !signedIdentity(ownBundle,layout.installed?@"com.sylvan-stack.arbol-browser":@"com.sylvan-stack.arbol-browser.native-candidate",true)) return false;
+    if(!layout.installed) {
+      struct stat sealed{}; errno=0;
+      if(lstat((ownBundle+"/Contents/Resources/maintenance-fixture.json").c_str(),&sealed)) return errno==ENOENT;
+    }
+    guard=ownGuard; bundle.fd=::open(ownBundle.c_str(),O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if(bundle.fd<0||fstat(bundle.fd,&identity)||!S_ISDIR(identity.st_mode)||fstatfs(bundle.fd,&filesystem)||
+       !(filesystem.f_flags&MNT_RDONLY)||!(filesystem.f_flags&MNT_LOCAL)||
+       !policy.openPath(ownBundle+"/Contents/Resources/host-policy.json",0600,limit,true)) return false;
+    state=policyStateRoot(json(policy.content),layout);
+    if(!state||![profile.stringByDeletingLastPathComponent isEqual:[state stringByAppendingPathComponent:@"profiles"]]) return false;
+    if(layout.installed) {
+      NSString* home=physicalAccountHome(); if(!home) return false;
+      NSString* path=[[home stringByAppendingPathComponent:@ARBOL_INSTALLATION_ROOT] stringByAppendingPathComponent:@"runtime"];
+      if(!runtime.openPath(path.fileSystemRepresentation)) return false;
+      runtimePath=runtime.path; available=true;
+    } else {
+      const std::string path=ownBundle+"/Contents/Resources/maintenance-fixture.json"; struct stat st{}; errno=0;
+      if(lstat(path.c_str(),&st)) {
+        // A normal isolated host without a sealed migration policy cannot
+        // acquire receipt authority or choose a runtime. Its existing native
+        // predecessor checks remain in force, without any rewritten evidence.
+        return false; // a previously observed sealed fixture disappeared
+      }
+      if(!fixture.openPath(path,0600,limit,true)) return false;
+      id record=json(fixture.content); if(!arbol_attempt::path(record[@"runtime"])) return false;
+      if(!isolated.admit(path,[record[@"runtime"] UTF8String],ownBundle,deadline)||
+         isolated.stateRoot!=state.UTF8String) return false;
+      runtimePath=isolated.runtime.path; available=true;
+    }
+    return current();
+  }
+};
 struct ExitInspection {
   std::atomic<int> state{0}; std::atomic<bool> cancelled{false};
   std::atomic<int> recoveryPermit{0}; std::string recoveryReady;
-  arbol_boundary::Lock owner,build,dataBuild,nextBuild,registry; NSDictionary* input=nil; std::string result; double deadline=0;
+  arbol_boundary::Lock owner,build,dataBuild,nextBuild,registry,activeBuild; NSDictionary* input=nil; std::string result,activeBundle; double deadline=0;
   // Captured only on the owning N-API thread. Worker uses its private Context
   // fields and genuinely shared atomic state, never the live mutable Context
   // or global nativeCustodies container.
@@ -2186,6 +2241,8 @@ struct ExitInspection {
   bool maintenance = false;
   RetainedMigrationProof* migrated = nullptr; // stack-owned native validator only; never a JS option
   MigrationPublication* publication = nullptr;
+  OrdinaryMigrationAuthority* receiptAuthority = nullptr;
+  NSDictionary* appliedMigration = nil;
   std::thread* thread=nullptr;
   bool within() const { return !cancelled.load(std::memory_order_acquire)&&arbol_boundary::clockMs()<deadline&&
     arbol_boundary::lockIdentity(owner)&&arbol_boundary::lockIdentity(build)&&
@@ -2194,7 +2251,8 @@ struct ExitInspection {
     (build.heldMode==LOCK_SH||(maintenance&&originalMaintenanceBuild(build)))&&
     (dataBuild.fd<0||dataBuild.heldMode==LOCK_SH||(maintenance&&originalMaintenanceBuild(dataBuild)))&&
     (nextBuild.fd<0||nextBuild.heldMode==LOCK_SH||(maintenance&&originalMaintenanceBuild(nextBuild)))&&
-    (!migrated||migrated->current())&&(!publication||publication->current()); }
+    (activeBuild.fd<0||arbol_boundary::lockIdentity(activeBuild))&&
+    (!migrated||migrated->current())&&(!publication||publication->current())&&(!receiptAuthority||receiptAuthority->current()); }
   bool historicalBuildLock(id record, const arbol_boundary::Lock& actual, NSDictionary* claim=nil) const {
     if(migrated) return migrated->buildRecord(record,claim);
     if (actual.heldMode == LOCK_SH) return [record isEqual:arbol_boundary::capsuleLock(actual)];
@@ -3108,10 +3166,67 @@ static bool inspectExit(ExitInspection& job) {
       @"receipt":proof.chain.receiptFile.record()});
     return !job.result.empty()&&continuity();
   }
+  OrdinaryMigrationAuthority ordinaryAuthority;
+  MaintenanceFile candidateFile; NSDictionary* candidateReceipt=nil;
+  RetainedMigrationProof appliedProof; bool applied=false,wholeReceipt=false;
+  struct ReceiptAuthorityScope { ExitInspection& job; ~ReceiptAuthorityScope() { job.receiptAuthority=nullptr; } } receiptAuthorityScope{job};
+  if(profileFormat==2&&!migration) {
+    if(job.activeBuild.fd<0||job.activeBundle.empty()||
+       !ordinaryAuthority.open(job.activeBundle,profile,job.activeBuild,job.deadline)) return false;
+    if(ordinaryAuthority.available) {
+      const std::string path=ordinaryAuthority.runtimePath+"/browser-profile-migration/receipts/"+[input[@"profilePathHash"] UTF8String]+".json";
+      struct stat st{}; errno=0;
+      if(lstat(path.c_str(),&st)) { if(errno!=ENOENT) return false; }
+      else {
+        if(!candidateFile.openPath(path,0600,arbol_exit::exitReceiptLimit,true)) return false;
+        id candidate=strictManagementObject(candidateFile.content,arbol_exit::exitReceiptLimit);
+        if(!arbol_exit::migrationReceipt(candidate)||![candidate[@"profilePath"] isEqual:profile]||
+           ![candidate[@"profileSha256"] isEqual:input[@"profilePathHash"]]) return false;
+        // Recreated instances and superseded data keep the ordinary proof.
+        // No invalid applicable receipt ever falls back to retired Build I/O.
+        if([candidate[@"instance"] isEqual:input[@"profileInstance"]]) candidateReceipt=candidate;
+      }
+    }
+    if(candidateReceipt) wholeReceipt=closed?
+      [digest(bytes(closed)) isEqual:candidateReceipt[@"evidence"][@"closedClaimSha256"]]:
+      candidateReceipt[@"evidence"][@"closedClaimSha256"]==NSNull.null&&candidateReceipt[@"evidence"][@"dataClaimSha256"]==NSNull.null;
+  }
+  auto applyReceipt=[&](NSDictionary* observedData,bool whole) {
+    if(!candidateReceipt||!candidateFile.current()||!ordinaryAuthority.current()) return false;
+    if(!applied) {
+      if(!appliedProof.open([NSString stringWithUTF8String:ordinaryAuthority.runtimePath.c_str()],ordinaryAuthority.state,
+           input[@"profilePathHash"],input[@"profileInstance"],true)||
+         ![appliedProof.chain.receiptFile.record() isEqual:candidateFile.record()]||
+         ![appliedProof.chain.receipt isEqual:candidateReceipt]) return false;
+      job.receiptAuthority=&ordinaryAuthority; applied=true;
+    }
+    if(whole?(closed?![closed isEqual:appliedProof.closed]:appliedProof.closed!=nil):
+        (!observedData||![observedData isEqual:appliedProof.data])) return false;
+    if(!verifyRetainedMigration(appliedProof,job)) return false;
+    job.appliedMigration=@{@"path":[NSString stringWithUTF8String:candidateFile.path.c_str()],@"digest":digest(candidateFile.content)};
+    return job.within();
+  };
+  auto withReceipt=[&](const std::function<bool()>& operation) {
+    if(!applied) return operation();
+    if(job.migrated||!appliedProof.current()) return false;
+    struct Scope { ExitInspection& job; ~Scope() { job.migrated=nullptr; } } scope{job};
+    job.migrated=&appliedProof; return operation();
+  };
   NSDictionary* data=nil,*capability=nil,*receipt=nil,*frontier=nil,*unusedReceipt=nil;
   bool unused=closed&&[[closed[@"terminal"][@"path"] lastPathComponent] isEqual:@"unused.json"];
   auto verify=[&] {
-    if(!closed) {
+    if(wholeReceipt) {
+      if((closed?![closed isEqual:expected]:expected!=(id)NSNull.null)||!applyReceipt(nil,true)) return false;
+      data=appliedProof.data;
+      id expectedData=unused&&data?data:(id)NSNull.null;
+      if(![input[@"dataAttempt"] isEqual:expectedData]) return false;
+      if(unused) {
+        std::string raw; struct stat identity{};
+        if(!exitReceiptAt(closed[@"terminal"][@"path"],raw,unusedReceipt,identity)||
+           ![digest(raw) isEqual:closed[@"terminal"][@"digest"]]) return false;
+      }
+      if(!closed&&(input[@"previous"]!=NSNull.null||retire)) return false;
+    } else if(!closed) {
       if(expected!=(id)NSNull.null||input[@"dataAttempt"]!=NSNull.null||input[@"previous"]!=NSNull.null||retire) return false;
     } else {
       PackagedLayout layout;
@@ -3126,15 +3241,22 @@ static bool inspectExit(ExitInspection& job) {
         if(input[@"dataAttempt"]!=NSNull.null) return false;
         data=closed;
       }
+    }
       if(data) {
         const auto& guard=unused?job.dataBuild:job.build;
         PackagedLayout dataLayout; if(!claimedLayout(data,dataLayout)) return false;
         NSString* bundle=[NSString stringWithUTF8String:dataLayout.bundle.c_str()];
-        if(guard.fd<0||guard.path!=std::string([data[@"buildGuard"] UTF8String])||!arbol_boundary::signature(bundle.UTF8String,false)||
-           !verifyClosedReceipt(data,capability,receipt,frontier,job,guard,bundle)||
-           (!prior&&!receiptMarker(capability,receipt[@"marker"],job))) return false;
+        bool covered=wholeReceipt||(unused&&candidateReceipt&&[digest(bytes(data)) isEqual:candidateReceipt[@"evidence"][@"dataClaimSha256"]]);
+        if(covered) {
+          if(!applyReceipt(data,wholeReceipt)||!withReceipt([&] {
+            return verifyClosedReceipt(data,capability,receipt,frontier,job,job.build,bundle)&&
+              (prior||receiptMarker(capability,receipt[@"marker"],job));
+          })) return false;
+        } else if(guard.fd<0||guard.path!=std::string([data[@"buildGuard"] UTF8String])||!arbol_boundary::signature(bundle.UTF8String,false)||
+            !verifyClosedReceipt(data,capability,receipt,frontier,job,guard,bundle)||
+            (!prior&&!receiptMarker(capability,receipt[@"marker"],job))) return false;
       }
-      if(input[@"previous"]!=NSNull.null) {
+      if(closed&&input[@"previous"]!=NSNull.null) {
         NSDictionary* previous=input[@"previous"];
         bool latest=closed[@"runtime"]!=NSNull.null&&runtime(previous,closed)&&sameRuntimeBinding(previous,closed[@"runtime"]);
         bool writer=data&&data[@"runtime"]!=NSNull.null&&runtime(previous,data)&&sameRuntimeBinding(previous,data[@"runtime"]);
@@ -3146,7 +3268,6 @@ static bool inspectExit(ExitInspection& job) {
           [previous[@"processStartId"] isEqual:unusedReceipt[@"actor"][@"startId"]];
         if(!latest&&!writer&&!prefix) return false;
       }
-    }
     if(!data&&!prior) {
       arbol_exit::NativeFile root; root.fd=open(profile.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
       std::string raw; struct stat marker{}; bool missing;
@@ -3155,8 +3276,8 @@ static bool inspectExit(ExitInspection& job) {
     return job.within();
   };
   auto physical=[&] {
-    if(data&&(!receiptMetadata(capability,data,job)||!receiptFrontier(capability,frontier,receipt[@"capabilityDigest"],job)||
-       (!prior&&!receiptMarker(capability,receipt[@"marker"],job)))) return false;
+    if(data&&!withReceipt([&] { return receiptMetadata(capability,data,job)&&receiptFrontier(capability,frontier,receipt[@"capabilityDigest"],job)&&
+       (prior||receiptMarker(capability,receipt[@"marker"],job)); })) return false;
     if(unused) {
       std::string raw; NSDictionary* checked=nil; struct stat identity{};
       if(!exitReceiptAt(closed[@"terminal"][@"path"],raw,checked,identity)||
@@ -3222,6 +3343,21 @@ static napi_value beginExitInspection(napi_env env,napi_callback_info info) {
     if(!liveLocks.count(additional[i])||(additional[i]->mode!=LOCK_SH&&!(migration&&originalMaintenanceBuildHandle(additional[i])))) return fail(env);
   }
   auto* job=new ExitInspection; job->owner=duplicateHeld(owner); job->build=duplicateHeld(build); job->deadline=deadline;
+  if(arbol_attempt::profileFormat==2&&!migration) {
+    NSDictionary* self=arbol_attempt::processRecord(getpid());
+    NSString* executable=self[@"executable"];
+    NSString* suffix=@"/Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron";
+    if([executable hasSuffix:suffix]) {
+      NSString* bundle=[executable substringToIndex:executable.length-suffix.length];
+      arbol_attempt::PackagedLayout own;
+      if(arbol_attempt::packagedLayout(bundle.UTF8String,own)) {
+        job->activeBundle=own.bundle;
+        for(auto* held:liveLocks) if(held->mode==LOCK_SH&&held->path==own.guard) {
+          job->activeBuild=duplicateHeld(held); if(job->activeBuild.fd>=0) break;
+        }
+      }
+    }
+  }
   // In-process command bytes are ordinary JSON, not a durable canonical exit
   // certificate. Parse immutable data, then enforce exact envelope keys and
   // each complete 16 KiB native attempt grammar independently below.
@@ -3230,7 +3366,7 @@ static napi_value beginExitInspection(napi_env env,napi_callback_info info) {
   if(registry) job->registry=duplicateHeld(registry);
   if(additional[0]) job->dataBuild=duplicateHeld(additional[0]);
   if(additional[1]) job->nextBuild=duplicateHeld(additional[1]);
-  auto closeInputs=[&] { for(auto* lock:{&job->owner,&job->build,&job->dataBuild,&job->nextBuild,&job->registry}) if(lock->fd>=0) close(lock->fd); };
+  auto closeInputs=[&] { for(auto* lock:{&job->owner,&job->build,&job->dataBuild,&job->nextBuild,&job->registry,&job->activeBuild}) if(lock->fd>=0) close(lock->fd); };
   if(!job->input||!job->within()||(additional[0]&&job->dataBuild.fd<0)||(additional[1]&&job->nextBuild.fd<0)) {
     closeInputs(); delete job; return fail(env);
   }
@@ -3257,7 +3393,7 @@ static napi_value beginExitInspection(napi_env env,napi_callback_info info) {
     job->thread=new std::thread([job] {
       bool ok=false;
       @autoreleasepool { @try { try { ok=inspectExit(*job); } catch(...) {} } @catch(NSException*) {} }
-      for(auto* lock:{&job->owner,&job->build,&job->dataBuild,&job->nextBuild,&job->registry}) if(lock->fd>=0&&close(lock->fd)) ok=false;
+      for(auto* lock:{&job->owner,&job->build,&job->dataBuild,&job->nextBuild,&job->registry,&job->activeBuild}) if(lock->fd>=0&&close(lock->fd)) ok=false;
       job->state.store(ok&&!job->cancelled.load(std::memory_order_acquire)&&arbol_boundary::clockMs()<job->deadline?1:-1,std::memory_order_release);
     });
     try { job->thread->detach(); } catch(...) {}
