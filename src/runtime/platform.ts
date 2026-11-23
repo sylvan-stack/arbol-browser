@@ -29,7 +29,7 @@ export interface MaintenanceFileEvidence {
   readonly sha256: string;
 }
 export interface MaintenanceFacts {
-  readonly scope: 'isolated'; readonly epoch: string;
+  readonly scope: 'isolated' | 'installed'; readonly epoch: string;
   readonly bundle: string; readonly runtime: string; readonly stateRoot: string; readonly registry: string;
   readonly runtimeIdentity: FileIdentity & Readonly<{ mode: number }>;
   readonly policySha256: string; readonly hostPolicySha256: string;
@@ -41,6 +41,7 @@ export interface MaintenanceFacts {
 export interface IsolatedMaintenanceInput {
   readonly scope: 'isolated'; readonly bundle: string; readonly policy: string; readonly runtime: string;
 }
+export interface InstalledMaintenanceInput { readonly scope: 'installed'; readonly bundle: string }
 export interface MaintenanceCustody {
   readonly facts: MaintenanceFacts;
   readonly oldBuild: MaintenanceGuard | null;
@@ -233,7 +234,7 @@ export interface PlatformPort {
   /** One-use fixed-exec native adoption. No numeric FD or role is accepted. */
   adoptHostBuild(requestPath: string, guard: string, bundle: string): HeldLock;
   adoptInstalledLaunch(bundle: string): { lock: HeldLock; deadline: number };
-  adoptMaintenanceCustody(input: IsolatedMaintenanceInput): MaintenanceCustody;
+  adoptMaintenanceCustody(input: IsolatedMaintenanceInput | InstalledMaintenanceInput): MaintenanceCustody;
   /** Actual adopted original only: authentic no-use terminal or retained real
    * custody unwind, never normal adoption from cancellation or a public kill. */
   terminateAdoptedHost(build: HeldLock, owner?: HeldLock): never;
@@ -299,7 +300,7 @@ interface NativeSupport {
   latchWatchdogFatal(handle: object): void;
   adoptHostBuild(requestPath: string, guard: string, bundle: string): object;
   adoptInstalledLaunch?(bundle: string): { lock: object; remaining: number };
-  adoptMaintenanceCustody?(bundle: string, policy: string, runtime: string): {
+  adoptMaintenanceCustody?(bundle: string, policy: string | null, runtime: string | null): {
     handle: object; oldBuild: object | null; newBuild: object; facts: string; remaining: number;
   };
   assertMaintenanceCustody?(handle: object): void;
@@ -518,14 +519,17 @@ export function loadPlatform(): PlatformPort {
       held.assertIdentity();
       return { lock: held, deadline: began + remaining };
     },
-    adoptMaintenanceCustody(input: IsolatedMaintenanceInput): MaintenanceCustody {
-      if (process.type === 'browser' || input.scope !== 'isolated' ||
-          ![input.bundle, input.policy, input.runtime].every(path => typeof path === 'string' && isAbsolute(path) && !path.includes('\0')) ||
+    adoptMaintenanceCustody(input: IsolatedMaintenanceInput | InstalledMaintenanceInput): MaintenanceCustody {
+      if (!input || process.type === 'browser' || !['isolated', 'installed'].includes(input.scope) ||
+          Object.keys(input).sort().join(',') !== (input.scope === 'installed' ? 'bundle,scope' : 'bundle,policy,runtime,scope') ||
+          !(input.scope === 'installed' ? [input.bundle] : [input.bundle, input.policy, input.runtime])
+            .every(path => typeof path === 'string' && isAbsolute(path) && !path.includes('\0')) ||
           typeof native.adoptMaintenanceCustody !== 'function' || typeof native.assertMaintenanceCustody !== 'function')
         throw unavailable('browser');
       const adopt = native.adoptMaintenanceCustody, check = native.assertMaintenanceCustody;
       const began = performance.now();
-      const value = call(() => adopt(input.bundle, input.policy, input.runtime));
+      const value = call(() => adopt(input.bundle, input.scope === 'isolated' ? input.policy : null,
+        input.scope === 'isolated' ? input.runtime : null));
       if (!value || !value.handle || typeof value.handle !== 'object' || !value.newBuild || typeof value.newBuild !== 'object' ||
           (value.oldBuild !== null && typeof value.oldBuild !== 'object') ||
           !Number.isFinite(value.remaining) || value.remaining <= 0 || value.remaining > 60000 || typeof value.facts !== 'string')
@@ -535,9 +539,10 @@ export function loadPlatform(): PlatformPort {
       const identity = (i: MaintenanceFileEvidence['identity']): boolean => !!i &&
         /^[0-9]+$/.test(i.device) && /^[0-9]+$/.test(i.inode) && Number.isSafeInteger(i.uid) && i.uid === process.getuid?.();
       const evidence = (e: MaintenanceFileEvidence): boolean => !!e && identity(e.identity) && e.identity.mode === 0o600 && digest(e.sha256);
-      if (!facts || facts.scope !== 'isolated' || facts.bundle !== input.bundle || facts.runtime !== input.runtime ||
+      if (!facts || facts.scope !== input.scope || facts.bundle !== input.bundle ||
+          (input.scope === 'isolated' && facts.runtime !== input.runtime) ||
           ![facts.epoch, facts.policySha256, facts.hostPolicySha256, facts.launcherSha256, facts.imageSha256].every(digest) ||
-          ![facts.stateRoot, facts.registry, facts.journalPath, facts.newBuildPath].every(p => typeof p === 'string' && isAbsolute(p) && !p.includes('\0')) ||
+          ![facts.runtime, facts.stateRoot, facts.registry, facts.journalPath, facts.newBuildPath].every(p => typeof p === 'string' && isAbsolute(p) && !p.includes('\0')) ||
           !identity(facts.runtimeIdentity) || facts.runtimeIdentity.mode !== 0o700 || !evidence(facts.journal) ||
           (facts.selection !== null && !evidence(facts.selection)) ||
           (facts.oldBuildPath === null) !== (value.oldBuild === null) ||
