@@ -178,7 +178,41 @@ async function protectedLocation(path: string, deadline: number): Promise<string
     const physical = await realpath(current); assertBudget(deadline); return join(physical, ...tail);
   }
 }
-async function assertIsolation(layout: PackagedLayout, state: string, deadline: number, maintenanceRoot?: MaintenanceStateRoot): Promise<void> {
+/** Ordinary format2 admission may observe an absent exact signed root. The
+ * canonical private parent remains open while no-follow leaf observations and
+ * held/named parent identities are rechecked. This never creates state and
+ * does not substitute for signed host/image/guard or installed launch custody. */
+async function assertOrdinaryState(state: string, deadline: number): Promise<void> {
+  assertBudget(deadline);
+  const parent = dirname(state), expected = await directory(parent);
+  const held = await open(parent, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const assertParent = async () => {
+      assertBudget(deadline);
+      const current = await held.stat({ bigint: true });
+      if (!current.isDirectory() || String(current.dev) !== String(expected.device) || String(current.ino) !== String(expected.inode) ||
+          current.uid !== BigInt(userInfo().uid) || (current.mode & 0o7777n) !== 0o700n) throw unavailable('browser');
+      await assertDirectory(parent, expected); assertBudget(deadline);
+    };
+    await assertParent();
+    let observed: Awaited<ReturnType<typeof lstat>> | undefined;
+    try { observed = await lstat(state); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw unavailable('browser'); }
+    if (observed) {
+      const root = await directory(state);
+      if (!observed.isDirectory() || String(observed.dev) !== String(root.device) || String(observed.ino) !== String(root.inode))
+        throw unavailable('browser');
+      await assertDirectory(state, root);
+    } else {
+      // A concurrent appearance is uncertainty for this observation. A later
+      // normal command may verify the newly created private root afresh.
+      try { await lstat(state); throw unavailable('browser'); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw unavailable('browser'); }
+    }
+    await assertParent();
+  } finally { await held.close(); }
+}
+async function assertIsolation(layout: PackagedLayout, state: string, deadline: number, maintenanceRoot?: MaintenanceStateRoot, allowAbsent = false): Promise<void> {
   const account = userInfo();
   if (!process.geteuid || account.uid !== process.geteuid() || !canonicalPath(account.homedir)) throw unavailable('browser');
   assertBudget(deadline);
@@ -199,7 +233,10 @@ async function assertIsolation(layout: PackagedLayout, state: string, deadline: 
     await directory(dirname(state)); maintenanceRoot.assert();
     if (maintenanceRoot.initial === 'present') await directory(state);
     maintenanceRoot.assert();
-  } else { assertBudget(deadline); await directory(state); }
+  } else {
+    assertBudget(deadline);
+    if (allowAbsent) await assertOrdinaryState(state, deadline); else await directory(state);
+  }
 }
 export function installedImagePath(layout: PackagedLayout): string | undefined {
   if (layout.scope === 'installed') return join(dirname(dirname(layout.guard)), 'images', `${layout.build}.dmg`);
@@ -370,14 +407,15 @@ async function verifySelectedHost(selection: BuildSelection, payload: string, de
   if (manifest.qualification !== reader || policy.readerKey !== reader) throw unavailable('browser');
   async function assertRoots(limit: number): Promise<void> {
     if (maintenance) { assertMaintenanceCustody(maintenance.custody); maintenance.root.assert(); }
-    if (!image) return assertIsolation(layout, policy.stateRoot, limit, maintenance?.root);
+    if (!image) return assertIsolation(layout, policy.stateRoot, limit, maintenance?.root, identity.component.profileFormat === 2);
     assertBudget(limit);
     await directory(layout.buildRoot, false);
     if (maintenance) {
       await directory(dirname(policy.stateRoot)); maintenance.root.assert();
       if (maintenance.root.initial === 'present') await directory(policy.stateRoot);
       maintenance.root.assert();
-    } else await directory(policy.stateRoot);
+    } else if (identity.component.profileFormat === 2) await assertOrdinaryState(policy.stateRoot, limit);
+    else await directory(policy.stateRoot);
     manifests.assertInstalledImage(signed, image, limit);
   }
   noteHostVerification(observation, 'isolated-roots');

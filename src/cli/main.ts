@@ -180,6 +180,8 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
         },
       });
     }
+    // Info retains the real installed launcher capsule and complete signed
+    // image/policy/guard admission. The verifier alone observes root absence.
     if (ports === defaultPorts) installed = await installedLaunch(commandCutoff);
     const openCutoff = ports === defaultPorts && command.kind === 'open' ? installed?.deadline ?? commandCutoff : undefined;
     if (ports === defaultPorts && (command.kind === 'open' || command.kind === 'profiles-create'))
