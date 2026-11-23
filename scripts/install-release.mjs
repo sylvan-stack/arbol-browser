@@ -306,16 +306,21 @@ async function checkedGuard(path, create = true) {
   return guard;
 }
 
+const installerLocks = new WeakMap();
 async function withLock(provider, path, work, create = true) {
   const expected = await checkedGuard(path, create);
   const held = provider.tryLock(path);
   if (!held) throw new Error('The Browser installation or selected Build is in use');
+  installerLocks.set(provider, (installerLocks.get(provider) ?? 0) + 1);
   try {
     const current = provider.assertLock(held);
     if (current.device !== String(expected.dev) || current.inode !== String(expected.ino)) throw new Error('Browser Build guard changed');
     return await work(held);
   }
-  finally { provider.releaseLock(held); }
+  finally {
+    provider.releaseLock(held);
+    installerLocks.set(provider, installerLocks.get(provider) - 1);
+  }
 }
 
 async function withLockProvider(platform, work) {
@@ -592,6 +597,34 @@ async function prepareMigrationRelease(context, release, options, route, custody
     throw new Error('Maintenance preparation changed original admission');
   return { journal: { ...fileReference(journal), value: journal.value }, guards: custody.guards,
     selection: selected, assets, launcher: fileReference(launcher) };
+}
+
+/** The signed launcher acquires its OWN EX descriptions. The installer
+ * must have left every lock scope before this call: retaining another EX
+ * description would conflict with native acquisition, not transfer custody. */
+async function invokeSignedMaintenance(context, release, prepared, provider) {
+  if ((installerLocks.get(provider) ?? 0) !== 0) throw new Error('Installer custody must end before maintenance handoff');
+  const launcher = await exactFile(context.executable, launcherLimit);
+  const journal = await privateJson(context.journalPath, 16384);
+  if (!sameFile(launcher, prepared.launcher) || launcher.sha256 !== release.launcher.sha256 ||
+      !sameFile(journal, prepared.journal) || !valid('migration.Journal', journal.value))
+    throw new Error('Signed maintenance handoff changed');
+  checkSignature(context.executable, launcherIdentifier);
+  // No caller policy/root/runtime, inherited custody descriptor, environment
+  // selector or rehearsal flag enters the installed maintenance route.
+  const child = spawnSync(context.executable, ['--maintenance-migrate-profiles'], {
+    env: { PATH: '/usr/bin:/bin', LC_ALL: 'C' }, timeout: 31 * 60 * 1000, maxBuffer: 1048576,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let result;
+  try { result = parseStrictJson(child.stdout ?? Buffer.alloc(0), 1048576); }
+  catch { throw new Error('Signed maintenance returned no valid result; installation remains closed'); }
+  if (child.error || child.status !== 0 || !valid('migration.Result', result) || result.completionSha256 === null ||
+      result.diagnostic !== null || result.busy.length || result.converted > 4096 || result.neverOpened > result.converted)
+    throw new Error('Signed maintenance did not complete; installation remains closed');
+  if ((installerLocks.get(provider) ?? 0) !== 0 || !sameFile(await privateJson(context.journalPath, 16384), journal) ||
+      !sameFile(await exactFile(context.executable, launcherLimit), launcher)) throw new Error('Maintenance handoff continuity changed');
+  return Object.freeze({ ...result, busy: Object.freeze([...result.busy]) });
 }
 
 /** Publish the exact selected binary and image under the same guards used by launch and retirement. */
