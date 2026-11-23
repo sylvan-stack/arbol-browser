@@ -973,6 +973,35 @@ async function retireRollback(context, proof, custody, afterSelection) {
   await recheckRollback(context, proof.rollback, custody, true);
 }
 
+async function finalizeMigration(context, release, custody) {
+  let proofFile = await readReopeningProof(context, release, custody);
+  if (!proofFile) throw new Error('No durable native completion proof; admission remains closed');
+  const proof = proofFile.value, prepared = proofPrepared(proof);
+  let after = equal(await optionalSelection(context.selectionPath), proof.after.selection);
+  await retireRollback(context, proof, custody, after);
+  await preparedBindings(context, release, prepared, custody, after);
+  await recheckEvidence(context, proof);
+  if (!sameFile(await privateJson(context.proofPath, proofLimit), proofFile)) throw new Error('Reopening authority changed');
+  await recheckRollback(context, proof.rollback, custody, true);
+  if (!after) {
+    await replaceFile(context.selectionPath, encode(proof.after.selection), 0o600);
+    after = true;
+  }
+  proofFile = await readReopeningProof(context, release, custody);
+  if (!proofFile) throw new Error('Reopening proof disappeared');
+  await preparedBindings(context, release, prepared, custody, after);
+  await recheckRollback(context, proof.rollback, custody, true);
+  if (!sameFile(await privateJson(context.journalPath, 16384), proof.journal)) throw new Error('Journal changed before final removal');
+  await custody.assert();
+  await unlink(context.journalPath); await syncPath(context.support);
+  await absent(context.journalPath); await custody.assert();
+  return installationResult(context, release);
+}
+function installationResult(context, release) {
+  return { build: release.build, source: release.source, imageSha256: release.imageSha256,
+    executable: context.executable, image: context.image, mount: context.mount, alias: context.alias };
+}
+
 /** Publish the exact selected binary and image under the same guards used by launch and retirement. */
 export async function installRelease(options) {
   const release = await verifySignedRelease(options);
