@@ -1,4 +1,4 @@
-import { lstat, rename, rmdir } from 'node:fs/promises';
+import { lstat, opendir, rename, rmdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import type { Contract } from '../contracts/generated.js';
@@ -59,9 +59,28 @@ async function stageProfile(transaction: MigrationTransaction, registry: HeldLoc
   const assert = () => assertMigrationProfile(transaction, registry, owner, entry, deadline);
   const base = join(owner.state, 'migration-staged'), attempt = join(base, transaction.value.attempt), staging = join(attempt, entry.pathSha256);
   await ensureMigrationDirectory(base, assert); await ensureMigrationDirectory(attempt, assert);
-  await migrationAbsent(staging); await ensureMigrationDirectory(staging, assert);
-  const record = await publishMigrationFile(join(staging, 'profile.json'), Buffer.from(entry.targetRecord.base64, 'base64'), deadline, assert);
-  const marker = entry.targetMarker ? await publishMigrationFile(join(staging, 'engine.json'), Buffer.from(entry.targetMarker.base64, 'base64'), deadline, assert) : null;
+  await ensureMigrationDirectory(staging, assert);
+  // A crash may leave a fully fsynced target before the staged entry. Only
+  // exact predetermined target bytes on private single-link files may be
+  // recorded now, after fresh native ORIGINAL proof; unknown remnants refuse.
+  const directory = await opendir(staging); let count = 0;
+  try {
+    for (;;) {
+      const item = await directory.read(); if (!item) break;
+      if (++count > 2 || (item.name !== 'profile.json' && !(entry.targetMarker && item.name === 'engine.json'))) throw profileUnavailable();
+    }
+  } finally { await directory.close(); }
+  const target = async (name: string, expected: Contract<'migration.Target'>): Promise<MigrationContent> => {
+    const path = join(staging, name); let exists = true;
+    try { await lstat(path); } catch (error) { if (!missing(error)) throw error; exists = false; }
+    const actual = exists ? await readMigrationFile(path) :
+      await publishMigrationFile(path, Buffer.from(expected.base64, 'base64'), deadline, assert);
+    if (actual.sha256 !== expected.sha256 || actual.base64 !== expected.base64 || actual.identity.device !== entry.directory.device)
+      throw profileUnavailable();
+    await assert(); return actual;
+  };
+  const record = await target('profile.json', entry.targetRecord);
+  const marker = entry.targetMarker ? await target('engine.json', entry.targetMarker) : null;
   if (record.sha256 !== entry.targetRecord.sha256 || record.identity.device !== entry.directory.device ||
       (marker && (marker.sha256 !== entry.targetMarker?.sha256 || marker.identity.device !== entry.directory.device))) throw profileUnavailable();
   const file = (value: MigrationContent) => Object.freeze({ identity: value.identity, sha256: value.sha256 });
