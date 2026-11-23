@@ -1890,7 +1890,7 @@ struct MigrationObservation {
     if (!keys(profileRecord,@[@"format",@"id",@"instance",@"creationRequest",@"createdAt"]) ||
         !uintNumber(profileRecord[@"format"],format) || format != 1 || ![profileRecord[@"id"] isEqual:profile.lastPathComponent] ||
         ![profileRecord[@"instance"] isEqual:job.input[@"profileInstance"]] ||
-        !pattern(profileRecord[@"creationRequest"],@"^req_[A-Za-z0-9_-]{22}$") ||
+        !pattern(profileRecord[@"creationRequest"],@"^create_[A-Za-z0-9_-]{22}$") ||
         !pattern(profileRecord[@"createdAt"],@"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z$")) return false;
     NSISO8601DateFormatter* dates = [NSISO8601DateFormatter new];
     dates.formatOptions = NSISO8601DateFormatWithInternetDateTime |
