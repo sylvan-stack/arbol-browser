@@ -230,9 +230,6 @@ inline bool record(NSDictionary* p) {
       ![@[@"untransferred",@"transferring",@"retained",@"mutation-started",@"marker-bound",@"admitted"] containsObject:p[@"stage"]]) return false;
   if ((p[@"bootstrap"] != NSNull.null && !process(p[@"bootstrap"])) ||
       (p[@"engine"] != NSNull.null && !process(p[@"engine"])) || !runtime(p[@"runtime"],p)) return false;
-  NSString* component = [p[@"buildRoot"] stringByDeletingLastPathComponent];
-  if (![[component lastPathComponent] isEqual:@"arbol-browser"] || ![[p[@"buildRoot"] lastPathComponent] isEqual:p[@"build"]] ||
-      ![p[@"buildGuard"] isEqual:[[component stringByAppendingPathComponent:@".uses"] stringByAppendingPathComponent:p[@"build"]]]) return false;
   if ([p[@"phase"] isEqual:@"pending"] && (p[@"bootstrap"] != NSNull.null || p[@"engine"] != NSNull.null || p[@"runtime"] != NSNull.null || p[@"terminal"] != NSNull.null || ![p[@"stage"] isEqual:@"untransferred"])) return false;
   if (p[@"engine"] != NSNull.null) {
     NSDictionary* a = p[@"bootstrap"], *b = p[@"engine"];
@@ -246,6 +243,8 @@ inline bool record(NSDictionary* p) {
       ![p[@"runtime"][@"pid"] isEqual:p[@"engine"][@"pid"]] || ![p[@"runtime"][@"processStartId"] isEqual:p[@"engine"][@"startId"]])) return false;
   if (p[@"terminal"] != NSNull.null && !keys(p[@"terminal"],@[@"path",@"digest"])) return false;
   if (p[@"terminal"] != NSNull.null && (!path(p[@"terminal"][@"path"]) || !pattern(p[@"terminal"][@"digest"],@"^[0-9a-f]{64}$"))) return false;
+  // One layout check derives the installed support guard or isolated .uses,
+  // and binds it to the original starter/bootstrap/engine paths.
   PackagedLayout layout; return claimedLayout(p,layout);
 }
 inline bool immutable(NSDictionary* a, NSDictionary* b) {
