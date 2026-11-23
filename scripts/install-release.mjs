@@ -10,6 +10,14 @@ import { fileURLToPath } from 'node:url';
 import { inventory, inventoryDigest } from './package-base.mjs';
 import { assertPhysicalCap, canonical, exactFile, hash, json, privateDirectory, writeExclusive } from './package-host.mjs';
 import installation from '../src/runtime/installation-paths.json' with { type: 'json' };
+import { Ajv2020 } from 'ajv/dist/2020.js';
+import addFormats from 'ajv-formats';
+import browserContract from '../src/contracts/browser.schema.json' with { type: 'json' };
+import wireContract from '../src/contracts/wire.schema.json' with { type: 'json' };
+import profileContract from '../src/contracts/profile.schema.json' with { type: 'json' };
+import profile2Contract from '../src/contracts/profile-format-2.schema.json' with { type: 'json' };
+import migrationContract from '../src/contracts/migration.schema.json' with { type: 'json' };
+import nativeContract from '../src/contracts/native.schema.json' with { type: 'json' };
 import publisher from '../native/production-publisher-requirement.json' with { type: 'json' };
 
 const imageLimit = 1073741824;
@@ -20,6 +28,87 @@ const relativePlatform = 'Contents/Resources/browser/native/platform.node';
 const relativePolicy = 'Contents/Resources/host-policy.json';
 const digest = value => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
 const buildNumber = value => typeof value === 'string' && /^[1-9a-f][0-9a-f]{0,15}$/.test(value);
+
+const transactionLimit = 4096 * (4 * 87384 + 8192) + 65536;
+const proofLimit = 256 * 1024 * 1024;
+const schemas = { browser: browserContract, wire: wireContract, profile: profileContract,
+  profile2: profile2Contract, migration: migrationContract, native: nativeContract };
+const ajv = new Ajv2020({ strict: true, strictRequired: false, strictTypes: false, coerceTypes: false });
+ajv.addKeyword('x-tools'); addFormats(ajv);
+for (const schema of Object.values(schemas)) ajv.addSchema(schema);
+function valid(name, value) {
+  const [bundle, definition] = name.split('.');
+  return ajv.getSchema(`${schemas[bundle].$id}#/$defs/${definition}`)(value);
+}
+function keys(value, names) {
+  return value && typeof value === 'object' && !Array.isArray(value) &&
+    Object.keys(value).sort().join(',') === [...names].sort().join(',');
+}
+/** Bounded management JSON. Detect duplicate decoded names before JSON.parse. */
+function parseStrictJson(bytes, limit = 65536) {
+  if (!Number.isSafeInteger(limit) || limit < 1 || bytes.byteLength > limit) throw new Error('Invalid management JSON');
+  const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+  let at = 0;
+  const fail = () => { throw new Error('Invalid management JSON'); };
+  const space = () => { while (at < text.length && /[\x20\x09\x0a\x0d]/.test(text[at])) at++; };
+  const string = () => {
+    if (text[at] !== '"') return fail();
+    const start = at++;
+    while (at < text.length) {
+      const char = text[at++];
+      if (char === '"') {
+        const result = JSON.parse(text.slice(start, at));
+        return typeof result === 'string' ? result : fail();
+      }
+      if (char === '\\') { if (at >= text.length) return fail(); at++; }
+      else if (char.charCodeAt(0) < 0x20) return fail();
+    }
+    return fail();
+  };
+  const value = (depth) => {
+    if (depth > 128) return fail();
+    space();
+    if (text[at] === '"') { string(); return; }
+    if (text[at] === '{') {
+      at++; space();
+      const keys = new Set();
+      if (text[at] === '}') { at++; return; }
+      for (;;) {
+        space(); const key = string();
+        if (keys.has(key)) return fail();
+        keys.add(key); space();
+        if (text[at++] !== ':') return fail();
+        value(depth + 1); space();
+        const delimiter = text[at++];
+        if (delimiter === '}') return;
+        if (delimiter !== ',') return fail();
+      }
+    }
+    if (text[at] === '[') {
+      at++; space();
+      if (text[at] === ']') { at++; return; }
+      for (;;) {
+        value(depth + 1); space();
+        const delimiter = text[at++];
+        if (delimiter === ']') return;
+        if (delimiter !== ',') return fail();
+      }
+    }
+    const token = /^(?:true|false|null|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)/.exec(text.slice(at));
+    if (!token) return fail();
+    at += token[0].length;
+  };
+  value(0); space();
+  if (at !== text.length) return fail();
+  return JSON.parse(text);
+}
+
+async function privateJson(path, limit = 8388608) {
+  const file = await exactFile(path, limit);
+  if (file.identity.mode !== 0o600 || file.identity.uid !== userInfo().uid) throw new Error('Installer management file is unsafe');
+  return { ...file, value: parseStrictJson(file.bytes, limit) };
+}
+function sameFile(a, b) { return a && b && a.sha256 === b.sha256 && canonical(a.identity) === canonical(b.identity); }
 
 function run(program, args, input) {
   const result = spawnSync(program, args, { input, encoding: 'utf8', timeout: 120000, maxBuffer: 1048576,
@@ -82,7 +171,7 @@ export async function verifySignedRelease({ image, signedReceiptPath }) {
   const mount = await mkdtemp(join(await realpath(tmpdir()), 'arbol-browser-release-'));
   await privateDirectory(mount);
   let attached;
-  let launcher, platform;
+  let launcher, platform, metadata;
   try {
     attached = run('/usr/bin/hdiutil', ['attach', image, '-readonly', '-nokernel', '-mountpoint', mount,
       '-noautoopen', '-nobrowse', '-plist']).stdout;
@@ -96,6 +185,13 @@ export async function verifySignedRelease({ image, signedReceiptPath }) {
         policy.sha256 !== expected.files[relativePolicy] || canonical(policy.value) !== canonical(expected.policy)) {
       throw new Error('Application differs from its recorded signed inventory');
     }
+    metadata = await json(join(app, 'Contents/Resources/browser/metadata.json'));
+    const component = metadata.value.component;
+    if (!keys(component, ['name', 'version', 'build', 'contract', 'profileFormat']) ||
+        !valid('profile2.ComponentInfo', { ...component, stateDirectory: expected.policy.stateRoot }) ||
+        component.build !== expected.build || metadata.sha256 !== expected.policy.metadataDigest ||
+        metadata.value.sourceDigest !== expected.policy.sourceDigest ||
+        metadata.value.host?.productDigest !== expected.productDigest) throw new Error('Signed release management format or identity differs');
     const path = join(app, relativeLauncher);
     checkSignature(path, launcherIdentifier);
     launcher = await exactFile(path, launcherLimit);
@@ -111,7 +207,8 @@ export async function verifySignedRelease({ image, signedReceiptPath }) {
     await rmdir(mount);
   }
   return { build: expected.build, source: expected.source, imageSha256: expected.imageSha256,
-    payloadDigest: expected.payloadDigest, launcher, platform };
+    payloadDigest: expected.payloadDigest, sourceDigest: metadata.value.sourceDigest,
+    productDigest: expected.productDigest, profileFormat: 2, launcher, platform };
 }
 
 async function safeDirectories(home, parts, privateFrom) {
@@ -159,7 +256,7 @@ async function optionalFile(path, maximum) {
 async function optionalSelection(path) {
   const file = await optionalFile(path, 4096);
   if (!file) return null;
-  const value = JSON.parse(file.bytes.toString('utf8'));
+  const value = parseStrictJson(file.bytes, 4096);
   if (value?.scope === 'rehearsal') throw new Error('Withdraw the guarded Browser rehearsal before installing a release');
   if (Object.keys(value).sort().join(',') !== 'build,format,imageSha256' || value.format !== 1 ||
       !buildNumber(value.build) || !digest(value.imageSha256) || file.identity.mode !== 0o600 ||
@@ -244,7 +341,9 @@ async function recoverInstall(support, executable, alias, provider, uses) {
   const journal = join(support, 'install-transaction.json'), backup = join(support, 'install-previous-launcher');
   const pending = await optionalFile(journal, 4096);
   if (!pending) return;
-  const { format, before, after, aliasBefore } = JSON.parse(pending.bytes.toString('utf8'));
+  const decoded = parseStrictJson(pending.bytes, 4096);
+  if (decoded.format === 3) throw new Error('Journal3 requires forward signed maintenance; legacy rollback cannot consume it');
+  const { format, before, after, aliasBefore } = decoded;
   const checked = item => item && item.selection?.format === 1 && buildNumber(item.selection.build) &&
     digest(item.selection.imageSha256) && digest(item.launcherSha256);
   if (pending.identity.mode !== 0o600 || pending.identity.uid !== userInfo().uid ||
@@ -287,6 +386,75 @@ async function recoverInstall(support, executable, alias, provider, uses) {
     try { await unlink(backup); } catch (error) { if (error.code !== 'ENOENT') throw error; }
     await syncPath(support);
   }, false);
+}
+
+/** Read the predecessor format from its exact signed installed image, never
+ * from a Build number, rehearsal selection or editable format hint. */
+async function installedProfileFormat(support, selected) {
+  const receipt = await installedImageReceipt(support, selected);
+  if (!keys(receipt, ['format', 'build', 'imageSha256', 'source', 'payloadDigest', 'launcherSha256']) ||
+      !/^[0-9a-f]{40}$/.test(receipt.source)) throw new Error('Installed release receipt is incomplete');
+  const image = join(support, 'images', `${selected.build}.dmg`);
+  if ((await exactFile(image, imageLimit)).sha256 !== selected.imageSha256) throw new Error('Installed predecessor image differs');
+  checkSignature(image);
+  const mount = await mkdtemp(join(await realpath(tmpdir()), 'arbol-browser-predecessor-'));
+  await privateDirectory(mount); let attached = false;
+  try {
+    const data = plist('/usr/bin/hdiutil', ['attach', image, '-readonly', '-nokernel', '-mountpoint', mount,
+      '-noautoopen', '-nobrowse', '-plist']); attached = true;
+    const app = await mountedApplication(image, mount, data);
+    checkSignature(app, publisher.bundleIdentifier, true);
+    if (inventoryDigest(await inventory(app)) !== receipt.payloadDigest) throw new Error('Installed predecessor inventory differs');
+    const metadata = await json(join(app, 'Contents/Resources/browser/metadata.json'));
+    const policy = await json(join(app, relativePolicy));
+    const component = metadata.value.component;
+    if (!keys(component, ['name', 'version', 'build', 'contract', 'profileFormat']) ||
+        !valid('wire.ComponentInfo', { ...component, stateDirectory: policy.value.stateRoot }) ||
+        component.build !== selected.build || policy.value.purpose !== 'production' ||
+        policy.value.build !== selected.build || policy.value.buildRoot !== join(...installation.stableBuilds, selected.build) ||
+        policy.value.stateRoot !== join(installation.root, installation.browser) ||
+        policy.value.metadataDigest !== metadata.sha256 || policy.value.sourceDigest !== metadata.value.sourceDigest ||
+        policy.value.productDigest !== metadata.value.host?.productDigest ||
+        metadata.value.sourceIdentity?.commit !== receipt.source) throw new Error('Installed predecessor metadata differs');
+    if ((await exactFile(image, imageLimit)).sha256 !== selected.imageSha256) throw new Error('Installed predecessor changed');
+    return component.profileFormat;
+  } finally {
+    if (attached) run('/usr/bin/hdiutil', ['detach', mount]);
+    await rmdir(mount);
+  }
+}
+async function installationJournal(support) {
+  const path = join(support, 'install-transaction.json');
+  if (!await optionalFile(path, 16384)) return null;
+  const file = await privateJson(path, 16384);
+  if (file.value.format === 3 && (!valid('migration.Journal', file.value) ||
+      file.value.before?.selection.build === file.value.after.selection.build)) throw new Error('Journal3 is unsafe');
+  if (![1, 2, 3].includes(file.value.format)) throw new Error('Unknown installation journal');
+  return file;
+}
+async function installationRoute(context, release) {
+  if (release.profileFormat !== 2) throw new Error('Current release must operate profile format2');
+  const pending = await installationJournal(context.support);
+  const selected = await optionalSelection(context.selectionPath);
+  const after = { selection: { format: 1, build: release.build, imageSha256: release.imageSha256 },
+    launcherSha256: release.launcher.sha256 };
+  if (pending) {
+    if (pending.value.format !== 3) return { kind: 'legacy', pending };
+    if (canonical(pending.value.after) !== canonical(after) ||
+        ![pending.value.before?.selection ?? null, after.selection].some(value => canonical(value) === canonical(selected)))
+      throw new Error('Pending conversion requires its exact signed candidate and selection');
+    return { kind: 'migration', pending, previous: pending.value.before?.selection ?? null };
+  }
+  if (canonical(selected) === canonical(after.selection)) return { kind: 'same', previous: selected };
+  if (selected && BigInt(`0x${selected.build}`) >= BigInt(`0x${release.build}`)) throw new Error('Release number cannot move backwards');
+  const format = selected ? await installedProfileFormat(context.support, selected) : null;
+  if (format === 2) return { kind: 'ordinary', previous: selected };
+  // Completed migration evidence is immutable, not reusable for a new
+  // candidate or permission to select an old writer again.
+  const cutovers = (await readdir(join(context.support, 'releases'))).filter(name => /^[1-9a-f][0-9a-f]{0,15}\.migration\.json$/.test(name));
+  if (cutovers.length || await optionalFile(join(context.runtime, 'browser-profile-migration/current'), 16384))
+    throw new Error('Format1 selection contradicts retained cutover evidence');
+  return { kind: 'migration', pending: null, previous: selected };
 }
 
 /** Publish the exact selected binary and image under the same guards used by launch and retirement. */
