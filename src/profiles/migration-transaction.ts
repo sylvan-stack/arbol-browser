@@ -1,5 +1,5 @@
 import { constants, type BigIntStats } from 'node:fs';
-import { lstat, mkdir, open, realpath, link, unlink } from 'node:fs/promises';
+import { lstat, mkdir, open, realpath } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { dirname, join, relative, resolve } from 'node:path';
@@ -39,13 +39,12 @@ export async function ensureMigrationDirectory(path: string, assert: () => Promi
   if (result.device !== parent.device || !sameMigrationIdentity(parent, await migrationDirectory(dirname(path)))) throw profileUnavailable();
   await assert(); return result;
 }
-/** Atomic no-replace publication. A same-directory private temporary file is
- * fsynced before linking the final name, then unlinked and the directory synced.
- * Crash-between-link-and-unlink remains a closed, unprovable two-link file;
- * it is never accepted as a management record or silently overwritten. */
-export async function publishMigrationFile(path: string, bytes: Uint8Array, deadline: number,
+/** Atomic no-replace publication of a fully fsynced single-link inode.
+ * Native retains and validates the same source/parent through RENAME_EXCL;
+ * death can leave only the private temporary or the complete final file. */
+export async function publishMigrationFile(admission: MigrationAdmission, path: string, bytes: Uint8Array, deadline: number,
   assert: () => Promise<void>): Promise<MigrationContent> {
-  migrationTime(deadline); await assert();
+  assertMigrationAdmission(admission); migrationTime(deadline); await assert();
   const parent = await migrationDirectory(dirname(path)); await migrationAbsent(path);
   const temporary = join(dirname(path), `.migration-${randomBytes(16).toString('hex')}`);
   const fd = await open(temporary, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
@@ -58,11 +57,9 @@ export async function publishMigrationFile(path: string, bytes: Uint8Array, dead
     if (staged.sha256 !== migrationDigest(bytes) || !sameMigrationIdentity(staged.identity, migrationIdentity(original))) throw profileUnavailable();
     await assert(); migrationTime(deadline);
     if (!sameMigrationIdentity(parent, await migrationDirectory(dirname(path)))) throw profileUnavailable();
-    await link(temporary, path);
-    const published = await lstat(path, { bigint: true }), held = await fd.stat({ bigint: true });
-    if (!published.isFile() || published.dev !== original.dev || published.ino !== original.ino || published.nlink !== 2n ||
-        held.dev !== original.dev || held.ino !== original.ino || held.nlink !== 2n) throw profileUnavailable();
-    await unlink(temporary); await fd.sync(); await syncDirectory(dirname(path));
+    admission.platform.publishMaintenanceFile(admission.custody, temporary, path, parent,
+      { identity: staged.identity, sha256: staged.sha256 }, deadline);
+    await fd.sync(); await syncDirectory(dirname(path));
     const result = await readMigrationFile(path, Math.max(65536, bytes.byteLength));
     if (!sameMigrationFile(result, staged) || !sameMigrationIdentity(parent, await migrationDirectory(dirname(path)))) throw profileUnavailable();
     await assert(); migrationTime(deadline); return result;
@@ -244,11 +241,11 @@ export async function createMigrationTransaction(preflight: MigrationPreflight, 
     const assert = async () => { await preflight.assertOriginals(deadline); await archive.assert(); await migrationAbsent(join(root, 'current')); };
     await ensureMigrationDirectory(root, assert); await migrationAbsent(attempt);
     await ensureMigrationDirectory(attempt, assert); await ensureMigrationDirectory(join(attempt, 'progress'), assert);
-    const file = await publishMigrationFile(join(attempt, 'transaction.json'), bytes, deadline, assert);
+    const file = await publishMigrationFile(admission, join(attempt, 'transaction.json'), bytes, deadline, assert);
     await archive.assert(); await preflight.assertOriginals(deadline);
     // After the pointer is visible it cannot be required absent by the final
     // assertion. Exact transaction/admission and native custody remain held.
-    await publishMigrationFile(join(root, 'current'), Buffer.from(`${JSON.stringify({ format: 1, attempt: id, transactionSha256: file.sha256 })}\n`),
+    await publishMigrationFile(admission, join(root, 'current'), Buffer.from(`${JSON.stringify({ format: 1, attempt: id, transactionSha256: file.sha256 })}\n`),
       deadline, async () => { await preflight.assertOriginals(deadline); await archive.assert(); });
     const transaction = await readMigrationTransaction(admission, deadline); if (!transaction) throw profileUnavailable();
     return transaction;

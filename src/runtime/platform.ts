@@ -319,6 +319,8 @@ export interface PlatformPort {
   adoptInstalledLaunch(bundle: string): { lock: HeldLock; deadline: number };
   adoptMaintenanceCustody(input: IsolatedMaintenanceInput | InstalledMaintenanceInput): MaintenanceCustody;
   observeMaintenanceStateRoot(custody: MaintenanceCustody): MaintenanceStateRoot;
+  publishMaintenanceFile(custody: MaintenanceCustody, source: string, destination: string,
+    parent: MaintenanceFileEvidence['identity'], file: MaintenanceFileEvidence, deadline: number): void;
   /** Actual adopted original only: authentic no-use terminal or retained real
    * custody unwind, never normal adoption from cancellation or a public kill. */
   terminateAdoptedHost(build: HeldLock, owner?: HeldLock): never;
@@ -393,6 +395,7 @@ interface NativeSupport {
     handle: object; oldBuild: object | null; newBuild: object; facts: string; remaining: number;
   };
   assertMaintenanceCustody?(handle: object): void;
+  publishMaintenanceFile?(handle: object, source: string, destination: string, expected: string, deadline: number): void;
   observeMaintenanceStateRoot?(handle: object): string;
   assertMaintenanceStateRoot?(handle: object): void;
   terminateAdoptedHost(build: object, owner: object | null): never;
@@ -655,6 +658,20 @@ export function loadPlatform(): PlatformPort {
         oldBuild: value.oldBuild === null ? null : guard(value.oldBuild, facts.oldBuildPath!),
         newBuild: guard(value.newBuild, facts.newBuildPath), deadline: began + value.remaining, assert });
       assert(); maintenanceReceipts.add(custody); maintenanceHandles.set(custody, value.handle); return custody;
+    },
+    publishMaintenanceFile(custody: MaintenanceCustody, source: string, destination: string,
+      parent: MaintenanceFileEvidence['identity'], file: MaintenanceFileEvidence, deadline: number): void {
+      assertMaintenanceCustody(custody);
+      const handle = maintenanceHandles.get(custody), publish = native.publishMaintenanceFile;
+      if (!handle || typeof publish !== 'function' || !validator('migration.Identity')(parent) || parent.mode !== 0o700 ||
+          !validator('migration.File')(file) || file.identity.mode !== 0o600 ||
+          !Number.isFinite(deadline) || ![source, destination].every(path => isAbsolute(path) && !path.includes('\0')))
+        throw unavailable('profile');
+      const nativeNow = call(() => native.continuousTime()), sampled = performance.now();
+      if (sampled >= deadline) throw unavailable('profile');
+      call(() => publish(handle, source, destination, JSON.stringify({ parent, file }), nativeNow + Math.min(10000, deadline - sampled)));
+      assertMaintenanceCustody(custody);
+      if (performance.now() >= deadline) throw unavailable('profile');
     },
     observeMaintenanceStateRoot(custody: MaintenanceCustody): MaintenanceStateRoot {
       assertMaintenanceCustody(custody);

@@ -750,6 +750,55 @@ static napi_value assertMaintenanceCustody(napi_env env, napi_callback_info info
   } @catch (NSException*) { return fail(env); } } catch (...) { return fail(env); } }
 }
 
+// Management publication only; ordinary profile metadata and retained native
+// receipts have their own, stronger publication/permit routes. A single-link
+// inode moves atomically, including when this process dies during publication.
+static napi_value publishMaintenanceFile(napi_env env,napi_callback_info info) {
+  napi_value args[5]; size_t count=5; void* raw=nullptr; std::string source,destination,encoded; double deadline=0;
+  if(arbol_attempt::profileFormat!=2||napi_get_cb_info(env,info,&count,args,nullptr,nullptr)!=napi_ok||count!=5||
+     napi_get_value_external(env,args[0],&raw)!=napi_ok||!raw||raw!=maintenanceCustody||!maintenanceCustody->accepted||
+     !boundedText(env,args[1],source)||!boundedText(env,args[2],destination)||!boundedText(env,args[3],encoded)||
+     napi_get_value_double(env,args[4],&deadline)!=napi_ok||!std::isfinite(deadline)||
+     deadline<=arbol_boundary::clockMs()||deadline>arbol_boundary::clockMs()+10000) return fail(env);
+  @autoreleasepool { try { @try {
+    using namespace arbol_attempt;
+    auto custody=[] { return maintenanceCustody&&maintenanceCustody->accepted&&maintenanceCustody->current()&&
+      [maintenanceCustody->parent[@"pid"] intValue]==getppid()&&currentProcess(maintenanceCustody->parent); };
+    const size_t a=source.rfind('/'),b=destination.rfind('/');
+    if(a==std::string::npos||b==std::string::npos||a==0||source.substr(0,a)!=destination.substr(0,b)||source==destination)
+      return fail(env);
+    const std::string parentPath=source.substr(0,a),from=source.substr(a+1),to=destination.substr(b+1);
+    const std::string runtimeRoot=maintenanceCustody->runtime().path+"/browser-profile-migration";
+    NSString* state=maintenanceCustody->stateRoot(); if(!path(state)) return fail(env);
+    const std::string stagingRoot=std::string(state.fileSystemRepresentation)+"/migration-staged";
+    if((parentPath!=runtimeRoot&&!within(parentPath,runtimeRoot)&&!within(parentPath,stagingRoot))||
+       !pattern([NSString stringWithUTF8String:from.c_str()],@"^\\.migration-[0-9a-f]{32}$")||
+       to.empty()||to=="."||to==".."||!arbol_boundary::canonical(source)||!custody()) return fail(env);
+    NSDictionary* expected=json(encoded);
+    if(!keys(expected,@[@"parent",@"file"])||!keys(expected[@"file"],@[@"identity",@"sha256"])||
+       !pattern(expected[@"file"][@"sha256"],@"^[0-9a-f]{64}$")) return fail(env);
+    MaintenanceDirectory parent; MaintenanceFile file;
+    if(!parent.openPath(parentPath,expected[@"parent"])||!file.openPath(source,0600,1500000000)||
+       file.identity.st_dev!=parent.identity.st_dev||
+       ![maintenanceIdentity(file.identity) isEqual:expected[@"file"][@"identity"]]||
+       ![file.sha256(deadline) isEqual:expected[@"file"][@"sha256"]]) return fail(env);
+    auto current=[&] { return custody()&&parent.current()&&file.current()&&arbol_boundary::clockMs()<deadline; };
+    if(!current()||fsync(file.fd)||fcntl(file.fd,F_FULLFSYNC)||!current()||
+       renameatx_np(parent.fd,from.c_str(),parent.fd,to.c_str(),RENAME_EXCL)) return fail(env);
+    struct stat held{},named{},old{};
+    if(fstat(file.fd,&held)||fstatat(parent.fd,to.c_str(),&named,AT_SYMLINK_NOFOLLOW)||!sameFile(held,named)) return fail(env);
+    // Rename may change ctime, and only ctime. Rebase that observation only
+    // after the same original inode and every other file property agree.
+    struct stat renamedExpected=file.identity; renamedExpected.st_ctimespec=held.st_ctimespec;
+    if(!sameFile(renamedExpected,held)||![maintenanceIdentity(held) isEqual:expected[@"file"][@"identity"]]) return fail(env);
+    file.path=destination; file.identity=held;
+    errno=0; if(!fstatat(parent.fd,from.c_str(),&old,AT_SYMLINK_NOFOLLOW)||errno!=ENOENT) return fail(env);
+    if(!current()||![file.sha256(deadline) isEqual:expected[@"file"][@"sha256"]]||
+       fsync(file.fd)||fcntl(file.fd,F_FULLFSYNC)||fsync(parent.fd)||!current()) return fail(env);
+    napi_value out; if(napi_get_undefined(env,&out)!=napi_ok) return fail(env); return out;
+  } @catch(NSException*) { return fail(env); } } catch(...) { return fail(env); } }
+}
+
 static napi_value adoptInstalledLaunch(napi_env env, napi_callback_info info) {
   static bool attempted = false;
   if (attempted) return fail(env);
@@ -3551,6 +3600,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"adoptInstalledLaunch",nullptr,adoptInstalledLaunch,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"adoptMaintenanceCustody",nullptr,adoptMaintenanceCustody,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"assertMaintenanceCustody",nullptr,assertMaintenanceCustody,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"publishMaintenanceFile",nullptr,publishMaintenanceFile,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"observeMaintenanceStateRoot",nullptr,observeMaintenanceStateRoot,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"assertMaintenanceStateRoot",nullptr,assertMaintenanceStateRoot,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"continuousTime",nullptr,continuousTime,nullptr,nullptr,nullptr,napi_default,nullptr},

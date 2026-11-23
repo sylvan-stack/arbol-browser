@@ -74,7 +74,7 @@ async function stageProfile(transaction: MigrationTransaction, registry: HeldLoc
     const path = join(staging, name); let exists = true;
     try { await lstat(path); } catch (error) { if (!missing(error)) throw error; exists = false; }
     const actual = exists ? await readMigrationFile(path) :
-      await publishMigrationFile(path, Buffer.from(expected.base64, 'base64'), deadline, assert);
+      await publishMigrationFile(transaction.admission, path, Buffer.from(expected.base64, 'base64'), deadline, assert);
     if (actual.sha256 !== expected.sha256 || actual.base64 !== expected.base64 || actual.identity.device !== entry.directory.device)
       throw profileUnavailable();
     await assert(); return actual;
@@ -87,7 +87,7 @@ async function stageProfile(transaction: MigrationTransaction, registry: HeldLoc
   const staged: Staged = Object.freeze({ format: 1, attempt: transaction.value.attempt, profileSha256: entry.pathSha256,
     record: file(record), marker: marker ? file(marker) : null });
   if (!validator('migration.Staged')(staged)) throw profileUnavailable();
-  await publishMigrationFile(join(transaction.attempt, 'progress', `${entry.pathSha256}.staged.json`),
+  await publishMigrationFile(transaction.admission, join(transaction.attempt, 'progress', `${entry.pathSha256}.staged.json`),
     Buffer.from(`${JSON.stringify(staged)}\n`), deadline, assert);
   const actual = await readMigrationStage(transaction, entry, deadline);
   if (!actual || !isDeepStrictEqual(actual, staged)) throw profileUnavailable();
@@ -122,7 +122,7 @@ export async function publishMigrationCommitted(transaction: MigrationTransactio
   const committed: Contract<'migration.Committed'> = { format: 1, attempt: transaction.value.attempt,
     profileSha256: entry.pathSha256, receipt: receipt.receipt };
   if (!validator('migration.Committed')(committed)) throw profileUnavailable();
-  await publishMigrationFile(join(transaction.attempt, 'progress', `${entry.pathSha256}.committed.json`),
+  await publishMigrationFile(transaction.admission, join(transaction.attempt, 'progress', `${entry.pathSha256}.committed.json`),
     Buffer.from(`${JSON.stringify(committed)}\n`), deadline, assert);
 }
 /** Continuation is only a routing hint. Native independently proves original,
@@ -194,7 +194,7 @@ export async function publishMigrationCompletion(transaction: MigrationTransacti
   const completion: Contract<'migration.Completion'> = { format: 1, attempt: transaction.value.attempt,
     transactionSha256: transaction.file.sha256, profiles: items };
   if (!validator('migration.Completion')(completion)) throw profileUnavailable();
-  return publishMigrationFile(join(transaction.attempt, 'completed.json'), Buffer.from(`${JSON.stringify(completion)}\n`), deadline, assert);
+  return publishMigrationFile(transaction.admission, join(transaction.attempt, 'completed.json'), Buffer.from(`${JSON.stringify(completion)}\n`), deadline, assert);
 }
 export async function cleanMigrationStaging(transaction: MigrationTransaction, deadline: number,
   assertCustody: () => Promise<void>): Promise<void> {
