@@ -509,7 +509,59 @@ inline bool maintenanceImageSignature(const MaintenanceFile& image) {
   if (requirement) CFRelease(requirement); if (code) CFRelease(code);
   return valid && image.current();
 }
-inline bool maintenanceMount(const std::string& mount, const MaintenanceFile& image, double deadline) {
+struct MaintenanceBacking {
+  Identity helper;
+  struct stat executableIdentity{};
+  std::vector<int> regularDescriptors;
+  static std::string helperPath() { return "/System/Library/PrivateFrameworks/DiskImages.framework/Versions/A/Resources/diskimages-helper"; }
+  bool signedHelper() const {
+    std::string executable; struct stat named{};
+    if (arbol_boundary::current(helper) != 1 || helper.uid != geteuid() || !arbol_boundary::executable(helper,executable) ||
+        executable != helperPath() || lstat(executable.c_str(),&named) || !sameFile(executableIdentity,named) ||
+        !S_ISREG(named.st_mode) || named.st_uid != 0 || (named.st_mode & 0022) || !(named.st_mode & 0111)) return false;
+    SecCodeRef code = nullptr; SecRequirementRef requirement = nullptr;
+    NSDictionary* attributes = @{(__bridge NSString*)kSecGuestAttributePid:@(helper.pid)};
+    bool valid = SecRequirementCreateWithString(CFSTR("anchor apple"),kSecCSDefaultFlags,&requirement) == errSecSuccess &&
+      SecCodeCopyGuestWithAttributes(nullptr,(__bridge CFDictionaryRef)attributes,kSecCSDefaultFlags,&code) == errSecSuccess &&
+      SecCodeCheckValidity(code,kSecCSDefaultFlags,requirement) == errSecSuccess;
+    if (code) CFRelease(code); if (requirement) CFRelease(requirement);
+    return valid && arbol_boundary::current(helper) == 1 && !lstat(executable.c_str(),&named) && sameFile(executableIdentity,named);
+  }
+  bool descriptors(const MaintenanceFile& image, std::vector<int>& regular) const {
+    if (!image.current() || arbol_boundary::current(helper) != 1) return false;
+    int needed = proc_pidinfo(helper.pid,PROC_PIDLISTFDS,0,nullptr,0);
+    if (needed < 1 || needed % sizeof(struct proc_fdinfo) || needed > int(4096*sizeof(struct proc_fdinfo))) return false;
+    std::vector<struct proc_fdinfo> rows(size_t(needed)/sizeof(struct proc_fdinfo)+16);
+    int used = proc_pidinfo(helper.pid,PROC_PIDLISTFDS,0,rows.data(),int(rows.size()*sizeof(struct proc_fdinfo)));
+    if (used < 1 || used % sizeof(struct proc_fdinfo) || size_t(used) >= rows.size()*sizeof(struct proc_fdinfo)) return false;
+    std::set<int> seen;
+    for (size_t i = 0; i < size_t(used)/sizeof(struct proc_fdinfo); ++i) {
+      const auto& row = rows[i];
+      if (row.proc_fd < 0 || !seen.insert(row.proc_fd).second) return false;
+      if (row.proc_fdtype != PROX_FDTYPE_VNODE) continue;
+      struct vnode_fdinfo file{};
+      if (proc_pidfdinfo(helper.pid,row.proc_fd,PROC_PIDFDVNODEINFO,&file,sizeof(file)) != sizeof(file)) return false;
+      const auto& vnode = file.pvi.vi_stat;
+      if (!S_ISREG(vnode.vst_mode)) continue;
+      if ((file.pfi.fi_openflags & (FREAD|FWRITE)) != FREAD || vnode.vst_dev != uint32_t(image.identity.st_dev) ||
+          vnode.vst_ino != image.identity.st_ino || vnode.vst_nlink != 1 || vnode.vst_uid != image.identity.st_uid ||
+          vnode.vst_size != image.identity.st_size) return false;
+      regular.push_back(row.proc_fd);
+    }
+    std::sort(regular.begin(),regular.end());
+    return !regular.empty() && image.current() && arbol_boundary::current(helper) == 1;
+  }
+  bool current(const MaintenanceFile& image) const {
+    std::vector<int> observed;
+    return helper.pid > 1 && signedHelper() && descriptors(image,observed) && observed == regularDescriptors && signedHelper();
+  }
+  bool capture(int pid, const MaintenanceFile& image) {
+    if (helper.pid || pid <= 1 || arbol_boundary::observe(pid,helper) != 1 || lstat(helperPath().c_str(),&executableIdentity) ||
+        !signedHelper() || !descriptors(image,regularDescriptors)) return false;
+    return current(image);
+  }
+};
+inline bool maintenanceMount(const std::string& mount, const MaintenanceFile& image, double deadline, MaintenanceBacking& backing) {
   struct statfs fs{}; struct stat mounted{}, device{};
   if (!image.current() || !arbol_boundary::canonical(mount) || statfs(mount.c_str(),&fs) ||
       mount != fs.f_mntonname || !(fs.f_flags & MNT_RDONLY) || !(fs.f_flags & MNT_LOCAL) || strcmp(fs.f_fstypename,"apfs") ||
@@ -526,7 +578,7 @@ inline bool maintenanceMount(const std::string& mount, const MaintenanceFile& im
       ![volume isKindOfClass:NSDictionary.class] || ![volume[@"MountPoint"] isEqual:point] || ![volume[@"DeviceNode"] isEqual:node] ||
       ![volume[@"FilesystemType"] isEqual:@"apfs"] || ![volume[@"BusProtocol"] isEqual:@"Disk Image"] ||
       ![volume[@"Writable"] isEqual:@NO] || ![volume[@"WritableMedia"] isEqual:@NO] || ![volume[@"WritableVolume"] isEqual:@NO]) return false;
-  size_t matches = 0;
+  size_t matches = 0; int helperPid = 0;
   for (id row in info[@"images"]) {
     if (![row isKindOfClass:NSDictionary.class] || ![row[@"system-entities"] isKindOfClass:NSArray.class]) return false;
     for (id entity in row[@"system-entities"]) {
@@ -538,6 +590,7 @@ inline bool maintenanceMount(const std::string& mount, const MaintenanceFile& im
           ![row[@"owner-uid"] isEqual:@(geteuid())] || ![row[@"image-type"] isEqual:@"UDIF read-only"] ||
           ![row[@"writeable"] isEqual:@NO] || ![row[@"diskimages2"] isEqual:@NO] || ![row[@"image-encrypted"] isEqual:@NO] ||
           !uintNumber(row[@"hdid-pid"],pid) || pid < 1 || pid > INT_MAX) return false;
+      helperPid = int(pid);
       for (id key in [row allKeys]) {
         if (![key isKindOfClass:NSString.class] || [key rangeOfString:@"shadow" options:NSCaseInsensitiveSearch].location != NSNotFound ||
             [key rangeOfString:@"overlay" options:NSCaseInsensitiveSearch].location != NSNotFound) return false;
@@ -545,7 +598,7 @@ inline bool maintenanceMount(const std::string& mount, const MaintenanceFile& im
     }
   }
   struct statfs after{};
-  return matches == 1 && image.current() && !statfs(mount.c_str(),&after) && (after.f_flags & MNT_RDONLY) &&
+  return matches == 1 && backing.capture(helperPid,image) && image.current() && !statfs(mount.c_str(),&after) && (after.f_flags & MNT_RDONLY) &&
     !memcmp(&fs.f_fsid,&after.f_fsid,sizeof(fs.f_fsid)) && !strcmp(fs.f_mntfromname,after.f_mntfromname) &&
     !strcmp(fs.f_mntonname,after.f_mntonname);
 }
@@ -695,12 +748,13 @@ struct IsolatedMaintenanceAdmission {
   MaintenanceGuard selection, oldBuild, newBuild;
   MaintenanceFile journal, image, oldImage;
   MaintenancePayload payload;
+  MaintenanceBacking backing;
   MaintenanceSelectionSnapshot selected;
   NSDictionary* journalObject = nil;
   struct statfs imageMount{};
   bool current() const {
     MaintenanceSelectionSnapshot now; struct statfs mount{};
-    return authority.current() && payload.current() && payload.sameFilesystem(imageMount) && selection.current() && newBuild.current() &&
+    return authority.current() && backing.current(image) && payload.current() && payload.sameFilesystem(imageMount) && selection.current() && newBuild.current() &&
       (oldBuild.lock.fd < 0 || (oldBuild.current() && oldImage.current())) && journal.current() && image.current() &&
       maintenanceSelectionSnapshot(authority.support.fd,authority.support.path,now) && sameMaintenanceSelection(selected,now) &&
       maintenanceSelectionMatches(now,journalObject[@"before"]) &&
@@ -743,7 +797,7 @@ struct IsolatedMaintenanceAdmission {
         !sameMaintenanceSelection(selected,again) ||
         !image.openPath(authority.support.path + "/images/" + authority.layout.build + ".dmg",0600,1024LL*1024*1024) ||
         ![image.sha256(deadline) isEqual:journalObject[@"after"][@"selection"][@"imageSha256"]] ||
-        !maintenanceImageSignature(image) || !maintenanceMount(authority.layout.buildRoot + "/app",image,deadline) ||
+        !maintenanceImageSignature(image) || !maintenanceMount(authority.layout.buildRoot + "/app",image,deadline,backing) ||
         statfs((authority.layout.buildRoot + "/app").c_str(),&imageMount) ||
         !(imageMount.f_flags & MNT_RDONLY) || !payload.capture(authority.layout,true)) return false;
     return signedIdentity(bundle,@"com.sylvan-stack.arbol-browser.native-candidate",true) &&
@@ -756,13 +810,14 @@ struct InstalledMaintenanceAdmission {
   MaintenanceGuard selection, oldBuild, newBuild, mounting;
   MaintenanceFile launcher, journal, release, image, hostPolicy;
   MaintenancePayload payload;
+  MaintenanceBacking backing;
   MaintenanceSelectionSnapshot selected;
   NSDictionary* journalObject = nil;
   NSString* launcherDigest = nil;
   struct statfs imageMount{};
   bool current() const {
     MaintenanceSelectionSnapshot now; struct statfs mount{};
-    return support.current() && uses.current() && payload.current() && payload.sameFilesystem(imageMount) && selection.current() && newBuild.current() &&
+    return support.current() && uses.current() && backing.current(image) && payload.current() && payload.sameFilesystem(imageMount) && selection.current() && newBuild.current() &&
       (oldBuild.lock.fd < 0 || oldBuild.current()) && (mounting.lock.fd < 0 || mounting.current()) &&
       launcher.current() && journal.current() && release.current() && image.current() && hostPolicy.current() &&
       maintenanceSelectionSnapshot(support.fd,support.path,now) && sameMaintenanceSelection(selected,now) &&
@@ -823,7 +878,7 @@ struct InstalledMaintenanceAdmission {
             @"-readonly",@"-nokernel",@"-mountpoint",point,@"-noautoopen",@"-nobrowse",@"-plist"],deadline)) return false;
       }
     }
-    if (!maintenanceMount(mount,image,deadline) || statfs(mount.c_str(),&imageMount) ||
+    if (!maintenanceMount(mount,image,deadline,backing) || statfs(mount.c_str(),&imageMount) ||
         !arbol_boundary::canonical(layout.bundle) || !signedIdentity(layout.bundle,@"com.sylvan-stack.arbol-browser",true) ||
         !hostPolicy.openPath(layout.bundle + "/Contents/Resources/host-policy.json",0600,limit,true) ||
         !policyStateRoot(json(hostPolicy.content),layout) || !payload.capture(layout,false)) return false;
