@@ -1339,7 +1339,53 @@ async function installVerifiedRelease(context, release, options) {
   });
 }
 
+function fixedQualificationOptions(cohort, role) {
+  const input = name => {
+    const source = cohort.originals[name].input;
+    return { image: source.image, signedReceiptPath: source.signedReceipt, review: source.review };
+  };
+  return { ...input(role), predecessors: ['historical', 'A', 'B', 'C'].filter(name => name !== role).map(input) };
+}
+
+/** A result is an observation following the real install, not a selector or
+ * substitute for the shared owner's common eligibility/lock/postcheck. */
+async function fixedQualificationSelection(cohort, role) {
+  const { context, release } = await isolatedContext(fixedQualificationOptions(cohort, role));
+  requireEqual(release.build, cohort.observation.releases[role].build);
+  return withLockProvider(release.platform, provider => withInstallationGuards(context, provider, null, release.build, async custody => {
+    const selected = { format: 1, build: release.build, imageSha256: release.imageSha256 };
+    requireEqual(await optionalSelection(context.selectionPath), selected);
+    if (await installationJournal(context.support) || await contextProfileFormat(context, selected, custody) !== 2)
+      throw new Error('Qualification installation has not completed');
+    const launcher = await exactFile(context.executable, launcherLimit);
+    if (launcher.sha256 !== release.launcher.sha256 || launcher.identity.mode !== release.launcherMode ||
+        !await installedAlias(context.alias, context.executable)) throw new Error('Qualification selected entry differs');
+    checkContextLauncher(context, context.executable, release.launcher.sha256);
+    await custody.assert(); requireEqual(await optionalSelection(context.selectionPath), selected);
+    return release.build;
+  }));
+}
+
+async function qualificationForwardEntry() {
+  const wire = await import('./qualification-authority.mjs');
+  try {
+    wire.qualificationRequire(process.argv.length === 3, 'Invalid fixed forward entry', 2);
+    const { value } = await wire.qualificationInput(['schema', 'action', 'authoritySha256']);
+    wire.qualificationRequire(value.schema === 1 && value.action === 'forward', 'Invalid fixed forward request', 2);
+    const before = await wire.authenticateQualification(value.authoritySha256);
+    const result = await installIsolatedRelease(fixedQualificationOptions(before, 'C'));
+    requireEqual(result.build, before.observation.releases.C.build);
+    const after = await wire.authenticateQualification(value.authoritySha256);
+    requireEqual(after.observation, before.observation, 'Qualification authority changed during forward');
+    const selected = await fixedQualificationSelection(after, 'C');
+    wire.qualificationOutput({ schema: 1, authoritySha256: value.authoritySha256, selected });
+  } catch (error) { wire.qualificationFailure(error); }
+}
+
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  if (process.argv[2] === 'qualification-forward-v1') {
+    await qualificationForwardEntry();
+  } else {
   const [action, imageFlag, image, signedFlag, signedReceiptPath, ...extra] = process.argv.slice(2);
   if (!['verify', 'install'].includes(action) || imageFlag !== '--image' || signedFlag !== '--signed-receipt' ||
       !image || !signedReceiptPath || extra.length) {
@@ -1350,4 +1396,5 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   delete result.launcher;
   delete result.platform;
   console.log(JSON.stringify(result));
+  }
 }
