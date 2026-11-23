@@ -2448,6 +2448,7 @@ struct ExitInspection {
 static std::set<ExitInspection*> exitInspections;
 using arbol_exit::strictManagementObject;
 struct MigrationObservation {
+  static constexpr size_t metadataLimit = 65536;
   arbol_attempt::MaintenanceDirectory directory;
   arbol_attempt::MaintenanceFile record, marker;
   bool markerAbsent = false;
@@ -2467,8 +2468,8 @@ struct MigrationObservation {
         ![profile.stringByDeletingLastPathComponent isEqual:[state stringByAppendingPathComponent:@"profiles"]] ||
         !pattern(profile.lastPathComponent,@"^[a-z](?:[a-z0-9-]{0,62}[a-z0-9])?$") ||
         !directory.openPath(profile.fileSystemRepresentation) ||
-        !record.openPath(directory.path + "/profile.json",0600,limit,true)) return false;
-    profileRecord = strictManagementObject(record.content);
+        !record.openPath(directory.path + "/profile.json",0600,metadataLimit,true)) return false;
+    profileRecord = strictManagementObject(record.content,metadataLimit);
     uint64_t format = 0;
     if (!keys(profileRecord,@[@"format",@"id",@"instance",@"creationRequest",@"createdAt"]) ||
         !uintNumber(profileRecord[@"format"],format) || format != 1 || ![profileRecord[@"id"] isEqual:profile.lastPathComponent] ||
@@ -2482,8 +2483,8 @@ struct MigrationObservation {
     struct stat st{}; errno = 0;
     if (fstatat(directory.fd,"engine.json",&st,AT_SYMLINK_NOFOLLOW)) { if (errno != ENOENT) return false; markerAbsent = true; }
     else {
-      if (!marker.openPath(directory.path + "/engine.json",0600,limit,true)) return false;
-      engineMarker = strictManagementObject(marker.content);
+      if (!marker.openPath(directory.path + "/engine.json",0600,metadataLimit,true)) return false;
+      engineMarker = strictManagementObject(marker.content,metadataLimit);
       if (!nativeMarker(engineMarker,true) || !uintNumber(engineMarker[@"format"],format) || format != 1 ||
           ![engineMarker[@"profileInstance"] isEqual:profileRecord[@"instance"]]) return false;
       NSDictionary* policy = json(maintenanceCustody->hostPolicy().content);
