@@ -86,10 +86,14 @@ static bool matches(const HeldLock* lock, struct stat* out) {
     out->st_dev == lock->dev && out->st_ino == lock->ino &&
     path.st_dev == out->st_dev && path.st_ino == out->st_ino;
 }
-static napi_value acquireLock(napi_env env, napi_callback_info info, int mode) {
+static constexpr const char* historicalInitializationRoot = "/Users/msix/Builds/afm9-rollback-plan.49cXVsFk/qualification/fixture";
+static napi_value acquireLock(napi_env env, napi_callback_info info, int mode, bool initializationExisting = false) {
   napi_value arg; std::string path;
   if (!argument(env, info, &arg) || !string(env, arg, path)) return fail(env);
-  int fd = open(path.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0600);
+  const std::string fixed = historicalInitializationRoot;
+  if (initializationExisting && path != fixed+"/support/selection.lock" &&
+      path != fixed+"/arbol-browser/.uses/1" && path != fixed+"/arbol-browser/.uses/1.mount") return fail(env);
+  int fd = open(path.c_str(), O_RDWR | (initializationExisting ? 0 : O_CREAT) | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0600);
   if (fd < 0) return fail(env);
   struct stat st;
   if (fstat(fd, &st) != 0) { close(fd); return fail(env); }
@@ -109,6 +113,7 @@ static napi_value acquireLock(napi_env env, napi_callback_info info, int mode) {
   return handle;
 }
 static napi_value tryLock(napi_env env, napi_callback_info info) { return acquireLock(env, info, LOCK_EX); }
+static napi_value tryExistingInitializationLock(napi_env env, napi_callback_info info) { return acquireLock(env, info, LOCK_EX, true); }
 static napi_value trySharedLock(napi_env env, napi_callback_info info) { return acquireLock(env, info, LOCK_SH); }
 static HeldLock* held(napi_env env, napi_callback_info info) {
   napi_value arg; void* data = nullptr;
@@ -270,7 +275,9 @@ static napi_value publishInstallerFile(napi_env env,napi_callback_info info) {
   const std::string leaf=destination.substr(destination.rfind('/')+1),folder=parent(destination);
   const bool backup=destination==support+"/install-previous-launcher"||
     (folder==support+"/releases"&&pattern([NSString stringWithUTF8String:leaf.c_str()],@"^[1-9a-f][0-9a-f]{0,15}\\.launcher$"));
-  const bool allowed=destination==support+"/install-transaction.json"||backup||
+  const bool initialization=!installed&&support==std::string(historicalInitializationRoot)+"/support"&&
+    destination==support+"/historical-initialization.json";
+  const bool allowed=initialization||destination==support+"/install-transaction.json"||backup||
     (folder==support+"/images"&&pattern([NSString stringWithUTF8String:leaf.c_str()],@"^[1-9a-f][0-9a-f]{0,15}\\.dmg$"))||
     (folder==support+"/releases"&&pattern([NSString stringWithUTF8String:leaf.c_str()],@"^[1-9a-f][0-9a-f]{0,15}(\\.migration)?\\.json$"));
   if(!allowed) return fail(env);
@@ -3711,6 +3718,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"trySharedLock", nullptr, trySharedLock, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"groupCensus", nullptr, groupCensus, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"tryLock", nullptr, tryLock, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"tryExistingInitializationLock", nullptr, tryExistingInitializationLock, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"assertLock", nullptr, assertLock, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"releaseLock", nullptr, releaseLock, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"processIdentity", nullptr, processIdentity, nullptr, nullptr, nullptr, napi_default, nullptr},

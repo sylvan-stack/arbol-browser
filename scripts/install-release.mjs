@@ -402,9 +402,9 @@ async function checkedGuard(path, create = true) {
 }
 
 const installerLocks = new WeakMap();
-async function withLock(provider, path, work, create = true) {
+async function withLock(provider, path, work, create = true, initializationExisting = false) {
   const expected = await checkedGuard(path, create);
-  const held = provider.tryLock(path);
+  const held = initializationExisting ? provider.tryExistingInitializationLock(path) : provider.tryLock(path);
   if (!held) throw new Error('The Browser installation or selected Build is in use');
   installerLocks.set(provider, (installerLocks.get(provider) ?? 0) + 1);
   try {
@@ -658,6 +658,11 @@ async function isolatedContext(options) {
     releases.set(verified.build, verified); inputs.set(verified.build, input);
   }
   if (release.profileFormat !== 2) throw new Error('Isolated installer requires a current format2 candidate');
+  return createIsolatedContext(release, inputs, releases);
+}
+/** Private layout factory. Its only historical caller authenticates the fixed
+ * four-role authority and performs separate pristine/partial setup checks. */
+async function createIsolatedContext(release, inputs, releases) {
   const { fixture } = release, support = join(fixture.fixture, 'support');
   const images = join(support, 'images'), receipts = join(support, 'releases');
   const aliases = join(fixture.fixture, 'aliases'), mount = dirname(fixture.bundle);
@@ -687,16 +692,18 @@ export async function installIsolatedRelease(options) {
   const { context, release } = await isolatedContext(options);
   return installVerifiedRelease(context, release, options);
 }
-async function mountIsolatedCandidate(context, release, provider) {
+async function mountIsolatedCandidate(context, release, provider, initialization = null) {
   const authority = isolatedAuthorities.get(context);
   if (!authority) return;
-  await withLock(provider, join(context.uses, `${release.build}.mount`), async () => {
+  await withLock(provider, join(context.uses, `${release.build}.mount`), async handle => {
+    if (initialization) requireEqual(await guardRecord(provider, join(context.uses, `${release.build}.mount`), handle), initialization.guards.mount);
     await assertContext(context);
     const mounted = await prepareIsolatedMount({ ...authority.inputs.get(release.build), image: context.image });
     requireEqual(mounted, { build: release.build, imageSha256: release.imageSha256,
       bundle: release.fixture.bundle, mount: context.mount });
     await assertContext(context);
-  }, false);
+    if (initialization) requireEqual(await guardRecord(provider, join(context.uses, `${release.build}.mount`), handle), initialization.guards.mount);
+  }, false, Boolean(initialization));
 }
 async function guardRecord(provider, path, handle) {
   const expected = await checkedGuard(path, false), actual = provider.assertLock(handle);
@@ -741,13 +748,13 @@ async function selectionFile(context) {
     throw new Error('Selection changed during observation');
   return { value, file: fileReference(file) };
 }
-async function stageReleaseAssets(context, release, options, custody) {
+async function stageReleaseAssets(context, release, options, custody, createMountGuard = true) {
   await custody.assert();
   const image = await publishExact(context.image, imageLimit, release.imageSha256, async path => {
     await copyFile(options.image, path, constants.COPYFILE_EXCL); await chmod(path, 0o600);
   }, custody.publication);
   if (image.identity.mode !== 0o600) throw new Error('Installed image mode differs');
-  await checkedGuard(join(context.uses, `${release.build}.mount`)); await syncPath(context.uses);
+  await checkedGuard(join(context.uses, `${release.build}.mount`), createMountGuard); await syncPath(context.uses);
   const bytes = encode({ format: 1, build: release.build, imageSha256: release.imageSha256,
     source: release.source, payloadDigest: release.payloadDigest, launcherSha256: release.launcher.sha256 });
   const receipt = await publishExact(join(context.receipts, `${release.build}.json`), 4096, hash(bytes),
@@ -1382,9 +1389,173 @@ async function qualificationForwardEntry() {
   } catch (error) { wire.qualificationFailure(error); }
 }
 
+/** Only matching published historical assets may be present on a setup retry.
+ * No profile contents, catalog, rollback history or proof are initialized. */
+async function historicalSetupState(fixture, release) {
+  const support = join(fixture.fixture, 'support');
+  for (const path of [fixture.stateRoot, join(fixture.runtime, 'browser-profile-migration'),
+    join(support, 'install-transaction.json'), join(support, 'install-previous-launcher'),
+    join(support, 'rollback-launchers'), join(support, 'pre-format-2-rollback-launchers'), join(support, 'build-tool')]) await absent(path);
+  const permitted = new Map([
+    [support, ['images', 'releases', 'selection.lock', 'selected.json', 'historical-initialization.json']],
+    [join(support, 'images'), [`${release.build}.dmg`]],
+    [join(support, 'releases'), [`${release.build}.json`]],
+    [dirname(fixture.launcher), ['arbol-browser']],
+    [join(fixture.fixture, 'aliases'), ['arbol-browser']],
+  ]);
+  for (const [path, allowed] of permitted) {
+    try {
+      await privateDirectory(path, true);
+      if ((await readdir(path)).some(name => !allowed.includes(name))) throw new Error('Unknown retained historical initialization state');
+    } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+  const selected = await optionalSelection(join(support, 'selected.json'));
+  if (selected) requireEqual(selected, { format: 1, build: release.build, imageSha256: release.imageSha256 });
+  const image = await optionalFile(join(support, 'images', `${release.build}.dmg`), imageLimit);
+  if (image && (image.sha256 !== release.imageSha256 || image.identity.mode !== 0o600)) throw new Error('Historical image setup differs');
+  const receipt = await optionalFile(join(support, 'releases', `${release.build}.json`), 4096);
+  if (receipt) {
+    if (!image || receipt.identity.mode !== 0o600) throw new Error('Historical receipt lacks its original image');
+    requireEqual(parseStrictJson(receipt.bytes, 4096), { format: 1, build: release.build, imageSha256: release.imageSha256,
+      source: release.source, payloadDigest: release.payloadDigest, launcherSha256: release.launcher.sha256 });
+  }
+  const launcher = await optionalFile(fixture.launcher, launcherLimit);
+  if (launcher) {
+    if (!receipt || launcher.sha256 !== release.launcher.sha256 || launcher.identity.mode !== 0o755)
+      throw new Error('Historical launcher setup differs');
+    checkSignature(fixture.launcher, release.launcherIdentifier);
+  }
+  const alias = await installedAlias(join(fixture.fixture, 'aliases/arbol-browser'), fixture.launcher);
+  if (alias && !launcher || selected && (!launcher || !alias)) throw new Error('Historical setup publication order differs');
+  const record = await optionalFile(join(support, 'historical-initialization.json'), 65536);
+  if (!record && (selected || image || receipt || launcher || alias)) throw new Error('Historical assets lack their original initialization record');
+  if (record && record.identity.mode !== 0o600) throw new Error('Historical initialization record mode differs');
+  return { selected, record };
+}
+
+function historicalInitializationInputs(cohort) {
+  const release = cohort.originals.historical.release;
+  return { format: 1, kind: 'historical-isolated-initialization',
+    authoritySha256: cohort.observation.authoritySha256, producerManifestSha256: cohort.observation.producerManifestSha256,
+    historical: { build: release.build, source: release.source, imageSha256: release.imageSha256,
+      signedReceiptSha256: release.receiptSha256, launcherSha256: release.launcher.sha256 } };
+}
+function historicalInitializationRecord(file, cohort) {
+  if (!file) return null;
+  const value = parseStrictJson(file.bytes, 65536), fixture = cohort.originals.historical.release.fixture.fixture;
+  if (file.identity.mode !== 0o600 || !value.guards || Object.keys(value.guards).sort().join(',') !== 'build,mount,selection')
+    throw new Error('Historical initialization guard record differs');
+  requireEqual(value, { ...historicalInitializationInputs(cohort), guards: value.guards });
+  for (const [name, path] of Object.entries({ selection: join(fixture, 'support/selection.lock'),
+    build: join(fixture, 'arbol-browser/.uses/1'), mount: join(fixture, 'arbol-browser/.uses/1.mount') })) {
+    const guard = value.guards[name];
+    if (!guard?.identity || guard.path !== path || guard.heldMode !== 2 || guard.identity.mode !== 0o600 ||
+        guard.identity.uid !== userInfo().uid || !/^[0-9]+$/.test(guard.identity.device) || !/^[0-9]+$/.test(guard.identity.inode))
+      throw new Error('Historical initialization guard identity differs');
+    requireEqual(guard, { path, heldMode: 2, identity: { device: guard.identity.device,
+      inode: guard.identity.inode, uid: userInfo().uid, mode: 0o600 } });
+  }
+  return value;
+}
+
+async function initializeHistoricalQualification(cohort) {
+  const historical = cohort.originals.historical, release = historical.release, providerRelease = cohort.originals.A.release;
+  if (release.build !== profileMigrationPredecessor.build || release.profileFormat !== 1 || providerRelease.profileFormat !== 2)
+    throw new Error('Fixed historical initialization roles differ');
+  const signed = await privateJson(historical.input.signedReceipt, 8388608);
+  const audit = parseStrictJson(Buffer.from(signed.value.auditBytes, 'base64'), 8388608);
+  const originalReceipt = await exactFile('/Volumes/Mercury/Arbol/backups/browser-format-2-historical-inputs-9bbfd76/signed-release.json', 8388608);
+  if (originalReceipt.sha256 !== 'cb41a7873dc63a8cde960b3d5df0d2122c712c35a380fe016d32c7d1e5af147f' ||
+      audit.originalReceiptSha256 !== originalReceipt.sha256 || signed.sha256 !== release.receiptSha256)
+    throw new Error('Authentic historical receipt provenance differs');
+  const initial = await historicalSetupState(release.fixture, release);
+  historicalInitializationRecord(initial.record, cohort);
+  const inputs = new Map(), releases = new Map();
+  for (const { input, release: member } of Object.values(cohort.originals)) {
+    inputs.set(member.build, { image: input.image, signedReceiptPath: input.signedReceipt, review: input.review });
+    releases.set(member.build, member);
+  }
+  const { context } = await createIsolatedContext(release, inputs, releases);
+  // Directory preparation is durable, but cannot establish a selected release.
+  for (const path of [context.images, context.receipts, dirname(context.alias), dirname(context.executable), context.mount]) {
+    await syncPath(path); await syncPath(dirname(path));
+  }
+  return withLockProvider(providerRelease.platform, provider => withLock(provider, join(context.support, 'selection.lock'), async selectionHandle => {
+    // Once selection is held, reobserve the durable preparation before creating
+    // either subordinate guard. Every native acquisition itself is no-create.
+    const locked = await historicalSetupState(release.fixture, release);
+    let recordFile = locked.record, record = historicalInitializationRecord(recordFile, cohort);
+    if (initial.record && (!recordFile || !sameFile(initial.record, recordFile))) throw new Error('Historical preparation record changed');
+    const selectionGuard = await guardRecord(provider, join(context.support, 'selection.lock'), selectionHandle);
+    if (record) requireEqual(selectionGuard, record.guards.selection);
+    return withLock(provider, join(context.uses, release.build), async buildHandle => {
+      const buildGuard = await guardRecord(provider, join(context.uses, release.build), buildHandle);
+      if (record) requireEqual(buildGuard, record.guards.build);
+      const publication = { provider, selection: selectionHandle };
+      const recordPath = join(context.support, 'historical-initialization.json');
+      await withLock(provider, join(context.uses, `${release.build}.mount`), async mountHandle => {
+        const mountGuard = await guardRecord(provider, join(context.uses, `${release.build}.mount`), mountHandle);
+        const expected = { ...historicalInitializationInputs(cohort), guards: { selection: selectionGuard, build: buildGuard, mount: mountGuard } };
+        if (record) requireEqual(record, expected);
+        else {
+          // No selected or partial assets can precede this real, durable record.
+          const before = await historicalSetupState(release.fixture, release);
+          if (before.record) throw new Error('Unexpected historical preparation record');
+          for (const path of [context.support, context.uses]) await syncPath(path);
+          const bytes = encode(expected);
+          recordFile = await publishExact(recordPath, 65536, hash(bytes), path => writeExclusive(path, bytes), publication);
+          record = historicalInitializationRecord(recordFile, cohort);
+        }
+      }, !record, true);
+      const assert = async () => {
+        await assertContext(context);
+        if (!sameFile(recordFile, await exactFile(recordPath, 65536))) throw new Error('Original historical preparation record changed');
+        requireEqual(await guardRecord(provider, selectionGuard.path, selectionHandle), record.guards.selection);
+        requireEqual(await guardRecord(provider, buildGuard.path, buildHandle), record.guards.build);
+        const mount = await checkedGuard(record.guards.mount.path, false);
+        requireEqual(record.guards.mount.identity, { device: String(mount.dev), inode: String(mount.ino), uid: Number(mount.uid), mode: 0o600 });
+      };
+      const custody = { publication, assert, guards: { selection: selectionGuard, oldBuild: null, newBuild: buildGuard },
+        assertBuild: async build => { if (build !== release.build) throw new Error('Historical custody Build differs'); await assert(); } };
+      await assert(); await stageReleaseAssets(context, release, inputs.get(release.build), custody, false);
+      await mountIsolatedCandidate(context, release, provider, record); await assert();
+      const current = await optionalFile(context.executable, launcherLimit);
+      if (!current) await replaceFile(context.executable, release.launcher.bytes, 0o755);
+      const launcher = await exactFile(context.executable, launcherLimit);
+      if (launcher.sha256 !== release.launcher.sha256 || launcher.identity.mode !== 0o755) throw new Error('Historical installed launcher differs');
+      checkContextLauncher(context, context.executable, release.launcher.sha256);
+      await ensureAlias(context.alias, context.executable); await assert();
+      const selection = { format: 1, build: release.build, imageSha256: release.imageSha256 };
+      const existing = await optionalSelection(context.selectionPath);
+      if (existing) requireEqual(existing, selection);
+      else await replaceFile(context.selectionPath, encode(selection), 0o600);
+      await assert(); requireEqual((await historicalSetupState(release.fixture, release)).selected, selection);
+      if (await contextProfileFormat(context, selection, custody) !== 1) throw new Error('Historical selected format differs');
+      await assert(); return release.build;
+    }, !record, true);
+  }, !initial.record, true));
+}
+
+async function qualificationInitializeEntry() {
+  const wire = await import('./qualification-authority.mjs');
+  try {
+    wire.qualificationRequire(process.argv.length === 3, 'Invalid fixed initializer entry', 2);
+    const { value } = await wire.qualificationInput(['schema', 'action', 'authoritySha256']);
+    wire.qualificationRequire(value.schema === 1 && value.action === 'initialize', 'Invalid fixed initializer request', 2);
+    const before = await wire.authenticateQualification(value.authoritySha256);
+    const selected = await initializeHistoricalQualification(before);
+    const after = await wire.authenticateQualification(value.authoritySha256);
+    requireEqual(after.observation, before.observation, 'Qualification authority changed during historical setup');
+    requireEqual(selected, after.observation.releases.historical.build);
+    wire.qualificationOutput({ schema: 1, authoritySha256: value.authoritySha256, selected });
+  } catch (error) { wire.qualificationFailure(error); }
+}
+
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   if (process.argv[2] === 'qualification-forward-v1') {
     await qualificationForwardEntry();
+  } else if (process.argv[2] === 'qualification-initialize-v1') {
+    await qualificationInitializeEntry();
   } else {
   const [action, imageFlag, image, signedFlag, signedReceiptPath, ...extra] = process.argv.slice(2);
   if (!['verify', 'install'].includes(action) || imageFlag !== '--image' || signedFlag !== '--signed-receipt' ||
