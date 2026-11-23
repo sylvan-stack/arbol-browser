@@ -1385,9 +1385,10 @@ static bool priorMarkerMatches(Custody* c,const std::string& raw,const struct st
   bool ok=arbol_exit::readNativeFile(fd,path.lastPathComponent.UTF8String,bytes,receiptIdentity,arbol_exit::exitReceiptLimit)&&
     [arbol_attempt::digest(bytes) isEqual:prior[@"digest"]];
   if(close(fd)) ok=false;
-  NSDictionary* receipt=arbol_exit::parseExitReceipt(bytes),*marker=receipt[@"marker"];
+  NSDictionary* receipt=arbol_exit::parseExitReceipt(bytes); id marker=receipt[@"marker"];
   ok=ok&&[receipt[@"format"] isEqual:@1]&&[receipt[@"profileInstance"] isEqual:attempt[@"profileInstance"]]&&
     [receipt[@"profilePathHash"] isEqual:attempt[@"profilePathHash"]]&&[receipt[@"profileDirectory"] isEqual:capability[@"profileDirectory"]];
+  if(prior[@"migration"]&&!arbol_exit::migrationPriorMarker(prior,attempt,capability[@"profileDirectory"],marker,marker)) return false;
   if(absent) return ok&&marker==(id)NSNull.null;
   return ok&&arbol_attempt::keys(marker,@[@"identity",@"digest",@"value"])&&
     [marker[@"identity"] isEqual:arbol_exit::fileIdentity(st)]&&[marker[@"digest"] isEqual:arbol_attempt::digest(raw)]&&
@@ -3060,6 +3061,9 @@ static bool inspectExit(ExitInspection& job) {
       return !job.result.empty()&&job.within()&&migrationSource.current()&&(!runtimeMissing||missingRuntime.current());
     }
     NSDictionary* expectation=data?@{@"kind":clean?@"activated":@"terminal",@"path":data[@"terminal"][@"path"],@"digest":data[@"terminal"][@"digest"]}:@{@"kind":@"absent"};
+    if(data&&job.appliedMigration) {
+      NSMutableDictionary* migrated=[expectation mutableCopy]; migrated[@"migration"]=job.appliedMigration; expectation=migrated;
+    }
     job.result=bytes(@{@"format":@1,@"kind":kind,@"clean":@(clean),@"prior":expectation,@"request":request?:(id)NSNull.null});
     return !job.result.empty()&&job.within();
   };

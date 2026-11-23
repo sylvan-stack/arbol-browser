@@ -820,6 +820,17 @@ struct ActivationResult {
   std::atomic<int> state{0}; double acknowledged=0;
   std::string path,digest;
 };
+inline bool priorExpectation(id prior) {
+  using namespace arbol_attempt;
+  if(keys(prior,@[@"kind"])&&[prior[@"kind"] isEqual:@"absent"]) return true;
+  bool migrated=[prior isKindOfClass:NSDictionary.class]&&prior[@"migration"]!=nil;
+  if(!keys(prior,migrated?@[@"kind",@"path",@"digest",@"migration"]:@[@"kind",@"path",@"digest"])||
+     ![@[@"activated",@"terminal"] containsObject:prior[@"kind"]]||!path(prior[@"path"])||
+     !pattern(prior[@"digest"],@"^[0-9a-f]{64}$")) return false;
+  return !migrated||(profileFormat==2&&keys(prior[@"migration"],@[@"path",@"digest"])&&
+    path(prior[@"migration"][@"path"])&&pattern(prior[@"migration"][@"digest"],@"^[0-9a-f]{64}$"));
+}
+inline bool migrationPriorMarker(NSDictionary* prior,NSDictionary* attempt,NSDictionary* directory,id original,id __strong& converted);
 class HostCapability {
   int capsule_=-1,stateFd_=-1; SharedState* state_=nullptr;
   int reads_[3]{-1,-1,-1},writes_[3]{-1,-1,-1}; unsigned role_=0;
@@ -992,9 +1003,7 @@ public:
     NSDictionary* prior=proposed[@"prior"];
     // This is an immutable expectation, never a PreviousExit proof or marker
     // read. Real held-guard readers and post-enrollment marker binding verify it.
-    bool priorOK=(arbol_attempt::keys(prior,@[@"kind"])&&[prior[@"kind"] isEqual:@"absent"]) ||
-      (arbol_attempt::keys(prior,@[@"kind",@"path",@"digest"])&&[@[@"activated",@"terminal"] containsObject:prior[@"kind"]]&&
-       arbol_attempt::path(prior[@"path"])&&arbol_attempt::pattern(prior[@"digest"],@"^[0-9a-f]{64}$"));
+    bool priorOK=priorExpectation(prior);
     if(!priorOK) return false;
     NSString* boot=bootSession(); if(!boot) return false;
     NSString* receiptPath=[[[state stringByAppendingPathComponent:@"exit-evidence"] stringByAppendingPathComponent:attempt[@"profilePathHash"]] stringByAppendingPathComponent:attempt[@"request"]];
@@ -1425,9 +1434,11 @@ public:
       if(parent.fd<0||!readNativeFile(parent.fd,path.lastPathComponent.UTF8String,previous,identity,exitReceiptLimit)||
          ![arbol_attempt::digest(previous) isEqual:prior[@"digest"]]) return nil;
       NSDictionary* receipt=parseExitReceipt(previous);
-      matches=receipt&&[receipt[@"profileInstance"] isEqual:value_[@"attempt"][@"profileInstance"]]&&
+      id expected=receipt[@"marker"];
+      bool migrated=!prior[@"migration"]||migrationPriorMarker(prior,value_[@"attempt"],value_[@"profileDirectory"],expected,expected);
+      matches=receipt&&migrated&&[receipt[@"profileInstance"] isEqual:value_[@"attempt"][@"profileInstance"]]&&
         [receipt[@"profilePathHash"] isEqual:value_[@"attempt"][@"profilePathHash"]]&&[receipt[@"profileDirectory"] isEqual:value_[@"profileDirectory"]]&&
-        [receipt[@"marker"] isEqual:marker];
+        [expected isEqual:marker];
       if(!parent.finish()) return nil;
     }
     if(absent) { errno=0; if(fstatat(root.fd,"engine.json",&named,AT_SYMLINK_NOFOLLOW)>=0||errno!=ENOENT) return nil; }
@@ -1942,5 +1953,35 @@ struct MigrationChain {
     return current();
   }
 };
+
+// This expectation's digest was issued by native inspection in this start.
+// Like the terminal receipt it names, it is re-read by exact digest; no caller
+// path or success flag can substitute a different marker. Completion was
+// already independently validated before issuing the immutable expectation.
+inline bool migrationPriorMarker(NSDictionary* prior,NSDictionary* attempt,NSDictionary* directory,id original,id __strong& converted) {
+  using namespace arbol_attempt;
+  if(profileFormat!=2||!priorExpectation(prior)||!prior[@"migration"]) return false;
+  NSString* path=prior[@"migration"][@"path"];
+  NSString* parent=path.stringByDeletingLastPathComponent;
+  if(![path.lastPathComponent isEqual:[attempt[@"profilePathHash"] stringByAppendingString:@".json"]]||
+     ![parent.lastPathComponent isEqual:@"receipts"]||
+     ![parent.stringByDeletingLastPathComponent.lastPathComponent isEqual:@"browser-profile-migration"]) return false;
+  MaintenanceFile file;
+  if(!file.openPath(path.fileSystemRepresentation,0600,exitReceiptLimit,true)||
+     ![digest(file.content) isEqual:prior[@"migration"][@"digest"]]) return false;
+  NSDictionary* receipt=strictManagementObject(file.content,exitReceiptLimit);
+  if(!migrationReceipt(receipt)||![receipt[@"profilePath"] isEqual:attempt[@"profile"]]||
+     ![receipt[@"profileSha256"] isEqual:attempt[@"profilePathHash"]]||![receipt[@"instance"] isEqual:attempt[@"profileInstance"]]||
+     ![receipt[@"directory"] isEqual:directory]||![receipt[@"evidence"][@"terminalPath"] isEqual:prior[@"path"]]||
+     ![receipt[@"evidence"][@"terminalSha256"] isEqual:prior[@"digest"]]) return false;
+  auto marker=[](id value)->id {
+    if(value==NSNull.null) return NSNull.null;
+    NSDictionary* parsed=migrationContent(value,true);
+    return parsed?@{@"identity":value[@"identity"],@"digest":value[@"sha256"],@"value":parsed}:nil;
+  };
+  id before=marker(receipt[@"originalMarker"]),after=marker(receipt[@"convertedMarker"]);
+  if(!before||!after||![before isEqual:original]||!file.current()) return false;
+  converted=after; return true;
+}
 
 } // namespace arbol_exit

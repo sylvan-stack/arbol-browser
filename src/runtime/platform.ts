@@ -102,7 +102,10 @@ export interface WatchdogCustody {
   assert(): void;
   terminate(): never;
 }
-export type PriorMarkerExpectation = Readonly<{ kind: 'absent' } | { kind: 'activated' | 'terminal'; path: string; digest: string }>;
+export type PriorMarkerExpectation = Readonly<{ kind: 'absent' } | {
+  kind: 'activated' | 'terminal'; path: string; digest: string;
+  migration?: Readonly<{ path: string; digest: string }>;
+}>;
 export interface NativeExitInput {
   readonly format: 1;
   readonly mode: 'prior' | 'host' | 'full' | 'retire' | 'reserve' | 'withdraw';
@@ -900,12 +903,18 @@ export function loadPlatform(): PlatformPort {
               throw unavailable('profile');
             const prior = value.prior;
             if (!prior || (prior.kind === 'absent' ? Object.keys(prior).join(',') !== 'kind' :
-                !['activated', 'terminal'].includes(prior.kind) || Object.keys(prior).sort().join(',') !== 'digest,kind,path' ||
+                !['activated', 'terminal'].includes(prior.kind) || Object.keys(prior).sort().join(',') !==
+                  (prior.migration === undefined ? 'digest,kind,path' : 'digest,kind,migration,path') ||
                 !isAbsolute(prior.path) || !/^[0-9a-f]{64}$/.test(prior.digest))) throw unavailable('profile');
+            if (prior.kind !== 'absent' && prior.migration !== undefined &&
+                (!prior.migration || Object.keys(prior.migration).sort().join(',') !== 'digest,path' ||
+                  typeof prior.migration.path !== 'string' || !isAbsolute(prior.migration.path) ||
+                  typeof prior.migration.digest !== 'string' || !/^[0-9a-f]{64}$/.test(prior.migration.digest))) throw unavailable('profile');
             owner.assertIdentity(); build.assertIdentity(); guards?.data?.assertIdentity(); guards?.next?.assertIdentity();
             if (performance.now() >= deadline || call(() => native.continuousTime()) >= nativeDeadline) throw unavailable('profile');
             const result: ExitInspectionReceipt = Object.freeze({ kind: value.kind, clean: value.clean,
-              prior: Object.freeze({ ...prior }), request: value.request });
+              prior: Object.freeze({ ...prior, ...(prior.kind !== 'absent' && prior.migration ?
+                { migration: Object.freeze({ ...prior.migration }) } : {}) }), request: value.request });
             exitInspectionReceipts.add(result); return result;
           }
           await setTimeout(Math.min(5, Math.max(1, deadline - performance.now())));
