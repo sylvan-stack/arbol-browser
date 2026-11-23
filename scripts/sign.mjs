@@ -22,11 +22,14 @@ function command(program, args, input) {
 
 /** The caller must independently verify the unsigned bundle before signing.
  * Only the caller may regenerate the sealed metadata after nested signing. */
-export async function signBundle({ bundle, identity, publisher, sealResources }) {
+export async function signBundle({ bundle, identity, publisher, sealResources, isolatedMaintenance = false }) {
   if (!allowedPublishers.has(canonical(publisher))) throw new Error('Unrecognized Browser publisher policy');
   const bootstrap = join(bundle, 'Contents/MacOS/arbol-browser-native');
   const installedLauncher = join(bundle, 'Contents/Resources/browser/native/stable-launch');
-  const installedLauncherID = 'com.sylvan-stack.arbol-browser.launcher';
+  if (typeof isolatedMaintenance !== 'boolean' || (isolatedMaintenance && canonical(publisher) !== canonical(isolatedPublisher)))
+    throw new Error('Maintenance signing requires isolated publisher');
+  const installedLauncherID = isolatedMaintenance ? 'com.sylvan-stack.arbol-browser.isolated-maintenance-launcher' :
+    'com.sylvan-stack.arbol-browser.launcher';
   const electron = join(bundle, 'Contents/Resources/browser/runtime/Electron.app');
   const frameworks = join(electron, 'Contents/Frameworks');
   const jitTargets = new Set([electron, join(electron, 'Contents/MacOS/Electron')]);
@@ -60,7 +63,7 @@ export async function signBundle({ bundle, identity, publisher, sealResources })
   }
   await walk(bundle);
   if (!mutable.has(relative(bundle, bootstrap)) ||
-      (publisher.bundleIdentifier === productionPublisher.bundleIdentifier && !leaves.includes(installedLauncher)) ||
+      ((publisher.bundleIdentifier === productionPublisher.bundleIdentifier || isolatedMaintenance) && !leaves.includes(installedLauncher)) ||
       [...jitTargets].some(file => !leaves.includes(file) && !containers.includes(file))) {
     throw new Error('Pinned Electron or Browser launcher layout is incomplete');
   }

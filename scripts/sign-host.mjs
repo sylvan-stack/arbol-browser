@@ -38,7 +38,7 @@ export async function signHost({ bundle, runtimeArchive, review }) {
   await writeExclusive(bundle + '.signing-attempt.json', JSON.stringify({ format: 1, bundle, comparison,
     unsignedDigest: unsigned.sha256, reviewHandover: review, reviewDigest: accepted.digest, qualification: 'unexecuted' }) + '\n');
   const mutable = new Set(['Contents/Resources/browser/metadata.json', 'Contents/Resources/native-compatibility.json',
-    'Contents/Resources/host-policy.json']);
+    'Contents/Resources/host-policy.json', 'Contents/Resources/maintenance-fixture.json']);
   const signatureResource = name => /(?:^|\/)_CodeSignature\/CodeResources$/.test(name);
   async function assertUnchangedResources() {
     const actual = await inventory(bundle);
@@ -47,7 +47,7 @@ export async function signHost({ bundle, runtimeArchive, review }) {
     for (const name of Object.keys(actual)) if (!(name in expected.record.files) && !signatureResource(name)) fail();
     return actual;
   }
-  const { records, audit } = await signBundle({ bundle, identity, publisher, async sealResources(signedCode) {
+  const { records, audit } = await signBundle({ bundle, identity, publisher, isolatedMaintenance: Boolean(staged.maintenanceFixture), async sealResources(signedCode) {
     for (const name of signedCode) mutable.add(name);
     const records = await refreshHostRecords(bundle, staged);
     await assertUnchangedResources();
@@ -67,6 +67,7 @@ export async function signHost({ bundle, runtimeArchive, review }) {
     unsignedDigest: unsigned.sha256, compileDigest: compiled.digest, metadataDigest: records.policy.metadataDigest,
     compatibilityDigest: records.policy.compatibilityDigest, policyDigest: (await exactFile(join(bundle, 'Contents/Resources/host-policy.json'))).sha256,
     physicalEntries: { bundle: await assertPhysicalCap(bundle), payload: await assertPhysicalCap(join(bundle, 'Contents/Resources/browser')) },
+    maintenanceFixture: records.maintenanceFixture,
     files: finalFiles, payloadDigest: inventoryDigest(finalFiles), objects: audit, libraryValidationDisabled: false,
     qualification: 'unexecuted', unavailable: ['ABR-12 actual product/readiness/failure/race/persistence/close qualification', 'ABR-30 inspection and agent effects', 'ABR-25 distribution/notarization/release qualification'] };
   await writeExclusive(bundle + '.signature-audit.json', JSON.stringify(result, null, 2) + '\n');

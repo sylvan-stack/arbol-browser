@@ -384,6 +384,20 @@ async function productionDependencies(payload, scratch) {
 export function outerPlist(policy) {
   return `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>${policy.bundleIdentifier}</string><key>CFBundleName</key><string>Arbol Browser</string><key>CFBundleExecutable</key><string>arbol-browser-native</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleVersion</key><string>1</string><key>LSMinimumSystemVersion</key><string>27.0.1</string><key>LSMultipleInstancesProhibited</key><false/></dict></plist>\n`;
 }
+export async function refreshMaintenanceFixture(bundle, staged) {
+  if (!staged.maintenanceFixture) return null;
+  if (staged.purpose !== 'isolated-qualification' || staged.delivery === 'production') fail('Invalid maintenance fixture purpose');
+  const actual = await maintenanceFixtureLayout(staged.buildRoot, staged.stateRoot);
+  if (!actual || canonical(actual) !== canonical(staged.maintenanceFixture)) fail('Maintenance fixture identity changed');
+  const launcher = await exactFile(join(bundle, 'Contents/Resources/browser/native/stable-launch'), 67108864);
+  const policy = await exactFile(join(bundle, 'Contents/Resources/host-policy.json'));
+  const value = { format: 1, purpose: 'isolated-qualification', ...actual,
+    launcherSha256: launcher.sha256, hostPolicySha256: policy.sha256 };
+  await writeFile(join(bundle, 'Contents/Resources/maintenance-fixture.json'), JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
+  if (canonical(await maintenanceFixtureLayout(staged.buildRoot, staged.stateRoot)) !== canonical(actual)) fail('Fixture changed during sealing');
+  return value;
+}
+
 export async function refreshHostRecords(bundle, staged) {
   const payload = join(bundle, 'Contents/Resources/browser');
   if (staged.component.contract !== 1 || staged.component.profileFormat !== 2) fail('Current host metadata must select profile format2');
@@ -411,7 +425,8 @@ export async function refreshHostRecords(bundle, staged) {
       buildRoot: staged.buildRoot, stateRoot: staged.stateRoot, productDigest: staged.productDigest, originalProviderGates: 'unchanged' })),
     readerKey, readableReaderKeys: compatibility.compatibleReaderKeys, readableDataEpochs: compatibility.readableDataEpochs };
   await writeFile(join(bundle, 'Contents/Resources/host-policy.json'), JSON.stringify(policy, null, 2) + '\n', { mode: 0o600 });
-  return { metadata, compatibility, policy };
+  const maintenanceFixture = await refreshMaintenanceFixture(bundle, staged);
+  return { metadata, compatibility, policy, maintenanceFixture };
 }
 /** One new private outer, never an older signed candidate/registered payload.
  * Stage only; the separate signer and allocated-Build adapter own later steps. */
