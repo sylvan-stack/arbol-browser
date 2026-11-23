@@ -124,27 +124,35 @@ function convertProfiles(directory, original) {
 }
 
 function readProfiles(directory) {
-  let handle;
-  try { handle = openSync(join(directory, 'profiles.json'), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
-  catch (error) { if (error.code === 'ENOENT') return []; throw error; }
-  try {
-    const info = fstatSync(handle);
-    if (!info.isFile() || info.uid !== process.getuid() || info.nlink !== 1 ||
-        (info.mode & 0o7777) !== 0o600 || info.size > 256000)
-      throw new Error('The preview profile list must be a private file.');
-    const value = JSON.parse(readFileSync(handle, 'utf8'));
-    if (value?.format !== 1) throw new Error('This preview profile list format is unsupported.');
-    return validateProfiles(value.profiles);
-  } finally { closeSync(handle); }
+  let data;
+  try { data = readPrivateFile(join(directory, 'profiles.json'), format2Limit); }
+  catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    writeProfiles(directory, []);
+    return [];
+  }
+  const value = JSON.parse(data.toString('utf8'));
+  if (value?.format === 1) return convertProfiles(directory, data);
+  if (value?.format !== 2) throw new Error('This preview profile list format is unsupported.');
+  return validateFormat2(directory, value.profiles);
+}
+
+function createPartition(directory, record, records) {
+  validateProfiles(records);
+  const path = join(directory, partitionKey(record));
+  mkdirSync(path, { mode: 0o700 });
+  syncDirectory(directory);
+  return existingPartition(directory, record);
 }
 
 function writeProfiles(directory, records) {
-  const data = JSON.stringify({ format: 1, profiles: validateProfiles(records) });
-  const temporary = join(directory, '.profiles-' + randomUUID());
-  writeFileSync(temporary, data + '\n', { flag: 'wx', mode: 0o600 });
-  try { renameSync(temporary, join(directory, 'profiles.json')); }
-  catch (error) { unlinkSync(temporary); throw error; }
+  const data = Buffer.from(JSON.stringify({ format: 2, profiles: validateFormat2(directory, records) }) + '\n');
+  if (data.length > format2Limit) throw new Error('The preview profile list is too large.');
+  const temporary = stageFile(directory, data);
+  try { syncDirectory(directory); renameSync(temporary, join(directory, 'profiles.json')); }
+  catch (error) { try { unlinkSync(temporary); } catch {} throw error; }
+  syncDirectory(directory);
 }
 
 module.exports = { privateDirectory, validAccount, profileId, partitionKey, existingPartition,
-  validateFormat2, readPrivateFile, convertProfiles, readProfiles, writeProfiles };
+  validateFormat2, readPrivateFile, convertProfiles, createPartition, readProfiles, writeProfiles };

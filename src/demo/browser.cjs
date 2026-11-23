@@ -1,9 +1,9 @@
 const { app, BaseWindow, WebContentsView, ipcMain, protocol, session } = require('electron');
-const { createHash } = require('node:crypto');
 const { readFile } = require('node:fs/promises');
-const { join } = require('node:path');
+const { basename, dirname, join } = require('node:path');
 const { createInterface } = require('node:readline');
-const { privateDirectory, validAccount, profileId, readProfiles, writeProfiles } = require('./profile-storage.cjs');
+const { privateDirectory, validAccount, profileId, partitionKey, existingPartition, createPartition,
+  readProfiles, writeProfiles } = require('./profile-storage.cjs');
 const { dragInPage } = require('./drag.cjs');
 
 const maximumTabs = 40;
@@ -200,9 +200,10 @@ async function main(config, clipboard) {
     const id = profileId({ site, account });
     const current = loginProfiles.get(id);
     if (current && (!name || current.name === name)) return current;
-    const record = { site, account, name: name ?? id };
+    const record = { site, account, name: name ?? id, partition: partitionKey({ site, account }) };
     const records = new Map(loginProfiles);
     records.set(id, record);
+    if (!current) createPartition(profilesRoot, record, [...records.values()]);
     writeProfiles(privateDirectory(profilesRoot), [...records.values()]);
     if (current) current.name = record.name;
     else loginProfiles.set(id, { ...record, id, website: null, tabs: new Map(), selected: null });
@@ -212,8 +213,7 @@ async function main(config, clipboard) {
   function websiteSession(profile) {
     if (!profile.website) {
       privateDirectory(profilesRoot);
-      const key = createHash('sha256').update(profile.site).update('\0').update(profile.account).digest('hex');
-      const path = privateDirectory(join(profilesRoot, 'site-' + key));
+      const path = existingPartition(profilesRoot, profile);
       const website = session.fromPath(path);
       if (website.getStoragePath() !== path) throw new Error('Could not open the selected site profile.');
       sessionPolicy(website);
@@ -510,6 +510,9 @@ try {
   if (process.type !== 'browser' || process.versions.electron !== '45.3.2' ||
       Object.values(localPaths).some(path => !path)) throw new Error('Launch the preview with npm run demo.');
   const config = options(process.argv.slice(2));
+  if (basename(localPaths.userData) !== 'instance' || basename(localPaths.profiles) !== 'site-profiles' ||
+      dirname(localPaths.userData) !== dirname(localPaths.profiles))
+    throw new Error('The preview instance lock must belong to the selected profile store.');
   app.setName('Arbol Browser Preview');
   app.setPath('userData', localPaths.userData);
   app.setPath('sessionData', localPaths.sessionData);
