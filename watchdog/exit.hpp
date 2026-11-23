@@ -108,7 +108,9 @@ inline NSDictionary* strictManagementObject(const std::string& raw, size_t maxim
     }
     return true;
   };
-  if (!value(0)) return nil; space(); return at == raw.size() ? arbol_attempt::json(raw) : nil;
+  if (!value(0)) return nil; space(); if (at != raw.size()) return nil;
+  NSError* error=nil; id decoded=[NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
+  return !error&&[decoded isKindOfClass:NSDictionary.class]?decoded:nil;
 }
 class ExitWatch {
   int queue_=-1; Identity original_{}; bool attempted_=false, enrolled_=false, uncertain_=false, seen_=false;
@@ -1764,6 +1766,9 @@ public:
 // shared with the host/watchdog marker consumer; grammar alone grants no exit
 // authority. The platform must rederive the retained native proof afterwards.
 inline bool migrationDigest(id value) { return arbol_attempt::pattern(value,@"^[0-9a-f]{64}$"); }
+inline bool migrationFormat(id value,unsigned expected) {
+  uint64_t actual; return arbol_attempt::uintNumber(value,actual)&&actual==expected;
+}
 inline bool migrationIdentity(id value, unsigned mode) {
   uint64_t uid, permissions;
   return arbol_attempt::keys(value,@[@"device",@"inode",@"uid",@"mode"])&&
@@ -1797,7 +1802,7 @@ inline bool migrationEvidence(id value) {
 }
 inline bool migrationRecord(id value, NSString* identifier, NSString* instance, unsigned format) {
   using namespace arbol_attempt;
-  if(!keys(value,@[@"format",@"id",@"instance",@"creationRequest",@"createdAt"])||![value[@"format"] isEqual:@(format)]||
+  if(!keys(value,@[@"format",@"id",@"instance",@"creationRequest",@"createdAt"])||!migrationFormat(value[@"format"],format)||
      !pattern(identifier,@"^[a-z](?:[a-z0-9-]{0,62}[a-z0-9])?$")||![value[@"id"] isEqual:identifier]||
      !pattern(instance,@"^prf_[A-Za-z0-9_-]{22}$")||![value[@"instance"] isEqual:instance]||
      !pattern(value[@"creationRequest"],@"^create_[A-Za-z0-9_-]{22}$")||
@@ -1809,7 +1814,7 @@ inline bool migrationRecord(id value, NSString* identifier, NSString* instance, 
 }
 inline bool migrationOnlyFormat(id before,id after) {
   if(![before isKindOfClass:NSDictionary.class]||![after isKindOfClass:NSDictionary.class]||
-     ![before[@"format"] isEqual:@1]||![after[@"format"] isEqual:@2]) return false;
+     !migrationFormat(before[@"format"],1)||!migrationFormat(after[@"format"],2)) return false;
   NSMutableDictionary* converted=[before mutableCopy]; converted[@"format"]=@2; return [converted isEqual:after];
 }
 inline bool migrationMarkerPair(id before,id after,bool convertedIdentity,NSString* instance) {
@@ -1836,7 +1841,7 @@ inline bool migrationReceipt(id value) {
   using namespace arbol_attempt;
   return profileFormat==2&&keys(value,@[@"format",@"kind",@"attempt",@"transactionSha256",@"profilePath",@"profileSha256",@"instance",
     @"directory",@"evidence",@"originalRecord",@"convertedRecord",@"originalMarker",@"convertedMarker",@"bootSession",@"writer",
-    @"sourceSha256",@"productSha256",@"candidateSha256"])&&[value[@"format"] isEqual:@1]&&
+    @"sourceSha256",@"productSha256",@"candidateSha256"])&&migrationFormat(value[@"format"],1)&&
     [value[@"kind"] isEqual:@"browser-profile-migration-receipt"]&&pattern(value[@"attempt"],@"^[0-9a-f]{32}$")&&
     migrationDigest(value[@"transactionSha256"])&&path(value[@"profilePath"])&&migrationDigest(value[@"profileSha256"])&&
     [digest([value[@"profilePath"] UTF8String]) isEqual:value[@"profileSha256"]]&&pattern(value[@"instance"],@"^prf_[A-Za-z0-9_-]{22}$")&&
@@ -1852,7 +1857,7 @@ inline bool migrationRelease(id value) {
 inline bool migrationTransaction(id value) {
   using namespace arbol_attempt;
   if(!keys(value,@[@"format",@"kind",@"attempt",@"root",@"runtime",@"selection",@"selectionFile",@"journal",@"epoch",@"oldBuild",@"newBuild",
-      @"sourceSha256",@"productSha256",@"candidateSha256",@"profiles"])||![value[@"format"] isEqual:@1]||
+      @"sourceSha256",@"productSha256",@"candidateSha256",@"profiles"])||!migrationFormat(value[@"format"],1)||
      ![value[@"kind"] isEqual:@"browser-profile-migration"]||!pattern(value[@"attempt"],@"^[0-9a-f]{32}$")||
      !migrationIdentity(value[@"runtime"],0700)||!migrationFile(value[@"journal"])||!migrationDigest(value[@"epoch"])||
      !migrationRelease(value[@"newBuild"])||!migrationDigest(value[@"sourceSha256"])||!migrationDigest(value[@"productSha256"])||
@@ -1879,7 +1884,7 @@ inline bool migrationTransaction(id value) {
 }
 inline bool migrationCompletion(id value,id transaction,NSString* transactionDigest,NSString* profileHash,NSString* receiptDigest) {
   using namespace arbol_attempt;
-  if(!keys(value,@[@"format",@"attempt",@"transactionSha256",@"profiles"])||![value[@"format"] isEqual:@1]||
+  if(!keys(value,@[@"format",@"attempt",@"transactionSha256",@"profiles"])||!migrationFormat(value[@"format"],1)||
      ![value[@"attempt"] isEqual:transaction[@"attempt"]]||![value[@"transactionSha256"] isEqual:transactionDigest]||
      ![value[@"profiles"] isKindOfClass:NSArray.class]||[value[@"profiles"] count]!=[transaction[@"profiles"] count]) return false;
   NSMutableDictionary* expected=[NSMutableDictionary new];

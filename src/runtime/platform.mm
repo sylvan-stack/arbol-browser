@@ -1906,7 +1906,7 @@ struct RetainedMigrationProof {
        "/migration/"+receiptDigest.UTF8String+".json",0600,arbol_exit::exitReceiptLimit,true)) return false;
     capture=arbol_exit::parseExitReceipt(captureFile.content);
     if(!keys(capture,@[@"format",@"kind",@"receiptSha256",@"transactionSha256",@"attempt",@"epoch",@"profileSha256",@"instance",@"directory",@"closed",@"data"])||
-       ![capture[@"format"] isEqual:@1]||![capture[@"kind"] isEqual:@"native-migration-evidence"]||
+       !arbol_exit::migrationFormat(capture[@"format"],1)||![capture[@"kind"] isEqual:@"native-migration-evidence"]||
        ![capture[@"receiptSha256"] isEqual:receiptDigest]||![capture[@"epoch"] isEqual:chain.transaction[@"epoch"]]) return false;
     for(NSString* key in @[@"transactionSha256",@"attempt",@"profileSha256",@"instance",@"directory"])
       if(![capture[key] isEqual:chain.receipt[key]]) return false;
