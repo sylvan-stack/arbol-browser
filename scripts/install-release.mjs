@@ -826,6 +826,88 @@ async function verifyCompletion(context, release, prepared, result, custody) {
   completionObservations.add(observation); return observation;
 }
 
+async function recheckEvidence(context, proof) {
+  if (!Array.isArray(proof.files) || proof.files.length > 131072 || !Array.isArray(proof.directories) ||
+      proof.directories.length > 65536 || !valid('migration.Root', proof.state.root)) throw new Error('Invalid reopening inventory');
+  requireEqual(await privateDirectory(dirname(context.state), true), proof.state.parent);
+  requireEqual(await privateDirectory(context.runtime, true), proof.state.runtime);
+  if (proof.state.root.path !== context.state) throw new Error('Reopening state root differs');
+  if (proof.state.root.initial === 'absent') await absent(context.state);
+  else {
+    requireEqual(await privateDirectory(context.state, true), proof.state.root.identity);
+    const transactionRef = proof.files.find(f => f.scope === 'migration' && /^[0-9a-f]{32}\/transaction\.json$/.test(f.path));
+    if (!transactionRef) throw new Error('Reopening transaction missing');
+    const transaction = await privateJson(evidencePath(context, transactionRef.scope, transactionRef.path), transactionLimit);
+    if (!sameFile(transaction, transactionRef) || !valid('migration.Transaction', transaction.value)) throw new Error('Reopening transaction changed');
+    requireEqual((await readdir(join(context.state, 'profiles'))).sort(), transaction.value.profiles.map(p => p.id).sort());
+    for (const p of transaction.value.profiles) if (!p.targetMarker) await absent(join(context.state, 'profiles', p.id, 'engine.json'));
+  }
+  for (const [entries, isFile] of [[proof.directories, false], [proof.files, true]]) {
+    let previous = '';
+    for (const entry of entries) {
+      const path = evidencePath(context, entry.scope, entry.path), key = `${entry.scope}:${entry.path}`;
+      if (previous && previous.localeCompare(key, 'en') >= 0) throw new Error('Reopening inventory is not unique and ordered');
+      previous = key;
+      if (isFile) {
+        if (!keys(entry, ['scope', 'path', 'identity', 'sha256', 'size', 'gid', 'mtimeNs', 'ctimeNs']) ||
+            !/^(0|[1-9][0-9]{0,18})$/.test(entry.size) || !digest(entry.sha256)) throw new Error('Invalid reopening file');
+        const maximum = /\/family-(main|primary|custody)\.log$/.test(entry.path) ? 9223372036854775807n :
+          /^[0-9a-f]{32}\/transaction\.json$/.test(entry.path) && entry.scope === 'migration' ? BigInt(transactionLimit) : 8388608n;
+        const { scope, path: ignored, ...expected } = entry;
+        requireEqual(await observeFile(path, maximum), expected);
+      } else {
+        if (!keys(entry, ['scope', 'path', 'identity'])) throw new Error('Invalid reopening directory');
+        requireEqual(await privateDirectory(path, true), entry.identity);
+      }
+    }
+  }
+}
+function proofPrepared(proof) {
+  return { journal: { ...proof.journal, value: { format: 3, aliasBefore: proof.source.aliasBefore, before: proof.before,
+    after: proof.after, migration: { fromProfileFormat: 1, toProfileFormat: 2 } } }, guards: proof.guards,
+    selection: { value: proof.before?.selection ?? null, file: proof.source.selectionFile },
+    assets: proof.source.assets, launcher: proof.source.launcher, oldAssets: proof.source.oldAssets,
+    state: { parent: proof.state.parent, runtime: proof.state.runtime } };
+}
+async function readReopeningProof(context, release, custody) {
+  if (!await optionalFile(context.proofPath, proofLimit)) return null;
+  const file = await privateJson(context.proofPath, proofLimit), proof = file.value;
+  if (!keys(proof, ['format', 'kind', 'journal', 'before', 'after', 'source', 'result', 'epoch', 'guards', 'state', 'directories', 'files']) ||
+      proof.format !== 1 || proof.kind !== 'browser-profile-migration-reopen' || !digest(proof.epoch) ||
+      !valid('migration.Result', proof.result) || !digest(proof.result.completionSha256) || proof.result.diagnostic !== null || proof.result.busy.length ||
+      !keys(proof.state, ['root', 'parent', 'runtime']) || !keys(proof.journal, ['path', 'identity', 'sha256']) ||
+      proof.journal.path !== context.journalPath || !keys(proof.source, ['build', 'git', 'sourceDigest', 'productDigest', 'aliasBefore', 'selectionFile', 'assets', 'launcher', 'oldAssets']) ||
+      proof.source.build !== release.build || proof.source.git !== release.source || proof.source.sourceDigest !== release.sourceDigest ||
+      proof.source.productDigest !== release.productDigest || typeof proof.source.aliasBefore !== 'boolean' ||
+      !equal(proof.after, { selection: { format: 1, build: release.build, imageSha256: release.imageSha256 }, launcherSha256: release.launcher.sha256 }))
+    throw new Error('Reopening proof does not bind exact signed release');
+  const prepared = proofPrepared(proof);
+  if (!valid('migration.Journal', prepared.journal.value)) throw new Error('Reopening journal grammar differs');
+  const journal = await privateJson(context.journalPath, 16384);
+  requireEqual(journal.value, prepared.journal.value);
+  const selected = await optionalSelection(context.selectionPath), after = equal(selected, proof.after.selection);
+  await preparedBindings(context, release, prepared, custody, after);
+  await recheckEvidence(context, proof);
+  if (!sameFile(await privateJson(context.proofPath, proofLimit), file)) throw new Error('Reopening proof changed');
+  return file;
+}
+async function publishReopeningProof(context, release, observation, custody) {
+  if (!completionObservations.has(observation)) throw new Error('Native completion observation is required');
+  const { prepared, result, epoch, root, directories, files } = observation;
+  await preparedBindings(context, release, prepared, custody);
+  const proof = { format: 1, kind: 'browser-profile-migration-reopen',
+    journal: { path: context.journalPath, ...fileReference(prepared.journal) }, before: prepared.journal.value.before,
+    after: prepared.journal.value.after,
+    source: { build: release.build, git: release.source, sourceDigest: release.sourceDigest, productDigest: release.productDigest,
+      aliasBefore: prepared.journal.value.aliasBefore, selectionFile: prepared.selection.file,
+      assets: prepared.assets, launcher: prepared.launcher, oldAssets: prepared.oldAssets },
+    result, epoch, guards: prepared.guards, state: { ...prepared.state, root }, directories, files };
+  await recheckEvidence(context, proof);
+  const bytes = encode(proof); if (bytes.length > proofLimit) throw new Error('Reopening proof exceeds bound');
+  await publishExact(context.proofPath, proofLimit, hash(bytes), path => writeExclusive(path, bytes), custody.publication);
+  return readReopeningProof(context, release, custody);
+}
+
 /** Publish the exact selected binary and image under the same guards used by launch and retirement. */
 export async function installRelease(options) {
   const release = await verifySignedRelease(options);
