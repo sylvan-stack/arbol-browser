@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { constants } from 'node:fs';
-import { chmod, copyFile, link, lstat, mkdir, mkdtemp, open, readdir, readlink, realpath, rename, rmdir, symlink,
+import { chmod, copyFile, lstat, mkdir, mkdtemp, open, readdir, readlink, realpath, rename, rmdir, symlink,
   unlink } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { tmpdir, userInfo } from 'node:os';
@@ -233,6 +233,7 @@ async function syncPath(path) {
 }
 
 async function publishExact(path, maximum, sha256, stage, publication) {
+  if (!publication) throw new Error('Native EX publication authority required');
   if (publication) {
     const existing = await optionalFile(path, maximum);
     if (existing) {
@@ -253,10 +254,6 @@ async function publishExact(path, maximum, sha256, stage, publication) {
       publication.provider.assertLock(publication.selection);
       publication.provider.publishInstallerFile(publication.selection, JSON.stringify({ source: tmp, destination: path,
         identity: staged.identity, sha256 }));
-    } else {
-      // Historical journal1/2 path only. New lifecycle callers always supply
-      // the genuine EX selector and use native single-link RENAME_EXCL.
-      try { await link(tmp, path); } catch (error) { if (error.code !== 'EEXIST') throw error; }
     }
   } finally {
     try { await unlink(tmp); } catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -1002,77 +999,93 @@ function installationResult(context, release) {
     executable: context.executable, image: context.image, mount: context.mount, alias: context.alias };
 }
 
-/** Publish the exact selected binary and image under the same guards used by launch and retirement. */
+/** Compatible updates never reuse, remove or reinterpret migration evidence. */
+async function ordinaryInstall(context, release, options, route, custody) {
+  await custody.assert(); requireEqual(await optionalSelection(context.selectionPath), route.previous);
+  if (await installationJournal(context.support)) throw new Error('Pending installation requires recovery first');
+  await stageReleaseAssets(context, release, options, custody);
+  const old = await installedImageReceipt(context.support, route.previous);
+  const current = await exactFile(context.executable, launcherLimit);
+  if (current.sha256 !== old.launcherSha256 || current.identity.mode !== 0o755) throw new Error('Selected launcher changed');
+  checkSignature(context.executable, launcherIdentifier);
+  if (route.kind === 'same') {
+    if (await installedProfileFormat(context.support, route.previous) !== 2 || current.sha256 !== release.launcher.sha256)
+      throw new Error('Same candidate is not selected format2');
+    await ensureAlias(context.alias, context.executable); await custody.assert();
+    return installationResult(context, release);
+  }
+  // Preserve an earlier conversion backup before reusing the legacy slot for
+  // a later compatible transaction. Existing immutable release bytes remain.
+  const prior = await optionalFile(context.backup, launcherLimit);
+  if (prior) {
+    const pinned = profileMigrationPredecessor;
+    if (prior.sha256 !== pinned.launcherSha256 || prior.identity.mode !== 0o755) throw new Error('Unknown retained launcher backup');
+    checkSignature(context.backup, launcherIdentifier);
+    await publishExact(join(context.receipts, `${pinned.build}.launcher`), launcherLimit, prior.sha256,
+      path => writeExclusive(path, prior.bytes, 0o755), custody.publication);
+    if (!sameFile(await exactFile(context.backup, launcherLimit), prior)) throw new Error('Retained backup changed');
+    await unlink(context.backup); await syncPath(context.support);
+  }
+  await publishExact(context.backup, launcherLimit, current.sha256, path => writeExclusive(path, current.bytes, 0o755), custody.publication);
+  const transaction = { format: 2, aliasBefore: Boolean(await installedAlias(context.alias, context.executable)),
+    before: { selection: route.previous, launcherSha256: old.launcherSha256 },
+    after: { selection: { format: 1, build: release.build, imageSha256: release.imageSha256 }, launcherSha256: release.launcher.sha256 } };
+  const bytes = encode(transaction);
+  await publishExact(context.journalPath, 4096, hash(bytes), path => writeExclusive(path, bytes), custody.publication);
+  await replaceFile(context.executable, release.launcher.bytes, 0o755);
+  if ((await exactFile(context.executable, launcherLimit)).sha256 !== release.launcher.sha256) throw new Error('Installed launcher differs');
+  checkSignature(context.executable, launcherIdentifier); await ensureAlias(context.alias, context.executable);
+  await custody.assert(); await replaceFile(context.selectionPath, encode(transaction.after.selection), 0o600);
+  return installationResult(context, release);
+}
+/** Publish the exact selected binary and image under native installation guards.
+ * Journal3 is never consumed by rollback, including any exceptional path. */
 export async function installRelease(options) {
-  const release = await verifySignedRelease(options);
-  const { homedir: home } = userInfo();
-  const supportParts = installation.stableUses.slice(0, -1);
-  const privateFrom = supportParts.length - 1;
-  const support = await safeDirectories(home, supportParts, privateFrom);
-  const uses = await safeDirectories(home, installation.stableUses, privateFrom);
-  const bin = await safeDirectories(home, [...installation.stableBuilds.slice(0, 2), 'bin'], 1);
-  const executable = join(bin, 'arbol-browser');
-  const alias = join(await safeDirectories(home, ['.local', 'bin'], 2), 'arbol-browser');
-  const selectionPath = join(support, 'selected.json');
-  const selected = { format: 1, build: release.build, imageSha256: release.imageSha256 };
-  return withLockProvider(release.platform, provider => withLock(provider, join(support, 'selection.lock'), async () => {
-    await recoverInstall(support, executable, alias, provider, uses);
-    const previous = await optionalSelection(selectionPath);
-    const aliasBefore = Boolean(await installedAlias(alias, executable));
-    const same = canonical(previous) === canonical(selected);
-    if (previous && !same && BigInt(`0x${previous.build}`) >= BigInt(`0x${release.build}`)) {
-      throw new Error('Browser release number is older or already belongs to different signed bytes');
-    }
-    const update = async () => {
-      const images = await safeDirectories(home, [...supportParts, 'images'], privateFrom);
-      const receipts = await safeDirectories(home, [...supportParts, 'releases'], privateFrom);
-      const mount = await safeDirectories(home, [...installation.stableBuilds, release.build, 'app'], 1);
-      const image = join(images, `${release.build}.dmg`);
-      const saved = await publishExact(image, imageLimit, release.imageSha256, async path => {
-        await copyFile(options.image, path, constants.COPYFILE_EXCL);
-        await chmod(path, 0o600);
-      });
-      if (saved.identity.mode !== 0o600) throw new Error('Installed image permissions differ');
-      await checkedGuard(join(uses, `${release.build}.mount`));
-      await syncPath(uses);
-      const receipt = encode({ ...selected, source: release.source, payloadDigest: release.payloadDigest,
-        launcherSha256: release.launcher.sha256 });
-      await publishExact(join(receipts, `${release.build}.json`), 4096, hash(receipt), path => writeExclusive(path, receipt));
-
-      const current = await optionalFile(executable, launcherLimit);
-      const old = previous ? await installedImageReceipt(support, previous) : undefined;
-      if (old ? current?.sha256 !== old.launcherSha256 : current !== undefined) throw new Error('Existing launcher differs from its release receipt');
-      if (!same) {
-        const journal = join(support, 'install-transaction.json');
-        const backup = join(support, 'install-previous-launcher');
-        if (current) {
-          checkSignature(executable, launcherIdentifier);
-          await publishExact(backup, launcherLimit, current.sha256, path => writeExclusive(path, current.bytes, 0o755));
-        }
-        const transaction = encode({ format: 2, aliasBefore,
-          before: old ? { selection: previous, launcherSha256: old.launcherSha256 } : null,
-          after: { selection: selected, launcherSha256: release.launcher.sha256 } });
-        await publishExact(journal, 4096, hash(transaction), path => writeExclusive(path, transaction));
-        await replaceFile(executable, release.launcher.bytes, 0o755);
-        if ((await exactFile(executable, launcherLimit)).sha256 !== release.launcher.sha256) throw new Error('Installed launcher differs');
-        checkSignature(executable, launcherIdentifier);
-        await ensureAlias(alias, executable);
-        await replaceFile(selectionPath, encode(selected), 0o600);
-      } else {
-        checkSignature(executable, launcherIdentifier);
-        await ensureAlias(alias, executable);
-      }
-      return { build: release.build, source: release.source, imageSha256: release.imageSha256, executable, image, mount, alias };
-    };
-    const candidate = () => withLock(provider, join(uses, release.build), update, !same);
-    let result;
+  const release = await verifySignedRelease(options), context = await releaseContext(release);
+  return withLockProvider(release.platform, async provider => {
+    // Legacy recovery runs under selection EX before taking any Build EX;
+    // its own Build guard must not conflict with a caller-held description.
+    await withLock(provider, join(context.support, 'selection.lock'), async () => {
+      const pending = await installationJournal(context.support);
+      if (pending && pending.value.format !== 3)
+        await recoverInstall(context.support, context.executable, context.alias, provider, context.uses);
+    });
+    const initialJournal = await installationJournal(context.support);
+    const previous = initialJournal?.value.format === 3 ? initialJournal.value.before?.selection ?? null :
+      await optionalSelection(context.selectionPath);
+    let prepared, route;
     try {
-      result = previous && !same ? await withLock(provider, join(uses, previous.build), candidate, false) : await candidate();
+      const completed = await withInstallationGuards(context, provider, previous, release.build, async custody => {
+        route = await installationRoute(context, release);
+        requireEqual(route.previous, previous);
+        if (route.kind === 'legacy') throw new Error('Installation changed while taking original guards');
+        if (route.kind === 'same' || route.kind === 'ordinary') return ordinaryInstall(context, release, options, route, custody);
+        const proof = await readReopeningProof(context, release, custody);
+        if (proof) return finalizeMigration(context, release, custody);
+        if (equal(await optionalSelection(context.selectionPath), route.pending?.value.after.selection))
+          throw new Error('After selection without native-bound proof stays closed');
+        prepared = await prepareMigrationRelease(context, release, options, route, custody);
+        return null;
+      }, !initialJournal && previous?.build !== release.build);
+      if (completed) return completed;
+      // All installer-held descriptions have closed. Native acquires its own
+      // original EX set, and journal3 closes admission throughout the handoff.
+      const result = await invokeSignedMaintenance(context, release, prepared, provider);
+      return await withInstallationGuards(context, provider, previous, release.build, async custody => {
+        const observation = await verifyCompletion(context, release, prepared, result, custody);
+        await publishReopeningProof(context, release, observation, custody);
+        return finalizeMigration(context, release, custody);
+      });
     } finally {
-      await recoverInstall(support, executable, alias, provider, uses);
+      // Only legacy transactions may roll back. Format3 persists on every
+      // failure until the exact signed candidate can finish forwards.
+      await withLock(provider, join(context.support, 'selection.lock'), async () => {
+        const pending = await installationJournal(context.support);
+        if (pending && pending.value.format !== 3)
+          await recoverInstall(context.support, context.executable, context.alias, provider, context.uses);
+      });
     }
-    return result;
-  }));
+  });
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
