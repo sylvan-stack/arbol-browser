@@ -1837,7 +1837,7 @@ static napi_value abortHostMarkerMutation(napi_env env,napi_callback_info info) 
 // Actual owner/old-Build descriptions and code lifetime survive a bounded
 // caller's departure; blocking read-only kernel/FS work is off its event loop.
 static bool migrationInspectionMode(id mode) {
-  return arbol_attempt::profileFormat == 2 && [@[@"migrate-verify",@"migrate-commit",@"migrate-recover",@"migrate-receipt-progress"] containsObject:mode];
+  return arbol_attempt::profileFormat == 2 && [@[@"migrate-verify",@"migrate-commit",@"migrate-recover",@"migrate-receipt-progress",@"migrate-committed-check"] containsObject:mode];
 }
 static bool originalMaintenanceBuild(const arbol_boundary::Lock& lock) {
   if (arbol_attempt::profileFormat != 2 || !maintenanceCustody || !maintenanceCustody->accepted ||
@@ -2983,11 +2983,12 @@ static bool inspectExit(ExitInspection& job) {
   NSDictionary* input=job.input,*expected=input[@"attempt"]; NSString* leaf=input[@"runtimeLeaf"],*profile=input[@"profile"];
   bool prior=[input[@"mode"] isEqual:@"prior"],hostMode=[input[@"mode"] isEqual:@"host"],
     retire=[input[@"mode"] isEqual:@"retire"],reserve=[input[@"mode"] isEqual:@"reserve"],withdraw=[input[@"mode"] isEqual:@"withdraw"];
-  bool progress=[input[@"mode"] isEqual:@"migrate-receipt-progress"],recover=[input[@"mode"] isEqual:@"migrate-recover"],
-    commit=[input[@"mode"] isEqual:@"migrate-commit"],migration=progress||recover||commit||[input[@"mode"] isEqual:@"migrate-verify"];
+  bool progress=[input[@"mode"] isEqual:@"migrate-receipt-progress"],checked=[input[@"mode"] isEqual:@"migrate-committed-check"],
+    recover=[input[@"mode"] isEqual:@"migrate-recover"],commit=[input[@"mode"] isEqual:@"migrate-commit"],
+    migration=progress||checked||recover||commit||[input[@"mode"] isEqual:@"migrate-verify"];
   NSArray* inputKeys=@[@"format",@"mode",@"profile",@"profileInstance",@"profilePathHash",@"runtimeLeaf",@"bundle",@"attempt",@"previous",@"dataAttempt",@"pending"];
-  if(commit||recover||progress) inputKeys=[inputKeys arrayByAddingObject:@"migration"];
-  if(migration&&!progress) inputKeys=[inputKeys arrayByAddingObject:@"sources"];
+  if(commit||recover||progress||checked) inputKeys=[inputKeys arrayByAddingObject:@"migration"];
+  if(migration&&!progress&&!checked) inputKeys=[inputKeys arrayByAddingObject:@"sources"];
   if(!job.within()||!keys(input,inputKeys)||
      ![input[@"format"] isEqual:@1]||(![@[@"prior",@"host",@"full",@"retire",@"reserve",@"withdraw"] containsObject:input[@"mode"]]&&!migration)||
      (migration&&!job.maintenance)||
@@ -3000,7 +3001,7 @@ static bool inspectExit(ExitInspection& job) {
   if(!packagedLayout([input[@"bundle"] UTF8String],inputLayout)||inputLayout.guard!=job.build.path) return false;
   MigrationSourceCapture originalClosed,originalData;
   struct SourceScope { ExitInspection& job; ~SourceScope() { job.originalClosed=nullptr; job.originalData=nullptr; } } sourceScope{job};
-  if(migration&&!progress) {
+  if(migration&&!progress&&!checked) {
     id sources=input[@"sources"];
     if(!keys(sources,@[@"closed",@"data"])) return false;
     for(NSString* key in @[@"closed",@"data"]) {
@@ -3014,7 +3015,7 @@ static bool inspectExit(ExitInspection& job) {
   MigrationObservation migrationSource;
   MigrationPublication publication;
   struct PublicationScope { ExitInspection& job; ~PublicationScope() { job.publication=nullptr; } } publicationScope{job};
-  if(commit||recover||progress) {
+  if(commit||recover||progress||checked) {
     if(!publication.open(input,recover,job.deadline)) return false; job.publication=&publication;
     if(!rewrittenMigrationMetadata(job)) return false;
   } else if(migration&&!migrationSource.capture(job)) return false;
@@ -3180,13 +3181,16 @@ static bool inspectExit(ExitInspection& job) {
          !receiptMetadata(job.hostCapability,current,job)) return false;
     }
   } else if(hostMode) return false;
-  if(progress) {
+  if(progress||checked) {
     if(!originalMaintenanceBuild(job.build)||job.build.path!=maintenanceCustody->newGuard().lock.path||
        ![input[@"bundle"] isEqual:[NSString stringWithUTF8String:maintenanceCustody->layout().bundle.c_str()]]||
        (closed?![closed isEqual:expected]:expected!=(id)NSNull.null)||!reclaim()) return false;
+    struct stat completeIdentity{}; errno=0;
+    bool completed=!fstatat(publication.attempt.fd,"completed.json",&completeIdentity,AT_SYMLINK_NOFOLLOW);
+    if((!completed&&errno!=ENOENT)||(progress&&completed)) return false;
     RetainedMigrationProof proof;
     if(!proof.open([NSString stringWithUTF8String:maintenanceCustody->runtime().path.c_str()],maintenanceCustody->stateRoot(),
-         input[@"profilePathHash"],input[@"profileInstance"],false)||
+         input[@"profilePathHash"],input[@"profileInstance"],completed)||
        ![proof.chain.receipt[@"attempt"] isEqual:input[@"migration"][@"attempt"]]||
        ![proof.chain.receipt[@"transactionSha256"] isEqual:input[@"migration"][@"transactionSha256"]]||
        ![proof.chain.transaction isEqual:publication.transaction]||
@@ -3197,6 +3201,14 @@ static bool inspectExit(ExitInspection& job) {
     MaintenanceDirectory progressAuthority;
     if(!progressAuthority.openPath(publication.attempt.path+"/progress")) return false;
     const std::string committed=std::string([input[@"profilePathHash"] UTF8String])+".committed.json";
+    MaintenanceFile committedFile;
+    if(checked) {
+      if(!committedFile.openPath(progressAuthority.path+"/"+committed,0600,limit,true)) return false;
+      id value=strictManagementObject(committedFile.content);
+      if(!keys(value,@[@"format",@"attempt",@"profileSha256",@"receipt"])||!arbol_exit::migrationFormat(value[@"format"],1)||
+         ![value[@"attempt"] isEqual:proof.chain.receipt[@"attempt"]]||![value[@"profileSha256"] isEqual:input[@"profilePathHash"]]||
+         ![value[@"receipt"] isEqual:proof.chain.receiptFile.record()]) return false;
+    }
     auto continuity=[&] {
       std::string raw; bool missing; struct stat named{};
       if(!job.within()||!publication.current()||!proof.current()) return false;
@@ -3206,8 +3218,9 @@ static bool inspectExit(ExitInspection& job) {
       if(historyMissing||!historyAuthority.current()||
          !readAt(historyAuthority.fd,"previous-claim.json",raw,missing)||missing!=headAbsent||raw!=headRaw||
          !readAt(historyAuthority.fd,"current-attempt.json",raw,missing)||missing!=pointerAbsent||raw!=pointerRaw) return false;
-      errno=0; if(!fstatat(publication.attempt.fd,"completed.json",&named,AT_SYMLINK_NOFOLLOW)||errno!=ENOENT) return false;
+      if(!completed) { errno=0; if(!fstatat(publication.attempt.fd,"completed.json",&named,AT_SYMLINK_NOFOLLOW)||errno!=ENOENT) return false; }
       if(!progressAuthority.current()) return false;
+      if(checked) return committedFile.current()&&proof.current();
       errno=0; return fstatat(progressAuthority.fd,committed.c_str(),&named,AT_SYMLINK_NOFOLLOW)<0&&errno==ENOENT&&progressAuthority.current();
     };
     if(!continuity()||!verifyRetainedMigration(proof,job)||!continuity()) return false;
@@ -3224,9 +3237,11 @@ static bool inspectExit(ExitInspection& job) {
       }
       if(!latest&&!writer&&!prefix) return false;
     }
-    job.result=bytes(@{@"format":@1,@"kind":@"migration-receipt-progress",@"epoch":maintenanceCustody->epoch,
+    NSMutableDictionary* result=[@{@"format":@1,@"kind":checked?@"migration-committed-validated":@"migration-receipt-progress",@"epoch":maintenanceCustody->epoch,
       @"attempt":proof.chain.receipt[@"attempt"],@"profileInstance":input[@"profileInstance"],@"profilePathHash":input[@"profilePathHash"],
-      @"receipt":proof.chain.receiptFile.record()});
+      @"receipt":proof.chain.receiptFile.record()} mutableCopy];
+    if(checked) { result[@"committed"]=committedFile.record(); result[@"completion"]=completed?(id)proof.chain.completionFile.record():NSNull.null; }
+    job.result=bytes(result);
     return !job.result.empty()&&continuity();
   }
   OrdinaryMigrationAuthority ordinaryAuthority;

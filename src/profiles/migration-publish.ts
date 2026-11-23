@@ -3,8 +3,8 @@ import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import type { Contract } from '../contracts/generated.js';
 import { validator } from '../contracts/schema.js';
-import { assertMigrationCommitReceipt, assertMigrationInspectionReceipt, assertMigrationRecoveryReceipt,
-  type HeldLock, type MigrationCommitReceipt, type MigrationInspectionReceipt } from '../runtime/platform.js';
+import { assertMigrationCommitReceipt, assertMigrationCompletionEvidence, assertMigrationInspectionReceipt, assertMigrationRecoveryReceipt,
+  type HeldLock, type MigrationCommitReceipt, type MigrationCompletionEvidence, type MigrationInspectionReceipt } from '../runtime/platform.js';
 import { withMigrationInspection } from '../runtime/migration-exit.js';
 import { migrationDirectory, migrationValue, readMigrationFile, sameMigrationFile, sameMigrationIdentity,
   withMigrationOwner, type MigrationOwner, type MigrationContent } from './migration-owner.js';
@@ -149,13 +149,13 @@ export async function publishMigrationProfile(transaction: MigrationTransaction,
   });
 }
 export async function publishMigrationCompletion(transaction: MigrationTransaction,
-  receipts: ReadonlyMap<string, MigrationCommitReceipt>, deadline: number, assertCustody: () => Promise<void>): Promise<MigrationContent> {
+  receipts: ReadonlyMap<string, MigrationCompletionEvidence>, deadline: number, assertCustody: () => Promise<void>): Promise<MigrationContent> {
   assertMigrationTransaction(transaction);
   if (receipts.size !== transaction.value.profiles.length) throw profileUnavailable();
   const items: Contract<'migration.CompletionItem'>[] = [];
   for (const entry of transaction.value.profiles) {
     const proof = receipts.get(entry.pathSha256); if (!proof) throw profileUnavailable();
-    assertMigrationCommitReceipt(proof, transaction.admission.custody);
+    assertMigrationCompletionEvidence(proof, transaction.admission.custody);
     if (proof.attempt !== transaction.value.attempt || proof.profilePathHash !== entry.pathSha256 || proof.profileInstance !== entry.instance)
       throw profileUnavailable();
     items.push({ profileSha256: entry.pathSha256, receiptSha256: proof.receipt.sha256 });
