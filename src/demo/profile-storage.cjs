@@ -1,6 +1,6 @@
 const { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readFileSync,
   realpathSync, renameSync, unlinkSync, writeFileSync } = require('node:fs');
-const { randomUUID } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 const { join } = require('node:path');
 
 function privateDirectory(path) {
@@ -38,6 +38,30 @@ function validateProfiles(records) {
   return records.map(({ site, account, name }) => ({ site, account, name }));
 }
 
+function partitionKey({ site, account }) {
+  return 'site-' + createHash('sha256').update(site).update('\0').update(account).digest('hex');
+}
+
+function existingPartition(directory, record) {
+  const path = join(directory, partitionKey(record));
+  const info = lstatSync(path);
+  if (!info.isDirectory() || info.uid !== process.getuid() ||
+      (info.mode & 0o7777) !== 0o700 || realpathSync(path) !== path)
+    throw new Error('The saved preview partition is missing or unsafe.');
+  return path;
+}
+
+function validateFormat2(directory, records) {
+  const validated = validateProfiles(records);
+  return validated.map((record, index) => {
+    const partition = partitionKey(record);
+    if (records[index].partition !== partition)
+      throw new Error('The preview profile partition does not match its identity.');
+    existingPartition(directory, record);
+    return { ...record, partition };
+  });
+}
+
 function readProfiles(directory) {
   let handle;
   try { handle = openSync(join(directory, 'profiles.json'), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
@@ -61,4 +85,5 @@ function writeProfiles(directory, records) {
   catch (error) { unlinkSync(temporary); throw error; }
 }
 
-module.exports = { privateDirectory, validAccount, profileId, readProfiles, writeProfiles };
+module.exports = { privateDirectory, validAccount, profileId, partitionKey, existingPartition,
+  validateFormat2, readProfiles, writeProfiles };
