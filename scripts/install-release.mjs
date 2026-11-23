@@ -735,6 +735,11 @@ async function evidenceCollector(context) {
 }
 async function preparedBindings(context, release, prepared, custody, after = false) {
   await custody.assert(); requireEqual(custody.guards, prepared.guards);
+  if (prepared.assets.image.sha256 !== release.imageSha256 || prepared.launcher.sha256 !== release.launcher.sha256)
+    throw new Error('Reopening references do not name the verified signed candidate');
+  const candidateReceipt = await privateJson(join(context.receipts, `${release.build}.json`));
+  requireEqual(candidateReceipt.value, { format: 1, build: release.build, imageSha256: release.imageSha256,
+    source: release.source, payloadDigest: release.payloadDigest, launcherSha256: release.launcher.sha256 });
   if (!sameFile(await privateJson(context.journalPath, 16384), prepared.journal) ||
       !sameFile(await exactFile(context.executable, launcherLimit), prepared.launcher) ||
       !sameFile(await exactFile(context.image, imageLimit), prepared.assets.image) ||
@@ -763,9 +768,10 @@ function targetValue(content, schema) {
   if (!valid(schema, value)) throw new Error('Migration content grammar differs');
   return value;
 }
-async function verifyCompletion(context, release, prepared, result, custody) {
-  if (!nativeResults.has(result)) throw new Error('A genuine signed maintenance return is required');
-  await preparedBindings(context, release, prepared, custody);
+// Read-only semantic reconstruction is shared by fresh completion and recovery.
+// It cannot mint a publication observation or a native success verdict.
+async function collectCompletion(context, release, prepared, result, custody, after = false) {
+  await preparedBindings(context, release, prepared, custody, after);
   const collector = await evidenceCollector(context), { file, directory } = collector;
   const current = await file('migration', 'current', 16384), pointer = current.value;
   if (!keys(pointer, ['format', 'attempt', 'transactionSha256']) || pointer.format !== 1 ||
@@ -853,8 +859,12 @@ async function verifyCompletion(context, release, prepared, result, custody) {
     completed.push({ profileSha256: h, receiptSha256: receipt.sha256 });
   }
   requireEqual(done.profiles, completed);
-  await preparedBindings(context, release, prepared, custody);
-  const observation = { prepared, result, epoch: tx.epoch, root: tx.root, ...collector.finish() };
+  await preparedBindings(context, release, prepared, custody, after);
+  return { prepared, result, epoch: tx.epoch, root: tx.root, ...collector.finish() };
+}
+async function verifyCompletion(context, release, prepared, result, custody) {
+  if (!nativeResults.has(result)) throw new Error('A genuine signed maintenance return is required');
+  const observation = await collectCompletion(context, release, prepared, result, custody);
   completionObservations.add(observation); return observation;
 }
 
@@ -920,6 +930,9 @@ async function readReopeningProof(context, release, custody) {
   const selected = await optionalSelection(context.selectionPath), after = equal(selected, proof.after.selection);
   await preparedBindings(context, release, prepared, custody, after);
   await recheckEvidence(context, proof);
+  const actual = await collectCompletion(context, release, prepared, proof.result, custody, after);
+  requireEqual(actual.epoch, proof.epoch); requireEqual(actual.root, proof.state.root);
+  requireEqual(actual.files, proof.files); requireEqual(actual.directories, proof.directories);
   await recheckRollback(context, proof.rollback, custody, after);
   if (!sameFile(await privateJson(context.proofPath, proofLimit), file)) throw new Error('Reopening proof changed');
   return file;
