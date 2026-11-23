@@ -8,7 +8,7 @@ import { tmpdir, userInfo } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { inventory, inventoryDigest } from './package-base.mjs';
-import { assertPhysicalCap, canonical, exactFile, hash, json, privateDirectory, writeExclusive } from './package-host.mjs';
+import { assertPhysicalCap, canonical, exactFile, hash, json, profileMigrationPredecessor, privateDirectory, writeExclusive } from './package-host.mjs';
 import installation from '../src/runtime/installation-paths.json' with { type: 'json' };
 import { Ajv2020 } from 'ajv/dist/2020.js';
 import addFormats from 'ajv-formats';
@@ -872,7 +872,7 @@ function proofPrepared(proof) {
 async function readReopeningProof(context, release, custody) {
   if (!await optionalFile(context.proofPath, proofLimit)) return null;
   const file = await privateJson(context.proofPath, proofLimit), proof = file.value;
-  if (!keys(proof, ['format', 'kind', 'journal', 'before', 'after', 'source', 'result', 'epoch', 'guards', 'state', 'directories', 'files']) ||
+  if (!keys(proof, ['format', 'kind', 'journal', 'before', 'after', 'source', 'result', 'epoch', 'guards', 'state', 'directories', 'files', 'rollback']) ||
       proof.format !== 1 || proof.kind !== 'browser-profile-migration-reopen' || !digest(proof.epoch) ||
       !valid('migration.Result', proof.result) || !digest(proof.result.completionSha256) || proof.result.diagnostic !== null || proof.result.busy.length ||
       !keys(proof.state, ['root', 'parent', 'runtime']) || !keys(proof.journal, ['path', 'identity', 'sha256']) ||
@@ -888,6 +888,7 @@ async function readReopeningProof(context, release, custody) {
   const selected = await optionalSelection(context.selectionPath), after = equal(selected, proof.after.selection);
   await preparedBindings(context, release, prepared, custody, after);
   await recheckEvidence(context, proof);
+  await recheckRollback(context, proof.rollback, custody, after);
   if (!sameFile(await privateJson(context.proofPath, proofLimit), file)) throw new Error('Reopening proof changed');
   return file;
 }
@@ -901,11 +902,75 @@ async function publishReopeningProof(context, release, observation, custody) {
     source: { build: release.build, git: release.source, sourceDigest: release.sourceDigest, productDigest: release.productDigest,
       aliasBefore: prepared.journal.value.aliasBefore, selectionFile: prepared.selection.file,
       assets: prepared.assets, launcher: prepared.launcher, oldAssets: prepared.oldAssets },
-    result, epoch, guards: prepared.guards, state: { ...prepared.state, root }, directories, files };
+    result, epoch, guards: prepared.guards, state: { ...prepared.state, root }, directories, files,
+    rollback: await observeRollback(context, custody) };
   await recheckEvidence(context, proof);
+  await recheckRollback(context, proof.rollback, custody);
   const bytes = encode(proof); if (bytes.length > proofLimit) throw new Error('Reopening proof exceeds bound');
   await publishExact(context.proofPath, proofLimit, hash(bytes), path => writeExclusive(path, bytes), custody.publication);
   return readReopeningProof(context, release, custody);
+}
+
+async function optionalDirectory(path) {
+  try { await lstat(path); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  return privateDirectory(path, true);
+}
+async function rollbackInventory(context, name, identity) {
+  const path = join(context.support, name);
+  requireEqual(await privateDirectory(path, true), identity);
+  const names = (await readdir(path)).sort();
+  if (names.length > 4096 || names.some(n => !buildNumber(n))) throw new Error('Unsupported rollback namespace inventory');
+  const entries = [];
+  for (const build of names) {
+    const launcherPath = join(path, build), launcher = await exactFile(launcherPath, launcherLimit);
+    if (launcher.identity.mode !== 0o755 || launcher.identity.uid !== userInfo().uid) throw new Error('Unsafe archived launcher');
+    const receiptFile = await privateJson(join(context.receipts, `${build}.json`)), receipt = receiptFile.value;
+    const selected = { format: 1, build, imageSha256: receipt.imageSha256 };
+    const pinned = profileMigrationPredecessor;
+    if (build !== pinned.build || receipt.source !== pinned.source || receipt.imageSha256 !== pinned.imageSha256 ||
+        receipt.payloadDigest !== pinned.payloadDigest || receipt.launcherSha256 !== pinned.launcherSha256 ||
+        launcher.sha256 !== pinned.launcherSha256 || await installedProfileFormat(context.support, selected) !== 1)
+      throw new Error('Rollback archive is not the supported authentic predecessor');
+    checkSignature(launcherPath, launcherIdentifier);
+    const image = await exactFile(join(context.images, `${build}.dmg`), imageLimit);
+    if (image.sha256 !== selected.imageSha256) throw new Error('Rollback image changed');
+    entries.push({ build, launcher: { ...fileReference(launcher), size: launcher.bytes.length },
+      release: fileReference(receiptFile), image: fileReference(image) });
+  }
+  requireEqual((await readdir(path)).sort(), names);
+  requireEqual(await privateDirectory(path, true), identity);
+  return entries;
+}
+async function observeRollback(context, custody) {
+  await custody.assert(); const parent = await privateDirectory(context.support, true);
+  const active = await optionalDirectory(join(context.support, 'rollback-launchers'));
+  await absent(join(context.support, 'pre-format-2-rollback-launchers'));
+  if (active && active.device !== parent.device) throw new Error('Rollback namespace crossed filesystems');
+  const observation = { parent, active, entries: active ? await rollbackInventory(context, 'rollback-launchers', active) : [] };
+  requireEqual(await privateDirectory(context.support, true), parent); await custody.assert(); return observation;
+}
+async function recheckRollback(context, observation, custody, requireRetired = false) {
+  if (!keys(observation, ['parent', 'active', 'entries']) || !Array.isArray(observation.entries) || observation.entries.length > 4096)
+    throw new Error('Invalid rollback namespace proof');
+  await custody.assert(); requireEqual(await privateDirectory(context.support, true), observation.parent);
+  const active = await optionalDirectory(join(context.support, 'rollback-launchers'));
+  const retired = await optionalDirectory(join(context.support, 'pre-format-2-rollback-launchers'));
+  if (!observation.active) {
+    if (active || retired || observation.entries.length) throw new Error('Originally absent rollback namespace changed');
+    return 'absent';
+  }
+  if (Boolean(active) === Boolean(retired) || (requireRetired && !retired)) throw new Error('Unknown rollback retirement state');
+  requireEqual(active ?? retired, observation.active);
+  requireEqual(await rollbackInventory(context, active ? 'rollback-launchers' : 'pre-format-2-rollback-launchers', observation.active), observation.entries);
+  await custody.assert(); return active ? 'active' : 'retired';
+}
+async function retireRollback(context, proof, custody, afterSelection) {
+  const state = await recheckRollback(context, proof.rollback, custody, afterSelection);
+  if (state === 'active') {
+    custody.publication.provider.retireInstallerRollback(custody.publication.selection,
+      JSON.stringify({ parent: proof.rollback.parent, directory: proof.rollback.active }));
+  }
+  await recheckRollback(context, proof.rollback, custody, true);
 }
 
 /** Publish the exact selected binary and image under the same guards used by launch and retirement. */
