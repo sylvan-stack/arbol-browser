@@ -211,6 +211,41 @@ export async function verifySignedRelease({ image, signedReceiptPath }) {
     productDigest: expected.productDigest, profileFormat: 2, launcher, platform };
 }
 
+/** Narrow historical input for the reviewed isolated predecessor adapter.
+ * Current verify/install remains format2-only. No historical payload executes. */
+export async function withVerifiedMigrationPredecessor(options, consume) {
+  const signed = await signedReceipt(options.signedReceiptPath), expected = signed.value, pinned = profileMigrationPredecessor;
+  for (const key of ['build', 'source', 'productDigest', 'imageSha256', 'payloadDigest'])
+    requireEqual(expected[key], pinned[key], 'Historical release is not the pinned predecessor');
+  if (expected.launcherDigest !== pinned.launcherSha256 || expected.policy.sourceDigest !== pinned.sourceDigest ||
+      (await exactFile(options.image, imageLimit)).sha256 !== pinned.imageSha256) throw new Error('Historical release differs');
+  checkSignature(options.image);
+  const mount = await mkdtemp(join(await realpath(tmpdir()), 'arbol-browser-historical-input-'));
+  await privateDirectory(mount); let attached = false;
+  try {
+    const data = plist('/usr/bin/hdiutil', ['attach', options.image, '-readonly', '-nokernel', '-mountpoint', mount,
+      '-noautoopen', '-nobrowse', '-plist']); attached = true;
+    const app = await mountedApplication(options.image, mount, data);
+    checkSignature(app, publisher.bundleIdentifier, true); await assertPhysicalCap(app);
+    const files = await inventory(app), policy = await json(join(app, relativePolicy));
+    const metadata = await json(join(app, 'Contents/Resources/browser/metadata.json'));
+    const compatibility = await json(join(app, 'Contents/Resources/native-compatibility.json'));
+    if (inventoryDigest(files) !== pinned.payloadDigest || !equal(files, expected.files) || !equal(policy.value, expected.policy) ||
+        policy.sha256 !== expected.files[relativePolicy] || metadata.sha256 !== policy.value.metadataDigest ||
+        compatibility.sha256 !== policy.value.compatibilityDigest || metadata.value.component?.profileFormat !== 1 ||
+        metadata.value.component?.contract !== 1 || metadata.value.component?.build !== pinned.build ||
+        metadata.value.sourceDigest !== pinned.sourceDigest || metadata.value.host?.productDigest !== pinned.productDigest ||
+        metadata.value.sourceIdentity?.commit !== pinned.source || files[relativeLauncher] !== pinned.launcherSha256)
+      throw new Error('Historical sealed payload provenance differs');
+    const result = await consume({ app, signed: expected, files, metadata: metadata.value, compatibility: compatibility.value,
+      policy: policy.value, receiptSha256: signed.sha256 });
+    if ((await exactFile(options.image, imageLimit)).sha256 !== pinned.imageSha256 ||
+        (await signedReceipt(options.signedReceiptPath)).sha256 !== signed.sha256 || !equal(await inventory(app), files))
+      throw new Error('Historical input changed during staging');
+    return result;
+  } finally { if (attached) run('/usr/bin/hdiutil', ['detach', mount]); await rmdir(mount); }
+}
+
 async function safeDirectories(home, parts, privateFrom) {
   let path = home;
   if (await realpath(home) !== home) throw new Error('Account home must be physical');
