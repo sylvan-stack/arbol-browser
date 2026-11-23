@@ -54,7 +54,8 @@ export async function signMigrationPredecessor({ out, buildRoot, stateRoot, imag
     const policy = { ...original.policy, purpose: 'isolated-qualification', buildRoot, stateRoot,
       metadataDigest: (await exactFile(join(payload, 'metadata.json'))).sha256,
       compatibilityDigest: hash(bytes), reviewDigest: accepted.digest,
-      qualificationDigest: hash(canonical({ kind: 'historical-isolated-adapter', fixture, original: pinned, adapter: accepted.digest })),
+      qualificationDigest: hash(canonical({ kind: 'historical-isolated-adapter', fixture, original: pinned,
+        adapter: accepted.digest, adapterSource: compiled.sourceIdentity, originalReceiptSha256: original.receiptSha256 })),
       readerKey, readableReaderKeys: [readerKey] };
     await writeFile(join(resources, 'host-policy.json'), JSON.stringify(policy, null, 2) + '\n', { mode: 0o600 });
     return { metadata, compatibility, policy };
