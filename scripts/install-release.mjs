@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { constants } from 'node:fs';
 import { chmod, copyFile, link, lstat, mkdir, mkdtemp, open, readdir, readlink, realpath, rename, rmdir, symlink,
   unlink } from 'node:fs/promises';
@@ -596,7 +596,11 @@ async function prepareMigrationRelease(context, release, options, route, custody
   if (canonical(current) !== canonical(selected) || !sameFile(await privateJson(context.journalPath, 16384), journal))
     throw new Error('Maintenance preparation changed original admission');
   return { journal: { ...fileReference(journal), value: journal.value }, guards: custody.guards,
-    selection: selected, assets, launcher: fileReference(launcher) };
+    selection: selected, assets, launcher: fileReference(launcher),
+    state: { parent: await privateDirectory(dirname(context.state), true), runtime: await privateDirectory(context.runtime, true) },
+    oldAssets: before ? { image: fileReference(await exactFile(join(context.images, `${before.selection.build}.dmg`), imageLimit)),
+      release: fileReference(await privateJson(join(context.receipts, `${before.selection.build}.json`))),
+      launcher: fileReference(await exactFile(context.backup, launcherLimit)) } : null };
 }
 
 /** The signed launcher acquires its OWN EX descriptions. The installer
@@ -624,7 +628,202 @@ async function invokeSignedMaintenance(context, release, prepared, provider) {
     throw new Error('Signed maintenance did not complete; installation remains closed');
   if ((installerLocks.get(provider) ?? 0) !== 0 || !sameFile(await privateJson(context.journalPath, 16384), journal) ||
       !sameFile(await exactFile(context.executable, launcherLimit), launcher)) throw new Error('Maintenance handoff continuity changed');
-  return Object.freeze({ ...result, busy: Object.freeze([...result.busy]) });
+  const accepted = Object.freeze({ ...result, busy: Object.freeze([...result.busy]) });
+  nativeResults.add(accepted); return accepted;
+}
+
+const nativeResults = new WeakSet();
+const completionObservations = new WeakSet();
+const equal = (a, b) => canonical(a) === canonical(b);
+function requireEqual(a, b, message = 'Migration binding changed') { if (!equal(a, b)) throw new Error(message); }
+async function absent(path) {
+  try { await lstat(path); } catch (error) { if (error.code === 'ENOENT') return; throw error; }
+  throw new Error('Expected absent migration path exists');
+}
+const identityOf = st => ({ device: String(st.dev), inode: String(st.ino), uid: Number(st.uid), mode: Number(st.mode & 0o7777n) });
+/** Streaming observations include empty locks and native LLONG_MAX ledgers.
+ * No data directory contents or Chromium files are read. */
+async function observeFile(path, maximum = 8388608n) {
+  if (resolve(path) !== path || await realpath(path) !== path) throw new Error('Nonphysical migration evidence');
+  const fd = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const first = await fd.stat({ bigint: true });
+    const same = st => st.isFile() && st.nlink === 1n && st.uid === BigInt(userInfo().uid) &&
+      st.mode === first.mode && (st.mode & 0o7777n) === 0o600n && st.dev === first.dev && st.ino === first.ino &&
+      st.gid === first.gid && st.size === first.size && st.mtimeNs === first.mtimeNs && st.ctimeNs === first.ctimeNs;
+    if (!same(first) || first.size < 0n || first.size > BigInt(maximum) || !same(await lstat(path, { bigint: true })))
+      throw new Error('Unsafe migration evidence');
+    const sha = createHash('sha256'), buffer = Buffer.alloc(1048576); let count = 0n;
+    for (;;) {
+      const part = await fd.read(buffer, 0, buffer.length, null);
+      if (!part.bytesRead) break;
+      count += BigInt(part.bytesRead); if (count > first.size) throw new Error('Evidence grew during observation');
+      sha.update(buffer.subarray(0, part.bytesRead));
+    }
+    if (count !== first.size || !same(await fd.stat({ bigint: true })) || !same(await lstat(path, { bigint: true })) ||
+        await realpath(path) !== path) throw new Error('Migration evidence changed');
+    return { identity: identityOf(first), sha256: sha.digest('hex'), size: String(count),
+      gid: String(first.gid), mtimeNs: String(first.mtimeNs), ctimeNs: String(first.ctimeNs) };
+  } finally { await fd.close(); }
+}
+function evidencePath(context, scope, path) {
+  if (!['migration', 'state'].includes(scope) || typeof path !== 'string' || path.length > 512 ||
+      !/^[A-Za-z0-9_.\/-]*$/.test(path) || path.split('/').some(p => p === '.' || p === '..') || path.startsWith('/') ||
+      (path && path.split('/').some(p => !p))) throw new Error('Invalid evidence reference');
+  return join(scope === 'migration' ? join(context.runtime, 'browser-profile-migration') : context.state, path);
+}
+async function evidenceCollector(context) {
+  const files = new Map(), directories = new Map();
+  async function directory(scope, path, expected) {
+    const value = await privateDirectory(evidencePath(context, scope, path), true);
+    if (expected) requireEqual(value, expected);
+    const entry = { scope, path, identity: value }, key = `${scope}:${path}`;
+    if (directories.has(key)) requireEqual(directories.get(key), entry);
+    directories.set(key, entry);
+    if (directories.size > 65536) throw new Error('Too many evidence directories');
+    if (path) await directory(scope, path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
+    return value;
+  }
+  async function file(scope, path, maximum = 8388608, parse = true) {
+    await directory(scope, path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
+    const full = evidencePath(context, scope, path), observation = await observeFile(full, BigInt(maximum));
+    const entry = { scope, path, ...observation }, key = `${scope}:${path}`;
+    if (files.has(key)) requireEqual(files.get(key), entry);
+    files.set(key, entry); if (files.size > 131072) throw new Error('Too many evidence files');
+    if (!parse) return observation;
+    const decoded = await privateJson(full, maximum);
+    if (!sameFile(decoded, observation)) throw new Error('Evidence changed while decoding');
+    requireEqual(await observeFile(full, BigInt(maximum)), observation);
+    return decoded;
+  }
+  return { directory, file, finish: () => ({
+    directories: [...directories.values()].sort((a, b) => `${a.scope}:${a.path}`.localeCompare(`${b.scope}:${b.path}`, 'en')),
+    files: [...files.values()].sort((a, b) => `${a.scope}:${a.path}`.localeCompare(`${b.scope}:${b.path}`, 'en')),
+  }) };
+}
+async function preparedBindings(context, release, prepared, custody, after = false) {
+  await custody.assert(); requireEqual(custody.guards, prepared.guards);
+  if (!sameFile(await privateJson(context.journalPath, 16384), prepared.journal) ||
+      !sameFile(await exactFile(context.executable, launcherLimit), prepared.launcher) ||
+      !sameFile(await exactFile(context.image, imageLimit), prepared.assets.image) ||
+      !sameFile(await privateJson(join(context.receipts, `${release.build}.json`)), prepared.assets.release))
+    throw new Error('Original installation inputs changed');
+  const selected = await selectionFile(context);
+  if (after) requireEqual(selected.value, prepared.journal.value.after.selection);
+  else requireEqual(selected, prepared.selection);
+  requireEqual(await privateDirectory(context.runtime, true), prepared.state.runtime);
+  requireEqual(await privateDirectory(dirname(context.state), true), prepared.state.parent);
+  if (prepared.oldAssets) {
+    const build = prepared.journal.value.before.selection.build;
+    if (!sameFile(await exactFile(join(context.images, `${build}.dmg`), imageLimit), prepared.oldAssets.image) ||
+        !sameFile(await privateJson(join(context.receipts, `${build}.json`)), prepared.oldAssets.release) ||
+        !sameFile(await exactFile(context.backup, launcherLimit), prepared.oldAssets.launcher))
+      throw new Error('Original predecessor artifacts changed');
+  }
+  checkSignature(context.executable, launcherIdentifier);
+  if (!await installedAlias(context.alias, context.executable)) throw new Error('Installed alias disappeared');
+  await custody.assert();
+}
+function targetValue(content, schema) {
+  const bytes = Buffer.from(content.base64, 'base64');
+  if (bytes.toString('base64') !== content.base64 || hash(bytes) !== content.sha256) throw new Error('Migration content hash differs');
+  const value = parseStrictJson(bytes, 65536);
+  if (!valid(schema, value)) throw new Error('Migration content grammar differs');
+  return value;
+}
+async function verifyCompletion(context, release, prepared, result, custody) {
+  if (!nativeResults.has(result)) throw new Error('A genuine signed maintenance return is required');
+  await preparedBindings(context, release, prepared, custody);
+  const collector = await evidenceCollector(context), { file, directory } = collector;
+  const current = await file('migration', 'current', 16384), pointer = current.value;
+  if (!keys(pointer, ['format', 'attempt', 'transactionSha256']) || pointer.format !== 1 ||
+      !/^[0-9a-f]{32}$/.test(pointer.attempt) || !digest(pointer.transactionSha256)) throw new Error('Invalid migration pointer');
+  const transaction = await file('migration', `${pointer.attempt}/transaction.json`, transactionLimit), tx = transaction.value;
+  if (!valid('migration.Transaction', tx) || transaction.sha256 !== pointer.transactionSha256 || tx.attempt !== pointer.attempt ||
+      tx.root.path !== context.state || tx.sourceSha256 !== release.sourceDigest || tx.productSha256 !== release.productDigest)
+    throw new Error('Migration transaction differs from signed candidate');
+  requireEqual(tx.runtime, prepared.state.runtime); requireEqual(tx.journal, fileReference(prepared.journal));
+  requireEqual(tx.selection, prepared.selection.value); requireEqual(tx.selectionFile, prepared.selection.file);
+  requireEqual(tx.oldBuild, prepared.journal.value.before); requireEqual(tx.newBuild, prepared.journal.value.after);
+  const completion = await file('migration', `${tx.attempt}/completed.json`), done = completion.value;
+  if (!valid('migration.Completion', done) || completion.sha256 !== result.completionSha256 || done.attempt !== tx.attempt ||
+      done.transactionSha256 !== transaction.sha256 || result.converted !== tx.profiles.length ||
+      result.neverOpened !== tx.profiles.filter(p => p.evidence.classification === 'never-opened').length)
+    throw new Error('Native completion does not bind this transaction');
+  if (tx.root.initial === 'absent') {
+    await absent(context.state);
+    if (tx.profiles.length || tx.root.identity || tx.root.profiles || tx.root.registry) throw new Error('Absent root transaction differs');
+  } else {
+    await directory('state', '', tx.root.identity); await directory('state', 'profiles', tx.root.profiles);
+    requireEqual((await file('state', 'registry.lock', 8388608, false)).identity, tx.root.registry);
+    requireEqual((await readdir(join(context.state, 'profiles'))).sort(), tx.profiles.map(p => p.id).sort());
+  }
+  const completed = [];
+  for (const entry of tx.profiles) {
+    const path = `profiles/${entry.id}`, profile = join(context.state, path), h = entry.pathSha256;
+    if (hash(profile) !== h) throw new Error('Profile path digest differs');
+    await directory('state', path, entry.directory);
+    await directory('state', `${path}/data`, entry.dataDirectory);
+    await directory('state', `${path}/userData`, entry.userDataDirectory);
+    requireEqual((await file('state', `${path}/owner.lock`, 8388608, false)).identity, entry.ownerLock);
+    const record = await file('state', `${path}/profile.json`, 65536), original = targetValue(entry.originalRecord, 'profile.ProfileRecord');
+    const target = targetValue(entry.targetRecord, 'profile2.ProfileRecord');
+    requireEqual(target, { ...original, format: 2 }); requireEqual(record.value, target);
+    if (record.sha256 !== entry.targetRecord.sha256 || target.id !== entry.id || target.instance !== entry.instance)
+      throw new Error('Converted profile differs');
+    let marker = null;
+    if (entry.originalMarker) {
+      const old = targetValue(entry.originalMarker, 'profile.EngineMarker'), next = targetValue(entry.targetMarker, 'profile2.EngineMarker');
+      requireEqual(next, { ...old, format: 2 }); marker = await file('state', `${path}/engine.json`, 65536);
+      requireEqual(marker.value, next); if (marker.sha256 !== entry.targetMarker.sha256) throw new Error('Converted marker differs');
+    } else { if (entry.targetMarker) throw new Error('Unexpected target marker'); await absent(join(profile, 'engine.json')); }
+    const staged = (await file('migration', `${tx.attempt}/progress/${h}.staged.json`)).value;
+    if (!valid('migration.Staged', staged) || staged.attempt !== tx.attempt || staged.profileSha256 !== h ||
+        !sameFile(staged.record, record) || !equal(staged.marker, fileReference(marker))) throw new Error('Staged pair differs');
+    const receipt = await file('migration', `receipts/${h}.json`), r = receipt.value;
+    if (!valid('migration.Receipt', r) || r.attempt !== tx.attempt || r.transactionSha256 !== transaction.sha256 ||
+        r.profilePath !== profile || r.profileSha256 !== h || r.instance !== entry.instance ||
+        !sameFile(r.originalRecord, entry.originalRecord) || !sameFile(r.convertedRecord, record) ||
+        !equal(r.originalMarker, entry.originalMarker) || !equal(fileReference(r.convertedMarker), fileReference(marker)))
+      throw new Error('Native receipt differs from converted pair');
+    requireEqual(r.directory, entry.directory); requireEqual(r.evidence, entry.evidence);
+    if (r.convertedMarker) requireEqual(targetValue(r.convertedMarker, 'profile2.EngineMarker'), marker.value);
+    for (const key of ['sourceSha256', 'productSha256', 'candidateSha256']) requireEqual(r[key], tx[key]);
+    const committed = (await file('migration', `${tx.attempt}/progress/${h}.committed.json`)).value;
+    if (!valid('migration.Committed', committed) || committed.attempt !== tx.attempt || committed.profileSha256 !== h ||
+        !sameFile(committed.receipt, receipt)) throw new Error('Committed native receipt differs');
+    const base = `exit-evidence/${h}`, capture = (await file('state', `${base}/migration/${receipt.sha256}.json`)).value;
+    if (!keys(capture, ['format', 'kind', 'receiptSha256', 'transactionSha256', 'attempt', 'epoch', 'profileSha256', 'instance', 'directory', 'closed', 'data']) ||
+        capture.format !== 1 || capture.kind !== 'native-migration-evidence' || capture.receiptSha256 !== receipt.sha256 || capture.epoch !== tx.epoch)
+      throw new Error('Retained native capture differs');
+    for (const key of ['transactionSha256', 'attempt', 'profileSha256', 'instance', 'directory']) requireEqual(capture[key], r[key]);
+    for (const role of ['closed', 'data']) {
+      const claimHash = entry.evidence[`${role}ClaimSha256`];
+      if (!claimHash) { requireEqual(capture[role], null); continue; }
+      const claimFile = await file('state', `${base}/claims/${claimHash}.json`), claim = claimFile.value;
+      if (claimFile.sha256 !== claimHash || capture[role]?.claimSha256 !== claimHash || claim.phase !== 'closed' ||
+          claim.profile !== profile || claim.profileInstance !== entry.instance || claim.profilePathHash !== h ||
+          typeof claim.request !== 'string' || !/^[A-Za-z0-9_-]+$/.test(claim.request)) throw new Error('Retained native Claim differs');
+      const request = `${base}/${claim.request}`, terminal = claim.terminal;
+      if (!terminal || !['activation.json', 'terminal.json', 'unused.json'].includes(basename(terminal.path)) ||
+          terminal.path !== join(context.state, request, basename(terminal.path))) throw new Error('Native terminal path differs');
+      const terminalFile = await file('state', `${request}/${basename(terminal.path)}`);
+      if (terminalFile.sha256 !== terminal.digest) throw new Error('Native terminal changed');
+      if (role === 'data') { requireEqual(terminal.path, entry.evidence.terminalPath); requireEqual(terminal.digest, entry.evidence.terminalSha256); }
+      if (basename(terminal.path) === 'activation.json') {
+        const proof = await file('state', `${request}/proof.json`);
+        if (proof.sha256 !== terminalFile.value.journal?.digest) throw new Error('Native exit journal changed');
+      }
+      if (basename(terminal.path) !== 'unused.json')
+        for (const name of ['family-main.log', 'family-primary.log', 'family-custody.log'])
+          await file('state', `${request}/${name}`, 9223372036854775807n, false);
+    }
+    completed.push({ profileSha256: h, receiptSha256: receipt.sha256 });
+  }
+  requireEqual(done.profiles, completed);
+  await preparedBindings(context, release, prepared, custody);
+  const observation = { prepared, result, epoch: tx.epoch, root: tx.root, ...collector.finish() };
+  completionObservations.add(observation); return observation;
 }
 
 /** Publish the exact selected binary and image under the same guards used by launch and retirement. */
