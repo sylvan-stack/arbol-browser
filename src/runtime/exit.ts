@@ -47,7 +47,9 @@ export function isProductionExitAuthority(value: unknown): value is ProductionEx
 export function assertProductionExitAuthority(value: ProductionExitAuthority): void {
   if (!authorities.has(value)) throw unavailable('profile');
 }
-function closedCandidate(value: unknown, profile: ProfileSnapshot, hash: string): LaunchAttempt {
+export function closedCandidate(value: unknown, profile: {
+  readonly paths: Readonly<{ root: string; state: string }>; readonly record: Readonly<{ instance: string }>;
+}, hash: string): LaunchAttempt {
   const attempt = value as LaunchAttempt;
   // These checks authorize only selecting an old immutable signed package and
   // guard. The native reader still validates the COMPLETE shared record grammar
@@ -68,7 +70,7 @@ const diskImage = promisify(execFile);
 
 /** Re-establish the previous immutable bundle at the path named by its real Claim.
  * The caller still proves the original native snapshot and policies before trusting it. */
-async function mountRetainedImage(layout: PackagedLayout, build: BuildLease, platform: PlatformPort, deadline: number): Promise<void> {
+export async function mountRetainedImage(layout: PackagedLayout, build: Pick<BuildLease, 'assert'>, platform: PlatformPort, deadline: number): Promise<void> {
   if (layout.scope !== 'installed' || await statOrAbsent(layout.bundle)) return;
   const guard = `${layout.guard}.mount`;
   privateFile(await lstat(guard));

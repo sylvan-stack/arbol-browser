@@ -6,11 +6,38 @@ import type { PlatformPort, HeldLock } from './platform.js';
 import { buildLocation, selectedLayout, type BuildSelection } from './selection.js';
 import type { BuildGuard } from './start.js';
 import { assertHostCloseContinuity, assertHostStartupContinuity, assertTrustedHost, type VerifiedHost } from './authorities.js';
-import { assertPlatform } from './platform.js';
+import { assertPlatform, assertMaintenanceCustody, type MaintenanceCustody, type MaintenanceGuard } from './platform.js';
 import { withOwnerLockForCustody, type OwnerLease } from '../profiles/locking.js';
 
 export interface BuildLease extends BuildGuard {
   readonly selection: BuildSelection;
+}
+/** Separate from an ordinary releasable SH lease. No flock operation is made
+ * on the inherited original EX description and there is no release method. */
+export interface MaintenanceBuildLease {
+  readonly selection: BuildSelection;
+  assert(): Promise<void>;
+}
+const maintenanceDescriptions = new WeakMap<MaintenanceBuildLease, {
+  platform: PlatformPort; custody: MaintenanceCustody; guard: MaintenanceGuard;
+}>();
+export function maintenanceBuildLease(custody: MaintenanceCustody, platform: PlatformPort,
+  input: BuildSelection): MaintenanceBuildLease {
+  assertPlatform(platform); assertMaintenanceCustody(custody);
+  const selection = Object.freeze({ ...input });
+  if (selection.guard !== buildLocation(selection.build, selection.directory)?.guard) throw profileUnavailable();
+  const guard = [custody.oldBuild, custody.newBuild].find(value => value?.path === selection.guard);
+  if (!guard) throw profileUnavailable();
+  const lease: MaintenanceBuildLease = Object.freeze({ selection,
+    async assert() { assertMaintenanceCustody(custody); guard.assertIdentity(); },
+  });
+  maintenanceDescriptions.set(lease, { platform, custody, guard }); return lease;
+}
+export async function withMaintenanceBuildLock<T>(lease: MaintenanceBuildLease, platform: PlatformPort,
+  custody: MaintenanceCustody, operation: (held: MaintenanceGuard) => T): Promise<T> {
+  const source = maintenanceDescriptions.get(lease);
+  if (!source || source.platform !== platform || source.custody !== custody) throw profileUnavailable();
+  await lease.assert(); source.guard.assertIdentity(); return operation(source.guard);
 }
 const buildDescriptions = new WeakMap<BuildLease, { platform: PlatformPort; held: HeldLock }>();
 const adoptedBuildChecks = new WeakMap<BuildLease, { host: VerifiedHost;
