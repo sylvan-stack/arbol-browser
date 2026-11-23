@@ -1,4 +1,4 @@
-const { closeSync, constants, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync,
+const { closeSync, constants, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync,
   realpathSync, renameSync, unlinkSync, writeFileSync } = require('node:fs');
 const { createHash, randomUUID } = require('node:crypto');
 const { join } = require('node:path');
@@ -65,11 +65,11 @@ function validateFormat2(directory, records) {
 const legacyLimit = 256000;
 const format2Limit = legacyLimit + 256 * 100;
 
-function readPrivateFile(path, limit) {
+function readPrivateFile(path, limit, links = 1) {
   const handle = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const info = fstatSync(handle);
-    if (!info.isFile() || info.uid !== process.getuid() || info.nlink !== 1 ||
+    if (!info.isFile() || info.uid !== process.getuid() || info.nlink !== links ||
         (info.mode & 0o7777) !== 0o600 || info.size > limit)
       throw new Error('The preview profile list must be a private bounded file.');
     return readFileSync(handle);
@@ -90,6 +90,21 @@ function stageFile(directory, data) {
   return path;
 }
 
+function recoverLinkedBackup(directory, backup, original) {
+  let info;
+  try { info = lstatSync(backup); } catch (error) { if (error.code === 'ENOENT') return; throw error; }
+  if (info.nlink !== 2) return;
+  if (!readPrivateFile(backup, legacyLimit, 2).equals(original))
+    throw new Error('The preview profile before-image conflicts with the current index.');
+  const matches = readdirSync(directory).filter(name => name.startsWith('.profiles-')).filter(name => {
+    const candidate = lstatSync(join(directory, name));
+    return candidate.isFile() && candidate.dev === info.dev && candidate.ino === info.ino;
+  });
+  if (matches.length !== 1) throw new Error('The preview profile before-image is unsafe.');
+  unlinkSync(join(directory, matches[0]));
+  syncDirectory(directory);
+}
+
 function convertProfiles(directory, original) {
   const value = JSON.parse(original.toString('utf8'));
   if (original.length > legacyLimit || value?.format !== 1)
@@ -100,6 +115,7 @@ function convertProfiles(directory, original) {
   if (converted.length > format2Limit) throw new Error('The preview profile list is too large.');
   const backup = join(directory, 'profiles.format-1.before.json');
   let stagedBackup;
+  recoverLinkedBackup(directory, backup, original);
   try {
     try {
       if (!readPrivateFile(backup, legacyLimit).equals(original))
