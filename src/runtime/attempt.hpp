@@ -5,6 +5,7 @@
 #include <CommonCrypto/CommonDigest.h>
 #include <cmath>
 #include <pwd.h>
+#include <poll.h>
 namespace arbol_attempt {
 using arbol_boundary::Identity;
 constexpr size_t limit = 16384;
@@ -280,10 +281,374 @@ inline NSDictionary* json(const std::string& bytes) {
   id object = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
   return [object isKindOfClass:NSDictionary.class] ? object : nil;
 }
+// The caller retains both this directory descriptor and the exclusive
+// selection lock. A snapshot is evidence only while those remain held.
+struct MaintenanceSelectionSnapshot {
+  bool absent = false;
+  std::string bytes;
+  struct stat directory{}, file{};
+};
+inline bool maintenanceSelectionSnapshot(int directory, const std::string& directoryPath,
+                                         MaintenanceSelectionSnapshot& out) {
+  char heldPath[PATH_MAX]{};
+  struct stat namedDirectory{}, before{}, after{};
+  if (directory < 0 || !arbol_boundary::canonical(directoryPath) ||
+      !arbol_boundary::privateAncestors(directoryPath) || fstat(directory, &out.directory) ||
+      !S_ISDIR(out.directory.st_mode) || out.directory.st_uid != geteuid() ||
+      (out.directory.st_mode & 07777) != 0700 ||
+      lstat(directoryPath.c_str(), &namedDirectory) ||
+      out.directory.st_dev != namedDirectory.st_dev || out.directory.st_ino != namedDirectory.st_ino ||
+      fcntl(directory, F_GETPATH, heldPath) || directoryPath != heldPath) return false;
+  errno = 0;
+  const bool existed = fstatat(directory, "selected.json", &before, AT_SYMLINK_NOFOLLOW) == 0;
+  if (!existed && errno != ENOENT) return false;
+  if (!readAt(directory, "selected.json", out.bytes, out.absent) || out.absent == existed) return false;
+  if (existed) {
+    if (fstatat(directory, "selected.json", &after, AT_SYMLINK_NOFOLLOW) ||
+        !privateFile(before) || !sameFile(before, after) || !maintenanceSelection(json(out.bytes))) return false;
+    out.file = after;
+  } else {
+    errno = 0;
+    if (!fstatat(directory, "selected.json", &after, AT_SYMLINK_NOFOLLOW) || errno != ENOENT) return false;
+  }
+  struct stat finalDirectory{}, finalName{};
+  return !fstat(directory, &finalDirectory) && !lstat(directoryPath.c_str(), &finalName) &&
+    out.directory.st_dev == finalDirectory.st_dev && out.directory.st_ino == finalDirectory.st_ino &&
+    out.directory.st_dev == finalName.st_dev && out.directory.st_ino == finalName.st_ino &&
+    out.directory.st_uid == finalDirectory.st_uid && out.directory.st_mode == finalDirectory.st_mode &&
+    out.directory.st_uid == finalName.st_uid && out.directory.st_mode == finalName.st_mode;
+}
+inline bool sameMaintenanceSelection(const MaintenanceSelectionSnapshot& a,
+                                     const MaintenanceSelectionSnapshot& b) {
+  return a.absent == b.absent && a.bytes == b.bytes &&
+    a.directory.st_dev == b.directory.st_dev && a.directory.st_ino == b.directory.st_ino &&
+    (a.absent || sameFile(a.file, b.file));
+}
+inline bool maintenanceSelectionMatches(const MaintenanceSelectionSnapshot& actual, id before) {
+  if (before == NSNull.null) return actual.absent;
+  return maintenanceRelease(before) && !actual.absent && [json(actual.bytes) isEqual:before[@"selection"]];
+}
 inline std::string bytes(NSDictionary* object) {
   NSData* data = [NSJSONSerialization dataWithJSONObject:object options:NSJSONWritingSortedKeys error:nil];
   if (!data || !data.length || data.length >= limit) return {};
   return std::string((const char*)data.bytes,data.length) + "\n";
+}
+// Maintenance transport has its own descriptors; ordinary launch capsules do
+// not confer maintenance authority. SpawnCopies duplicates above these slots.
+inline constexpr int maintenanceSelectionDescriptor = 10, maintenanceOldDescriptor = 11,
+  maintenanceNewDescriptor = 12, maintenanceCapsuleDescriptor = 13;
+inline bool within(const std::string& child, const std::string& parent) {
+  return child.size() > parent.size() && child.compare(0, parent.size(), parent) == 0 && child[parent.size()] == '/';
+}
+inline bool overlaps(const std::string& a, const std::string& b) { return a == b || within(a,b) || within(b,a); }
+inline NSDictionary* maintenanceIdentity(const struct stat& st) {
+  return @{ @"device":[NSString stringWithUTF8String:std::to_string(st.st_dev).c_str()],
+    @"inode":[NSString stringWithUTF8String:std::to_string(st.st_ino).c_str()], @"uid":@(st.st_uid), @"mode":@(st.st_mode & 07777) };
+}
+// Retained private directories cannot be redirected by a rename, symlink or
+// replacement. Directory mtimes may change when legitimate children change.
+struct MaintenanceDirectory {
+  int fd = -1; std::string path; struct stat identity{};
+  MaintenanceDirectory() = default;
+  MaintenanceDirectory(const MaintenanceDirectory&) = delete;
+  ~MaintenanceDirectory() { if (fd >= 0) close(fd); }
+  bool current() const {
+    struct stat held{}, named{}; char actual[PATH_MAX]{};
+    return fd >= 0 && arbol_boundary::canonical(path) && arbol_boundary::privateAncestors(path + "/entry") &&
+      !fstat(fd,&held) && !lstat(path.c_str(),&named) && !fcntl(fd,F_GETPATH,actual) && path == actual &&
+      S_ISDIR(held.st_mode) && S_ISDIR(named.st_mode) && held.st_uid == geteuid() && (held.st_mode & 07777) == 0700 &&
+      held.st_dev == identity.st_dev && held.st_ino == identity.st_ino && held.st_mode == identity.st_mode &&
+      held.st_dev == named.st_dev && held.st_ino == named.st_ino && held.st_mode == named.st_mode && held.st_uid == named.st_uid;
+  }
+  bool openPath(const std::string& value, id sealed = nil) {
+    if (fd >= 0 || !arbol_boundary::canonical(value)) return false;
+    path = value; fd = open(path.c_str(),O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    return fd >= 0 && !fstat(fd,&identity) && current() && (!sealed || [maintenanceIdentity(identity) isEqual:sealed]);
+  }
+};
+struct MaintenanceFile {
+  int fd = -1; std::string path, content; struct stat identity{};
+  MaintenanceFile() = default;
+  MaintenanceFile(const MaintenanceFile&) = delete;
+  ~MaintenanceFile() { if (fd >= 0) close(fd); }
+  bool current() const {
+    struct stat held{}, named{}; char actual[PATH_MAX]{};
+    return fd >= 0 && arbol_boundary::canonical(path) && arbol_boundary::privateAncestors(path) &&
+      !fstat(fd,&held) && !lstat(path.c_str(),&named) && !fcntl(fd,F_GETPATH,actual) && path == actual &&
+      sameFile(identity,held) && sameFile(held,named);
+  }
+  bool openPath(const std::string& value, mode_t mode, off_t maximum, bool readBytes = false) {
+    if (fd >= 0 || !arbol_boundary::canonical(value)) return false;
+    path = value; fd = open(path.c_str(),O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
+    if (fd < 0 || fstat(fd,&identity) || !S_ISREG(identity.st_mode) || identity.st_uid != geteuid() ||
+        (identity.st_mode & 07777) != mode || identity.st_nlink != 1 || identity.st_size < 1 || identity.st_size > maximum || !current()) return false;
+    if (readBytes) {
+      content.resize(size_t(identity.st_size)); size_t at = 0;
+      while (at < content.size()) {
+        ssize_t n = pread(fd,content.data()+at,content.size()-at,off_t(at));
+        if (n > 0) at += size_t(n); else if (n != -1 || errno != EINTR) return false;
+      }
+    }
+    return current();
+  }
+  NSDictionary* record() const { return @{ @"identity":maintenanceIdentity(identity), @"sha256":digest(content) }; }
+  NSString* sha256(double deadline) const {
+    if (!current()) return nil;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    CC_SHA256_CTX hash; CC_SHA256_Init(&hash); char block[65536]; off_t at = 0;
+    while (at < identity.st_size && arbol_boundary::clockMs() < deadline) {
+      ssize_t n = pread(fd,block,size_t(std::min(off_t(sizeof(block)),identity.st_size-at)),at);
+      if (n > 0) { CC_SHA256_Update(&hash,block,CC_LONG(n)); at += n; }
+      else if (n != -1 || errno != EINTR) return nil;
+    }
+    if (at != identity.st_size || arbol_boundary::clockMs() >= deadline || !current()) return nil;
+    unsigned char raw[CC_SHA256_DIGEST_LENGTH]; CC_SHA256_Final(raw,&hash);
+#pragma clang diagnostic pop
+    NSMutableString* result = [NSMutableString new];
+    for (unsigned char byte : raw) [result appendFormat:@"%02x",byte]; return result;
+  }
+};
+// Resolve even an absent installed root through its nearest existing ancestor.
+// This detects aliases without creating, opening or reading installed data.
+inline bool physicalFuturePath(const std::string& value, std::string& out) {
+  std::string prefix = value, suffix; char actual[PATH_MAX]{}; struct stat st{};
+  for (;;) {
+    if (!lstat(prefix.c_str(),&st)) {
+      if (!realpath(prefix.c_str(),actual)) return false;
+      out = std::string(actual) + suffix; return true;
+    }
+    if (errno != ENOENT) return false;
+    size_t slash = prefix.rfind('/'); if (slash == std::string::npos || slash == 0) return false;
+    suffix = prefix.substr(slash) + suffix; prefix.resize(slash);
+  }
+}
+inline bool isolatedFromInstallation(const std::string& fixture) {
+  NSString* home = physicalAccountHome(); if (!home) return false;
+  for (NSString* component in @[@ARBOL_INSTALLATION_ROOT, @ARBOL_INSTALLATION_BUILDS,
+      @ARBOL_INSTALLATION_PAYLOADS, @ARBOL_INSTALLATION_STABLE_BUILDS, @ARBOL_INSTALLATION_STABLE_USES,
+      @".local/lib/sylvan-stack/arbol-browser", @"Applications/Arbol Browser"]) {
+    std::string installed = [home stringByAppendingPathComponent:component].fileSystemRepresentation, resolved;
+    if (!physicalFuturePath(installed,resolved) || overlaps(fixture,installed) || overlaps(fixture,resolved)) return false;
+  }
+  return true;
+}
+// Sealed Contents/Resources/maintenance-fixture.json is signed with the
+// isolated candidate. Directory identities are allocated before signing. The
+// host-policy digest binds product identity without a circular image digest;
+// the journal separately pins the complete signed disk image.
+inline NSData* diskImageTool(NSArray<NSString*>* arguments, double deadline) {
+  if (arbol_boundary::clockMs() >= deadline) return nil;
+  NSPipe* pipe = [NSPipe pipe];
+  NSFileHandle* input = pipe.fileHandleForReading;
+  const int fd = input.fileDescriptor;
+  const int flags = fcntl(fd, F_GETFL);
+  if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK)) return nil;
+  NSTask* task = [NSTask new];
+  task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/hdiutil"];
+  task.arguments = arguments;
+  task.environment = @{@"PATH": @"/usr/bin:/bin"};
+  task.standardInput = [NSFileHandle fileHandleWithNullDevice];
+  task.standardOutput = pipe;
+  task.standardError = [NSFileHandle fileHandleWithNullDevice];
+  if (![task launchAndReturnError:nil]) return nil;
+  NSMutableData* output = [NSMutableData new];
+  bool eof = false;
+  while (arbol_boundary::clockMs() < deadline && (!eof || task.running)) {
+    char bytes[8192];
+    ssize_t size = eof ? 0 : read(fd, bytes, sizeof(bytes));
+    if (size > 0) {
+      [output appendBytes:bytes length:size_t(size)];
+      if (output.length > 1048576) break;
+    } else if (!size) {
+      eof = true;
+      if (task.running) usleep(1000);
+    } else if (errno == EAGAIN) {
+      struct pollfd ready{fd, POLLIN, 0};
+      (void)poll(&ready, 1, 20);
+    } else if (errno != EINTR) break;
+  }
+  if (task.running) { [task terminate]; return nil; }
+  return eof && arbol_boundary::clockMs() < deadline && output.length <= 1048576 && task.terminationStatus == 0 ? output : nil;
+}
+
+inline bool mountedImage(const std::string& mount, NSString* image, double deadline) {
+  struct statfs fs{};
+  if (statfs(mount.c_str(), &fs) || mount != fs.f_mntonname || !(fs.f_flags & MNT_RDONLY) ||
+      strcmp(fs.f_fstypename, "apfs")) return false;
+  NSData* bytes = diskImageTool(@[@"info", @"-plist"], deadline);
+  if (!bytes) return false;
+  id info = [NSPropertyListSerialization propertyListWithData:bytes options:NSPropertyListImmutable format:nil error:nil];
+  if (![info isKindOfClass:NSDictionary.class] || ![info[@"images"] isKindOfClass:NSArray.class]) return false;
+  NSString* point = [NSString stringWithUTF8String:mount.c_str()];
+  NSString* device = [NSString stringWithUTF8String:fs.f_mntfromname];
+  size_t matches = 0;
+  for (NSDictionary* row in info[@"images"]) {
+    if (![row isKindOfClass:NSDictionary.class] || ![row[@"system-entities"] isKindOfClass:NSArray.class]) continue;
+    for (NSDictionary* entity in row[@"system-entities"]) {
+      if (![entity isKindOfClass:NSDictionary.class] || ![entity[@"mount-point"] isEqual:point]) continue;
+      if (![entity[@"dev-entry"] isEqual:device] || ![row[@"image-path"] isEqual:image] ||
+          ![row[@"owner-uid"] isEqual:@(geteuid())]) return false;
+      ++matches;
+    }
+  }
+  return matches == 1;
+}
+
+struct IsolatedMaintenance {
+  PackagedLayout layout;
+  MaintenanceDirectory fixture, support, registry, uses, runtime, stateParent;
+  MaintenanceFile policy, hostPolicy, launcher;
+  std::string stateRoot, launcherPath;
+  NSString* launcherDigest = nil;
+  bool current() const {
+    return fixture.current() && support.current() && registry.current() && uses.current() && runtime.current() &&
+      stateParent.current() && policy.current() && hostPolicy.current() && launcher.current() && isolatedFromInstallation(fixture.path);
+  }
+  bool admit(const std::string& policyPath, const std::string& runtimePath, const std::string& bundle, double deadline) {
+    if (profileFormat != 2 || !packagedLayout(bundle,layout) || layout.installed ||
+        bundle != layout.buildRoot + "/app/ArbolBrowser.app" || !arbol_boundary::canonical(bundle) ||
+        !signedIdentity(bundle,@"com.sylvan-stack.arbol-browser.native-candidate",true) ||
+        policyPath != bundle + "/Contents/Resources/maintenance-fixture.json" ||
+        !policy.openPath(policyPath,0600,limit,true) ||
+        !hostPolicy.openPath(bundle + "/Contents/Resources/host-policy.json",0600,limit,true)) return false;
+    NSDictionary* p = json(policy.content), *host = json(hostPolicy.content); uint64_t format = 0;
+    if (!keys(p,@[@"format",@"purpose",@"fixture",@"directories",@"stateRoot",@"runtime",@"registry",@"launcher",@"launcherSha256",@"bundle",@"build",@"hostPolicySha256"]) ||
+        !uintNumber(p[@"format"],format) || format != 1 || ![p[@"purpose"] isEqual:@"isolated-qualification"] ||
+        !path(p[@"fixture"]) || !keys(p[@"directories"],@[@"fixture",@"support",@"registry",@"uses",@"runtime",@"stateParent"]) ||
+        ![p[@"bundle"] isEqual:[NSString stringWithUTF8String:bundle.c_str()]] ||
+        ![p[@"build"] isEqual:[NSString stringWithUTF8String:layout.build.c_str()]] ||
+        ![p[@"hostPolicySha256"] isEqual:digest(hostPolicy.content)] ||
+        ![host[@"purpose"] isEqual:@"isolated-qualification"] || !policyStateRoot(host,layout)) return false;
+    const std::string root = [p[@"fixture"] UTF8String];
+    const auto exact = [&](NSString* key, const std::string& value) { return [p[key] isEqual:[NSString stringWithUTF8String:value.c_str()]]; };
+    stateRoot = root + "/state/browser"; launcherPath = root + "/bin/arbol-browser";
+    if (!isolatedFromInstallation(root) || layout.buildRoot != root + "/arbol-browser/" + layout.build ||
+        runtimePath != root + "/runtime" || !exact(@"runtime",runtimePath) || !exact(@"registry",root + "/arbol-browser") ||
+        !exact(@"stateRoot",stateRoot) || !exact(@"launcher",launcherPath) ||
+        ![host[@"stateRoot"] isEqual:p[@"stateRoot"]] || layout.guard != root + "/arbol-browser/.uses/" + layout.build ||
+        !fixture.openPath(root,p[@"directories"][@"fixture"]) ||
+        !support.openPath(root + "/support",p[@"directories"][@"support"]) ||
+        !registry.openPath(root + "/arbol-browser",p[@"directories"][@"registry"]) ||
+        !uses.openPath(root + "/arbol-browser/.uses",p[@"directories"][@"uses"]) ||
+        !runtime.openPath(runtimePath,p[@"directories"][@"runtime"]) ||
+        !stateParent.openPath(root + "/state",p[@"directories"][@"stateParent"]) ||
+        !launcher.openPath(launcherPath,0700,1024LL*1024*1024) ||
+        !signedIdentity(launcherPath,@"com.sylvan-stack.arbol-browser.isolated-maintenance-launcher")) return false;
+    std::set<std::pair<dev_t,ino_t>> identities;
+    for (auto* d : {&fixture,&support,&registry,&uses,&runtime,&stateParent})
+      if (!identities.insert({d->identity.st_dev,d->identity.st_ino}).second ||
+          d->identity.st_dev != fixture.identity.st_dev || (d != &fixture && !within(d->path,root))) return false;
+    // The state itself may be absent. This route only checks containment; step
+    // 4 observes absence/presence through the retained parent under custody.
+    struct stat state{};
+    if (!fstatat(stateParent.fd,"browser",&state,AT_SYMLINK_NOFOLLOW)) {
+      if (!S_ISDIR(state.st_mode) || state.st_uid != geteuid() || (state.st_mode & 07777) != 0700 ||
+          state.st_dev != stateParent.identity.st_dev ||
+          !arbol_boundary::canonical(stateRoot)) return false;
+    } else if (errno != ENOENT) return false;
+    launcherDigest = launcher.sha256(deadline);
+    return launcherDigest && [launcherDigest isEqual:p[@"launcherSha256"]] && current() &&
+      signedIdentity(bundle,@"com.sylvan-stack.arbol-browser.native-candidate",true) && current();
+  }
+};
+struct MaintenanceGuard {
+  arbol_boundary::Lock lock;
+  MaintenanceGuard() = default; MaintenanceGuard(const MaintenanceGuard&) = delete;
+  ~MaintenanceGuard() { if (lock.fd >= 0) close(lock.fd); } // never LOCK_UN
+  bool take(const std::string& path, int inherited = -1, id record = nil) {
+    if (lock.fd >= 0 || !arbol_boundary::canonical(path)) return false;
+    int fd = inherited >= 0 ? inherited : open(path.c_str(),O_RDWR|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
+    if (fd < 0) return false;
+    lock.fd = fd; struct stat st{}; int flags = fcntl(fd,F_GETFL);
+    if (flags < 0 || (flags & O_ACCMODE) != O_RDWR || fcntl(fd,F_SETFD,FD_CLOEXEC) || fstat(fd,&st)) return false;
+    lock = {fd,path,uint64_t(st.st_dev),st.st_ino,st.st_uid,0600,LOCK_EX};
+    // Re-lock the original inherited description. Opening its path here would
+    // deadlock against the sender or silently lose the original custody.
+    return arbol_boundary::lockIdentity(lock) && (!record || [record isEqual:arbol_boundary::capsuleLock(lock)]) &&
+      !flock(fd,LOCK_EX|LOCK_NB) && arbol_boundary::lockIdentity(lock);
+  }
+  bool current() const { return arbol_boundary::lockIdentity(lock); }
+};
+struct IsolatedMaintenanceAdmission {
+  IsolatedMaintenance authority;
+  MaintenanceGuard selection, oldBuild, newBuild;
+  MaintenanceFile journal, image, oldImage;
+  MaintenanceSelectionSnapshot selected;
+  NSDictionary* journalObject = nil;
+  struct statfs imageMount{};
+  bool current() const {
+    MaintenanceSelectionSnapshot now; struct statfs mount{};
+    return authority.current() && selection.current() && newBuild.current() &&
+      (oldBuild.lock.fd < 0 || (oldBuild.current() && oldImage.current())) && journal.current() && image.current() &&
+      maintenanceSelectionSnapshot(authority.support.fd,authority.support.path,now) && sameMaintenanceSelection(selected,now) &&
+      maintenanceSelectionMatches(now,journalObject[@"before"]) &&
+      !statfs((authority.layout.buildRoot + "/app").c_str(),&mount) && (mount.f_flags & MNT_RDONLY) &&
+      !memcmp(&imageMount.f_fsid,&mount.f_fsid,sizeof(mount.f_fsid)) &&
+      !strcmp(imageMount.f_mntonname,mount.f_mntonname) && !strcmp(imageMount.f_mntfromname,mount.f_mntfromname);
+  }
+  bool admit(const std::string& policyPath, const std::string& runtimePath, const std::string& bundle,
+             double deadline, NSDictionary* capsule = nil) {
+    if (!authority.admit(policyPath,runtimePath,bundle,deadline) ||
+        !selection.take(authority.support.path + "/selection.lock",capsule ? maintenanceSelectionDescriptor : -1,
+          capsule ? capsule[@"selectionLock"] : nil) ||
+        !journal.openPath(authority.support.path + "/install-transaction.json",0600,limit,true)) return false;
+    journalObject = json(journal.content);
+    if (!maintenanceJournal(journalObject) ||
+        ![journalObject[@"after"][@"selection"][@"build"] isEqual:[NSString stringWithUTF8String:authority.layout.build.c_str()]] ||
+        ![journalObject[@"after"][@"launcherSha256"] isEqual:authority.launcherDigest] ||
+        !maintenanceSelectionSnapshot(authority.support.fd,authority.support.path,selected) ||
+        !maintenanceSelectionMatches(selected,journalObject[@"before"])) return false;
+    if (capsule && (![capsule[@"journalPath"] isEqual:[NSString stringWithUTF8String:journal.path.c_str()]] ||
+        ![capsule[@"journal"] isEqual:journal.record()])) return false;
+    if (journalObject[@"before"] != NSNull.null) {
+      const std::string old = [journalObject[@"before"][@"selection"][@"build"] UTF8String];
+      if (old == authority.layout.build ||
+          !oldBuild.take(authority.uses.path + "/" + old,capsule ? maintenanceOldDescriptor : -1,
+            capsule ? capsule[@"oldBuildLock"] : nil) ||
+          !oldImage.openPath(authority.support.path + "/images/" + old + ".dmg",0600,1024LL*1024*1024) ||
+          ![oldImage.sha256(deadline) isEqual:journalObject[@"before"][@"selection"][@"imageSha256"]]) return false;
+    } else if (capsule && capsule[@"oldBuildLock"] != NSNull.null) return false;
+    if (!newBuild.take(authority.layout.guard,capsule ? maintenanceNewDescriptor : -1,
+          capsule ? capsule[@"newBuildLock"] : nil)) return false;
+    std::set<std::pair<uint64_t,uint64_t>> guards;
+    for (auto* g : {&selection,&oldBuild,&newBuild})
+      if (g->lock.fd >= 0 && !guards.insert({g->lock.device,g->lock.inode}).second) return false;
+    // Selection was checked BEFORE acquiring any purported old guard. Check
+    // it again before accepting the already-mounted qualification image.
+    MaintenanceSelectionSnapshot again;
+    if (!journal.current() || !maintenanceSelectionSnapshot(authority.support.fd,authority.support.path,again) ||
+        !sameMaintenanceSelection(selected,again) ||
+        !image.openPath(authority.support.path + "/images/" + authority.layout.build + ".dmg",0600,1024LL*1024*1024) ||
+        ![image.sha256(deadline) isEqual:journalObject[@"after"][@"selection"][@"imageSha256"]] ||
+        !mountedImage(authority.layout.buildRoot + "/app",[NSString stringWithUTF8String:image.path.c_str()],deadline) ||
+        statfs((authority.layout.buildRoot + "/app").c_str(),&imageMount) ||
+        !(imageMount.f_flags & MNT_RDONLY)) return false;
+    return signedIdentity(bundle,@"com.sylvan-stack.arbol-browser.native-candidate",true) &&
+      arbol_boundary::clockMs() < deadline && current();
+  }
+};
+inline NSDictionary* readMaintenanceCapsule() {
+  const int fd = maintenanceCapsuleDescriptor; struct stat before{}, after{};
+  const int flags = fcntl(fd,F_GETFL);
+  if (flags < 0 || (flags & O_ACCMODE) != O_RDONLY || fcntl(fd,F_SETFD,FD_CLOEXEC) ||
+      fstat(fd,&before) || !S_ISREG(before.st_mode) || before.st_uid != geteuid() || before.st_nlink != 0 ||
+      (before.st_mode & 07777) != 0600 || before.st_size < 1 || before.st_size > off_t(limit)) return nil;
+  std::string raw(size_t(before.st_size),'\0'); size_t at = 0;
+  while (at < raw.size()) {
+    ssize_t n = pread(fd,raw.data()+at,raw.size()-at,off_t(at));
+    if (n > 0) at += size_t(n); else if (n != -1 || errno != EINTR) return nil;
+  }
+  if (fstat(fd,&after) || after.st_nlink != 0 || before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
+      before.st_mode != after.st_mode || before.st_uid != after.st_uid || before.st_size != after.st_size ||
+      before.st_mtimespec.tv_sec != after.st_mtimespec.tv_sec || before.st_mtimespec.tv_nsec != after.st_mtimespec.tv_nsec ||
+      before.st_ctimespec.tv_sec != after.st_ctimespec.tv_sec || before.st_ctimespec.tv_nsec != after.st_ctimespec.tv_nsec || close(fd)) return nil;
+  NSDictionary* p = json(raw); uint64_t format = 0;
+  if (!keys(p,@[@"format",@"kind",@"parent",@"deadline",@"selectionLock",@"oldBuildLock",@"newBuildLock",@"journalPath",@"journal",@"bundle"]) ||
+      !uintNumber(p[@"format"],format) || format != 1 || ![p[@"kind"] isEqual:@"maintenance"] || !process(p[@"parent"]) ||
+      ![p[@"deadline"] isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)p[@"deadline"]) == CFBooleanGetTypeID()) return nil;
+  const double remaining = [p[@"deadline"] doubleValue] - arbol_boundary::clockMs();
+  return std::isfinite(remaining) && remaining > 0 && remaining <= 60000 ? p : nil;
 }
 struct Location {
   int directory = -1, lock = -1; struct stat identity{}, lockIdentity{}; std::string path;

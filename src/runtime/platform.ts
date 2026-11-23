@@ -19,6 +19,41 @@ export interface HeldLock {
   /** Caller retains this object through flush and complete helper shutdown. Never unlinks. */
   release(): void;
 }
+export interface MaintenanceGuard {
+  readonly path: string;
+  /** Original exclusive description, retained until process exit. */
+  assertIdentity(): FileIdentity;
+}
+export interface MaintenanceFileEvidence {
+  readonly identity: FileIdentity & Readonly<{ mode: number }>;
+  readonly sha256: string;
+}
+export interface MaintenanceFacts {
+  readonly scope: 'isolated'; readonly epoch: string;
+  readonly bundle: string; readonly runtime: string; readonly stateRoot: string; readonly registry: string;
+  readonly runtimeIdentity: FileIdentity & Readonly<{ mode: number }>;
+  readonly policySha256: string; readonly hostPolicySha256: string;
+  readonly launcherSha256: string; readonly imageSha256: string;
+  readonly journalPath: string; readonly journal: MaintenanceFileEvidence;
+  readonly selection: MaintenanceFileEvidence | null;
+  readonly oldBuildPath: string | null; readonly newBuildPath: string;
+}
+export interface IsolatedMaintenanceInput {
+  readonly scope: 'isolated'; readonly bundle: string; readonly policy: string; readonly runtime: string;
+}
+export interface MaintenanceCustody {
+  readonly facts: MaintenanceFacts;
+  readonly oldBuild: MaintenanceGuard | null;
+  readonly newBuild: MaintenanceGuard;
+  /** Adoption budget only. It never releases the closed admission epoch. */
+  readonly deadline: number;
+  assert(): void;
+}
+const maintenanceReceipts = new WeakSet<object>();
+export function assertMaintenanceCustody(value: MaintenanceCustody): void {
+  if (!maintenanceReceipts.has(value)) throw unavailable('browser');
+  value.assert();
+}
 /** Genuine one-command native receipt; numeric fields are observations, never
  * transferable authority. The private native handle stays in this port. */
 export interface CloseBudget { readonly received: number; readonly grace: number; readonly overall: number }
@@ -198,6 +233,7 @@ export interface PlatformPort {
   /** One-use fixed-exec native adoption. No numeric FD or role is accepted. */
   adoptHostBuild(requestPath: string, guard: string, bundle: string): HeldLock;
   adoptInstalledLaunch(bundle: string): { lock: HeldLock; deadline: number };
+  adoptMaintenanceCustody(input: IsolatedMaintenanceInput): MaintenanceCustody;
   /** Actual adopted original only: authentic no-use terminal or retained real
    * custody unwind, never normal adoption from cancellation or a public kill. */
   terminateAdoptedHost(build: HeldLock, owner?: HeldLock): never;
@@ -263,6 +299,10 @@ interface NativeSupport {
   latchWatchdogFatal(handle: object): void;
   adoptHostBuild(requestPath: string, guard: string, bundle: string): object;
   adoptInstalledLaunch?(bundle: string): { lock: object; remaining: number };
+  adoptMaintenanceCustody?(bundle: string, policy: string, runtime: string): {
+    handle: object; oldBuild: object | null; newBuild: object; facts: string; remaining: number;
+  };
+  assertMaintenanceCustody?(handle: object): void;
   terminateAdoptedHost(build: object, owner: object | null): never;
   continuousTime(): number;
   processProvenance(pid: number): ProcessProvenance | null;
@@ -477,6 +517,42 @@ export function loadPlatform(): PlatformPort {
       const held = wrapLock(lock);
       held.assertIdentity();
       return { lock: held, deadline: began + remaining };
+    },
+    adoptMaintenanceCustody(input: IsolatedMaintenanceInput): MaintenanceCustody {
+      if (process.type === 'browser' || input.scope !== 'isolated' ||
+          ![input.bundle, input.policy, input.runtime].every(path => typeof path === 'string' && isAbsolute(path) && !path.includes('\0')) ||
+          typeof native.adoptMaintenanceCustody !== 'function' || typeof native.assertMaintenanceCustody !== 'function')
+        throw unavailable('browser');
+      const adopt = native.adoptMaintenanceCustody, check = native.assertMaintenanceCustody;
+      const began = performance.now();
+      const value = call(() => adopt(input.bundle, input.policy, input.runtime));
+      if (!value || !value.handle || typeof value.handle !== 'object' || !value.newBuild || typeof value.newBuild !== 'object' ||
+          (value.oldBuild !== null && typeof value.oldBuild !== 'object') ||
+          !Number.isFinite(value.remaining) || value.remaining <= 0 || value.remaining > 60000 || typeof value.facts !== 'string')
+        throw unavailable('browser');
+      const facts = call(() => JSON.parse(value.facts)) as MaintenanceFacts;
+      const digest = (s: unknown): s is string => typeof s === 'string' && /^[0-9a-f]{64}$/.test(s);
+      const identity = (i: MaintenanceFileEvidence['identity']): boolean => !!i &&
+        /^[0-9]+$/.test(i.device) && /^[0-9]+$/.test(i.inode) && Number.isSafeInteger(i.uid) && i.uid === process.getuid?.();
+      const evidence = (e: MaintenanceFileEvidence): boolean => !!e && identity(e.identity) && e.identity.mode === 0o600 && digest(e.sha256);
+      if (!facts || facts.scope !== 'isolated' || facts.bundle !== input.bundle || facts.runtime !== input.runtime ||
+          ![facts.epoch, facts.policySha256, facts.hostPolicySha256, facts.launcherSha256, facts.imageSha256].every(digest) ||
+          ![facts.stateRoot, facts.registry, facts.journalPath, facts.newBuildPath].every(p => typeof p === 'string' && isAbsolute(p) && !p.includes('\0')) ||
+          !identity(facts.runtimeIdentity) || facts.runtimeIdentity.mode !== 0o700 || !evidence(facts.journal) ||
+          (facts.selection !== null && !evidence(facts.selection)) ||
+          (facts.oldBuildPath === null) !== (value.oldBuild === null) ||
+          (facts.oldBuildPath !== null && (typeof facts.oldBuildPath !== 'string' || !isAbsolute(facts.oldBuildPath))))
+        throw unavailable('browser');
+      const assert = () => call(() => check(value.handle));
+      const guard = (handle: object, path: string): MaintenanceGuard => Object.freeze({ path,
+        assertIdentity: () => { assert(); return call(() => native.assertLock(handle)); },
+      });
+      Object.freeze(facts.runtimeIdentity); Object.freeze(facts.journal.identity); Object.freeze(facts.journal);
+      if (facts.selection) { Object.freeze(facts.selection.identity); Object.freeze(facts.selection); }
+      const custody: MaintenanceCustody = Object.freeze({ facts: Object.freeze(facts),
+        oldBuild: value.oldBuild === null ? null : guard(value.oldBuild, facts.oldBuildPath!),
+        newBuild: guard(value.newBuild, facts.newBuildPath), deadline: began + value.remaining, assert });
+      assert(); maintenanceReceipts.add(custody); return custody;
     },
     continuousTime(): number {
       const value = call(() => native.continuousTime());

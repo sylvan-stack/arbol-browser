@@ -109,62 +109,55 @@ NSString* imageDigest(int fd, const std::string& path, const struct stat& image,
 }
 #pragma clang diagnostic pop
 
-NSData* diskImageTool(NSArray<NSString*>* arguments, double deadline) {
-  if (clockMs() >= deadline) return nil;
-  NSPipe* pipe = [NSPipe pipe];
-  NSFileHandle* input = pipe.fileHandleForReading;
-  const int fd = input.fileDescriptor;
-  const int flags = fcntl(fd, F_GETFL);
-  if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK)) return nil;
-  NSTask* task = [NSTask new];
-  task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/hdiutil"];
-  task.arguments = arguments;
-  task.environment = @{@"PATH": @"/usr/bin:/bin"};
-  task.standardInput = [NSFileHandle fileHandleWithNullDevice];
-  task.standardOutput = pipe;
-  task.standardError = [NSFileHandle fileHandleWithNullDevice];
-  if (![task launchAndReturnError:nil]) return nil;
-  NSMutableData* output = [NSMutableData new];
-  bool eof = false;
-  while (clockMs() < deadline && (!eof || task.running)) {
-    char bytes[8192];
-    ssize_t size = eof ? 0 : read(fd, bytes, sizeof(bytes));
-    if (size > 0) {
-      [output appendBytes:bytes length:size_t(size)];
-      if (output.length > 1048576) break;
-    } else if (!size) {
-      eof = true;
-      if (task.running) usleep(1000);
-    } else if (errno == EAGAIN) {
-      struct pollfd ready{fd, POLLIN, 0};
-      (void)poll(&ready, 1, 20);
-    } else if (errno != EINTR) break;
-  }
-  if (task.running) { [task terminate]; return nil; }
-  return eof && clockMs() < deadline && output.length <= 1048576 && task.terminationStatus == 0 ? output : nil;
-}
+using arbol_attempt::diskImageTool;
+using arbol_attempt::mountedImage;
 
-bool mountedImage(const std::string& mount, NSString* image, double deadline) {
-  struct statfs fs{};
-  if (statfs(mount.c_str(), &fs) || mount != fs.f_mntonname || !(fs.f_flags & MNT_RDONLY) ||
-      strcmp(fs.f_fstypename, "apfs")) return false;
-  NSData* bytes = diskImageTool(@[@"info", @"-plist"], deadline);
-  if (!bytes) return false;
-  id info = [NSPropertyListSerialization propertyListWithData:bytes options:NSPropertyListImmutable format:nil error:nil];
-  if (![info isKindOfClass:NSDictionary.class] || ![info[@"images"] isKindOfClass:NSArray.class]) return false;
-  NSString* point = [NSString stringWithUTF8String:mount.c_str()];
-  NSString* device = [NSString stringWithUTF8String:fs.f_mntfromname];
-  size_t matches = 0;
-  for (NSDictionary* row in info[@"images"]) {
-    if (![row isKindOfClass:NSDictionary.class] || ![row[@"system-entities"] isKindOfClass:NSArray.class]) continue;
-    for (NSDictionary* entity in row[@"system-entities"]) {
-      if (![entity isKindOfClass:NSDictionary.class] || ![entity[@"mount-point"] isEqual:point]) continue;
-      if (![entity[@"dev-entry"] isEqual:device] || ![row[@"image-path"] isEqual:image] ||
-          ![row[@"owner-uid"] isEqual:@(geteuid())]) return false;
-      ++matches;
-    }
+// Qualification supplies a sealed policy in an already mounted, independently
+// signed isolated candidate. No installed path, policy override or ordinary
+// CLI argument is forwarded. The maintenance module adopts the original FDs.
+int isolatedMaintenance(int argc, const char* argv[], double deadline) {
+  if (arbol_attempt::profileFormat != 2 || argc != 8 || strcmp(argv[2],"--policy") ||
+      strcmp(argv[4],"--runtime") || strcmp(argv[6],"--bundle")) return 4;
+  const std::string policy = argv[3], runtime = argv[5], bundle = argv[7];
+  arbol_attempt::IsolatedMaintenanceAdmission admission;
+  if (!admission.admit(policy,runtime,bundle,deadline)) return 4;
+  NSDictionary* self = arbol_attempt::processRecord(getpid());
+  if (!self || ![self[@"executable"] isEqual:[NSString stringWithUTF8String:admission.authority.launcherPath.c_str()]] ||
+      !arbol_attempt::currentProcess(self,true)) return 4;
+  const auto& layout = admission.authority.layout;
+  NSDictionary* packet = @{@"format":@1,@"kind":@"maintenance",@"parent":self,@"deadline":@(deadline),
+    @"selectionLock":arbol_boundary::capsuleLock(admission.selection.lock),
+    @"oldBuildLock":admission.oldBuild.lock.fd < 0 ? (id)NSNull.null : arbol_boundary::capsuleLock(admission.oldBuild.lock),
+    @"newBuildLock":arbol_boundary::capsuleLock(admission.newBuild.lock),
+    @"journalPath":[NSString stringWithUTF8String:admission.journal.path.c_str()],@"journal":admission.journal.record(),
+    @"bundle":[NSString stringWithUTF8String:bundle.c_str()]};
+  FD capsule(arbol_boundary::capsuleDescriptor(arbol_attempt::bytes(packet)));
+  posix_spawn_file_actions_t actions;
+  if (capsule.get() < 0 || posix_spawn_file_actions_init(&actions)) return 4;
+  arbol_boundary::SpawnCopies copies;
+  bool mapped = copies.map(actions,admission.selection.lock.fd,arbol_attempt::maintenanceSelectionDescriptor) &&
+    copies.map(actions,admission.newBuild.lock.fd,arbol_attempt::maintenanceNewDescriptor) &&
+    copies.map(actions,capsule.get(),arbol_attempt::maintenanceCapsuleDescriptor);
+  if (mapped && admission.oldBuild.lock.fd >= 0)
+    mapped = copies.map(actions,admission.oldBuild.lock.fd,arbol_attempt::maintenanceOldDescriptor);
+  if (!mapped || !admission.current() || !arbol_attempt::currentProcess(self,true) || clockMs() >= deadline) {
+    posix_spawn_file_actions_destroy(&actions); return 4;
   }
-  return matches == 1;
+  const std::string entry = layout.payload + "/lib/cli/maintenance.js";
+  std::string home = "HOME=" + admission.authority.fixture.path;
+  char* environment[] = {home.data(),(char*)"PATH=/usr/bin:/bin",(char*)"ELECTRON_RUN_AS_NODE=1",(char*)"TMPDIR=/private/tmp",nullptr};
+  char* args[] = {(char*)layout.engine.c_str(),(char*)entry.c_str(),(char*)"--isolated-policy",(char*)policy.c_str(),
+    (char*)"--runtime",(char*)runtime.c_str(),nullptr};
+  pid_t child = 0;
+  int result = posix_spawn(&child,layout.engine.c_str(),&actions,nullptr,args,environment);
+  posix_spawn_file_actions_destroy(&actions); copies.closeCopies();
+  if (result) return 4;
+  // Original exclusive descriptions remain held across every child outcome.
+  // The format-3 journal continues to close admission after any failure.
+  int status = 0; pid_t waited;
+  do { waited = waitpid(child,&status,0); } while (waited < 0 && errno == EINTR);
+  if (waited != child) return 4;
+  return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
 }
 
 int launch(int argc, const char* argv[], double deadline) {
@@ -277,6 +270,8 @@ int launch(int argc, const char* argv[], double deadline) {
 
 int main(int argc, const char* argv[]) {
   @autoreleasepool { @try {
+    if (argc > 1 && !strcmp(argv[1],"--isolated-maintenance-migrate-profiles"))
+      return isolatedMaintenance(argc,argv,clockMs() + 60000);
     return launch(argc, argv, clockMs() + 60000);
   } @catch (NSException*) { return 4; } }
 }

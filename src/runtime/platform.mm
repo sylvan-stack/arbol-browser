@@ -562,6 +562,89 @@ static napi_value adoptHostBuild(napi_env env,napi_callback_info info) {
   } }
 }
 
+// Kept until process exit, including failed adoption. Neither GC nor any
+// public lock operation can release the inherited maintenance descriptions.
+struct MaintenanceCustody {
+  arbol_attempt::IsolatedMaintenanceAdmission admission;
+  NSDictionary* parent = nil;
+  NSString* epoch = nil;
+  HeldLock* oldBuild = nullptr;
+  HeldLock* newBuild = nullptr;
+  bool accepted = false;
+};
+static MaintenanceCustody* maintenanceCustody = nullptr;
+static napi_value adoptMaintenanceCustody(napi_env env, napi_callback_info info) {
+  if (arbol_attempt::profileFormat != 2 || maintenanceCustody) return fail(env);
+  size_t count = 3; napi_value args[3]; std::string bundle, policy, runtime;
+  if (napi_get_cb_info(env,info,&count,args,nullptr,nullptr) != napi_ok || count != 3 ||
+      !string(env,args[0],bundle) || !string(env,args[1],policy) || !string(env,args[2],runtime)) return fail(env);
+  maintenanceCustody = new MaintenanceCustody;
+  auto* custody = maintenanceCustody;
+  @autoreleasepool { try { @try {
+    NSDictionary* packet = arbol_attempt::readMaintenanceCapsule();
+    const int parentPid = getppid();
+    NSDictionary* parent = arbol_attempt::processRecord(parentPid);
+    NSDictionary* self = arbol_attempt::processRecord(getpid());
+    if (!packet || !parent || !self || parentPid <= 1 || ![packet[@"parent"] isEqual:parent] ||
+        ![packet[@"bundle"] isEqual:[NSString stringWithUTF8String:bundle.c_str()]] ||
+        !custody->admission.admit(policy,runtime,bundle,[packet[@"deadline"] doubleValue],packet)) return fail(env);
+    auto& authority = custody->admission.authority;
+    if (![parent[@"executable"] isEqual:[NSString stringWithUTF8String:authority.launcherPath.c_str()]] ||
+        ![self[@"executable"] isEqual:[NSString stringWithUTF8String:authority.layout.engine.c_str()]] ||
+        !arbol_boundary::signature(authority.layout.engine,true) ||
+        getppid() != parentPid || !arbol_attempt::currentProcess(parent) || !arbol_attempt::currentProcess(self,true) ||
+        !custody->admission.current()) return fail(env);
+    custody->parent = parent;
+    custody->epoch = arbol_attempt::digest(arbol_attempt::bytes(packet));
+    auto handleFor = [&](arbol_attempt::MaintenanceGuard& guard, HeldLock*& retained) -> napi_value {
+      napi_value result;
+      if (guard.lock.fd < 0) { if (napi_get_null(env,&result) != napi_ok) return nullptr; return result; }
+      retained = new HeldLock{guard.lock.fd,guard.lock.path,dev_t(guard.lock.device),ino_t(guard.lock.inode),LOCK_EX,true};
+      liveLocks.insert(retained);
+      return napi_create_external(env,retained,finalize,nullptr,&result) == napi_ok ? result : nullptr;
+    };
+    napi_value handle, result, remaining;
+    napi_value oldHandle = handleFor(custody->admission.oldBuild,custody->oldBuild);
+    napi_value newHandle = handleFor(custody->admission.newBuild,custody->newBuild);
+    const double duration = [packet[@"deadline"] doubleValue] - arbol_boundary::clockMs();
+    if (!oldHandle || !newHandle || !std::isfinite(duration) || duration <= 0 || duration > 60000 ||
+        napi_create_external(env,custody,nullptr,nullptr,&handle) != napi_ok ||
+        napi_create_object(env,&result) != napi_ok || napi_create_double(env,duration,&remaining) != napi_ok) return fail(env);
+    NSDictionary* selected = custody->admission.selected.absent ? (id)NSNull.null :
+      @{ @"identity":arbol_attempt::maintenanceIdentity(custody->admission.selected.file),
+         @"sha256":arbol_attempt::digest(custody->admission.selected.bytes) };
+    NSDictionary* facts = @{ @"scope":@"isolated",@"epoch":custody->epoch,
+      @"bundle":[NSString stringWithUTF8String:bundle.c_str()],@"runtime":[NSString stringWithUTF8String:runtime.c_str()],
+      @"stateRoot":[NSString stringWithUTF8String:authority.stateRoot.c_str()],
+      @"registry":[NSString stringWithUTF8String:authority.registry.path.c_str()],
+      @"runtimeIdentity":arbol_attempt::maintenanceIdentity(authority.runtime.identity),
+      @"policySha256":arbol_attempt::digest(authority.policy.content),
+      @"hostPolicySha256":arbol_attempt::digest(authority.hostPolicy.content),@"launcherSha256":authority.launcherDigest,
+      @"imageSha256":custody->admission.journalObject[@"after"][@"selection"][@"imageSha256"],
+      @"journalPath":[NSString stringWithUTF8String:custody->admission.journal.path.c_str()],
+      @"journal":custody->admission.journal.record(),@"selection":selected,
+      @"oldBuildPath":custody->oldBuild ? (id)[NSString stringWithUTF8String:custody->oldBuild->path.c_str()] : NSNull.null,
+      @"newBuildPath":[NSString stringWithUTF8String:custody->newBuild->path.c_str()] };
+    if (!property(env,result,"handle",handle) || !property(env,result,"oldBuild",oldHandle) ||
+        !property(env,result,"newBuild",newHandle) || !property(env,result,"remaining",remaining) ||
+        !property(env,result,"facts",text(env,arbol_attempt::bytes(facts)))) return fail(env);
+    custody->accepted = true;
+    return result;
+  } @catch (NSException*) { return fail(env); } } catch (...) { return fail(env); } }
+}
+static napi_value assertMaintenanceCustody(napi_env env, napi_callback_info info) {
+  napi_value arg; void* raw = nullptr;
+  if (arbol_attempt::profileFormat != 2 || !argument(env,info,&arg) ||
+      napi_get_value_external(env,arg,&raw) != napi_ok || !raw || raw != maintenanceCustody ||
+      !maintenanceCustody->accepted) return fail(env);
+  @autoreleasepool { try { @try {
+    if (!maintenanceCustody->admission.current() ||
+        [maintenanceCustody->parent[@"pid"] intValue] != getppid() ||
+        !arbol_attempt::currentProcess(maintenanceCustody->parent)) return fail(env);
+    napi_value result; if (napi_get_undefined(env,&result) != napi_ok) return fail(env); return result;
+  } @catch (NSException*) { return fail(env); } } catch (...) { return fail(env); } }
+}
+
 static napi_value adoptInstalledLaunch(napi_env env, napi_callback_info info) {
   static bool attempted = false;
   if (attempted) return fail(env);
@@ -2290,6 +2373,8 @@ static napi_value init(napi_env env, napi_value exports) {
     {"latchWatchdogFatal",nullptr,latchWatchdogFatal,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"adoptHostBuild",nullptr,adoptHostBuild,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"adoptInstalledLaunch",nullptr,adoptInstalledLaunch,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"adoptMaintenanceCustody",nullptr,adoptMaintenanceCustody,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"assertMaintenanceCustody",nullptr,assertMaintenanceCustody,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"continuousTime",nullptr,continuousTime,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"processProvenance",nullptr,processProvenance,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"readLaunchAttempt",nullptr,readLaunchAttempt,nullptr,nullptr,nullptr,napi_default,nullptr},
