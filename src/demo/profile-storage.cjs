@@ -1,4 +1,4 @@
-const { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readFileSync,
+const { closeSync, constants, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync,
   realpathSync, renameSync, unlinkSync, writeFileSync } = require('node:fs');
 const { createHash, randomUUID } = require('node:crypto');
 const { join } = require('node:path');
@@ -62,6 +62,67 @@ function validateFormat2(directory, records) {
   });
 }
 
+const legacyLimit = 256000;
+const format2Limit = legacyLimit + 256 * 100;
+
+function readPrivateFile(path, limit) {
+  const handle = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const info = fstatSync(handle);
+    if (!info.isFile() || info.uid !== process.getuid() || info.nlink !== 1 ||
+        (info.mode & 0o7777) !== 0o600 || info.size > limit)
+      throw new Error('The preview profile list must be a private bounded file.');
+    return readFileSync(handle);
+  } finally { closeSync(handle); }
+}
+
+function syncDirectory(directory) {
+  const handle = openSync(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try { fsyncSync(handle); } finally { closeSync(handle); }
+}
+
+function stageFile(directory, data) {
+  const path = join(directory, '.profiles-' + randomUUID());
+  const handle = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  try { writeFileSync(handle, data); fsyncSync(handle); }
+  catch (error) { unlinkSync(path); throw error; }
+  finally { closeSync(handle); }
+  return path;
+}
+
+function convertProfiles(directory, original) {
+  const value = JSON.parse(original.toString('utf8'));
+  if (original.length > legacyLimit || value?.format !== 1)
+    throw new Error('This preview profile list format is unsupported or too large.');
+  const records = validateProfiles(value.profiles).map(record => ({ ...record, partition: partitionKey(record) }));
+  validateFormat2(directory, records);
+  const converted = Buffer.from(JSON.stringify({ format: 2, profiles: records }) + '\n');
+  if (converted.length > format2Limit) throw new Error('The preview profile list is too large.');
+  const backup = join(directory, 'profiles.format-1.before.json');
+  let stagedBackup;
+  try {
+    try {
+      if (!readPrivateFile(backup, legacyLimit).equals(original))
+        throw new Error('The preview profile before-image conflicts with the current index.');
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      stagedBackup = stageFile(directory, original);
+      try { linkSync(stagedBackup, backup); }
+      catch (linkError) {
+        if (linkError.code !== 'EEXIST' || !readPrivateFile(backup, legacyLimit).equals(original)) throw linkError;
+      }
+      unlinkSync(stagedBackup);
+      stagedBackup = null;
+      syncDirectory(directory);
+    }
+    const stagedIndex = stageFile(directory, converted);
+    try { syncDirectory(directory); renameSync(stagedIndex, join(directory, 'profiles.json')); }
+    catch (error) { try { unlinkSync(stagedIndex); } catch {} throw error; }
+    syncDirectory(directory);
+  } finally { if (stagedBackup) try { unlinkSync(stagedBackup); } catch {} }
+  return records;
+}
+
 function readProfiles(directory) {
   let handle;
   try { handle = openSync(join(directory, 'profiles.json'), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
@@ -86,4 +147,4 @@ function writeProfiles(directory, records) {
 }
 
 module.exports = { privateDirectory, validAccount, profileId, partitionKey, existingPartition,
-  validateFormat2, readProfiles, writeProfiles };
+  validateFormat2, readPrivateFile, convertProfiles, readProfiles, writeProfiles };
