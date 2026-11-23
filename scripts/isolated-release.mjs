@@ -213,11 +213,43 @@ export async function verifyIsolatedRelease({ image, signedReceiptPath, review }
   }
 }
 
+/** Called under the installer's original candidate mount guard. Derive the
+ * mount solely from reauthenticated signed authority; never detach an existing
+ * volume or accept caller-supplied roots, preverified objects or backing proof. */
+export async function prepareIsolatedMount(options) {
+  const release = await verifyIsolatedRelease(options), { fixture } = release;
+  const image = options.image, mount = dirname(fixture.bundle);
+  if (image !== join(fixture.fixture, 'support/images', `${release.build}.dmg`)) fail();
+  await privateDirectory(dirname(mount), true); await privateDirectory(mount, true);
+  const existing = plist('/usr/bin/hdiutil', ['info', '-plist']).images
+    .flatMap(row => row['system-entities'] ?? []).filter(row => row['mount-point'] === mount);
+  let mapping;
+  if (existing.length) {
+    if (existing.length !== 1) fail();
+    mapping = { 'system-entities': existing };
+  } else {
+    if ((await readdir(mount)).length) fail();
+    mapping = plist('/usr/bin/hdiutil', ['attach', image, '-readonly', '-nokernel', '-mountpoint', mount,
+      '-noautoopen', '-nobrowse', '-plist']);
+  }
+  const bundle = await mountedBundle(image, mount, mapping);
+  signature(bundle, publisher.bundleIdentifier, true);
+  if (inventoryDigest(await inventory(bundle)) !== release.payloadDigest ||
+      (await exactFile(image, imageLimit)).sha256 !== release.imageSha256 ||
+      !equal(await maintenanceFixtureLayout(dirname(mount), fixture.stateRoot), fixture)) fail();
+  // Native admission independently retains the original readonly backing and
+  // checks it throughout custody. A failure here leaves diagnostic state.
+  return { build: release.build, imageSha256: release.imageSha256, bundle, mount };
+}
+
 /** Seal only an authenticated output of the existing genuine signing recipes.
  * It is not a release allocation, production receipt or qualification verdict. */
 export async function sealIsolatedRelease({ bundle, out, review }) {
   const admission = await admitted(review), auditFile = await document(bundle + '.signature-audit.json');
-  const inside = (path, parent) => path === parent || path.startsWith(parent + '/');
+  const inside = (path, parent) => {
+    path = path.normalize('NFC').toLowerCase(); parent = parent.normalize('NFC').toLowerCase();
+    return path === parent || path.startsWith(parent + '/');
+  };
   if (auditFile.value.bundle !== bundle || resolve(out) !== out || inside(out, bundle) || inside(bundle, out)) fail();
   const release = await inspectBundle(bundle, auditFile.value, review, admission);
   await assertHostIsolation(dirname(dirname(release.fixture.bundle)), release.fixture.stateRoot, out);

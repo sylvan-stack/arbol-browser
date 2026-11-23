@@ -9,6 +9,8 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { inventory, inventoryDigest } from './package-base.mjs';
 import { assertPhysicalCap, canonical, exactFile, hash, json, profileMigrationPredecessor, privateDirectory, writeExclusive } from './package-host.mjs';
+import { prepareIsolatedMount, verifyIsolatedRelease } from './isolated-release.mjs';
+import { maintenanceFixtureLayout } from './package-host.mjs';
 import installation from '../src/runtime/installation-paths.json' with { type: 'json' };
 import { Ajv2020 } from 'ajv/dist/2020.js';
 import addFormats from 'ajv-formats';
@@ -393,7 +395,9 @@ async function ensureAlias(alias, executable) {
   await syncPath(dirname(alias));
 }
 
-async function recoverInstall(support, executable, alias, provider, uses) {
+async function recoverInstall(context, provider) {
+  const { support, executable, alias, uses } = context;
+  await assertContext(context);
   const journal = join(support, 'install-transaction.json'), backup = join(support, 'install-previous-launcher');
   const pending = await optionalFile(journal, 4096);
   if (!pending) return;
@@ -430,14 +434,14 @@ async function recoverInstall(support, executable, alias, provider, uses) {
       if (target === after || (current && current.sha256 !== after.launcherSha256)) throw new Error('Uncertain installed launcher identity');
       const original = await exactFile(backup, launcherLimit);
       if (original.sha256 !== target.launcherSha256) throw new Error('Previous launcher recovery bytes differ');
-      checkSignature(backup, launcherIdentifier);
-      await replaceFile(executable, original.bytes, 0o755);
+      checkContextLauncher(context, backup, target.launcherSha256);
+      await replaceFile(executable, original.bytes, contextLauncherMode(context, target.launcherSha256));
     } else if (!target && current) {
       if (current.sha256 !== after.launcherSha256) throw new Error('Uncertain first installation');
       await unlink(executable);
       await syncPath(dirname(executable));
     }
-    if (target) checkSignature(executable, launcherIdentifier);
+    if (target) checkContextLauncher(context, executable, target.launcherSha256);
     await unlink(journal);
     try { await unlink(backup); } catch (error) { if (error.code !== 'ENOENT') throw error; }
     await syncPath(support);
@@ -503,7 +507,7 @@ async function installationRoute(context, release) {
   }
   if (canonical(selected) === canonical(after.selection)) return { kind: 'same', previous: selected };
   if (selected && BigInt(`0x${selected.build}`) >= BigInt(`0x${release.build}`)) throw new Error('Release number cannot move backwards');
-  const format = selected ? await installedProfileFormat(context.support, selected) : null;
+  const format = selected ? await contextProfileFormat(context, selected) : null;
   if (format === 2) return { kind: 'ordinary', previous: selected };
   // Completed migration evidence is immutable, not reusable for a new
   // candidate or permission to select an old writer again.
@@ -530,6 +534,106 @@ async function releaseContext(release) {
     journalPath: join(support, 'install-transaction.json'), backup: join(support, 'install-previous-launcher'),
     proofPath: join(receipts, `${release.build}.migration.json`) };
 }
+
+// Only the private factory below can associate a context with isolated
+// authority. Neither public installer accepts a caller-created context,
+// verifier, native result or completion observation.
+const isolatedAuthorities = new WeakMap();
+async function assertContext(context) {
+  const authority = isolatedAuthorities.get(context);
+  if (!authority) return;
+  const { release, directories, inputs, releases } = authority;
+  requireEqual(await maintenanceFixtureLayout(dirname(dirname(release.fixture.bundle)), context.state), release.fixture);
+  for (const [path, identity] of directories) requireEqual(await privateDirectory(path, true), identity);
+  for (const [build, input] of inputs)
+    if ((await exactFile(input.signedReceiptPath, 8388608)).sha256 !== releases.get(build).receiptSha256)
+      throw new Error('Original isolated receipt changed');
+}
+function contextLauncher(context, sha256) {
+  const authority = isolatedAuthorities.get(context);
+  if (!authority) return { launcherIdentifier, launcherMode: 0o755 };
+  const release = [...authority.releases.values()].find(item => item.launcher.sha256 === sha256);
+  if (!release) throw new Error('Launcher is outside the authenticated isolated cohort');
+  return release;
+}
+function contextLauncherMode(context, sha256) { return contextLauncher(context, sha256).launcherMode; }
+function checkContextLauncher(context, path, sha256) {
+  checkSignature(path, contextLauncher(context, sha256).launcherIdentifier);
+}
+function contextPredecessor(context) {
+  const authority = isolatedAuthorities.get(context);
+  if (!authority) return profileMigrationPredecessor;
+  const release = authority.releases.get(profileMigrationPredecessor.build);
+  return release?.profileFormat === 1 ? { ...release, launcherSha256: release.launcher.sha256 } : null;
+}
+async function contextProfileFormat(context, selected) {
+  const authority = isolatedAuthorities.get(context);
+  if (!authority) return installedProfileFormat(context.support, selected);
+  await assertContext(context);
+  const input = authority.inputs.get(selected.build), expected = authority.releases.get(selected.build);
+  if (!input || expected.imageSha256 !== selected.imageSha256) throw new Error('Selected isolated release is outside the cohort');
+  const verified = await verifyIsolatedRelease({ ...input, image: join(context.images, `${selected.build}.dmg`) });
+  requireEqual(await installedImageReceipt(context.support, selected), { format: 1, build: expected.build,
+    imageSha256: expected.imageSha256, source: expected.source, payloadDigest: expected.payloadDigest,
+    launcherSha256: expected.launcher.sha256 });
+  if (verified.receiptSha256 !== expected.receiptSha256 || verified.imageSha256 !== expected.imageSha256)
+    throw new Error('Original isolated release changed');
+  return verified.profileFormat;
+}
+async function isolatedContext(options) {
+  const predecessors = options.predecessors ?? [];
+  if (!Array.isArray(predecessors) || predecessors.length > 4096) throw new Error('Invalid isolated release cohort');
+  const inputs = new Map(), releases = new Map(); let release;
+  for (const value of [options, ...predecessors]) {
+    const input = { image: value.image, signedReceiptPath: value.signedReceiptPath, review: value.review };
+    const verified = await verifyIsolatedRelease(input);
+    if (releases.has(verified.build)) throw new Error('Duplicate isolated release identity');
+    release ??= verified;
+    for (const key of ['fixture', 'directories', 'stateRoot', 'runtime', 'registry', 'launcher'])
+      requireEqual(verified.fixture[key], release.fixture[key], 'Isolated releases name different physical authority');
+    releases.set(verified.build, verified); inputs.set(verified.build, input);
+  }
+  if (release.profileFormat !== 2) throw new Error('Isolated installer requires a current format2 candidate');
+  const { fixture } = release, support = join(fixture.fixture, 'support');
+  const images = join(support, 'images'), receipts = join(support, 'releases');
+  const aliases = join(fixture.fixture, 'aliases'), mount = dirname(fixture.bundle);
+  const directories = new Map();
+  for (const path of [images, receipts, aliases, dirname(fixture.launcher)]) {
+    try { await mkdir(path, { mode: 0o700 }); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+    const identity = await privateDirectory(path, true);
+    if (identity.device !== fixture.directories.fixture.device) throw new Error('Isolated installer directories crossed filesystems');
+    directories.set(path, identity);
+  }
+  await privateDirectory(dirname(mount), true);
+  try { await mkdir(mount, { mode: 0o700 }); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+  await privateDirectory(mount, true);
+  const context = { support, uses: join(fixture.registry, '.uses'), executable: fixture.launcher,
+    alias: join(aliases, 'arbol-browser'), images, receipts, mount,
+    image: join(images, `${release.build}.dmg`), selectionPath: join(support, 'selected.json'),
+    runtime: fixture.runtime, state: fixture.stateRoot, journalPath: join(support, 'install-transaction.json'),
+    backup: join(support, 'install-previous-launcher'), proofPath: join(receipts, `${release.build}.migration.json`) };
+  isolatedAuthorities.set(context, { release, inputs, releases, directories });
+  await assertContext(context);
+  return { context, release };
+}
+
+/** Explicit disposable entry. All paths and launcher identities derive from
+ * real signed images. Its common lifecycle cannot manufacture native custody. */
+export async function installIsolatedRelease(options) {
+  const { context, release } = await isolatedContext(options);
+  return installVerifiedRelease(context, release, options);
+}
+async function mountIsolatedCandidate(context, release, provider) {
+  const authority = isolatedAuthorities.get(context);
+  if (!authority) return;
+  await withLock(provider, join(context.uses, `${release.build}.mount`), async () => {
+    await assertContext(context);
+    const mounted = await prepareIsolatedMount({ ...authority.inputs.get(release.build), image: context.image });
+    requireEqual(mounted, { build: release.build, imageSha256: release.imageSha256,
+      bundle: release.fixture.bundle, mount: context.mount });
+    await assertContext(context);
+  }, false);
+}
 async function guardRecord(provider, path, handle) {
   const expected = await checkedGuard(path, false), actual = provider.assertLock(handle);
   if (actual.device !== String(expected.dev) || actual.inode !== String(expected.ino) || actual.uid !== Number(expected.uid))
@@ -539,12 +643,14 @@ async function guardRecord(provider, path, handle) {
 /** Every handle is closed before returning. The result of work must contain
  * observations only, never these native EX descriptions or publication cap. */
 async function withInstallationGuards(context, provider, previous, build, work, createNew = false) {
+  await assertContext(context);
   return withLock(provider, join(context.support, 'selection.lock'), async selection => {
     const candidate = async old => withLock(provider, join(context.uses, build), async next => {
       const guards = { selection: await guardRecord(provider, join(context.support, 'selection.lock'), selection),
         oldBuild: old ? await guardRecord(provider, join(context.uses, previous.build), old) : null,
         newBuild: await guardRecord(provider, join(context.uses, build), next) };
       const assert = async () => {
+        await assertContext(context);
         const current = { selection: await guardRecord(provider, guards.selection.path, selection),
           oldBuild: old ? await guardRecord(provider, guards.oldBuild.path, old) : null,
           newBuild: await guardRecord(provider, guards.newBuild.path, next) };
@@ -596,7 +702,7 @@ async function prepareMigrationRelease(context, release, options, route, custody
   if (!journal) {
     if (old ? launcher?.sha256 !== old.launcherSha256 : Boolean(launcher)) throw new Error('Original launcher differs');
     if (launcher) {
-      checkSignature(context.executable, launcherIdentifier);
+      checkContextLauncher(context, context.executable, old.launcherSha256);
       await publishExact(context.backup, launcherLimit, launcher.sha256,
         path => writeExclusive(path, launcher.bytes, 0o755), custody.publication);
     } else if (await optionalFile(context.backup, launcherLimit)) throw new Error('Unexpected first-install launcher backup');
@@ -613,16 +719,16 @@ async function prepareMigrationRelease(context, release, options, route, custody
   if (before) {
     const backup = await exactFile(context.backup, launcherLimit);
     if (backup.sha256 !== before.launcherSha256 || backup.identity.mode !== 0o755) throw new Error('Original launcher backup differs');
-    checkSignature(context.backup, launcherIdentifier);
+    checkContextLauncher(context, context.backup, before.launcherSha256);
   }
   launcher = await optionalFile(context.executable, launcherLimit);
   if (launcher?.sha256 !== after.launcherSha256) {
     if (before ? launcher?.sha256 !== before.launcherSha256 : Boolean(launcher)) throw new Error('Unknown launcher preparation state');
-    await replaceFile(context.executable, release.launcher.bytes, 0o755);
+    await replaceFile(context.executable, release.launcher.bytes, contextLauncherMode(context, release.launcher.sha256));
   }
   launcher = await exactFile(context.executable, launcherLimit);
-  if (launcher.sha256 !== after.launcherSha256 || launcher.identity.mode !== 0o755) throw new Error('Prepared launcher differs');
-  checkSignature(context.executable, launcherIdentifier); await ensureAlias(context.alias, context.executable);
+  if (launcher.sha256 !== after.launcherSha256 || launcher.identity.mode !== contextLauncherMode(context, release.launcher.sha256)) throw new Error('Prepared launcher differs');
+  checkContextLauncher(context, context.executable, release.launcher.sha256); await ensureAlias(context.alias, context.executable);
   await custody.assert();
   const current = await selectionFile(context);
   if (canonical(current) !== canonical(selected) || !sameFile(await privateJson(context.journalPath, 16384), journal))
@@ -645,10 +751,20 @@ async function invokeSignedMaintenance(context, release, prepared, provider) {
   if (!sameFile(launcher, prepared.launcher) || launcher.sha256 !== release.launcher.sha256 ||
       !sameFile(journal, prepared.journal) || !valid('migration.Journal', journal.value))
     throw new Error('Signed maintenance handoff changed');
-  checkSignature(context.executable, launcherIdentifier);
-  // No caller policy/root/runtime, inherited custody descriptor, environment
-  // selector or rehearsal flag enters the installed maintenance route.
-  const child = spawnSync(context.executable, ['--maintenance-migrate-profiles'], {
+  checkContextLauncher(context, context.executable, release.launcher.sha256);
+  const isolated = isolatedAuthorities.get(context);
+  await mountIsolatedCandidate(context, release, provider);
+  await assertContext(context);
+  if (!sameFile(await exactFile(context.executable, launcherLimit), prepared.launcher) ||
+      !sameFile(await privateJson(context.journalPath, 16384), prepared.journal))
+    throw new Error('Signed maintenance inputs changed while preparing the mount');
+  if ((installerLocks.get(provider) ?? 0) !== 0) throw new Error('Mount custody must end before native handoff');
+  // Production accepts no policy/root/runtime/environment selector. Isolated
+  // arguments come only from this call's authenticated signed fixture.
+  const args = isolated ? ['--isolated-maintenance-migrate-profiles', '--policy',
+    join(release.fixture.bundle, 'Contents/Resources/maintenance-fixture.json'), '--runtime', context.runtime,
+    '--bundle', release.fixture.bundle] : ['--maintenance-migrate-profiles'];
+  const child = spawnSync(context.executable, args, {
     env: { PATH: '/usr/bin:/bin', LC_ALL: 'C' }, timeout: 31 * 60 * 1000, maxBuffer: 1048576,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -764,7 +880,7 @@ async function preparedBindings(context, release, prepared, custody, after = fal
         !sameFile(await exactFile(context.backup, launcherLimit), prepared.oldAssets.launcher))
       throw new Error('Original predecessor artifacts changed');
   }
-  checkSignature(context.executable, launcherIdentifier);
+  checkContextLauncher(context, context.executable, release.launcher.sha256);
   if (!await installedAlias(context.alias, context.executable)) throw new Error('Installed alias disappeared');
   await custody.assert();
 }
@@ -978,12 +1094,12 @@ async function rollbackInventory(context, name, identity) {
     if (launcher.identity.mode !== 0o755 || launcher.identity.uid !== userInfo().uid) throw new Error('Unsafe archived launcher');
     const receiptFile = await privateJson(join(context.receipts, `${build}.json`)), receipt = receiptFile.value;
     const selected = { format: 1, build, imageSha256: receipt.imageSha256 };
-    const pinned = profileMigrationPredecessor;
-    if (build !== pinned.build || receipt.source !== pinned.source || receipt.imageSha256 !== pinned.imageSha256 ||
+    const pinned = contextPredecessor(context);
+    if (!pinned || build !== pinned.build || receipt.source !== pinned.source || receipt.imageSha256 !== pinned.imageSha256 ||
         receipt.payloadDigest !== pinned.payloadDigest || receipt.launcherSha256 !== pinned.launcherSha256 ||
-        launcher.sha256 !== pinned.launcherSha256 || await installedProfileFormat(context.support, selected) !== 1)
+        launcher.sha256 !== pinned.launcherSha256 || await contextProfileFormat(context, selected) !== 1)
       throw new Error('Rollback archive is not the supported authentic predecessor');
-    checkSignature(launcherPath, launcherIdentifier);
+    checkContextLauncher(context, launcherPath, launcher.sha256);
     const image = await exactFile(join(context.images, `${build}.dmg`), imageLimit);
     if (image.sha256 !== selected.imageSha256) throw new Error('Rollback image changed');
     entries.push({ build, launcher: { ...fileReference(launcher), size: launcher.bytes.length },
@@ -1059,12 +1175,14 @@ async function ordinaryInstall(context, release, options, route, custody) {
   await custody.assert(); requireEqual(await optionalSelection(context.selectionPath), route.previous);
   if (await installationJournal(context.support)) throw new Error('Pending installation requires recovery first');
   await stageReleaseAssets(context, release, options, custody);
+  await mountIsolatedCandidate(context, release, custody.publication.provider);
+  await custody.assert();
   const old = await installedImageReceipt(context.support, route.previous);
   const current = await exactFile(context.executable, launcherLimit);
-  if (current.sha256 !== old.launcherSha256 || current.identity.mode !== 0o755) throw new Error('Selected launcher changed');
-  checkSignature(context.executable, launcherIdentifier);
+  if (current.sha256 !== old.launcherSha256 || current.identity.mode !== contextLauncherMode(context, old.launcherSha256)) throw new Error('Selected launcher changed');
+  checkContextLauncher(context, context.executable, old.launcherSha256);
   if (route.kind === 'same') {
-    if (await installedProfileFormat(context.support, route.previous) !== 2 || current.sha256 !== release.launcher.sha256)
+    if (await contextProfileFormat(context, route.previous) !== 2 || current.sha256 !== release.launcher.sha256)
       throw new Error('Same candidate is not selected format2');
     await ensureAlias(context.alias, context.executable); await custody.assert();
     return installationResult(context, release);
@@ -1074,11 +1192,11 @@ async function ordinaryInstall(context, release, options, route, custody) {
   const prior = await optionalFile(context.backup, launcherLimit);
   if (prior && prior.sha256 === current.sha256) {
     if (prior.identity.mode !== 0o755 || prior.identity.uid !== userInfo().uid) throw new Error('Unsafe current launcher backup');
-    checkSignature(context.backup, launcherIdentifier);
+    checkContextLauncher(context, context.backup, current.sha256);
   } else if (prior) {
-    const pinned = profileMigrationPredecessor;
-    if (prior.sha256 !== pinned.launcherSha256 || prior.identity.mode !== 0o755) throw new Error('Unknown retained launcher backup');
-    checkSignature(context.backup, launcherIdentifier);
+    const pinned = contextPredecessor(context);
+    if (!pinned || prior.sha256 !== pinned.launcherSha256 || prior.identity.mode !== 0o755) throw new Error('Unknown retained launcher backup');
+    checkContextLauncher(context, context.backup, prior.sha256);
     await publishExact(join(context.receipts, `${pinned.build}.launcher`), launcherLimit, prior.sha256,
       path => writeExclusive(path, prior.bytes, 0o755), custody.publication);
     if (!sameFile(await exactFile(context.backup, launcherLimit), prior)) throw new Error('Retained backup changed');
@@ -1090,9 +1208,9 @@ async function ordinaryInstall(context, release, options, route, custody) {
     after: { selection: { format: 1, build: release.build, imageSha256: release.imageSha256 }, launcherSha256: release.launcher.sha256 } };
   const bytes = encode(transaction);
   await publishExact(context.journalPath, 4096, hash(bytes), path => writeExclusive(path, bytes), custody.publication);
-  await replaceFile(context.executable, release.launcher.bytes, 0o755);
+  await replaceFile(context.executable, release.launcher.bytes, contextLauncherMode(context, release.launcher.sha256));
   if ((await exactFile(context.executable, launcherLimit)).sha256 !== release.launcher.sha256) throw new Error('Installed launcher differs');
-  checkSignature(context.executable, launcherIdentifier); await ensureAlias(context.alias, context.executable);
+  checkContextLauncher(context, context.executable, release.launcher.sha256); await ensureAlias(context.alias, context.executable);
   await custody.assert(); await replaceFile(context.selectionPath, encode(transaction.after.selection), 0o600);
   return installationResult(context, release);
 }
@@ -1100,13 +1218,18 @@ async function ordinaryInstall(context, release, options, route, custody) {
  * Journal3 is never consumed by rollback, including any exceptional path. */
 export async function installRelease(options) {
   const release = await verifySignedRelease(options), context = await releaseContext(release);
+  return installVerifiedRelease(context, release, options);
+}
+
+async function installVerifiedRelease(context, release, options) {
+  await assertContext(context);
   return withLockProvider(release.platform, async provider => {
     // Legacy recovery runs under selection EX before taking any Build EX;
     // its own Build guard must not conflict with a caller-held description.
     await withLock(provider, join(context.support, 'selection.lock'), async () => {
       const pending = await installationJournal(context.support);
       if (pending && pending.value.format !== 3)
-        await recoverInstall(context.support, context.executable, context.alias, provider, context.uses);
+        await recoverInstall(context, provider);
     });
     const initialJournal = await installationJournal(context.support);
     const previous = initialJournal?.value.format === 3 ? initialJournal.value.before?.selection ?? null :
@@ -1140,7 +1263,7 @@ export async function installRelease(options) {
       await withLock(provider, join(context.support, 'selection.lock'), async () => {
         const pending = await installationJournal(context.support);
         if (pending && pending.value.format !== 3)
-          await recoverInstall(context.support, context.executable, context.alias, provider, context.uses);
+          await recoverInstall(context, provider);
       });
     }
   });
