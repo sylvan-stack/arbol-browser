@@ -34,7 +34,7 @@ function invocation(args: readonly string[]): InstalledMaintenanceInput | Isolat
       process.versions.electron !== pinnedRuntime.electron || process.versions.node !== pinnedRuntime.node ||
       process.versions.modules !== pinnedRuntime.modules || process.versions.napi !== pinnedRuntime.napi ||
       process.platform !== pinnedRuntime.platform || process.arch !== pinnedRuntime.arch) throw profileUnavailable();
-  if (args.length === 0 && layout.scope === 'installed') return { scope: 'installed', bundle };
+  if (args.length === 1 && args[0] === '--installed' && layout.scope === 'installed') return { scope: 'installed', bundle };
   if (layout.scope !== 'isolated' || args.length !== 4 || args[0] !== '--isolated-policy' || args[2] !== '--runtime')
     throw profileUnavailable();
   const policy = args[1]!, runtime = args[3]!;
