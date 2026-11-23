@@ -232,15 +232,34 @@ async function syncPath(path) {
   try { await fd.sync(); } finally { await fd.close(); }
 }
 
-async function publishExact(path, maximum, sha256, stage) {
+async function publishExact(path, maximum, sha256, stage, publication) {
+  if (publication) {
+    const existing = await optionalFile(path, maximum);
+    if (existing) {
+      if (existing.sha256 !== sha256 || existing.identity.uid !== userInfo().uid) throw new Error('Installed immutable file differs');
+      await syncPath(path); await syncPath(dirname(path));
+      const current = await exactFile(path, maximum);
+      if (!sameFile(current, existing)) throw new Error('Installed immutable file changed during synchronization');
+      return current;
+    }
+  }
   const tmp = join(dirname(path), `.install-${randomBytes(12).toString('hex')}`);
   await stage(tmp);
   try {
     if ((await exactFile(tmp, maximum)).sha256 !== sha256) throw new Error('Installed input changed while copying');
     await syncPath(tmp);
-    try { await link(tmp, path); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+    if (publication) {
+      const staged = await exactFile(tmp, maximum);
+      publication.provider.assertLock(publication.selection);
+      publication.provider.publishInstallerFile(publication.selection, JSON.stringify({ source: tmp, destination: path,
+        identity: staged.identity, sha256 }));
+    } else {
+      // Historical journal1/2 path only. New lifecycle callers always supply
+      // the genuine EX selector and use native single-link RENAME_EXCL.
+      try { await link(tmp, path); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+    }
   } finally {
-    await unlink(tmp);
+    try { await unlink(tmp); } catch (error) { if (error.code !== 'ENOENT') throw error; }
     await syncPath(dirname(path));
   }
   const result = await exactFile(path, maximum);
@@ -294,7 +313,7 @@ async function withLock(provider, path, work, create = true) {
   try {
     const current = provider.assertLock(held);
     if (current.device !== String(expected.dev) || current.inode !== String(expected.ino)) throw new Error('Browser Build guard changed');
-    return await work();
+    return await work(held);
   }
   finally { provider.releaseLock(held); }
 }
@@ -455,6 +474,124 @@ async function installationRoute(context, release) {
   if (cutovers.length || await optionalFile(join(context.runtime, 'browser-profile-migration/current'), 16384))
     throw new Error('Format1 selection contradicts retained cutover evidence');
   return { kind: 'migration', pending: null, previous: selected };
+}
+
+async function releaseContext(release) {
+  const { homedir: home } = userInfo(), supportParts = installation.stableUses.slice(0, -1);
+  const privateFrom = supportParts.length - 1;
+  const support = await safeDirectories(home, supportParts, privateFrom);
+  const uses = await safeDirectories(home, installation.stableUses, privateFrom);
+  const bin = await safeDirectories(home, [...installation.stableBuilds.slice(0, 2), 'bin'], 1);
+  const executable = join(bin, 'arbol-browser');
+  const alias = join(await safeDirectories(home, ['.local', 'bin'], 2), 'arbol-browser');
+  const images = await safeDirectories(home, [...supportParts, 'images'], privateFrom);
+  const receipts = await safeDirectories(home, [...supportParts, 'releases'], privateFrom);
+  const mount = await safeDirectories(home, [...installation.stableBuilds, release.build, 'app'], 1);
+  return { home, support, uses, executable, alias, images, receipts, mount,
+    image: join(images, `${release.build}.dmg`), selectionPath: join(support, 'selected.json'),
+    runtime: join(home, installation.root, 'runtime'), state: join(home, installation.root, installation.browser),
+    journalPath: join(support, 'install-transaction.json'), backup: join(support, 'install-previous-launcher'),
+    proofPath: join(receipts, `${release.build}.migration.json`) };
+}
+async function guardRecord(provider, path, handle) {
+  const expected = await checkedGuard(path, false), actual = provider.assertLock(handle);
+  if (actual.device !== String(expected.dev) || actual.inode !== String(expected.ino) || actual.uid !== Number(expected.uid))
+    throw new Error('Original installation guard changed');
+  return { path, identity: { ...actual, mode: 0o600 }, heldMode: 2 };
+}
+/** Every handle is closed before returning. The result of work must contain
+ * observations only, never these native EX descriptions or publication cap. */
+async function withInstallationGuards(context, provider, previous, build, work, createNew = false) {
+  return withLock(provider, join(context.support, 'selection.lock'), async selection => {
+    const candidate = async old => withLock(provider, join(context.uses, build), async next => {
+      const guards = { selection: await guardRecord(provider, join(context.support, 'selection.lock'), selection),
+        oldBuild: old ? await guardRecord(provider, join(context.uses, previous.build), old) : null,
+        newBuild: await guardRecord(provider, join(context.uses, build), next) };
+      const assert = async () => {
+        const current = { selection: await guardRecord(provider, guards.selection.path, selection),
+          oldBuild: old ? await guardRecord(provider, guards.oldBuild.path, old) : null,
+          newBuild: await guardRecord(provider, guards.newBuild.path, next) };
+        if (canonical(current) !== canonical(guards)) throw new Error('Installation custody changed');
+      };
+      await assert();
+      return work({ guards, assert, publication: { provider, selection } });
+    }, createNew);
+    return previous && previous.build !== build
+      ? withLock(provider, join(context.uses, previous.build), candidate, false) : candidate(null);
+  });
+}
+function fileReference(file) { return file ? { identity: file.identity, sha256: file.sha256 } : null; }
+async function selectionFile(context) {
+  const file = await optionalFile(context.selectionPath, 4096);
+  const value = await optionalSelection(context.selectionPath);
+  if (Boolean(file) !== Boolean(value) || (file && canonical(parseStrictJson(file.bytes, 4096)) !== canonical(value)))
+    throw new Error('Selection changed during observation');
+  return { value, file: fileReference(file) };
+}
+async function stageReleaseAssets(context, release, options, custody) {
+  await custody.assert();
+  const image = await publishExact(context.image, imageLimit, release.imageSha256, async path => {
+    await copyFile(options.image, path, constants.COPYFILE_EXCL); await chmod(path, 0o600);
+  }, custody.publication);
+  if (image.identity.mode !== 0o600) throw new Error('Installed image mode differs');
+  await checkedGuard(join(context.uses, `${release.build}.mount`)); await syncPath(context.uses);
+  const bytes = encode({ format: 1, build: release.build, imageSha256: release.imageSha256,
+    source: release.source, payloadDigest: release.payloadDigest, launcherSha256: release.launcher.sha256 });
+  const receipt = await publishExact(join(context.receipts, `${release.build}.json`), 4096, hash(bytes),
+    path => writeExclusive(path, bytes), custody.publication);
+  if (receipt.identity.mode !== 0o600) throw new Error('Installed release receipt mode differs');
+  await custody.assert(); return { image: fileReference(image), release: fileReference(receipt) };
+}
+/** Idempotently finish journal-before-launcher preparation while still under
+ * the original EX. This helper never switches selection or opens admission. */
+async function prepareMigrationRelease(context, release, options, route, custody) {
+  await privateDirectory(context.runtime, true); await privateDirectory(dirname(context.state), true);
+  await custody.assert();
+  const selected = await selectionFile(context);
+  if (canonical(selected.value) !== canonical(route.previous)) throw new Error('Original Browser selection changed');
+  const assets = await stageReleaseAssets(context, release, options, custody);
+  const old = route.previous ? await installedImageReceipt(context.support, route.previous) : null;
+  const after = { selection: { format: 1, build: release.build, imageSha256: release.imageSha256 },
+    launcherSha256: release.launcher.sha256 };
+  const before = old ? { selection: route.previous, launcherSha256: old.launcherSha256 } : null;
+  let journal = route.pending;
+  let launcher = await optionalFile(context.executable, launcherLimit);
+  if (!journal) {
+    if (old ? launcher?.sha256 !== old.launcherSha256 : Boolean(launcher)) throw new Error('Original launcher differs');
+    if (launcher) {
+      checkSignature(context.executable, launcherIdentifier);
+      await publishExact(context.backup, launcherLimit, launcher.sha256,
+        path => writeExclusive(path, launcher.bytes, 0o755), custody.publication);
+    } else if (await optionalFile(context.backup, launcherLimit)) throw new Error('Unexpected first-install launcher backup');
+    const value = { format: 3, aliasBefore: Boolean(await installedAlias(context.alias, context.executable)), before, after,
+      migration: { fromProfileFormat: 1, toProfileFormat: 2 } };
+    if (!valid('migration.Journal', value)) throw new Error('Invalid maintenance journal');
+    const bytes = encode(value);
+    await publishExact(context.journalPath, 16384, hash(bytes), path => writeExclusive(path, bytes), custody.publication);
+    journal = await privateJson(context.journalPath, 16384);
+  }
+  if (!valid('migration.Journal', journal.value) || canonical(journal.value.before) !== canonical(before) ||
+      canonical(journal.value.after) !== canonical(after) || !sameFile(await privateJson(context.journalPath, 16384), journal))
+    throw new Error('Original maintenance journal changed');
+  if (before) {
+    const backup = await exactFile(context.backup, launcherLimit);
+    if (backup.sha256 !== before.launcherSha256 || backup.identity.mode !== 0o755) throw new Error('Original launcher backup differs');
+    checkSignature(context.backup, launcherIdentifier);
+  }
+  launcher = await optionalFile(context.executable, launcherLimit);
+  if (launcher?.sha256 !== after.launcherSha256) {
+    if (before ? launcher?.sha256 !== before.launcherSha256 : Boolean(launcher)) throw new Error('Unknown launcher preparation state');
+    await replaceFile(context.executable, release.launcher.bytes, 0o755);
+  }
+  launcher = await exactFile(context.executable, launcherLimit);
+  if (launcher.sha256 !== after.launcherSha256 || launcher.identity.mode !== 0o755) throw new Error('Prepared launcher differs');
+  checkSignature(context.executable, launcherIdentifier); await ensureAlias(context.alias, context.executable);
+  await custody.assert();
+  const current = await selectionFile(context);
+  if (canonical(current) !== canonical(selected) || !sameFile(await privateJson(context.journalPath, 16384), journal))
+    throw new Error('Maintenance preparation changed original admission');
+  return { journal: { ...fileReference(journal), value: journal.value }, guards: custody.guards,
+    selection: selected, assets, launcher: fileReference(launcher) };
 }
 
 /** Publish the exact selected binary and image under the same guards used by launch and retirement. */
