@@ -437,7 +437,7 @@ inline bool isolatedFromInstallation(const std::string& fixture) {
 // isolated candidate. Directory identities are allocated before signing. The
 // host-policy digest binds product identity without a circular image digest;
 // the journal separately pins the complete signed disk image.
-inline NSData* diskImageTool(NSArray<NSString*>* arguments, double deadline) {
+inline NSData* maintenanceAppleTool(NSString* program, NSArray<NSString*>* arguments, double deadline) {
   if (arbol_boundary::clockMs() >= deadline) return nil;
   NSPipe* pipe = [NSPipe pipe];
   NSFileHandle* input = pipe.fileHandleForReading;
@@ -445,7 +445,7 @@ inline NSData* diskImageTool(NSArray<NSString*>* arguments, double deadline) {
   const int flags = fcntl(fd, F_GETFL);
   if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK)) return nil;
   NSTask* task = [NSTask new];
-  task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/hdiutil"];
+  task.executableURL = [NSURL fileURLWithPath:program];
   task.arguments = arguments;
   task.environment = @{@"PATH": @"/usr/bin:/bin"};
   task.standardInput = [NSFileHandle fileHandleWithNullDevice];
@@ -471,6 +471,9 @@ inline NSData* diskImageTool(NSArray<NSString*>* arguments, double deadline) {
   if (task.running) { [task terminate]; return nil; }
   return eof && arbol_boundary::clockMs() < deadline && output.length <= 1048576 && task.terminationStatus == 0 ? output : nil;
 }
+inline NSData* diskImageTool(NSArray<NSString*>* arguments, double deadline) {
+  return maintenanceAppleTool(@"/usr/bin/hdiutil",arguments,deadline);
+}
 
 inline bool mountedImage(const std::string& mount, NSString* image, double deadline) {
   struct statfs fs{};
@@ -494,6 +497,123 @@ inline bool mountedImage(const std::string& mount, NSString* image, double deadl
   }
   return matches == 1;
 }
+// Disk images are signed data, not executable code: apply the same Developer
+// ID requirement as the installer, without requiring Mach-O runtime flags.
+inline bool maintenanceImageSignature(const MaintenanceFile& image) {
+  if (!image.current()) return false;
+  SecStaticCodeRef code = nullptr; SecRequirementRef requirement = nullptr;
+  NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:image.path.c_str()]];
+  bool valid = SecStaticCodeCreateWithPath((__bridge CFURLRef)url,kSecCSDefaultFlags,&code) == errSecSuccess &&
+    SecRequirementCreateWithString(CFSTR("anchor apple generic and certificate leaf[subject.OU] = \"7V372XL59S\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"),kSecCSDefaultFlags,&requirement) == errSecSuccess &&
+    SecStaticCodeCheckValidity(code,kSecCSStrictValidate|kSecCSCheckAllArchitectures,requirement) == errSecSuccess;
+  if (requirement) CFRelease(requirement); if (code) CFRelease(code);
+  return valid && image.current();
+}
+inline bool maintenanceMount(const std::string& mount, const MaintenanceFile& image, double deadline) {
+  struct statfs fs{}; struct stat mounted{}, device{};
+  if (!image.current() || !arbol_boundary::canonical(mount) || statfs(mount.c_str(),&fs) ||
+      mount != fs.f_mntonname || !(fs.f_flags & MNT_RDONLY) || !(fs.f_flags & MNT_LOCAL) || strcmp(fs.f_fstypename,"apfs") ||
+      lstat(mount.c_str(),&mounted) || !S_ISDIR(mounted.st_mode) || lstat(fs.f_mntfromname,&device) ||
+      !S_ISBLK(device.st_mode) || device.st_rdev != mounted.st_dev) return false;
+  NSData* infoBytes = diskImageTool(@[@"info",@"-plist"],deadline);
+  NSData* volumeBytes = maintenanceAppleTool(@"/usr/sbin/diskutil",@[@"info",@"-plist",[NSString stringWithUTF8String:fs.f_mntfromname]],deadline);
+  if (!infoBytes || !volumeBytes) return false;
+  id info = [NSPropertyListSerialization propertyListWithData:infoBytes options:NSPropertyListImmutable format:nil error:nil];
+  id volume = [NSPropertyListSerialization propertyListWithData:volumeBytes options:NSPropertyListImmutable format:nil error:nil];
+  NSString* point = [NSString stringWithUTF8String:mount.c_str()];
+  NSString* node = [NSString stringWithUTF8String:fs.f_mntfromname];
+  if (![info isKindOfClass:NSDictionary.class] || ![info[@"images"] isKindOfClass:NSArray.class] ||
+      ![volume isKindOfClass:NSDictionary.class] || ![volume[@"MountPoint"] isEqual:point] || ![volume[@"DeviceNode"] isEqual:node] ||
+      ![volume[@"FilesystemType"] isEqual:@"apfs"] || ![volume[@"BusProtocol"] isEqual:@"Disk Image"] ||
+      ![volume[@"Writable"] isEqual:@NO] || ![volume[@"WritableMedia"] isEqual:@NO] || ![volume[@"WritableVolume"] isEqual:@NO]) return false;
+  size_t matches = 0;
+  for (id row in info[@"images"]) {
+    if (![row isKindOfClass:NSDictionary.class] || ![row[@"system-entities"] isKindOfClass:NSArray.class]) return false;
+    for (id entity in row[@"system-entities"]) {
+      if (![entity isKindOfClass:NSDictionary.class]) return false;
+      if (![entity[@"mount-point"] isEqual:point] && ![entity[@"dev-entry"] isEqual:node]) continue;
+      uint64_t pid = 0;
+      if (++matches != 1 || ![entity[@"mount-point"] isEqual:point] || ![entity[@"dev-entry"] isEqual:node] ||
+          ![row[@"image-path"] isEqual:[NSString stringWithUTF8String:image.path.c_str()]] ||
+          ![row[@"owner-uid"] isEqual:@(geteuid())] || ![row[@"image-type"] isEqual:@"UDIF read-only"] ||
+          ![row[@"writeable"] isEqual:@NO] || ![row[@"diskimages2"] isEqual:@NO] || ![row[@"image-encrypted"] isEqual:@NO] ||
+          !uintNumber(row[@"hdid-pid"],pid) || pid < 1 || pid > INT_MAX) return false;
+      for (id key in [row allKeys]) {
+        if (![key isKindOfClass:NSString.class] || [key rangeOfString:@"shadow" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [key rangeOfString:@"overlay" options:NSCaseInsensitiveSearch].location != NSNotFound) return false;
+      }
+    }
+  }
+  struct statfs after{};
+  return matches == 1 && image.current() && !statfs(mount.c_str(),&after) && (after.f_flags & MNT_RDONLY) &&
+    !memcmp(&fs.f_fsid,&after.f_fsid,sizeof(fs.f_fsid)) && !strcmp(fs.f_mntfromname,after.f_mntfromname) &&
+    !strcmp(fs.f_mntonname,after.f_mntonname);
+}
+// Retain the actual entry, addon, engine and signed resource descriptions and
+// reject every nested mount. All imported code must remain on this immutable
+// volume, including targets of sealed symlinks; an overlay cannot supply code.
+struct MaintenancePayload {
+  int root = -1; std::string mount; struct stat identity{}; struct statfs filesystem{};
+  std::vector<std::unique_ptr<MaintenanceFile>> files;
+  MaintenancePayload() = default; MaintenancePayload(const MaintenancePayload&) = delete;
+  ~MaintenancePayload() { if (root >= 0) close(root); }
+  bool sameFilesystem(const struct statfs& now) const {
+    return (now.f_flags & MNT_RDONLY) && (now.f_flags & MNT_LOCAL) && !strcmp(now.f_fstypename,"apfs") &&
+      !memcmp(&filesystem.f_fsid,&now.f_fsid,sizeof(now.f_fsid)) &&
+      !strcmp(filesystem.f_mntonname,now.f_mntonname) && !strcmp(filesystem.f_mntfromname,now.f_mntfromname);
+  }
+  bool noNestedMounts() const {
+    int count = getfsstat(nullptr,0,MNT_NOWAIT); if (count < 1 || count >= 4096) return false;
+    std::vector<struct statfs> mounts(size_t(count)+1);
+    int read = getfsstat(mounts.data(),int(mounts.size()*sizeof(struct statfs)),MNT_NOWAIT);
+    if (read < 1 || size_t(read) >= mounts.size()) return false;
+    for (int i = 0; i < read; ++i) if (within(mounts[size_t(i)].f_mntonname,mount)) return false;
+    return true;
+  }
+  bool current() const {
+    struct stat held{}, named{}; struct statfs fs{}, actual{};
+    if (root < 0 || !arbol_boundary::canonical(mount) || fstat(root,&held) || lstat(mount.c_str(),&named) ||
+        held.st_dev != identity.st_dev || held.st_ino != identity.st_ino || held.st_dev != named.st_dev || held.st_ino != named.st_ino ||
+        fstatfs(root,&fs) || statfs(mount.c_str(),&actual) || !sameFilesystem(fs) || !sameFilesystem(actual) || !noNestedMounts()) return false;
+    for (const auto& file : files) {
+      struct statfs byFD{}, byPath{};
+      if (!file->current() || file->identity.st_dev != identity.st_dev || fstatfs(file->fd,&byFD) ||
+          statfs(file->path.c_str(),&byPath) || !sameFilesystem(byFD) || !sameFilesystem(byPath)) return false;
+    }
+    return true;
+  }
+  bool capture(const PackagedLayout& layout, bool isolated) {
+    if (root >= 0) return false;
+    mount = layout.buildRoot + "/app";
+    root = open(mount.c_str(),O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if (root < 0 || fstat(root,&identity) || fstatfs(root,&filesystem) || !current()) return false;
+    // Check every signed tree entry for another filesystem or an escaping
+    // symlink. The signature alone does not impose either path restriction.
+    __block bool enumerationFailed = false;
+    NSDirectoryEnumerator* entries = [[NSFileManager defaultManager] enumeratorAtURL:
+      [NSURL fileURLWithPath:[NSString stringWithUTF8String:layout.bundle.c_str()]] includingPropertiesForKeys:nil
+      options:0 errorHandler:^BOOL(NSURL*,NSError*) { enumerationFailed = true; return NO; }];
+    if (!entries) return false;
+    size_t count = 0;
+    for (NSURL* entry in entries) {
+      if (++count > 65536) return false;
+      std::string path = entry.path.fileSystemRepresentation; struct stat st{}; struct statfs fs{}; char resolved[PATH_MAX]{};
+      if (lstat(path.c_str(),&st) || !realpath(path.c_str(),resolved) || !within(resolved,mount) ||
+          statfs(path.c_str(),&fs) || !sameFilesystem(fs) || (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode))) return false;
+    }
+    if (enumerationFailed) return false;
+    std::vector<std::string> paths{layout.engine,layout.payload + "/lib/cli/maintenance.js",layout.payload + "/native/platform.node",
+      layout.bundle + "/Contents/Resources/host-policy.json",layout.bundle + "/Contents/Resources/native-compatibility.json"};
+    if (isolated) paths.push_back(layout.bundle + "/Contents/Resources/maintenance-fixture.json");
+    for (const auto& path : paths) {
+      struct stat st{}; if (lstat(path.c_str(),&st) || (st.st_mode & 07022) || !within(path,mount)) return false;
+      auto file = std::make_unique<MaintenanceFile>();
+      if (!file->openPath(path,st.st_mode & 07777,1024LL*1024*1024)) return false;
+      files.push_back(std::move(file));
+    }
+    return current();
+  }
+};
 
 struct IsolatedMaintenance {
   PackagedLayout layout;
@@ -574,12 +694,13 @@ struct IsolatedMaintenanceAdmission {
   IsolatedMaintenance authority;
   MaintenanceGuard selection, oldBuild, newBuild;
   MaintenanceFile journal, image, oldImage;
+  MaintenancePayload payload;
   MaintenanceSelectionSnapshot selected;
   NSDictionary* journalObject = nil;
   struct statfs imageMount{};
   bool current() const {
     MaintenanceSelectionSnapshot now; struct statfs mount{};
-    return authority.current() && selection.current() && newBuild.current() &&
+    return authority.current() && payload.current() && payload.sameFilesystem(imageMount) && selection.current() && newBuild.current() &&
       (oldBuild.lock.fd < 0 || (oldBuild.current() && oldImage.current())) && journal.current() && image.current() &&
       maintenanceSelectionSnapshot(authority.support.fd,authority.support.path,now) && sameMaintenanceSelection(selected,now) &&
       maintenanceSelectionMatches(now,journalObject[@"before"]) &&
@@ -607,7 +728,8 @@ struct IsolatedMaintenanceAdmission {
           !oldBuild.take(authority.uses.path + "/" + old,capsule ? maintenanceOldDescriptor : -1,
             capsule ? capsule[@"oldBuildLock"] : nil) ||
           !oldImage.openPath(authority.support.path + "/images/" + old + ".dmg",0600,1024LL*1024*1024) ||
-          ![oldImage.sha256(deadline) isEqual:journalObject[@"before"][@"selection"][@"imageSha256"]]) return false;
+          ![oldImage.sha256(deadline) isEqual:journalObject[@"before"][@"selection"][@"imageSha256"]] ||
+          !maintenanceImageSignature(oldImage)) return false;
     } else if (capsule && capsule[@"oldBuildLock"] != NSNull.null) return false;
     if (!newBuild.take(authority.layout.guard,capsule ? maintenanceNewDescriptor : -1,
           capsule ? capsule[@"newBuildLock"] : nil)) return false;
@@ -621,9 +743,9 @@ struct IsolatedMaintenanceAdmission {
         !sameMaintenanceSelection(selected,again) ||
         !image.openPath(authority.support.path + "/images/" + authority.layout.build + ".dmg",0600,1024LL*1024*1024) ||
         ![image.sha256(deadline) isEqual:journalObject[@"after"][@"selection"][@"imageSha256"]] ||
-        !mountedImage(authority.layout.buildRoot + "/app",[NSString stringWithUTF8String:image.path.c_str()],deadline) ||
+        !maintenanceImageSignature(image) || !maintenanceMount(authority.layout.buildRoot + "/app",image,deadline) ||
         statfs((authority.layout.buildRoot + "/app").c_str(),&imageMount) ||
-        !(imageMount.f_flags & MNT_RDONLY)) return false;
+        !(imageMount.f_flags & MNT_RDONLY) || !payload.capture(authority.layout,true)) return false;
     return signedIdentity(bundle,@"com.sylvan-stack.arbol-browser.native-candidate",true) &&
       arbol_boundary::clockMs() < deadline && current();
   }
@@ -633,13 +755,14 @@ struct InstalledMaintenanceAdmission {
   MaintenanceDirectory support, uses;
   MaintenanceGuard selection, oldBuild, newBuild, mounting;
   MaintenanceFile launcher, journal, release, image, hostPolicy;
+  MaintenancePayload payload;
   MaintenanceSelectionSnapshot selected;
   NSDictionary* journalObject = nil;
   NSString* launcherDigest = nil;
   struct statfs imageMount{};
   bool current() const {
     MaintenanceSelectionSnapshot now; struct statfs mount{};
-    return support.current() && uses.current() && selection.current() && newBuild.current() &&
+    return support.current() && uses.current() && payload.current() && payload.sameFilesystem(imageMount) && selection.current() && newBuild.current() &&
       (oldBuild.lock.fd < 0 || oldBuild.current()) && (mounting.lock.fd < 0 || mounting.current()) &&
       launcher.current() && journal.current() && release.current() && image.current() && hostPolicy.current() &&
       maintenanceSelectionSnapshot(support.fd,support.path,now) && sameMaintenanceSelection(selected,now) &&
@@ -687,7 +810,7 @@ struct InstalledMaintenanceAdmission {
     MaintenanceSelectionSnapshot again;
     if (!journal.current() || !maintenanceSelectionSnapshot(support.fd,support.path,again) || !sameMaintenanceSelection(selected,again) ||
         !image.openPath(support.path + "/images/" + layout.build + ".dmg",0600,1024LL*1024*1024) ||
-        ![image.sha256(deadline) isEqual:receipt[@"imageSha256"]]) return false;
+        ![image.sha256(deadline) isEqual:receipt[@"imageSha256"]] || !maintenanceImageSignature(image)) return false;
     const std::string mount = root + "/app";
     if (!arbol_boundary::canonical(mount) || !arbol_boundary::privateAncestors(mount)) return false;
     if (attach) {
@@ -700,10 +823,10 @@ struct InstalledMaintenanceAdmission {
             @"-readonly",@"-nokernel",@"-mountpoint",point,@"-noautoopen",@"-nobrowse",@"-plist"],deadline)) return false;
       }
     }
-    if (!mountedImage(mount,[NSString stringWithUTF8String:image.path.c_str()],deadline) || statfs(mount.c_str(),&imageMount) ||
+    if (!maintenanceMount(mount,image,deadline) || statfs(mount.c_str(),&imageMount) ||
         !arbol_boundary::canonical(layout.bundle) || !signedIdentity(layout.bundle,@"com.sylvan-stack.arbol-browser",true) ||
         !hostPolicy.openPath(layout.bundle + "/Contents/Resources/host-policy.json",0600,limit,true) ||
-        !policyStateRoot(json(hostPolicy.content),layout)) return false;
+        !policyStateRoot(json(hostPolicy.content),layout) || !payload.capture(layout,false)) return false;
     return arbol_boundary::clockMs() < deadline && current();
   }
 };
