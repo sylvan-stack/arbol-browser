@@ -1052,7 +1052,10 @@ async function ordinaryInstall(context, release, options, route, custody) {
   // Preserve an earlier conversion backup before reusing the legacy slot for
   // a later compatible transaction. Existing immutable release bytes remain.
   const prior = await optionalFile(context.backup, launcherLimit);
-  if (prior) {
+  if (prior && prior.sha256 === current.sha256) {
+    if (prior.identity.mode !== 0o755 || prior.identity.uid !== userInfo().uid) throw new Error('Unsafe current launcher backup');
+    checkSignature(context.backup, launcherIdentifier);
+  } else if (prior) {
     const pinned = profileMigrationPredecessor;
     if (prior.sha256 !== pinned.launcherSha256 || prior.identity.mode !== 0o755) throw new Error('Unknown retained launcher backup');
     checkSignature(context.backup, launcherIdentifier);
