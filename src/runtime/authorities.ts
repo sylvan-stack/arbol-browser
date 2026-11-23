@@ -11,6 +11,7 @@ import type { Contract } from '../contracts/generated.js';
 import { directory, assertDirectory } from '../profiles/paths.js';
 import { noteHostStartup, assertHostCustody } from './custody.js';
 import type { SignedBundle, SignedVerificationPhase } from '../native/manifest.js';
+import { assertPlatform, assertMaintenanceCustody, type PlatformPort, type MaintenanceCustody, type MaintenanceStateRoot } from './platform.js';
 import installation from './installation-paths.json' with { type: 'json' };
 
 const physicalFS = process.getBuiltinModule(typeof process.versions.electron === 'string' ? 'original-fs' : 'fs') as typeof import('node:fs') | undefined;
@@ -94,6 +95,16 @@ export interface VerifiedHost {
   readonly guardIdentity: Readonly<{ device: string; inode: string; uid: number }>;
   assertTrusted(deadline: number, originalStartupCutoff?: number): Promise<void>;
 }
+export interface VerifiedMaintenanceHost extends VerifiedHost {
+  readonly root: MaintenanceStateRoot;
+  readonly custody: MaintenanceCustody;
+}
+const maintenanceHosts = new WeakSet<object>();
+const maintenanceHostReceipts = new WeakSet<object>();
+export function assertVerifiedMaintenanceHost(value: VerifiedMaintenanceHost): void {
+  if (!maintenanceHostReceipts.has(value)) throw unavailable('browser');
+  assertMaintenanceCustody(value.custody); value.root.assert();
+}
 const verifiedHosts = new WeakSet<object>();
 const armedHosts = new WeakMap<VerifiedHost, import('./custody.js').HostCustody>();
 const startupTrustChecks = new WeakMap<VerifiedHost, (deadline: number, originalStartupCutoff: number) => Promise<void>>();
@@ -167,7 +178,7 @@ async function protectedLocation(path: string, deadline: number): Promise<string
     const physical = await realpath(current); assertBudget(deadline); return join(physical, ...tail);
   }
 }
-async function assertIsolation(layout: PackagedLayout, state: string, deadline: number): Promise<void> {
+async function assertIsolation(layout: PackagedLayout, state: string, deadline: number, maintenanceRoot?: MaintenanceStateRoot): Promise<void> {
   const account = userInfo();
   if (!process.geteuid || account.uid !== process.geteuid() || !canonicalPath(account.homedir)) throw unavailable('browser');
   assertBudget(deadline);
@@ -182,7 +193,13 @@ async function assertIsolation(layout: PackagedLayout, state: string, deadline: 
     for (const actual of [layout.buildRoot, state])
       if (below(actual, physical) || below(physical, actual)) throw unavailable('browser');
   }
-  for (const path of [dirname(layout.buildRoot), layout.buildRoot, state]) { assertBudget(deadline); await directory(path); }
+  for (const path of [dirname(layout.buildRoot), layout.buildRoot]) { assertBudget(deadline); await directory(path); }
+  if (maintenanceRoot) {
+    if (maintenanceRoot.path !== state) throw unavailable('browser');
+    await directory(dirname(state)); maintenanceRoot.assert();
+    if (maintenanceRoot.initial === 'present') await directory(state);
+    maintenanceRoot.assert();
+  } else { assertBudget(deadline); await directory(state); }
 }
 export function installedImagePath(layout: PackagedLayout): string | undefined {
   if (layout.scope === 'installed') return join(dirname(dirname(layout.guard)), 'images', `${layout.build}.dmg`);
@@ -290,11 +307,28 @@ export function verifyPackagedOpenHost(selection: BuildSelection, payload: strin
   observation?: HostVerificationObservation): Promise<VerifiedHost> {
   return verifySelectedHost(selection, payload, deadline, undefined, observation, true);
 }
+/** Only genuine native maintenance custody admits an absent signed state root.
+ * This result has a separate brand and cannot authorize ordinary host startup. */
+export async function verifyMaintenancePackagedHost(selection: BuildSelection, payload: string, deadline: number,
+  custody: MaintenanceCustody, platform: PlatformPort): Promise<VerifiedMaintenanceHost> {
+  assertPlatform(platform); assertMaintenanceCustody(custody); assertBudget(deadline);
+  const root = platform.observeMaintenanceStateRoot(custody);
+  const host = await verifySelectedHost(selection, payload, deadline, undefined, undefined, false, { custody, root });
+  const result: VerifiedMaintenanceHost = Object.freeze({ ...host, custody, root });
+  maintenanceHostReceipts.add(result); assertVerifiedMaintenanceHost(result); return result;
+}
 async function verifySelectedHost(selection: BuildSelection, payload: string, deadline: number,
-  bootstrapSigned?: SignedBundle, observation?: HostVerificationObservation, ordinaryOpen = false): Promise<VerifiedHost> {
+  bootstrapSigned?: SignedBundle, observation?: HostVerificationObservation, ordinaryOpen = false,
+  maintenance?: Readonly<{ custody: MaintenanceCustody; root: MaintenanceStateRoot }>): Promise<VerifiedHost> {
   noteHostVerification(observation, 'signed-bundle');
   assertBudget(deadline);
   const layout = selectedLayout(selection, payload);
+  if (maintenance) {
+    assertMaintenanceCustody(maintenance.custody); maintenance.root.assert();
+    if (bootstrapSigned || ordinaryOpen || layout.bundle !== maintenance.custody.facts.bundle ||
+        selection.guard !== maintenance.custody.newBuild.path ||
+        (layout.scope === 'installed') !== (maintenance.custody.facts.scope === 'installed')) throw unavailable('browser');
+  }
   const image = installedImagePath(layout);
   const manifestURL = new URL('../native/manifest.js', import.meta.url).href;
   const manifests = await import(manifestURL) as typeof import('../native/manifest.js');
@@ -318,6 +352,8 @@ async function verifySelectedHost(selection: BuildSelection, payload: string, de
   noteHostVerification(observation, 'signed-policy-metadata-compatibility');
   const policyFile = join(layout.bundle, 'Contents/Resources/host-policy.json');
   const rawPolicy = await physicalJson(policyFile, 1048576, deadline), policy = readPolicy(rawPolicy.value, layout);
+  if (maintenance && (policy.stateRoot !== maintenance.root.path || rawPolicy.digest !== maintenance.root.policySha256 ||
+      rawPolicy.digest !== maintenance.custody.facts.hostPolicySha256)) throw unavailable('browser');
   const identity = await readPackagedIdentity(selection, payload, policy.stateRoot, deadline);
   const compatibility = await physicalJson(join(layout.bundle, 'Contents/Resources/native-compatibility.json'), 1048576, deadline);
   const manifest = signed.manifest;
@@ -333,10 +369,15 @@ async function verifySelectedHost(selection: BuildSelection, payload: string, de
   const reader = `host-${image ? 'production' : 'isolated'}:1:${policy.productDigest}`;
   if (manifest.qualification !== reader || policy.readerKey !== reader) throw unavailable('browser');
   async function assertRoots(limit: number): Promise<void> {
-    if (!image) return assertIsolation(layout, policy.stateRoot, limit);
+    if (maintenance) { assertMaintenanceCustody(maintenance.custody); maintenance.root.assert(); }
+    if (!image) return assertIsolation(layout, policy.stateRoot, limit, maintenance?.root);
     assertBudget(limit);
     await directory(layout.buildRoot, false);
-    await directory(policy.stateRoot);
+    if (maintenance) {
+      await directory(dirname(policy.stateRoot)); maintenance.root.assert();
+      if (maintenance.root.initial === 'present') await directory(policy.stateRoot);
+      maintenance.root.assert();
+    } else await directory(policy.stateRoot);
     manifests.assertInstalledImage(signed, image, limit);
   }
   noteHostVerification(observation, 'isolated-roots');
@@ -345,6 +386,11 @@ async function verifySelectedHost(selection: BuildSelection, payload: string, de
   const usesIdentity = await directory(dirname(selection.guard)); assertBudget(deadline);
   const guard = await lstat(selection.guard, { bigint: true });
   const guardIdentity = Object.freeze({ device: String(guard.dev), inode: String(guard.ino), uid: Number(guard.uid) });
+  if (maintenance) {
+    const original = maintenance.custody.newBuild.assertIdentity();
+    if (original.device !== guardIdentity.device || original.inode !== guardIdentity.inode || original.uid !== guardIdentity.uid)
+      throw unavailable('browser');
+  }
   const assertGuard = async (limit: number) => {
     assertBudget(limit);
     await assertDirectory(dirname(selection.guard), usesIdentity);
@@ -360,7 +406,7 @@ async function verifySelectedHost(selection: BuildSelection, payload: string, de
     assertTrusted: (limit: number, originalStartupCutoff?: number) => verifyTrusted(limit, originalStartupCutoff),
   });
   async function verifyTrusted(limit: number, originalStartupCutoff?: number, retainedFor?: 'startup' | 'close'): Promise<void> {
-    if (!verifiedHosts.has(result)) throw unavailable('browser');
+    if (!(maintenance ? maintenanceHosts.has(result) : verifiedHosts.has(result))) throw unavailable('browser');
     const custody = armedHosts.get(result);
     const closing = retainedFor === 'close' ? custody?.instance.record : undefined;
     let observeReady = false;
@@ -410,6 +456,7 @@ async function verifySelectedHost(selection: BuildSelection, payload: string, de
         assertHostCustody(custody);
       } else signed.assertIdentity(limit);
       if (closing && custody?.instance.record !== closing) throw unavailable('browser');
+      if (maintenance) { assertMaintenanceCustody(maintenance.custody); maintenance.root.assert(); }
       assertBudget(limit);
     } catch (error) {
       try {
@@ -424,10 +471,12 @@ async function verifySelectedHost(selection: BuildSelection, payload: string, de
       throw error;
     }
   }
-  startupTrustChecks.set(result, (limit, cutoff) => verifyTrusted(limit, cutoff, 'startup'));
-  closeTrustChecks.set(result, limit => verifyTrusted(limit, undefined, 'close'));
+  if (!maintenance) {
+    startupTrustChecks.set(result, (limit, cutoff) => verifyTrusted(limit, cutoff, 'startup'));
+    closeTrustChecks.set(result, limit => verifyTrusted(limit, undefined, 'close'));
+  }
   noteHostVerification(observation, 'initial-verified-host');
-  assertBudget(deadline); verifiedHosts.add(result);
+  assertBudget(deadline); (maintenance ? maintenanceHosts : verifiedHosts).add(result);
   // Ordinary Open already verified both complete snapshots in this factory.
   if (ordinaryOpen) await assertHostStartupContinuity(result, deadline, deadline);
   else await result.assertTrusted(deadline);

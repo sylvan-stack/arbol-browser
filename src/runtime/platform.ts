@@ -50,6 +50,13 @@ export interface MaintenanceCustody {
   readonly deadline: number;
   assert(): void;
 }
+export interface MaintenanceStateRoot {
+  readonly path: string; readonly initial: 'absent' | 'present';
+  readonly identity: MaintenanceFileEvidence['identity'] | null;
+  readonly parent: Readonly<{ path: string; identity: MaintenanceFileEvidence['identity'] }>;
+  readonly policySha256: string; readonly epoch: string;
+  assert(): void;
+}
 const maintenanceReceipts = new WeakSet<object>();
 export function assertMaintenanceCustody(value: MaintenanceCustody): void {
   if (!maintenanceReceipts.has(value)) throw unavailable('browser');
@@ -235,6 +242,7 @@ export interface PlatformPort {
   adoptHostBuild(requestPath: string, guard: string, bundle: string): HeldLock;
   adoptInstalledLaunch(bundle: string): { lock: HeldLock; deadline: number };
   adoptMaintenanceCustody(input: IsolatedMaintenanceInput | InstalledMaintenanceInput): MaintenanceCustody;
+  observeMaintenanceStateRoot(custody: MaintenanceCustody): MaintenanceStateRoot;
   /** Actual adopted original only: authentic no-use terminal or retained real
    * custody unwind, never normal adoption from cancellation or a public kill. */
   terminateAdoptedHost(build: HeldLock, owner?: HeldLock): never;
@@ -304,6 +312,8 @@ interface NativeSupport {
     handle: object; oldBuild: object | null; newBuild: object; facts: string; remaining: number;
   };
   assertMaintenanceCustody?(handle: object): void;
+  observeMaintenanceStateRoot?(handle: object): string;
+  assertMaintenanceStateRoot?(handle: object): void;
   terminateAdoptedHost(build: object, owner: object | null): never;
   continuousTime(): number;
   processProvenance(pid: number): ProcessProvenance | null;
@@ -351,6 +361,7 @@ export function loadPlatform(): PlatformPort {
   const budgets = new WeakMap<CloseBudget, object>();
   const consumedBudgets = new WeakMap<CloseBudget, object>();
   const custodyHandles = new WeakMap<WatchdogCustody, object>();
+  const maintenanceHandles = new WeakMap<MaintenanceCustody, object>();
   let clipboardAttempted = false;
   const clockBudget = (value: CloseBudget): CloseBudget => {
     if (!value || ![value.received, value.grace, value.overall].every(n => Number.isFinite(n) && n > 0) ||
@@ -557,7 +568,27 @@ export function loadPlatform(): PlatformPort {
       const custody: MaintenanceCustody = Object.freeze({ facts: Object.freeze(facts),
         oldBuild: value.oldBuild === null ? null : guard(value.oldBuild, facts.oldBuildPath!),
         newBuild: guard(value.newBuild, facts.newBuildPath), deadline: began + value.remaining, assert });
-      assert(); maintenanceReceipts.add(custody); return custody;
+      assert(); maintenanceReceipts.add(custody); maintenanceHandles.set(custody, value.handle); return custody;
+    },
+    observeMaintenanceStateRoot(custody: MaintenanceCustody): MaintenanceStateRoot {
+      assertMaintenanceCustody(custody);
+      const handle = maintenanceHandles.get(custody);
+      if (!handle || typeof native.observeMaintenanceStateRoot !== 'function' || typeof native.assertMaintenanceStateRoot !== 'function')
+        throw unavailable('browser');
+      const observe = native.observeMaintenanceStateRoot, check = native.assertMaintenanceStateRoot;
+      const value = call(() => JSON.parse(observe(handle))) as Omit<MaintenanceStateRoot, 'assert'>;
+      const identity = (i: MaintenanceFileEvidence['identity']): boolean => !!i &&
+        typeof i.device === 'string' && /^[0-9]+$/.test(i.device) && typeof i.inode === 'string' && /^[0-9]+$/.test(i.inode) &&
+        i.uid === process.getuid?.() && i.mode === 0o700;
+      if (!value || value.path !== custody.facts.stateRoot || value.epoch !== custody.facts.epoch ||
+          value.policySha256 !== custody.facts.hostPolicySha256 || !['absent', 'present'].includes(value.initial) ||
+          (value.initial === 'absent' ? value.identity !== null : !value.identity || !identity(value.identity)) ||
+          !value.parent || value.parent.path !== value.path.slice(0, value.path.lastIndexOf('/')) || !identity(value.parent.identity))
+        throw unavailable('browser');
+      if (value.identity) Object.freeze(value.identity);
+      Object.freeze(value.parent.identity); Object.freeze(value.parent);
+      const assert = () => { assertMaintenanceCustody(custody); call(() => check(handle)); };
+      const root: MaintenanceStateRoot = Object.freeze({ ...value, assert }); assert(); return root;
     },
     continuousTime(): number {
       const value = call(() => native.continuousTime());

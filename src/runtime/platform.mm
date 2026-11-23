@@ -588,6 +588,68 @@ struct MaintenanceCustody {
   bool current() const { return installed ? production.current() && installedRuntime.current() : isolated.current(); }
 };
 static MaintenanceCustody* maintenanceCustody = nullptr;
+struct MaintenanceStateRoot {
+  arbol_attempt::MaintenanceDirectory parent;
+  int fd = -1; std::string path, leaf; struct stat identity{};
+  bool captured = false, absent = false;
+  bool current() const {
+    auto* custody = maintenanceCustody; struct stat named{}, held{}; char actual[PATH_MAX]{};
+    if (!captured || !custody || !custody->accepted || !custody->current() || !parent.current() ||
+        [custody->parent[@"pid"] intValue] != getppid() || !arbol_attempt::currentProcess(custody->parent) ||
+        ![custody->stateRoot() isEqual:[NSString stringWithUTF8String:path.c_str()]]) return false;
+    errno = 0; int result = fstatat(parent.fd,leaf.c_str(),&named,AT_SYMLINK_NOFOLLOW);
+    if (absent) return result < 0 && errno == ENOENT && fd < 0;
+    return !result && fd >= 0 && !fstat(fd,&held) && !fcntl(fd,F_GETPATH,actual) && path == actual &&
+      arbol_boundary::canonical(path) && S_ISDIR(named.st_mode) && S_ISDIR(held.st_mode) && named.st_uid == geteuid() &&
+      named.st_dev == identity.st_dev && named.st_ino == identity.st_ino && named.st_mode == identity.st_mode &&
+      named.st_dev == held.st_dev && named.st_ino == held.st_ino && named.st_mode == held.st_mode && held.st_uid == named.st_uid &&
+      (named.st_mode & 07777) == 0700;
+  }
+  bool capture() {
+    auto* custody = maintenanceCustody;
+    if (captured) return current();
+    if (!custody || !custody->accepted || !custody->current()) return false;
+    NSString* state = custody->stateRoot(); if (!arbol_attempt::path(state)) return false;
+    path = state.fileSystemRepresentation; leaf = state.lastPathComponent.UTF8String;
+    if (!parent.openPath(state.stringByDeletingLastPathComponent.fileSystemRepresentation)) return false;
+    errno = 0;
+    if (fstatat(parent.fd,leaf.c_str(),&identity,AT_SYMLINK_NOFOLLOW)) {
+      if (errno != ENOENT) return false; absent = true;
+    } else {
+      if (!S_ISDIR(identity.st_mode) || identity.st_uid != geteuid() || (identity.st_mode & 07777) != 0700) return false;
+      fd = openat(parent.fd,leaf.c_str(),O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC); if (fd < 0) return false;
+    }
+    captured = true; return current();
+  }
+};
+static MaintenanceStateRoot* maintenanceStateRoot = nullptr;
+static bool maintenanceHandle(napi_env env, napi_callback_info info) {
+  napi_value arg; void* raw = nullptr;
+  return arbol_attempt::profileFormat == 2 && argument(env,info,&arg) &&
+    napi_get_value_external(env,arg,&raw) == napi_ok && raw && raw == maintenanceCustody && maintenanceCustody->accepted;
+}
+static napi_value observeMaintenanceStateRoot(napi_env env, napi_callback_info info) {
+  if (!maintenanceHandle(env,info)) return fail(env);
+  @autoreleasepool { try { @try {
+    if (!maintenanceStateRoot) maintenanceStateRoot = new MaintenanceStateRoot;
+    auto* root = maintenanceStateRoot; auto* custody = maintenanceCustody;
+    if (!root->capture()) return fail(env);
+    NSDictionary* record = @{ @"path":[NSString stringWithUTF8String:root->path.c_str()],
+      @"initial":root->absent ? @"absent" : @"present",
+      @"identity":root->absent ? (id)NSNull.null : arbol_attempt::maintenanceIdentity(root->identity),
+      @"parent":@{@"path":[NSString stringWithUTF8String:root->parent.path.c_str()],
+        @"identity":arbol_attempt::maintenanceIdentity(root->parent.identity)},
+      @"policySha256":arbol_attempt::digest(custody->hostPolicy().content),@"epoch":custody->epoch };
+    return text(env,arbol_attempt::bytes(record));
+  } @catch (NSException*) { return fail(env); } } catch (...) { return fail(env); } }
+}
+static napi_value assertMaintenanceStateRoot(napi_env env, napi_callback_info info) {
+  if (!maintenanceHandle(env,info)) return fail(env);
+  @autoreleasepool { try { @try {
+    if (!maintenanceStateRoot || !maintenanceStateRoot->current()) return fail(env);
+    napi_value result; if (napi_get_undefined(env,&result) != napi_ok) return fail(env); return result;
+  } @catch (NSException*) { return fail(env); } } catch (...) { return fail(env); } }
+}
 static napi_value adoptMaintenanceCustody(napi_env env, napi_callback_info info) {
   if (arbol_attempt::profileFormat != 2 || maintenanceCustody) return fail(env);
   size_t count = 3; napi_value args[3]; std::string bundle, policy, runtime;
@@ -2401,6 +2463,8 @@ static napi_value init(napi_env env, napi_value exports) {
     {"adoptInstalledLaunch",nullptr,adoptInstalledLaunch,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"adoptMaintenanceCustody",nullptr,adoptMaintenanceCustody,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"assertMaintenanceCustody",nullptr,assertMaintenanceCustody,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"observeMaintenanceStateRoot",nullptr,observeMaintenanceStateRoot,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"assertMaintenanceStateRoot",nullptr,assertMaintenanceStateRoot,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"continuousTime",nullptr,continuousTime,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"processProvenance",nullptr,processProvenance,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"readLaunchAttempt",nullptr,readLaunchAttempt,nullptr,nullptr,nullptr,napi_default,nullptr},
