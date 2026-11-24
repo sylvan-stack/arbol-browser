@@ -19,8 +19,9 @@ const mercury = '/Volumes/Mercury', archiveRoot = `${mercury}/Arbol`;
 // ARC-5's real archive identity, shared with Arbol database/archive_volume.py.
 const mercuryUUID = 'AE1E97B8-CE93-4019-B6DC-21482165C3F2';
 const transactionLimit = 4096 * (4 * 87384 + 8192) + 65536;
+const nativeInterruptionPoints = ['record-rename', 'record-durable', 'claim-retained', 'capture-durable', 'receipt-durable'] as const;
 const transactionInterruptionPoints = ['before-transaction', 'transaction-publication', 'current-publication',
-  'native-rename-excl', ...maintenanceStagingPoints] as const;
+  'native-rename-excl', ...maintenanceStagingPoints, ...nativeInterruptionPoints] as const;
 function activeTransactionInterruption({ platform, custody }: MigrationAdmission) {
   return transactionInterruptionPoints.find(point => platform.maintenanceInterruptionMatches?.(custody, point));
 }
@@ -205,7 +206,8 @@ export function readMigrationTransaction(admission: MigrationAdmission, deadline
   return openMigrationTransaction(admission, deadline);
 }
 async function openMigrationTransaction(admission: MigrationAdmission, deadline: number,
-  fresh?: Readonly<{ current: MigrationFile; point: MaintenanceStagingPoint; profileSha256: string }>): Promise<MigrationTransaction | null> {
+  fresh?: Readonly<{ current: MigrationFile } & ({ point: MaintenanceStagingPoint; profileSha256: string } |
+    { point: typeof nativeInterruptionPoints[number] })>): Promise<MigrationTransaction | null> {
   await admission.assert(deadline);
   const facts = admission.custody.facts, root = join(facts.runtime, 'browser-profile-migration'), path = join(root, 'current');
   try { await lstat(path); } catch (error) { if (missing(error)) return null; throw error; }
@@ -226,7 +228,7 @@ async function openMigrationTransaction(admission: MigrationAdmission, deadline:
       !isDeepStrictEqual(value.newBuild, admission.journal.after) || value.sourceSha256 !== admission.host.identity.sourceDigest ||
       value.productSha256 !== admission.host.identity.productDigest || value.candidateSha256 !== admission.host.signed.snapshotDigest) throw profileUnavailable();
   const transaction: MigrationTransaction = Object.freeze({ admission, value: freeze(value), file, current, root, attempt,
-    ...(fresh && { stagingInterruption: Object.freeze({ point: fresh.point, profileSha256: fresh.profileSha256 }) }),
+    ...(fresh && 'profileSha256' in fresh && { stagingInterruption: Object.freeze({ point: fresh.point, profileSha256: fresh.profileSha256 }) }),
     async assert(cutoff: number) {
       await admission.assert(cutoff);
       if (!sameMigrationIdentity(rootIdentity, await migrationDirectory(root)) || !sameMigrationIdentity(attemptIdentity, await migrationDirectory(attempt)) ||
@@ -250,9 +252,12 @@ export async function createMigrationTransaction(preflight: MigrationPreflight, 
   if (!validator('migration.Transaction')(value)) throw profileUnavailable();
   const interception = activeTransactionInterruption(admission);
   const stagingPoint = maintenanceStagingPoints.find(point => point === interception);
+  const nativePoint = nativeInterruptionPoints.find(point => point === interception);
   const needsMarker = stagingPoint === 'staged-marker' || stagingPoint === 'marker-rename' || stagingPoint === 'marker-durable';
   const stagingProfile = stagingPoint ? value.profiles.find(entry => !needsMarker || entry.targetMarker !== null) : undefined;
   if (stagingPoint && !stagingProfile) throw profileUnavailable();
+  if (nativePoint && !value.profiles.some(entry => nativePoint !== 'claim-retained' ||
+      entry.evidence.closedClaimSha256 !== null || entry.evidence.dataClaimSha256 !== null)) throw profileUnavailable();
   const bytes = Buffer.from(`${JSON.stringify(value)}\n`, 'utf8');
   const archive = await requireMercury(deadline);
   try {
@@ -299,7 +304,8 @@ export async function createMigrationTransaction(preflight: MigrationPreflight, 
     const current = await publishMigrationFile(admission, join(root, 'current'), Buffer.from(`${JSON.stringify({ format: 1, attempt: id, transactionSha256: file.sha256 })}\n`),
       deadline, async () => { await preflight.assertOriginals(deadline); await archive.assert(); });
     await park('current-publication', file, current);
-    const fresh = stagingPoint && stagingProfile ? { current, point: stagingPoint, profileSha256: stagingProfile.pathSha256 } : undefined;
+    const fresh = stagingPoint && stagingProfile ? { current, point: stagingPoint, profileSha256: stagingProfile.pathSha256 } :
+      nativePoint ? { current, point: nativePoint } : undefined;
     const transaction = await openMigrationTransaction(admission, deadline, fresh);
     if (!transaction) throw profileUnavailable();
     return transaction;

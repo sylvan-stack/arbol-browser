@@ -1606,7 +1606,8 @@ const installerInterruptionPoints = new Set(['final-verification', 'reopening-pr
 // A point joins this set in the same source step that binds its actual writer.
 const enabledQualificationInterruptionPoints = new Set(['before-transaction', 'transaction-publication',
   'current-publication', 'native-rename-excl', 'empty-staging', 'partial-staging', 'staged-record', 'staged-marker',
-  'staged-progress', 'marker-rename', 'marker-durable']);
+  'staged-progress', 'marker-rename', 'marker-durable', 'record-rename', 'record-durable', 'claim-retained',
+  'capture-durable', 'receipt-durable']);
 const controlledMaintenanceLimit = 31 * 60 * 1000;
 const controlledCleanupLimit = 30000;
 
