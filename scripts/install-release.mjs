@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { constants, fstatSync } from 'node:fs';
-import { chmod, copyFile, lstat, mkdir, mkdtemp, open, readdir, readlink, realpath, rename, rmdir, symlink,
+import { chmod, copyFile, lstat, mkdir, mkdtemp, open, opendir, readdir, readlink, realpath, rename, rmdir, symlink,
   unlink } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { Socket } from 'node:net';
@@ -114,9 +114,13 @@ async function privateJson(path, limit = 8388608) {
 }
 function sameFile(a, b) { return a && b && a.sha256 === b.sha256 && canonical(a.identity) === canonical(b.identity); }
 
-function run(program, args, input) {
-  const result = spawnSync(program, args, { input, encoding: 'utf8', timeout: 120000, maxBuffer: 1048576,
+function run(program, args, input, deadline = Infinity) {
+  const timeout = Math.min(120000, Math.floor(deadline - performance.now()));
+  if (timeout <= 0) throw new InstallationOperationError('Observation verifier deadline exceeded', 5);
+  const result = spawnSync(program, args, { input, encoding: 'utf8', timeout, maxBuffer: 1048576,
+    ...(Number.isFinite(deadline) && { killSignal: 'SIGKILL' }),
     env: { PATH: '/usr/bin:/bin', LC_ALL: 'C' } });
+  if (performance.now() >= deadline) throw new InstallationOperationError('Observation verifier deadline exceeded', 5);
   if (result.error || result.status !== 0) throw new Error(`${basename(program)} refused release verification`);
   return result;
 }
@@ -125,9 +129,9 @@ function plist(program, args) {
   return JSON.parse(run('/usr/bin/plutil', ['-convert', 'json', '-o', '-', '--', '-'], run(program, args).stdout).stdout);
 }
 
-function checkSignature(path, identifier, deep = false) {
+function checkSignature(path, identifier, deep = false, deadline) {
   const requirement = publisher.requirement + (identifier ? ` and identifier "${identifier}"` : '');
-  run('/usr/bin/codesign', ['--verify', '--strict', ...(deep ? ['--deep'] : []), '-R', `=${requirement}`, path]);
+  run('/usr/bin/codesign', ['--verify', '--strict', ...(deep ? ['--deep'] : []), '-R', `=${requirement}`, path], undefined, deadline);
 }
 
 async function signedReceipt(path) {
@@ -411,9 +415,9 @@ class InstallationOperationError extends Error {
   }
 }
 
-async function withLock(provider, path, work, create = true, initializationExisting = false) {
+async function withLock(provider, path, work, create = true, acquire = 'tryLock') {
   const expected = await checkedGuard(path, create);
-  const held = initializationExisting ? provider.tryExistingInitializationLock(path) : provider.tryLock(path);
+  const held = provider[acquire](path);
   if (!held) throw new InstallationOperationError('The Browser installation or selected Build is in use', 4);
   installerLocks.set(provider, (installerLocks.get(provider) ?? 0) + 1);
   try {
@@ -427,13 +431,15 @@ async function withLock(provider, path, work, create = true, initializationExist
   }
 }
 
-async function withLockProvider(platform, work) {
+async function withLockProvider(platform, work, budget = null) {
   const tmp = await mkdtemp(join(await realpath(tmpdir()), 'arbol-browser-installer-'));
   const path = join(tmp, 'platform.node');
   try {
     await writeExclusive(path, platform.bytes);
+    budget?.check(platform.bytes.length);
     if ((await exactFile(path, launcherLimit)).sha256 !== platform.sha256) throw new Error('Installer lock provider changed');
-    checkSignature(path);
+    budget?.check(platform.bytes.length);
+    checkSignature(path, undefined, false, budget?.deadline);
     const provider = createRequire(import.meta.url)(path);
     return await work(provider);
   } finally {
@@ -613,19 +619,24 @@ async function releaseContext(release) {
 // verifier, native result or completion observation.
 const isolatedAuthorities = new WeakMap();
 function verifyInIsolatedContext(context, verify) {
-  return isolatedAuthorities.get(context)?.boundedVerification
-    ? withIsolatedVerificationDeadline(performance.now() + 480000, verify) : verify();
+  const authority = isolatedAuthorities.get(context);
+  return authority?.boundedVerification
+    ? withIsolatedVerificationDeadline(performance.now() + 480000, verify)
+    : verify();
 }
 
 async function assertContext(context) {
   const authority = isolatedAuthorities.get(context);
   if (!authority) return;
-  const { release, directories, inputs, releases } = authority;
+  const { release, directories, inputs, releases, observationBudget } = authority;
   requireEqual(await maintenanceFixtureLayout(dirname(dirname(release.fixture.bundle)), context.state), release.fixture);
   for (const [path, identity] of directories) requireEqual(await privateDirectory(path, true), identity);
-  for (const [build, input] of inputs)
-    if ((await exactFile(input.signedReceiptPath, 8388608)).sha256 !== releases.get(build).receiptSha256)
+  for (const [build, input] of inputs) {
+    const receipt = observationBudget ? await observeFile(input.signedReceiptPath, 8388608n, observationBudget) :
+      await exactFile(input.signedReceiptPath, 8388608);
+    if (receipt.sha256 !== releases.get(build).receiptSha256)
       throw new Error('Original isolated receipt changed');
+  }
 }
 function contextLauncher(context, sha256) {
   const authority = isolatedAuthorities.get(context);
@@ -635,8 +646,8 @@ function contextLauncher(context, sha256) {
   return release;
 }
 function contextLauncherMode(context, sha256) { return contextLauncher(context, sha256).launcherMode; }
-function checkContextLauncher(context, path, sha256) {
-  checkSignature(path, contextLauncher(context, sha256).launcherIdentifier);
+function checkContextLauncher(context, path, sha256, deadline) {
+  checkSignature(path, contextLauncher(context, sha256).launcherIdentifier, false, deadline);
 }
 function contextPredecessor(context) {
   const authority = isolatedAuthorities.get(context);
@@ -675,27 +686,32 @@ async function isolatedContext(options) {
   if (release.profileFormat !== 2) throw new Error('Isolated installer requires a current format2 candidate');
   return createIsolatedContext(release, inputs, releases);
 }
-/** Private layout factory. Its only historical caller authenticates the fixed
- * four-role authority and performs separate pristine/partial setup checks. */
-async function createIsolatedContext(release, inputs, releases, boundedVerification = false) {
+function isolatedLayout(release) {
   const { fixture } = release, support = join(fixture.fixture, 'support');
   const images = join(support, 'images'), receipts = join(support, 'releases');
   const aliases = join(fixture.fixture, 'aliases'), mount = dirname(fixture.bundle);
+  return { support, uses: join(fixture.registry, '.uses'), executable: fixture.launcher,
+    alias: join(aliases, 'arbol-browser'), images, receipts, mount,
+    image: join(images, `${release.build}.dmg`), selectionPath: join(support, 'selected.json'),
+    runtime: fixture.runtime, state: fixture.stateRoot, journalPath: join(support, 'install-transaction.json'),
+    backup: join(support, 'install-previous-launcher'), proofPath: join(receipts, `${release.build}.migration.json`) };
+}
+
+/** Private layout factory. Its only historical caller authenticates the fixed
+ * four-role authority and performs separate pristine/partial setup checks. */
+async function createIsolatedContext(release, inputs, releases, boundedVerification = false) {
+  const context = isolatedLayout(release);
+  const { images, receipts, alias, executable, mount } = context;
   const directories = new Map();
-  for (const path of [images, receipts, aliases, dirname(fixture.launcher)]) {
+  for (const path of [images, receipts, dirname(alias), dirname(executable)]) {
     try { await mkdir(path, { mode: 0o700 }); } catch (error) { if (error.code !== 'EEXIST') throw error; }
     const identity = await privateDirectory(path, true);
-    if (identity.device !== fixture.directories.fixture.device) throw new Error('Isolated installer directories crossed filesystems');
+    if (identity.device !== release.fixture.directories.fixture.device) throw new Error('Isolated installer directories crossed filesystems');
     directories.set(path, identity);
   }
   await privateDirectory(dirname(mount), true);
   try { await mkdir(mount, { mode: 0o700 }); } catch (error) { if (error.code !== 'EEXIST') throw error; }
   await privateDirectory(mount, true);
-  const context = { support, uses: join(fixture.registry, '.uses'), executable: fixture.launcher,
-    alias: join(aliases, 'arbol-browser'), images, receipts, mount,
-    image: join(images, `${release.build}.dmg`), selectionPath: join(support, 'selected.json'),
-    runtime: fixture.runtime, state: fixture.stateRoot, journalPath: join(support, 'install-transaction.json'),
-    backup: join(support, 'install-previous-launcher'), proofPath: join(receipts, `${release.build}.migration.json`) };
   isolatedAuthorities.set(context, { release, inputs, releases, directories, boundedVerification });
   await assertContext(context);
   return { context, release };
@@ -719,7 +735,7 @@ async function mountIsolatedCandidate(context, release, provider, initialization
       bundle: release.fixture.bundle, mount: context.mount });
     await assertContext(context);
     if (initialization) requireEqual(await guardRecord(provider, join(context.uses, `${release.build}.mount`), handle), initialization.guards.mount);
-  }, false, Boolean(initialization));
+  }, false, initialization ? 'tryExistingInitializationLock' : 'tryLock');
 }
 async function guardRecord(provider, path, handle) {
   const expected = await checkedGuard(path, false), actual = provider.assertLock(handle);
@@ -889,7 +905,7 @@ async function absent(path) {
 const identityOf = st => ({ device: String(st.dev), inode: String(st.ino), uid: Number(st.uid), mode: Number(st.mode & 0o7777n) });
 /** Streaming observations include empty locks and native LLONG_MAX ledgers.
  * No data directory contents or Chromium files are read. */
-async function observeFile(path, maximum = 8388608n) {
+async function observeFile(path, maximum = 8388608n, budget = null) {
   if (resolve(path) !== path || await realpath(path) !== path) throw new Error('Nonphysical migration evidence');
   const fd = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
@@ -899,8 +915,10 @@ async function observeFile(path, maximum = 8388608n) {
       st.gid === first.gid && st.size === first.size && st.mtimeNs === first.mtimeNs && st.ctimeNs === first.ctimeNs;
     if (!same(first) || first.size < 0n || first.size > BigInt(maximum) || !same(await lstat(path, { bigint: true })))
       throw new Error('Unsafe migration evidence');
+    budget?.check(Number(first.size));
     const sha = createHash('sha256'), buffer = Buffer.alloc(1048576); let count = 0n;
     for (;;) {
+      budget?.check();
       const part = await fd.read(buffer, 0, buffer.length, null);
       if (!part.bytesRead) break;
       count += BigInt(part.bytesRead); if (count > first.size) throw new Error('Evidence grew during observation');
@@ -918,9 +936,10 @@ function evidencePath(context, scope, path) {
       (path && path.split('/').some(p => !p))) throw new Error('Invalid evidence reference');
   return join(scope === 'migration' ? join(context.runtime, 'browser-profile-migration') : context.state, path);
 }
-async function evidenceCollector(context) {
+async function evidenceCollector(context, budget = null) {
   const files = new Map(), directories = new Map();
   async function directory(scope, path, expected) {
+    budget?.check();
     const value = await privateDirectory(evidencePath(context, scope, path), true);
     if (expected) requireEqual(value, expected);
     const entry = { scope, path, identity: value }, key = `${scope}:${path}`;
@@ -932,14 +951,15 @@ async function evidenceCollector(context) {
   }
   async function file(scope, path, maximum = 8388608, parse = true) {
     await directory(scope, path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
-    const full = evidencePath(context, scope, path), observation = await observeFile(full, BigInt(maximum));
+    const full = evidencePath(context, scope, path), observation = await observeFile(full, BigInt(maximum), budget);
     const entry = { scope, path, ...observation }, key = `${scope}:${path}`;
     if (files.has(key)) requireEqual(files.get(key), entry);
     files.set(key, entry); if (files.size > 131072) throw new Error('Too many evidence files');
     if (!parse) return observation;
+    budget?.check(Number(observation.size));
     const decoded = await privateJson(full, maximum);
     if (!sameFile(decoded, observation)) throw new Error('Evidence changed while decoding');
-    requireEqual(await observeFile(full, BigInt(maximum)), observation);
+    requireEqual(await observeFile(full, BigInt(maximum), budget), observation);
     return decoded;
   }
   return { directory, file, finish: () => ({
@@ -993,7 +1013,13 @@ function targetValue(content, schema) {
 // It cannot mint a publication observation or a native success verdict.
 async function collectCompletion(context, release, prepared, result, custody, after = false) {
   await preparedBindings(context, release, prepared, custody, after);
-  const collector = await evidenceCollector(context), { file, directory } = collector;
+  const observation = await collectCompletionEvidence(context, release, prepared, result);
+  await preparedBindings(context, release, prepared, custody, after);
+  return observation;
+}
+
+async function collectCompletionEvidence(context, release, prepared, result, budget = null) {
+  const collector = await evidenceCollector(context, budget), { file, directory } = collector;
   const current = await file('migration', 'current', 16384), pointer = current.value;
   if (!keys(pointer, ['format', 'attempt', 'transactionSha256']) || pointer.format !== 1 ||
       !/^[0-9a-f]{32}$/.test(pointer.attempt) || !digest(pointer.transactionSha256)) throw new Error('Invalid migration pointer');
@@ -1080,7 +1106,6 @@ async function collectCompletion(context, release, prepared, result, custody, af
     completed.push({ profileSha256: h, receiptSha256: receipt.sha256 });
   }
   requireEqual(done.profiles, completed);
-  await preparedBindings(context, release, prepared, custody, after);
   return { prepared, result, epoch: tx.epoch, root: tx.root, ...collector.finish() };
 }
 async function verifyCompletion(context, release, prepared, result, custody) {
@@ -1132,9 +1157,7 @@ function proofPrepared(proof) {
     assets: proof.source.assets, launcher: proof.source.launcher, oldAssets: proof.source.oldAssets,
     state: { parent: proof.state.parent, runtime: proof.state.runtime } };
 }
-async function readReopeningProof(context, release, custody) {
-  if (!await optionalFile(context.proofPath, proofLimit)) return null;
-  const file = await privateJson(context.proofPath, proofLimit), proof = file.value;
+function validateReopeningProof(context, release, proof) {
   if (!keys(proof, ['format', 'kind', 'journal', 'before', 'after', 'source', 'result', 'epoch', 'guards', 'state', 'directories', 'files', 'rollback']) ||
       proof.format !== 1 || proof.kind !== 'browser-profile-migration-reopen' || !digest(proof.epoch) ||
       !valid('migration.Result', proof.result) || !digest(proof.result.completionSha256) || proof.result.diagnostic !== null || proof.result.busy.length ||
@@ -1146,6 +1169,13 @@ async function readReopeningProof(context, release, custody) {
     throw new Error('Reopening proof does not bind exact signed release');
   const prepared = proofPrepared(proof);
   if (!valid('migration.Journal', prepared.journal.value)) throw new Error('Reopening journal grammar differs');
+  return prepared;
+}
+
+async function readReopeningProof(context, release, custody) {
+  if (!await optionalFile(context.proofPath, proofLimit)) return null;
+  const file = await privateJson(context.proofPath, proofLimit), proof = file.value;
+  const prepared = validateReopeningProof(context, release, proof);
   const journal = await privateJson(context.journalPath, 16384);
   requireEqual(journal.value, prepared.journal.value);
   const selected = await optionalSelection(context.selectionPath), after = equal(selected, proof.after.selection);
@@ -1397,11 +1427,16 @@ function fixedQualificationOptions(cohort, role) {
   return { ...input(role), predecessors: ['historical', 'A', 'B', 'C'].filter(name => name !== role).map(input) };
 }
 
-function authenticatedQualificationContext(cohort, role) {
+function qualificationCohort(cohort, role) {
   const originals = Object.values(cohort.originals);
   const inputs = new Map(originals.map(({ input, release }) => [release.build, qualificationReleaseInput(input)]));
   const releases = new Map(originals.map(({ release }) => [release.build, release]));
-  return createIsolatedContext(cohort.originals[role].release, inputs, releases, true);
+  return { release: cohort.originals[role].release, inputs, releases };
+}
+
+function authenticatedQualificationContext(cohort, role) {
+  const { release, inputs, releases } = qualificationCohort(cohort, role);
+  return createIsolatedContext(release, inputs, releases, true);
 }
 
 function requireQualificationInstallRoute(route, release, { role, predecessor }) {
@@ -1663,7 +1698,7 @@ async function initializeHistoricalQualification(cohort) {
           recordFile = await publishExact(recordPath, 65536, hash(bytes), path => writeExclusive(path, bytes), publication);
           record = historicalInitializationRecord(recordFile, cohort);
         }
-      }, !record, true);
+      }, !record, 'tryExistingInitializationLock');
       const assert = async () => {
         await assertContext(context);
         if (!sameFile(recordFile, await exactFile(recordPath, 65536))) throw new Error('Original historical preparation record changed');
@@ -1689,8 +1724,8 @@ async function initializeHistoricalQualification(cohort) {
       await assert(); requireEqual((await historicalSetupState(release.fixture, release)).selected, selection);
       if (await contextProfileFormat(context, selection, custody) !== 1) throw new Error('Historical selected format differs');
       await assert(); return release.build;
-    }, !record, true);
-  }, !initial.record, true));
+    }, !record, 'tryExistingInitializationLock');
+  }, !initial.record, 'tryExistingInitializationLock'));
 }
 
 async function qualificationInitializeEntry() {
@@ -1708,8 +1743,595 @@ async function qualificationInitializeEntry() {
   } catch (error) { wire.qualificationFailure(error); }
 }
 
+const qualificationPhases = ['A', 'B', 'rollback-A', 'C'];
+const historicalArchive = 'rollback-launchers';
+const retiredArchive = 'pre-format-2-rollback-launchers';
+
+function observerBudget(deadline) {
+  let remaining = 8 * 1024 ** 3;
+  return { deadline, check(size = 0) {
+    remaining -= size;
+    if (remaining < 0 || performance.now() >= deadline)
+      throw new InstallationOperationError('Terminal observation exhausted its budget', 5);
+  } };
+}
+
+async function observerContext(cohort, budget) {
+  const { release, inputs, releases } = qualificationCohort(cohort, 'A');
+  const context = isolatedLayout(release), directories = new Map();
+  for (const path of [context.images, context.receipts, dirname(context.alias), dirname(context.executable)]) {
+    const identity = await privateDirectory(path, true);
+    requireEqual(identity.device, cohort.observation.fixture.directories.fixture.device);
+    directories.set(path, identity);
+  }
+  isolatedAuthorities.set(context, { release, inputs, releases, directories, observationBudget: budget });
+  await assertContext(context);
+  return { context, release, releases };
+}
+
+function observerFileStamp(info) {
+  return [info.dev, info.ino, info.uid, info.gid, info.mode, info.nlink, info.size, info.mtimeNs, info.ctimeNs].join(':');
+}
+
+async function checkObserverPath(record, path = record.path) {
+  const info = await record.fd.stat({ bigint: true });
+  requireEqual(identityOf(info), record.identity, 'Retained observer descriptor changed');
+  if (record.directory ? !info.isDirectory() : !info.isFile() || info.nlink > 1n)
+    throw new Error('Retained observer descriptor is unsafe');
+  if (path !== null) {
+    if (await realpath(path) !== path) throw new Error('Nonphysical observer evidence');
+    const named = await lstat(path, { bigint: true });
+    requireEqual(identityOf(named), record.identity, 'Observer path no longer names its retained descriptor');
+    if (!record.directory && (named.nlink !== 1n || observerFileStamp(named) !== observerFileStamp(info)))
+      throw new Error('Observer path changed while checking its descriptor');
+  }
+  return info;
+}
+
+async function holdObserverPath(handles, path, mode, directory = false) {
+  const fd = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK |
+    (directory ? constants.O_DIRECTORY : 0));
+  try {
+    const identity = identityOf(await fd.stat({ bigint: true }));
+    const record = { path, fd, identity, directory };
+    if (identity.uid !== userInfo().uid || identity.mode !== mode) throw new Error('Unsafe observer evidence mode or owner');
+    await checkObserverPath(record);
+    handles.add(fd);
+    return record;
+  } catch (error) { await fd.close(); throw error; }
+}
+
+async function observerFile(record, maximum, budget, { path = record.path, includeBytes = false } = {}) {
+  const first = await checkObserverPath(record, path);
+  if (first.size < 0n || first.size > BigInt(maximum)) throw new Error('Observer file exceeds its bound');
+  const size = Number(first.size), digest = createHash('sha256'), chunks = [];
+  budget.check(size);
+  const buffer = Buffer.alloc(Math.min(1024 * 1024, Math.max(size, 1)));
+  let offset = 0;
+  while (offset < size) {
+    budget.check();
+    const { bytesRead } = await record.fd.read(buffer, 0, Math.min(buffer.length, size - offset), offset);
+    if (!bytesRead) throw new Error('Observer evidence was truncated');
+    const bytes = buffer.subarray(0, bytesRead);
+    digest.update(bytes);
+    if (includeBytes) chunks.push(Buffer.from(bytes));
+    offset += bytesRead;
+  }
+  const stamp = observerFileStamp(first);
+  requireEqual(observerFileStamp(await checkObserverPath(record, path)), stamp);
+  const reference = { path: record.path, identity: record.identity, size: String(size), sha256: digest.digest('hex') };
+  return { record, path, stamp, reference, ...(includeBytes ? { bytes: Buffer.concat(chunks, size) } : {}) };
+}
+
+async function recheckObserverFile({ record, path, stamp }) {
+  requireEqual(observerFileStamp(await checkObserverPath(record, path)), stamp, 'Observer file changed after observation');
+}
+
+async function closeObserverHandles(handles) {
+  const results = await Promise.allSettled([...handles].map(fd => fd.close()));
+  handles.clear();
+  if (results.some(result => result.status === 'rejected'))
+    throw new InstallationOperationError('Could not close all observer descriptors', 5);
+}
+
+async function withObserverGuards(context, provider, builds, retained, work) {
+  const paths = [join(context.support, 'selection.lock'), ...[...new Set(builds)].sort().map(build => join(context.uses, build))];
+  const acquired = new Map();
+  async function next(index) {
+    if (index === paths.length) {
+      const assertGuards = async () => {
+        for (const [path, { handle, record }] of acquired) {
+          requireEqual(await guardRecord(provider, path, handle), record);
+          if (retained.has(path)) {
+            await checkObserverPath(retained.get(path));
+            requireEqual(retained.get(path).identity, record.identity);
+          }
+        }
+      };
+      const assert = async () => { await assertContext(context); await assertGuards(); };
+      const assertBuild = async build => {
+        if (!acquired.has(join(context.uses, build))) throw new Error('Observer lacks matching Build custody');
+        await assert();
+      };
+      await assert();
+      const result = await work({ assert, assertBuild, guards: new Map([...acquired].map(([path, value]) => [path, value.record])) });
+      await assertGuards();
+      return result;
+    }
+    const path = paths[index];
+    return withLock(provider, path, async handle => {
+      acquired.set(path, { handle, record: await guardRecord(provider, path, handle) });
+      return next(index + 1);
+    }, false, 'tryExistingQualificationObserverLock');
+  }
+  return next(0);
+}
+
+async function keepObserverGuards(custody, state) {
+  for (const [path, expected] of custody.guards) {
+    if (!state.guards.has(path)) state.guards.set(path, await holdObserverPath(state.handles, path, 0o600));
+    requireEqual(state.guards.get(path).identity, expected.identity);
+  }
+}
+
+function observerSelection(release) {
+  return { format: 1, build: release.build, imageSha256: release.imageSha256 };
+}
+
+function checkObserverLauncher(context, path, reference, budget) {
+  budget.check(Number(reference.size));
+  checkContextLauncher(context, path, reference.sha256, budget.deadline);
+}
+
+async function observeReleaseAssets(context, release, handles, budget) {
+  const image = await holdObserverPath(handles, join(context.images, release.build + '.dmg'), 0o600);
+  const receipt = await holdObserverPath(handles, join(context.receipts, release.build + '.json'), 0o600);
+  const imageFile = await observerFile(image, imageLimit, budget);
+  const receiptFile = await observerFile(receipt, 4096, budget, { includeBytes: true });
+  requireEqual(imageFile.reference.sha256, release.imageSha256);
+  requireEqual(parseStrictJson(receiptFile.bytes, 4096), { ...observerSelection(release),
+    source: release.source, payloadDigest: release.payloadDigest, launcherSha256: release.launcher.sha256 });
+  return { image, receipt, imageFile: imageFile.reference, releaseFile: receiptFile.reference, receiptBytes: receiptFile.bytes,
+    files: [imageFile, receiptFile] };
+}
+
+async function observeSelectedRelease(context, release, handles, budget, custody) {
+  await custody.assertBuild(release.build);
+  const selected = await holdObserverPath(handles, context.selectionPath, 0o600);
+  const file = await observerFile(selected, 4096, budget, { includeBytes: true });
+  requireEqual(parseStrictJson(file.bytes, 4096), observerSelection(release));
+  const launcher = await holdObserverPath(handles, context.executable, release.launcherMode);
+  const live = await observerFile(launcher, launcherLimit, budget);
+  requireEqual(live.reference.sha256, release.launcher.sha256);
+  checkObserverLauncher(context, context.executable, live.reference, budget);
+  const alias = await installedAlias(context.alias, context.executable);
+  if (!alias) throw new Error('Observer requires the original selected alias');
+  // The cohort verifier already authenticated the signed role and its format.
+  // Under custody, bind the installed image and receipt to that exact role.
+  const assets = await observeReleaseAssets(context, release, handles, budget);
+  const files = [file, live, ...assets.files];
+  for (const witness of files) await recheckObserverFile(witness);
+  return { selected, launcher, selection: file.reference, selectionBytes: file.bytes, live: live.reference, alias, files };
+}
+
+async function observerArchiveNames(path, budget) {
+  const names = [];
+  for await (const entry of await opendir(path)) {
+    budget.check();
+    if (names.length === 4096) throw new Error('Observer archive has too many entries');
+    names.push(entry.name);
+  }
+  return names.sort();
+}
+
+async function observeArchive(context, directory, releases, handles, budget, custody) {
+  const path = join(context.support, directory);
+  const root = await holdObserverPath(handles, path, 0o700, true);
+  requireEqual(root.identity.device, releases.values().next().value.fixture.directories.fixture.device);
+  const names = await observerArchiveNames(path, budget);
+  const records = [];
+  let launcherBytes = 0;
+  for (const build of names) {
+    const release = releases.get(build);
+    if (!release) throw new Error('Archived release is outside the expected observer cohort');
+    const launcher = await holdObserverPath(handles, join(path, build), 0o755);
+    const file = await observerFile(launcher, launcherLimit, budget);
+    const { reference } = file;
+    launcherBytes += Number(reference.size);
+    if (launcherBytes > 256 * 1024 ** 2) throw new Error('Observer archive exceeds its byte bound');
+    requireEqual(reference.sha256, release.launcher.sha256);
+    checkObserverLauncher(context, launcher.path, reference, budget);
+    await custody.assertBuild(build);
+    const assets = await observeReleaseAssets(context, release, handles, budget);
+    records.push({ build, launcher, reference, ...assets, files: [file, ...assets.files] });
+  }
+  await recheckObserverArchive(root, path, records, records.flatMap(record => record.files), budget);
+  return { root, records };
+}
+
+function archiveView(records) {
+  return records.map(record => ({ build: record.build, launcher: record.reference,
+    release: record.releaseFile, image: record.imageFile }));
+}
+
+async function recheckObserverArchive(root, path, records, files, budget) {
+  const stamp = observerFileStamp(await checkObserverPath(root, path));
+  requireEqual(await observerArchiveNames(path, budget), records.map(record => record.build));
+  for (const file of files) {
+    budget.check();
+    await recheckObserverFile(file);
+  }
+  requireEqual(observerFileStamp(await checkObserverPath(root, path)), stamp, 'Observer archive changed during final recheck');
+}
+
+async function observeOriginalArchive(context, original, budget, retired) {
+  const path = join(context.support, retired ? retiredArchive : historicalArchive);
+  const { root, records } = original.archive;
+  await checkObserverPath(root, path);
+  requireEqual(await observerArchiveNames(path, budget), records.map(record => record.build));
+  const files = [];
+  for (const record of records) {
+    const launcher = await observerFile(record.launcher, launcherLimit, budget, { path: join(path, record.build) });
+    requireEqual(launcher.reference, record.reference);
+    const receipt = await observerFile(record.receipt, 4096, budget, { includeBytes: true });
+    requireEqual(receipt.reference, record.releaseFile);
+    if (!receipt.bytes.equals(record.receiptBytes)) throw new Error('Original archived release bytes changed');
+    const image = await observerFile(record.image, imageLimit, budget);
+    requireEqual(image.reference, record.imageFile);
+    files.push(launcher, receipt, image);
+  }
+  // Retiring a directory changes its path, while the original file identities
+  // and the canonical archive inventory continue to use their original names.
+  await recheckObserverArchive(root, path, records, files, budget);
+  return { files, inventorySha256: hash(canonical(archiveView(records))) };
+}
+
+async function openOriginalObserver(context, cohort, state, budget, custody) {
+  await absent(context.journalPath);
+  await absent(join(context.support, retiredArchive));
+  await keepObserverGuards(custody, state);
+  const historical = cohort.originals.historical.release;
+  const support = await holdObserverPath(state.handles, context.support, 0o700, true);
+  const initializer = await holdObserverPath(state.handles, join(context.support, 'historical-initialization.json'), 0o600);
+  const initializerFile = await observerFile(initializer, 65536, budget, { includeBytes: true });
+  const initialization = historicalInitializationRecord({ ...initializerFile.reference, bytes: initializerFile.bytes }, cohort);
+  requireEqual(custody.guards.get(initialization.guards.selection.path), initialization.guards.selection);
+  requireEqual(custody.guards.get(initialization.guards.build.path), initialization.guards.build);
+  const mountGuard = await holdObserverPath(state.handles, initialization.guards.mount.path, 0o600);
+  requireEqual(mountGuard.identity, initialization.guards.mount.identity);
+  const current = await observeSelectedRelease(context, historical, state.handles, budget, custody);
+  const archive = await observeArchive(context, historicalArchive, new Map([[historical.build, historical]]), state.handles, budget, custody);
+  if (archive.records.length !== 1) throw new Error('The original historical archive is missing');
+  const inventorySha256 = hash(canonical(archiveView(archive.records)));
+  const original = { support, current, archive, inventorySha256, initializer, initializerFile, mountGuard };
+  await custody.assert();
+  requireEqual((await observeOriginalArchive(context, original, budget, false)).inventorySha256, inventorySha256);
+  for (const file of current.files) await recheckObserverFile(file);
+  const originalObservationSha256 = hash(canonical({ support: support.identity, archive: archive.root.identity,
+    selection: current.selection, launcher: current.live, inventorySha256, initialization: initializerFile.reference,
+    guards: [...custody.guards.values(), initialization.guards.mount] }));
+  return { ...original, originalObservationSha256 };
+}
+
+async function recheckOriginalSelection(original, budget, retainedOnly = false) {
+  await checkObserverPath(original.support);
+  await checkObserverPath(original.mountGuard);
+  const initialization = await observerFile(original.initializer, 65536, budget, { includeBytes: true });
+  requireEqual(initialization.reference, original.initializerFile.reference);
+  if (!initialization.bytes.equals(original.initializerFile.bytes)) throw new Error('Original historical initialization bytes changed');
+  const { selected, selection, selectionBytes, launcher, live } = original.current;
+  const observed = await observerFile(selected, 4096, budget, { path: retainedOnly ? null : selected.path, includeBytes: true });
+  requireEqual(observed.reference, selection);
+  if (!observed.bytes.equals(selectionBytes)) throw new Error('Original selection bytes changed');
+  const executable = await observerFile(launcher, launcherLimit, budget, { path: null });
+  requireEqual(executable.reference, live);
+  return [initialization, observed, executable];
+}
+
+async function bindPreparedObserver(context, cohort, state, budget, custody) {
+  const { original, handles } = state;
+  await recheckOriginalSelection(original, budget);
+  await keepObserverGuards(custody, state);
+  const historical = cohort.originals.historical.release, release = cohort.originals.A.release;
+  await absent(join(context.support, retiredArchive));
+  requireEqual((await observeOriginalArchive(context, original, budget, false)).inventorySha256, original.inventorySha256);
+  const journal = await holdObserverPath(handles, context.journalPath, 0o600);
+  const journalFile = await observerFile(journal, 16384, budget, { includeBytes: true });
+  const value = parseStrictJson(journalFile.bytes, 16384);
+  if (!valid('migration.Journal', value)) throw new Error('Observer requires the real prepared format-3 journal');
+  const binding = member => ({ selection: observerSelection(member), launcherSha256: member.launcher.sha256 });
+  requireEqual(value.before, binding(historical));
+  requireEqual(value.after, binding(release));
+  const launcher = await holdObserverPath(handles, context.executable, release.launcherMode);
+  const backup = await holdObserverPath(handles, context.backup, 0o755);
+  const launcherFile = (await observerFile(launcher, launcherLimit, budget)).reference;
+  const backupFile = (await observerFile(backup, launcherLimit, budget)).reference;
+  requireEqual(backupFile.sha256, original.current.live.sha256);
+  const assets = await observeReleaseAssets(context, release, handles, budget);
+  const [archived] = original.archive.records;
+  const prepared = {
+    journal: { path: journal.path, ...fileReference(journalFile.reference), value },
+    guards: { selection: custody.guards.get(join(context.support, 'selection.lock')),
+      oldBuild: custody.guards.get(join(context.uses, historical.build)), newBuild: custody.guards.get(join(context.uses, release.build)) },
+    selection: { value: observerSelection(historical), file: fileReference(original.current.selection) },
+    launcher: fileReference(launcherFile),
+    assets: { image: fileReference(assets.imageFile), release: fileReference(assets.releaseFile) },
+    oldAssets: { image: fileReference(archived.imageFile), release: fileReference(archived.releaseFile), launcher: fileReference(backupFile) },
+    state: { parent: await privateDirectory(dirname(context.state), true), runtime: await privateDirectory(context.runtime, true) },
+  };
+  await preparedBindings(context, release, prepared, { ...custody, guards: prepared.guards, assert: custody.assert });
+  requireEqual((await observerFile(journal, 16384, budget)).reference, journalFile.reference);
+  return { prepared, journal, journalFile, launcher, launcherFile, backup, backupFile, assets,
+    preparedObservationSha256: hash(canonical(prepared)) };
+}
+
+function reopeningArchiveView(original) {
+  return { parent: original.support.identity, active: original.archive.root.identity,
+    entries: original.archive.records.map(record => ({ build: record.build,
+      launcher: { ...fileReference(record.reference), size: Number(record.reference.size) },
+      release: fileReference(record.releaseFile), image: fileReference(record.imageFile) })) };
+}
+
+async function observerProofFile(path, maximum, budget, handles, retained, evidence) {
+  const record = retained ?? await holdObserverPath(handles, path, 0o600);
+  requireEqual(record.path, path);
+  const file = await observerFile(record, maximum, budget, { includeBytes: !evidence });
+  if (evidence) {
+    requireEqual(fileReference(file.reference), fileReference(evidence));
+    requireEqual(file.reference.size, evidence.size);
+  }
+  return file;
+}
+
+async function recheckObserverEvidence(context, actual, budget) {
+  if (actual.root.initial === 'absent') await absent(context.state);
+  else {
+    const profiles = actual.directories.filter(entry => entry.scope === 'state' && /^profiles\/[^/]+$/.test(entry.path));
+    requireEqual((await readdir(join(context.state, 'profiles'))).sort(), profiles.map(entry => basename(entry.path)).sort());
+    const stateFiles = new Set(actual.files.filter(file => file.scope === 'state').map(file => file.path));
+    for (const { path } of profiles) {
+      budget.check();
+      if (!stateFiles.has(`${path}/engine.json`)) await absent(join(context.state, path, 'engine.json'));
+    }
+  }
+  for (const { scope, path, identity } of actual.directories) {
+    budget.check();
+    requireEqual(await privateDirectory(evidencePath(context, scope, path), true), identity);
+  }
+  for (const { scope, path, identity, size, gid, mtimeNs, ctimeNs } of actual.files) {
+    budget.check();
+    const full = evidencePath(context, scope, path), info = await lstat(full, { bigint: true });
+    if (!info.isFile() || info.nlink !== 1n || await realpath(full) !== full)
+      throw new Error('Observer completion evidence is no longer physical');
+    requireEqual({ identity: identityOf(info), size: String(info.size), gid: String(info.gid),
+      mtimeNs: String(info.mtimeNs), ctimeNs: String(info.ctimeNs) }, { identity, size, gid, mtimeNs, ctimeNs });
+  }
+}
+
+async function terminalObserverEvidence(context, release, state, budget, custody) {
+  const original = state.original, bound = state.prepared;
+  const sources = await recheckOriginalSelection(original, budget, true);
+  await absent(context.journalPath);
+  if ((await checkObserverPath(bound.journal, null)).nlink !== 0n)
+    throw new Error('Original prepared journal still has a directory entry');
+  const journal = await observerFile(bound.journal, 16384, budget, { path: null, includeBytes: true });
+  requireEqual(journal.reference, bound.journalFile.reference);
+  if (!journal.bytes.equals(bound.journalFile.bytes)) throw new Error('Original journal bytes changed after unlink');
+  sources.push(journal);
+  for (const [record, reference, maximum, path] of [
+    [bound.launcher, bound.launcherFile, launcherLimit, null], [bound.backup, bound.backupFile, launcherLimit, null],
+    [bound.assets.image, bound.assets.imageFile, imageLimit, bound.assets.image.path],
+    [bound.assets.receipt, bound.assets.releaseFile, 4096, bound.assets.receipt.path],
+  ]) {
+    const file = await observerFile(record, maximum, budget, { path });
+    requireEqual(file.reference, reference);
+    sources.push(file);
+  }
+  for (const guard of Object.values(bound.prepared.guards)) requireEqual(custody.guards.get(guard.path), guard);
+  requireEqual(await privateDirectory(context.runtime, true), bound.prepared.state.runtime);
+  requireEqual(await privateDirectory(dirname(context.state), true), bound.prepared.state.parent);
+
+  const retained = state.terminal;
+  const proofFile = await observerProofFile(context.proofPath, proofLimit, budget, state.handles, retained?.proof.record);
+  const proof = parseStrictJson(proofFile.bytes, proofLimit);
+  const prepared = validateReopeningProof(context, release, proof);
+  requireEqual(prepared, bound.prepared);
+  requireEqual(proof.rollback, reopeningArchiveView(original));
+  const actual = await collectCompletionEvidence(context, release, bound.prepared, proof.result, budget);
+  requireEqual(actual.epoch, proof.epoch);
+  requireEqual(actual.root, proof.state.root);
+  requireEqual(actual.files, proof.files);
+  requireEqual(actual.directories, proof.directories);
+
+  const transaction = actual.files.find(file => file.scope === 'migration' && /^[0-9a-f]{32}\/transaction\.json$/.test(file.path));
+  if (!transaction) throw new Error('Observer could not locate the validated migration transaction');
+  const completionPath = transaction.path.replace(/transaction\.json$/, 'completed.json');
+  const completion = actual.files.find(file => file.scope === 'migration' && file.path === completionPath);
+  if (!completion) throw new Error('Observer could not locate the validated migration completion');
+  const transactionFile = await observerProofFile(evidencePath(context, 'migration', transaction.path),
+    transactionLimit, budget, state.handles, retained?.transaction.record, transaction);
+  const completionFile = await observerProofFile(evidencePath(context, 'migration', completionPath),
+    8388608, budget, state.handles, retained?.completion.record, completion);
+  const { bytes: _proofBytes, ...proofWitness } = proofFile;
+  const firstTerminal = { proof: proofWitness,
+    transaction: transactionFile, completion: completionFile };
+  if (retained) {
+    for (const [name, observed] of Object.entries(firstTerminal))
+      requireEqual(observed.reference, retained[name].reference);
+  }
+  return { terminal: firstTerminal, actual, sources };
+}
+
+async function terminalObserver(context, release, cohort, request, state, budget, custody) {
+  await keepObserverGuards(custody, state);
+  const roles = ['A', 'B', 'C'].map(role => cohort.originals[role].release);
+  const compatible = new Map(roles.map(member => [member.build, member]));
+  const expected = cohort.originals[request.phase === 'rollback-A' ? 'A' : request.phase].release;
+  const handles = new Set();
+  try {
+    const selected = await observeSelectedRelease(context, expected, handles, budget, custody);
+    const { terminal, actual, sources } = await terminalObserverEvidence(context, release, state, budget, custody);
+    const old = state.original.archive;
+    const retiredPath = join(context.support, retiredArchive);
+    const { files: retiredFiles, inventorySha256: retiredInventorySha256 } =
+      await observeOriginalArchive(context, state.original, budget, true);
+    requireEqual(retiredInventorySha256, state.original.inventorySha256);
+    for (const record of old.records)
+      checkObserverLauncher(context, join(retiredPath, record.build), record.reference, budget);
+    const activePath = join(context.support, historicalArchive);
+    const active = await optionalDirectory(activePath) ?
+      await observeArchive(context, historicalArchive, compatible, handles, budget, custody) : null;
+    if (active && (equal(active.root.identity, old.root.identity) ||
+        active.records.some(record => old.records.some(retired => equal(record.reference.identity, retired.reference.identity)))))
+      throw new Error('Compatible archive aliases the retired original');
+    if (request.phase === 'B' && !active?.records.some(record => record.build === cohort.originals.A.release.build))
+      throw new Error('Terminal B requires the archived role A launcher');
+
+    await custody.assert();
+    await recheckObserverEvidence(context, actual, budget);
+    await checkObserverPath(state.original.support);
+    await checkObserverPath(state.original.mountGuard);
+    for (const file of sources) await recheckObserverFile(file);
+    for (const file of Object.values(terminal)) await recheckObserverFile(file);
+    await recheckObserverArchive(old.root, retiredPath, old.records, retiredFiles, budget);
+    await absent(context.journalPath);
+    for (const file of selected.files) await recheckObserverFile(file);
+    const alias = await installedAlias(context.alias, context.executable);
+    if (!alias || alias.device !== selected.alias.device || alias.inode !== selected.alias.inode)
+      throw new Error('Selected alias changed during terminal observation');
+    if (active) {
+      await recheckObserverArchive(active.root, activePath, active.records, active.records.flatMap(record => record.files), budget);
+    } else await absent(activePath);
+    budget.check();
+    state.terminal = terminal;
+    return { schema: 1, sequence: request.sequence, phase: request.phase, kind: 'observed-terminal-retirement',
+      authoritySha256: cohort.observation.authoritySha256, producerManifestSha256: cohort.observation.producerManifestSha256,
+      originalObservationSha256: state.original.originalObservationSha256, preparedObservationSha256: state.prepared.preparedObservationSha256,
+      originalDirectory: old.root.identity, retiredDirectory: old.root.identity,
+      originalInventorySha256: state.original.inventorySha256, retiredInventorySha256,
+      proof: terminal.proof.reference, transaction: terminal.transaction.reference, completion: terminal.completion.reference,
+      journalDisposition: 'absent', activeDirectory: active?.root.identity ?? null,
+      activeInventorySha256: active ? hash(canonical(archiveView(active.records))) : null,
+      selected: expected.build, nativeAdmission: false };
+  } finally { await closeObserverHandles(handles); }
+}
+
+async function* qualificationObserverRequests(input, wire) {
+  const limit = 16384;
+  let pending = Buffer.alloc(0);
+  for await (const chunk of input) {
+    let start = 0;
+    while (start < chunk.length) {
+      const end = chunk.indexOf(0x0a, start);
+      const part = chunk.subarray(start, end < 0 ? chunk.length : end);
+      wire.qualificationRequire(pending.length + part.length <= limit, 'Observer request exceeds its byte limit', 2);
+      pending = Buffer.concat([pending, part]);
+      if (end < 0) break;
+      yield wire.qualificationJson(pending, limit);
+      pending = Buffer.alloc(0);
+      start = end + 1;
+    }
+  }
+  wire.qualificationRequire(!pending.length, 'Observer request ended in a partial frame', 2);
+}
+
+async function writeObserverResult(output, value, wire) {
+  const bytes = encode(value);
+  wire.qualificationRequire(bytes.length <= 65536, 'Observer output exceeds its byte limit');
+  await new Promise((resolve, reject) => {
+    output.once('error', reject);
+    output.write(bytes, error => {
+      output.off('error', reject);
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+}
+
+async function dispatchObserverRequest(request, state, wire, deadline) {
+  // The fixed authentication budget allows up to ten minutes including mount
+  // cleanup. Reserve a separate bounded observation interval before starting it.
+  const binding = request.action === 'bind-prepared-journal';
+  const reserve = binding ? 120000 : 1200000;
+  wire.qualificationRequire(deadline - performance.now() > reserve, 'Observer lifetime cannot cover another observation', 5);
+  if (!state.authoritySha256) {
+    const path = join(wire.qualificationDirectory, 'qualification/authority.json');
+    state.authoritySha256 = (await wire.qualificationFile(path, 16384, 0o600, false, deadline - reserve)).sha256;
+  }
+  // Bind within the installer's ACK window using the already authenticated
+  // cohort and its held original witnesses. Every terminal reauthenticates it.
+  const cohort = binding ? state.cohort : await wire.authenticateQualification(state.authoritySha256);
+  if (state.cohort) requireEqual(cohort.observation, state.cohort.observation, 'Observer authority changed between requests');
+  else state.cohort = cohort;
+  const budget = observerBudget(Math.min(deadline - (binding ? 5000 : 120000), performance.now() + (binding ? 105000 : 480000)));
+  const { context, release, releases } = await observerContext(cohort, budget);
+  const historical = cohort.originals.historical.release.build;
+  const terminal = request.action === 'terminal';
+  const builds = terminal ? [...releases.keys()] : request.action === 'open-original' ? [historical] : [historical, release.build];
+  return withLockProvider(release.platform, provider => withObserverGuards(context, provider, builds, state.guards, async custody => {
+    if (terminal) return terminalObserver(context, release, cohort, request, state, budget, custody);
+    if (request.action === 'open-original') {
+      // The shared harness checks catalog history before taking this independent
+      // selection custody. No mutable catalog row supplies Browser authority.
+      state.original = await openOriginalObserver(context, cohort, state, budget, custody);
+      return { schema: 1, sequence: request.sequence, kind: 'observed-original', authoritySha256: state.authoritySha256,
+        producerManifestSha256: state.cohort.observation.producerManifestSha256,
+        originalObservationSha256: state.original.originalObservationSha256 };
+    }
+    state.prepared = await bindPreparedObserver(context, cohort, state, budget, custody);
+    return { schema: 1, sequence: request.sequence, kind: 'observed-prepared-journal', authoritySha256: state.authoritySha256,
+      producerManifestSha256: state.cohort.observation.producerManifestSha256,
+      preparedObservationSha256: state.prepared.preparedObservationSha256 };
+  }), budget);
+}
+
+async function qualificationObserveEntry() {
+  const wire = await import('./qualification-authority.mjs');
+  const state = { handles: new Set(), guards: new Map() };
+  const lifetime = 7200000, deadline = performance.now() + lifetime, expiry = AbortSignal.timeout(lifetime);
+  let input, output;
+  try {
+    wire.qualificationRequire(process.argv.length === 3, 'Invalid fixed observer entry', 2);
+    const requestPipe = privateQualificationPipe(0, wire), resultPipe = privateQualificationPipe(1, wire);
+    wire.qualificationRequire(requestPipe !== resultPipe, 'Observer pipes must be distinct', 2);
+    input = addAbortSignal(expiry, process.stdin);
+    output = addAbortSignal(expiry, process.stdout);
+    // Keep output errors handled while a request is being processed.
+    output.on('error', () => input.destroy(new InstallationOperationError('Observer result pipe stopped', 5)));
+    const actions = ['open-original', 'bind-prepared-journal', ...qualificationPhases.map(() => 'terminal'), 'close'];
+    let sequence = 0;
+    for await (const request of qualificationObserverRequests(input, wire)) {
+      wire.qualificationRequire(sequence < 16 && request && typeof request === 'object', 'Observer request limit or shape differs', 2);
+      const action = actions[sequence];
+      wire.qualificationKeys(request, action === 'terminal' ? ['schema', 'sequence', 'action', 'phase'] : ['schema', 'sequence', 'action']);
+      wire.qualificationRequire(request.schema === 1 && request.sequence === sequence && request.action === action &&
+        (action !== 'terminal' || request.phase === qualificationPhases[sequence - 2]), 'Observer request is out of sequence', 2);
+      if (action === 'close') {
+        await closeObserverHandles(state.handles);
+        await writeObserverResult(output, { schema: 1, sequence, kind: 'observer-closed' }, wire);
+        return;
+      }
+      const result = await dispatchObserverRequest(request, state, wire, deadline);
+      wire.qualificationRequire(performance.now() < deadline, 'Observer observation expired', 5);
+      await writeObserverResult(output, result, wire);
+      sequence++;
+    }
+    throw new InstallationOperationError('Observer request pipe closed before completion', 5);
+  } catch (error) {
+    if (error instanceof InstallationOperationError) error.exitCode = error.qualificationExitCode;
+    else if (expiry.aborted || output?.destroyed || input?.errored === error) error.exitCode = 5;
+    wire.qualificationFailure(error);
+  } finally {
+    input?.destroy();
+    try { await closeObserverHandles(state.handles); }
+    catch (error) { wire.qualificationFailure(Object.assign(error, { exitCode: 5 })); }
+  }
+}
+
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  if (process.argv[2] === 'qualification-install-v1') {
+  if (process.argv[2] === 'qualification-observe-v1') {
+    await qualificationObserveEntry();
+  } else if (process.argv[2] === 'qualification-install-v1') {
     await qualificationInstallEntry();
   } else if (process.argv[2] === 'qualification-forward-v1') {
     await qualificationForwardEntry();

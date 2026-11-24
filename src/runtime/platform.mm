@@ -87,13 +87,22 @@ static bool matches(const HeldLock* lock, struct stat* out) {
     path.st_dev == out->st_dev && path.st_ino == out->st_ino;
 }
 static constexpr const char* historicalInitializationRoot = "/Users/msix/Builds/afm9-rollback-plan.49cXVsFk/qualification/fixture";
-static napi_value acquireLock(napi_env env, napi_callback_info info, int mode, bool initializationExisting = false) {
+enum class LockAccess { ordinary, historicalInitialization, qualificationObserver };
+static bool qualificationObserverGuard(const std::string& path, const std::string& root) {
+  if (path == root + "/support/selection.lock") return true;
+  const std::string prefix = root + "/arbol-browser/.uses/";
+  if (path.compare(0, prefix.size(), prefix) != 0 || path.size() <= prefix.size() ||
+      path.size() > prefix.size() + 16 || path[prefix.size()] == '0') return false;
+  return path.find_first_not_of("0123456789abcdef", prefix.size()) == std::string::npos;
+}
+static napi_value acquireLock(napi_env env, napi_callback_info info, int mode, LockAccess access = LockAccess::ordinary) {
   napi_value arg; std::string path;
   if (!argument(env, info, &arg) || !string(env, arg, path)) return fail(env);
   const std::string fixed = historicalInitializationRoot;
-  if (initializationExisting && path != fixed+"/support/selection.lock" &&
+  if (access == LockAccess::historicalInitialization && path != fixed+"/support/selection.lock" &&
       path != fixed+"/arbol-browser/.uses/1" && path != fixed+"/arbol-browser/.uses/1.mount") return fail(env);
-  int fd = open(path.c_str(), O_RDWR | (initializationExisting ? 0 : O_CREAT) | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0600);
+  if (access == LockAccess::qualificationObserver && !qualificationObserverGuard(path, fixed)) return fail(env);
+  int fd = open(path.c_str(), O_RDWR | (access == LockAccess::ordinary ? O_CREAT : 0) | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0600);
   if (fd < 0) return fail(env);
   struct stat st;
   if (fstat(fd, &st) != 0) { close(fd); return fail(env); }
@@ -113,7 +122,12 @@ static napi_value acquireLock(napi_env env, napi_callback_info info, int mode, b
   return handle;
 }
 static napi_value tryLock(napi_env env, napi_callback_info info) { return acquireLock(env, info, LOCK_EX); }
-static napi_value tryExistingInitializationLock(napi_env env, napi_callback_info info) { return acquireLock(env, info, LOCK_EX, true); }
+static napi_value tryExistingInitializationLock(napi_env env, napi_callback_info info) {
+  return acquireLock(env, info, LOCK_EX, LockAccess::historicalInitialization);
+}
+static napi_value tryExistingQualificationObserverLock(napi_env env, napi_callback_info info) {
+  return acquireLock(env, info, LOCK_EX, LockAccess::qualificationObserver);
+}
 static napi_value trySharedLock(napi_env env, napi_callback_info info) { return acquireLock(env, info, LOCK_SH); }
 static HeldLock* held(napi_env env, napi_callback_info info) {
   napi_value arg; void* data = nullptr;
@@ -3719,6 +3733,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"groupCensus", nullptr, groupCensus, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"tryLock", nullptr, tryLock, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"tryExistingInitializationLock", nullptr, tryExistingInitializationLock, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"tryExistingQualificationObserverLock", nullptr, tryExistingQualificationObserverLock, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"assertLock", nullptr, assertLock, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"releaseLock", nullptr, releaseLock, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"processIdentity", nullptr, processIdentity, nullptr, nullptr, nullptr, napi_default, nullptr},
