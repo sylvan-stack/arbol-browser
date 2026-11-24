@@ -53,10 +53,14 @@ export interface MaintenanceCustody {
   assert(): void;
 }
 
+export const maintenanceStagingPoints = ['empty-staging', 'partial-staging', 'staged-record', 'staged-marker',
+  'staged-progress', 'marker-rename', 'marker-durable'] as const;
+export type MaintenanceStagingPoint = typeof maintenanceStagingPoints[number];
+export type MaintenanceScratchPoint = 'empty-staging' | 'partial-staging';
+export type MaintenanceScratch = Readonly<{ name: string; identity: MaintenanceFileEvidence['identity'] }>;
 export type MaintenanceInterruptionPoint =
   | 'before-transaction' | 'transaction-publication' | 'current-publication' | 'native-rename-excl'
-  | 'empty-staging' | 'partial-staging' | 'staged-record' | 'staged-marker' | 'staged-progress'
-  | 'marker-rename' | 'marker-durable' | 'record-rename' | 'record-durable'
+  | MaintenanceStagingPoint | 'record-rename' | 'record-durable'
   | 'claim-retained' | 'capture-durable' | 'receipt-durable' | 'committed-progress' | 'completion';
 
 export type MaintenanceTransactionPoint = 'before-transaction' | 'transaction-publication' | 'current-publication';
@@ -338,6 +342,8 @@ export interface PlatformPort {
   /** Native resolves the fixed transaction paths and checks the actual files. */
   parkMaintenanceTransaction?(custody: MaintenanceCustody, point: MaintenanceTransactionPoint,
     witness: MaintenanceTransactionWitness, deadline: number): never;
+  parkMaintenanceStaging?(custody: MaintenanceCustody, point: MaintenanceStagingPoint, attempt: string,
+    profileSha256: string, staging: MaintenanceFileEvidence['identity'], scratch: MaintenanceScratch | null, deadline: number): never;
   observeMaintenanceStateRoot(custody: MaintenanceCustody): MaintenanceStateRoot;
   publishMaintenanceFile(custody: MaintenanceCustody, source: string, destination: string,
     parent: MaintenanceFileEvidence['identity'], file: MaintenanceFileEvidence, deadline: number): void;
@@ -418,6 +424,7 @@ interface NativeSupport {
   maintenanceInterruptionMatches?(handle: object, point: MaintenanceInterruptionPoint): boolean;
   bindMaintenanceTransaction?(handle: object, archive: string, registry: object | null, owners: readonly object[], deadline: number): void;
   parkMaintenanceTransaction?(handle: object, point: MaintenanceTransactionPoint, witness: string, deadline: number): never;
+  parkMaintenanceStaging?(handle: object, point: MaintenanceStagingPoint, witness: string, deadline: number): never;
   publishMaintenanceFile?(handle: object, source: string, destination: string, expected: string, deadline: number): void;
   observeMaintenanceStateRoot?(handle: object): string;
   assertMaintenanceStateRoot?(handle: object): void;
@@ -723,6 +730,23 @@ export function loadPlatform(): PlatformPort {
       if (sampled >= deadline) throw unavailable('profile');
       call(() => park(handle, point, encoded, nativeNow + Math.min(10000, deadline - sampled)));
       // A valid stop terminates the parked writer. A return is never progress.
+      throw unavailable('profile');
+    },
+    parkMaintenanceStaging(custody: MaintenanceCustody, point: MaintenanceStagingPoint, attempt: string,
+      profileSha256: string, staging: MaintenanceFileEvidence['identity'], scratch: MaintenanceScratch | null, deadline: number): never {
+      assertMaintenanceCustody(custody);
+      const handle = maintenanceHandles.get(custody), park = native.parkMaintenanceStaging;
+      const scratchPoint = point === 'empty-staging' || point === 'partial-staging';
+      if (!handle || typeof park !== 'function' || !Number.isFinite(deadline) || !maintenanceStagingPoints.includes(point) ||
+          !/^[0-9a-f]{32}$/.test(attempt) || !/^[0-9a-f]{64}$/.test(profileSha256) ||
+          !validator('migration.Identity')(staging) || staging.mode !== 0o700 ||
+          (scratchPoint ? !scratch || !/^\.migration-[0-9a-f]{32}$/.test(scratch.name) ||
+            !validator('migration.Identity')(scratch.identity) || scratch.identity.mode !== 0o600 : scratch !== null))
+        throw unavailable('profile');
+      const nativeNow = call(() => native.continuousTime()), sampled = performance.now();
+      if (sampled >= deadline) throw unavailable('profile');
+      call(() => park(handle, point, JSON.stringify({ attempt, profileSha256, staging, scratch }),
+        nativeNow + Math.min(10000, deadline - sampled)));
       throw unavailable('profile');
     },
     publishMaintenanceFile(custody: MaintenanceCustody, source: string, destination: string,

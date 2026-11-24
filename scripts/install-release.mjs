@@ -1605,7 +1605,8 @@ const installerInterruptionPoints = new Set(['final-verification', 'reopening-pr
   'journal-unlinked', 'journal-removal', 'compatible-pre-journal-backup']);
 // A point joins this set in the same source step that binds its actual writer.
 const enabledQualificationInterruptionPoints = new Set(['before-transaction', 'transaction-publication',
-  'current-publication', 'native-rename-excl']);
+  'current-publication', 'native-rename-excl', 'empty-staging', 'partial-staging', 'staged-record', 'staged-marker',
+  'staged-progress', 'marker-rename', 'marker-durable']);
 const controlledMaintenanceLimit = 31 * 60 * 1000;
 const controlledCleanupLimit = 30000;
 

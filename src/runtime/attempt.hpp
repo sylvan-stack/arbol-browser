@@ -344,15 +344,21 @@ inline constexpr const char* qualificationFixture = "/Users/msix/Builds/afm9-rol
 inline constexpr const char* qualificationNode = "/Users/msix/.nvm/versions/node/v24.22.1/bin/node";
 inline constexpr double qualificationMaintenanceMs = 31 * 60 * 1000, qualificationCleanupMs = 30000;
 
+inline bool qualificationStagingPoint(id point) {
+  return [@[@"empty-staging",@"partial-staging",@"staged-record",@"staged-marker",@"staged-progress",
+    @"marker-rename",@"marker-durable"] containsObject:point];
+}
+inline bool qualificationTransactionStartPoint(id point) {
+  return [@[@"before-transaction",@"transaction-publication",@"current-publication",@"native-rename-excl"] containsObject:point] ||
+    qualificationStagingPoint(point);
+}
 inline bool qualificationEnginePoint(id point) {
-  return [@[@"before-transaction",@"transaction-publication",@"current-publication",@"native-rename-excl",
-    @"empty-staging",@"partial-staging",@"staged-record",@"staged-marker",@"staged-progress",@"marker-rename",
-    @"marker-durable",@"record-rename",@"record-durable",@"claim-retained",@"capture-durable",@"receipt-durable",
-    @"committed-progress",@"completion"] containsObject:point];
+  return qualificationTransactionStartPoint(point) || [@[@"record-rename",@"record-durable",@"claim-retained",
+    @"capture-durable",@"receipt-durable",@"committed-progress",@"completion"] containsObject:point];
 }
 inline bool enabledQualificationEnginePoint(id point) {
   // Each writer enables only the point it actually implements.
-  return [@[@"before-transaction",@"transaction-publication",@"current-publication",@"native-rename-excl"] containsObject:point];
+  return qualificationTransactionStartPoint(point);
 }
 inline bool qualificationDigest(id value) { return pattern(value,@"\\A[0-9a-f]{64}\\z"); }
 inline bool qualificationNonce(id value) { return pattern(value,@"\\A[0-9a-f]{32}\\z"); }
@@ -496,11 +502,11 @@ struct MaintenanceFile {
       !fstat(fd,&held) && !lstat(path.c_str(),&named) && !fcntl(fd,F_GETPATH,actual) && path == actual &&
       sameFile(identity,held) && sameFile(held,named);
   }
-  bool openPath(const std::string& value, mode_t mode, off_t maximum, bool readBytes = false) {
+  bool openPath(const std::string& value, mode_t mode, off_t maximum, bool readBytes = false, off_t minimum = 1) {
     if (fd >= 0 || !arbol_boundary::canonical(value)) return false;
     path = value; fd = open(path.c_str(),O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
     if (fd < 0 || fstat(fd,&identity) || !S_ISREG(identity.st_mode) || identity.st_uid != geteuid() ||
-        (identity.st_mode & 07777) != mode || identity.st_nlink != 1 || identity.st_size < 1 || identity.st_size > maximum || !current()) return false;
+        (identity.st_mode & 07777) != mode || identity.st_nlink != 1 || identity.st_size < minimum || identity.st_size > maximum || !current()) return false;
     if (readBytes) {
       content.resize(size_t(identity.st_size)); size_t at = 0;
       while (at < content.size()) {

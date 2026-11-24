@@ -2,12 +2,13 @@ import { constants, type BigIntStats } from 'node:fs';
 import { lstat, mkdir, open, realpath } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { dirname, join, relative, resolve } from 'node:path';
+import { basename, dirname, join, relative, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { isDeepStrictEqual } from 'node:util';
 import type { Contract } from '../contracts/generated.js';
 import { validator } from '../contracts/schema.js';
-import type { MaintenanceTransactionPoint } from '../runtime/platform.js';
+import { maintenanceStagingPoints, type MaintenanceScratch, type MaintenanceScratchPoint, type MaintenanceStagingPoint,
+  type MaintenanceTransactionPoint } from '../runtime/platform.js';
 import { assertMigrationAdmission, type MigrationAdmission } from './migration-admission.js';
 import { assertMigrationPreflight, withMigrationRegistry, type MigrationPreflight } from './migration-preflight.js';
 import { migrationDirectory, migrationIdentity, migrationDigest, migrationValue, readMigrationFile, sameMigrationFile,
@@ -18,9 +19,10 @@ const mercury = '/Volumes/Mercury', archiveRoot = `${mercury}/Arbol`;
 // ARC-5's real archive identity, shared with Arbol database/archive_volume.py.
 const mercuryUUID = 'AE1E97B8-CE93-4019-B6DC-21482165C3F2';
 const transactionLimit = 4096 * (4 * 87384 + 8192) + 65536;
-const earlyInterruptionPoints = ['before-transaction', 'transaction-publication', 'current-publication', 'native-rename-excl'] as const;
-function activeEarlyInterruption({ platform, custody }: MigrationAdmission) {
-  return earlyInterruptionPoints.find(point => platform.maintenanceInterruptionMatches?.(custody, point));
+const transactionInterruptionPoints = ['before-transaction', 'transaction-publication', 'current-publication',
+  'native-rename-excl', ...maintenanceStagingPoints] as const;
+function activeTransactionInterruption({ platform, custody }: MigrationAdmission) {
+  return transactionInterruptionPoints.find(point => platform.maintenanceInterruptionMatches?.(custody, point));
 }
 export class MigrationArchiveUnavailable extends Error {
   readonly code = 'archive_unavailable';
@@ -48,7 +50,7 @@ export async function ensureMigrationDirectory(path: string, assert: () => Promi
  * Native retains and validates the same source/parent through RENAME_EXCL;
  * death can leave only the private temporary or the complete final file. */
 export async function publishMigrationFile(admission: MigrationAdmission, path: string, bytes: Uint8Array, deadline: number,
-  assert: () => Promise<void>): Promise<MigrationContent> {
+  assert: () => Promise<void>, scratch?: Readonly<{ point: MaintenanceScratchPoint; park(file: MaintenanceScratch): never }>): Promise<MigrationContent> {
   assertMigrationAdmission(admission); migrationTime(deadline); await assert();
   const parent = await migrationDirectory(dirname(path)); await migrationAbsent(path);
   const temporary = join(dirname(path), `.migration-${randomBytes(16).toString('hex')}`);
@@ -57,6 +59,12 @@ export async function publishMigrationFile(admission: MigrationAdmission, path: 
     const original = await fd.stat({ bigint: true });
     if (!original.isFile() || original.nlink !== 1n || original.uid !== BigInt(ownerUid()) || (original.mode & 0o7777n) !== 0o600n ||
         String(original.dev) !== parent.device) throw profileUnavailable();
+    if (scratch) {
+      if (original.size !== 0n || bytes.byteLength < 2) throw profileUnavailable();
+      if (scratch.point === 'partial-staging') await fd.writeFile(bytes.subarray(0, Math.floor(bytes.byteLength / 2)));
+      scratch.park({ name: basename(temporary), identity: migrationIdentity(original) });
+      throw profileUnavailable();
+    }
     await fd.writeFile(bytes); await fd.sync();
     const staged = await readMigrationFile(temporary, Math.max(65536, bytes.byteLength));
     if (staged.sha256 !== migrationDigest(bytes) || !sameMigrationIdentity(staged.identity, migrationIdentity(original))) throw profileUnavailable();
@@ -165,6 +173,7 @@ export interface MigrationTransaction {
   readonly value: Readonly<Contract<'migration.Transaction'>>;
   readonly file: MigrationContent; readonly current: MigrationContent;
   readonly root: string; readonly attempt: string;
+  readonly stagingInterruption?: Readonly<{ point: MaintenanceStagingPoint; profileSha256: string }>;
   assert(deadline: number): Promise<void>;
 }
 const transactions = new WeakSet<object>();
@@ -192,12 +201,17 @@ function freeze<T>(value: T): T {
 }
 /** Reopen only exact native-bound admission; caller separately reacquires the
  * original registry/owner custody and classifies physical files for recovery. */
-export async function readMigrationTransaction(admission: MigrationAdmission, deadline: number): Promise<MigrationTransaction | null> {
+export function readMigrationTransaction(admission: MigrationAdmission, deadline: number): Promise<MigrationTransaction | null> {
+  return openMigrationTransaction(admission, deadline);
+}
+async function openMigrationTransaction(admission: MigrationAdmission, deadline: number,
+  fresh?: Readonly<{ current: MigrationFile; point: MaintenanceStagingPoint; profileSha256: string }>): Promise<MigrationTransaction | null> {
   await admission.assert(deadline);
   const facts = admission.custody.facts, root = join(facts.runtime, 'browser-profile-migration'), path = join(root, 'current');
   try { await lstat(path); } catch (error) { if (missing(error)) return null; throw error; }
-  if (activeEarlyInterruption(admission)) throw profileUnavailable();
+  if (activeTransactionInterruption(admission) !== fresh?.point) throw profileUnavailable();
   const rootIdentity = await migrationDirectory(root), current = await readMigrationFile(path, 16384);
+  if (fresh && !sameMigrationFile(current, fresh.current)) throw profileUnavailable();
   const pointer = migrationValue(current, 16384) as { format?: unknown; attempt?: unknown; transactionSha256?: unknown };
   if (!pointer || Object.keys(pointer).sort().join(',') !== 'attempt,format,transactionSha256' || pointer.format !== 1 ||
       typeof pointer.attempt !== 'string' || !/^[0-9a-f]{32}$/.test(pointer.attempt) ||
@@ -212,6 +226,7 @@ export async function readMigrationTransaction(admission: MigrationAdmission, de
       !isDeepStrictEqual(value.newBuild, admission.journal.after) || value.sourceSha256 !== admission.host.identity.sourceDigest ||
       value.productSha256 !== admission.host.identity.productDigest || value.candidateSha256 !== admission.host.signed.snapshotDigest) throw profileUnavailable();
   const transaction: MigrationTransaction = Object.freeze({ admission, value: freeze(value), file, current, root, attempt,
+    ...(fresh && { stagingInterruption: Object.freeze({ point: fresh.point, profileSha256: fresh.profileSha256 }) }),
     async assert(cutoff: number) {
       await admission.assert(cutoff);
       if (!sameMigrationIdentity(rootIdentity, await migrationDirectory(root)) || !sameMigrationIdentity(attemptIdentity, await migrationDirectory(attempt)) ||
@@ -233,6 +248,11 @@ export async function createMigrationTransaction(preflight: MigrationPreflight, 
     sourceSha256: admission.host.identity.sourceDigest, productSha256: admission.host.identity.productDigest,
     candidateSha256: admission.host.signed.snapshotDigest, profiles: preflight.profiles.map(profile => profile.entry) };
   if (!validator('migration.Transaction')(value)) throw profileUnavailable();
+  const interception = activeTransactionInterruption(admission);
+  const stagingPoint = maintenanceStagingPoints.find(point => point === interception);
+  const needsMarker = stagingPoint === 'staged-marker' || stagingPoint === 'marker-rename' || stagingPoint === 'marker-durable';
+  const stagingProfile = stagingPoint ? value.profiles.find(entry => !needsMarker || entry.targetMarker !== null) : undefined;
+  if (stagingPoint && !stagingProfile) throw profileUnavailable();
   const bytes = Buffer.from(`${JSON.stringify(value)}\n`, 'utf8');
   const archive = await requireMercury(deadline);
   try {
@@ -246,7 +266,7 @@ export async function createMigrationTransaction(preflight: MigrationPreflight, 
     }
     const archived = await archive.write(join(backup, 'transaction.json'), bytes);
     await preflight.assertOriginals(deadline); await archive.assert();
-    const { platform, custody } = admission, interception = activeEarlyInterruption(admission);
+    const { platform, custody } = admission;
     if (interception) {
       const bind = platform.bindMaintenanceTransaction;
       if (!bind) throw profileUnavailable();
@@ -279,7 +299,9 @@ export async function createMigrationTransaction(preflight: MigrationPreflight, 
     const current = await publishMigrationFile(admission, join(root, 'current'), Buffer.from(`${JSON.stringify({ format: 1, attempt: id, transactionSha256: file.sha256 })}\n`),
       deadline, async () => { await preflight.assertOriginals(deadline); await archive.assert(); });
     await park('current-publication', file, current);
-    const transaction = await readMigrationTransaction(admission, deadline); if (!transaction) throw profileUnavailable();
+    const fresh = stagingPoint && stagingProfile ? { current, point: stagingPoint, profileSha256: stagingProfile.pathSha256 } : undefined;
+    const transaction = await openMigrationTransaction(admission, deadline, fresh);
+    if (!transaction) throw profileUnavailable();
     return transaction;
   } finally { await archive.close(); }
 }

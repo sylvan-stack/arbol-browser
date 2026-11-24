@@ -5,16 +5,19 @@ import { isDeepStrictEqual } from 'node:util';
 import type { Contract } from '../contracts/generated.js';
 import { validator } from '../contracts/schema.js';
 import { assertMigrationCommitReceipt, assertMigrationCompletionEvidence, assertMigrationInspectionReceipt, assertMigrationRecoveryReceipt,
-  type HeldLock, type MigrationCommitReceipt, type MigrationCompletionEvidence, type MigrationInspectionReceipt } from '../runtime/platform.js';
+  type HeldLock, type MaintenanceScratch, type MaintenanceStagingPoint, type MigrationCommitReceipt,
+  type MigrationCompletionEvidence, type MigrationInspectionReceipt } from '../runtime/platform.js';
 import { withMigrationInspection } from '../runtime/migration-exit.js';
 import { migrationDirectory, migrationIdentity, migrationValue, readMigrationFile, sameMigrationFile, sameMigrationIdentity,
-  withMigrationOwner, type MigrationOwner, type MigrationContent } from './migration-owner.js';
+  withMigrationOwner, type MigrationOwner, type MigrationContent, type MigrationIdentity } from './migration-owner.js';
 import { assertMigrationTransaction, ensureMigrationDirectory, migrationAbsent, migrationTime,
   publishMigrationFile, type MigrationTransaction } from './migration-transaction.js';
 import { missing, ownerUid, profileUnavailable, syncDirectory } from './paths.js';
 
 type Entry = Readonly<Contract<'migration.ProfileEntry'>>;
 type Staged = Readonly<Contract<'migration.Staged'>>;
+type StagingInterruption = Readonly<{ point: MaintenanceStagingPoint;
+  park(staging: MigrationIdentity, scratch?: MaintenanceScratch): never }>;
 export const migrationStagePath = (transaction: MigrationTransaction, hash: string): string =>
   join(transaction.value.root.path, 'migration-staged', transaction.value.attempt, hash);
 export async function assertMigrationProfile(transaction: MigrationTransaction, registry: HeldLock, owner: MigrationOwner,
@@ -130,7 +133,8 @@ async function reconcileStaging(transaction: MigrationTransaction, owner: Migrat
   }
 }
 async function stageProfile(transaction: MigrationTransaction, registry: HeldLock, owner: MigrationOwner, entry: Entry,
-  verify: () => Promise<MigrationInspectionReceipt>, deadline: number): Promise<Staged> {
+  verify: () => Promise<MigrationInspectionReceipt>, deadline: number, interruption?: StagingInterruption):
+  Promise<{ staged: Staged; directory: MigrationIdentity }> {
   originalVerification(transaction, entry, await verify());
   const profileAssert = () => assertMigrationProfile(transaction, registry, owner, entry, deadline);
   const base = join(owner.state, 'migration-staged'), attempt = join(base, transaction.value.attempt), staging = join(attempt, entry.pathSha256);
@@ -146,13 +150,19 @@ async function stageProfile(transaction: MigrationTransaction, registry: HeldLoc
   // recorded now, after fresh native ORIGINAL proof; unknown remnants refuse.
   await reconcileStaging(transaction, owner, entry, staging, assert);
   originalVerification(transaction, entry, await verify());
-  const target = async (name: string, expected: Contract<'migration.Target'>): Promise<MigrationContent> => {
+  const target = async (name: 'profile.json' | 'engine.json', expected: Contract<'migration.Target'>): Promise<MigrationContent> => {
     const path = join(staging, name); let exists = true;
     try { await lstat(path); } catch (error) { if (!missing(error)) throw error; exists = false; }
+    const point = interruption?.point;
+    const scratch = name === 'profile.json' && interruption && (point === 'empty-staging' || point === 'partial-staging') ?
+      { point, park: (file: MaintenanceScratch) => interruption.park(stagingIdentity, file) } : undefined;
+    const durablePoint = name === 'profile.json' ? 'staged-record' : 'staged-marker';
+    if (exists && interruption) throw profileUnavailable();
     const actual = exists ? await readMigrationFile(path) :
-      await publishMigrationFile(transaction.admission, path, Buffer.from(expected.base64, 'base64'), deadline, assert);
+      await publishMigrationFile(transaction.admission, path, Buffer.from(expected.base64, 'base64'), deadline, assert, scratch);
     if (actual.sha256 !== expected.sha256 || actual.base64 !== expected.base64 || actual.identity.device !== entry.directory.device)
       throw profileUnavailable();
+    if (interruption?.point === durablePoint) interruption.park(stagingIdentity);
     await assert(); return actual;
   };
   const record = await target('profile.json', entry.targetRecord);
@@ -165,9 +175,40 @@ async function stageProfile(transaction: MigrationTransaction, registry: HeldLoc
   if (!validator('migration.Staged')(staged)) throw profileUnavailable();
   await publishMigrationFile(transaction.admission, join(transaction.attempt, 'progress', `${entry.pathSha256}.staged.json`),
     Buffer.from(`${JSON.stringify(staged)}\n`), deadline, assert);
+  if (interruption?.point === 'staged-progress') interruption.park(stagingIdentity);
   const actual = await readMigrationStage(transaction, entry, deadline);
   if (!actual || !isDeepStrictEqual(actual, staged)) throw profileUnavailable();
-  return actual;
+  return { staged: actual, directory: stagingIdentity };
+}
+async function renameMigrationMarker(owner: MigrationOwner, staging: string, interruption?: StagingInterruption,
+  stagingIdentity?: MigrationIdentity): Promise<void> {
+  const source = join(staging, 'engine.json'), destination = join(owner.path, 'engine.json');
+  if (!interruption) {
+    await rename(source, destination);
+    await syncDirectory(owner.path); await syncDirectory(staging);
+    return;
+  }
+  if (!stagingIdentity || (interruption.point !== 'marker-rename' && interruption.point !== 'marker-durable'))
+    throw profileUnavailable();
+  const flags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
+  const profile = await open(owner.path, flags);
+  try {
+    const directory = await open(staging, flags);
+    try {
+      const assertDirectories = async () => {
+        if (!sameMigrationIdentity(owner.directory, migrationIdentity(await profile.stat({ bigint: true }))) ||
+            !sameMigrationIdentity(owner.directory, await migrationDirectory(owner.path)) ||
+            !sameMigrationIdentity(stagingIdentity, migrationIdentity(await directory.stat({ bigint: true }))) ||
+            !sameMigrationIdentity(stagingIdentity, await migrationDirectory(staging))) throw profileUnavailable();
+      };
+      await assertDirectories();
+      await rename(source, destination);
+      if (interruption.point === 'marker-rename') interruption.park(stagingIdentity);
+      await profile.sync(); await directory.sync();
+      await assertDirectories();
+      interruption.park(stagingIdentity);
+    } finally { await directory.close(); }
+  } finally { await profile.close(); }
 }
 export async function assertConvertedMigrationProfile(transaction: MigrationTransaction, owner: MigrationOwner,
   entry: Entry, staged: Staged, deadline: number): Promise<void> {
@@ -208,11 +249,22 @@ export async function publishMigrationProfile(transaction: MigrationTransaction,
   await assertMigrationProfile(transaction, registry, owner, entry, deadline);
   await migrationAbsent(join(transaction.root, 'receipts', `${entry.pathSha256}.json`));
   await migrationAbsent(join(transaction.attempt, 'progress', `${entry.pathSha256}.committed.json`));
+  const selected = transaction.stagingInterruption;
+  const interruption: StagingInterruption | undefined = selected?.profileSha256 === entry.pathSha256 ? {
+    point: selected.point,
+    park(staging, scratch) {
+      const { platform, custody } = transaction.admission, park = platform.parkMaintenanceStaging;
+      if (!park) throw profileUnavailable();
+      return park.call(platform, custody, selected.point, transaction.value.attempt, entry.pathSha256, staging, scratch ?? null, deadline);
+    },
+  } : undefined;
   return withMigrationInspection(transaction.admission.host, transaction.admission.platform, registry, owner, deadline, async inspection => {
-    let staged = await readMigrationStage(transaction, entry, deadline);
+    let staged = await readMigrationStage(transaction, entry, deadline), stagingIdentity: MigrationIdentity | undefined;
+    if (interruption && (staged || continuation !== 'original')) throw profileUnavailable();
     if (!staged) {
       if (continuation !== 'original') throw profileUnavailable();
-      staged = await stageProfile(transaction, registry, owner, entry, () => inspection.verify(), deadline);
+      const written = await stageProfile(transaction, registry, owner, entry, () => inspection.verify(), deadline, interruption);
+      staged = written.staged; stagingIdentity = written.directory;
     }
     await owner.admitStaged(staged.record);
     const staging = migrationStagePath(transaction, entry.pathSha256);
@@ -225,10 +277,7 @@ export async function publishMigrationProfile(transaction: MigrationTransaction,
             !sameMigrationFile(await readMigrationFile(join(owner.path, 'engine.json')), entry.originalMarker)) throw profileUnavailable();
       }
       originalVerification(transaction, entry, await inspection.verify());
-      if (entry.originalMarker) {
-        await rename(join(staging, 'engine.json'), join(owner.path, 'engine.json'));
-        await syncDirectory(owner.path); await syncDirectory(staging);
-      }
+      if (entry.originalMarker) await renameMigrationMarker(owner, staging, interruption, stagingIdentity);
     }
     if (continuation !== 'converted') {
       // The native mid-pair verifier is also the normal marker-to-record
