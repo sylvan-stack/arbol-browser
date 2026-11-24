@@ -107,8 +107,8 @@ function parseStrictJson(bytes, limit = 65536) {
   return JSON.parse(text);
 }
 
-async function privateJson(path, limit = 8388608) {
-  const file = await exactFile(path, limit);
+async function privateJson(path, limit = 8388608, installerBudget = null) {
+  const file = installerBudget ? await boundedInstallerFile(path, limit, 0o600, installerBudget, true) : await exactFile(path, limit);
   if (file.identity.mode !== 0o600 || file.identity.uid !== userInfo().uid) throw new Error('Installer management file is unsafe');
   return { ...file, value: parseStrictJson(file.bytes, limit) };
 }
@@ -337,25 +337,28 @@ async function syncPath(path) {
   try { await fd.sync(); } finally { await fd.close(); }
 }
 
-async function publishExact(path, maximum, sha256, stage, publication) {
+async function publishExact(path, maximum, sha256, stage, publication, requireNew = false, budget = null) {
   if (!publication) throw new Error('Native EX publication authority required');
+  budget?.check();
   if (publication) {
-    const existing = await optionalFile(path, maximum);
+    const existing = await optionalFile(path, maximum, budget, false);
     if (existing) {
+      if (requireNew) throw new Error('Qualification requires a new immutable publication');
       if (existing.sha256 !== sha256 || existing.identity.uid !== userInfo().uid) throw new Error('Installed immutable file differs');
       await syncPath(path); await syncPath(dirname(path));
-      const current = await exactFile(path, maximum);
+      const current = await boundedInstallerFile(path, maximum, null, budget);
       if (!sameFile(current, existing)) throw new Error('Installed immutable file changed during synchronization');
       return current;
     }
   }
   const tmp = join(dirname(path), `.install-${randomBytes(12).toString('hex')}`);
   await stage(tmp);
+  let staged;
   try {
-    if ((await exactFile(tmp, maximum)).sha256 !== sha256) throw new Error('Installed input changed while copying');
+    if ((await boundedInstallerFile(tmp, maximum, null, budget)).sha256 !== sha256) throw new Error('Installed input changed while copying');
     await syncPath(tmp);
     if (publication) {
-      const staged = await exactFile(tmp, maximum);
+      staged = await boundedInstallerFile(tmp, maximum, null, budget);
       publication.provider.assertLock(publication.selection);
       publication.provider.publishInstallerFile(publication.selection, JSON.stringify({ source: tmp, destination: path,
         identity: staged.identity, sha256 }));
@@ -364,13 +367,15 @@ async function publishExact(path, maximum, sha256, stage, publication) {
     try { await unlink(tmp); } catch (error) { if (error.code !== 'ENOENT') throw error; }
     await syncPath(dirname(path));
   }
-  const result = await exactFile(path, maximum);
+  const result = await boundedInstallerFile(path, maximum, null, budget);
   if (result.sha256 !== sha256 || result.identity.uid !== userInfo().uid) throw new Error('Installed path already holds different content');
+  if (requireNew && !sameFile(result, staged)) throw new Error('New publication differs from its original staged inode');
   return result;
 }
 
-async function optionalFile(path, maximum) {
-  try { return await exactFile(path, maximum); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+async function optionalFile(path, maximum, budget = null, includeBytes = true) {
+  try { return await boundedInstallerFile(path, maximum, null, budget, includeBytes); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
   return undefined;
 }
 
@@ -387,14 +392,21 @@ async function optionalSelection(path) {
 
 function encode(value) { return Buffer.from(JSON.stringify(value) + '\n'); }
 
-async function replaceFile(path, bytes, mode) {
+async function replaceFile(path, bytes, mode, observe = false) {
   const tmp = join(dirname(path), `.replace-${randomBytes(12).toString('hex')}`);
   await writeExclusive(tmp, bytes, mode);
+  let original;
   try {
+    if (observe) original = await exactFile(tmp, 4096);
     await rename(tmp, path);
     await syncPath(dirname(path));
   } finally {
     try { await unlink(tmp); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+  if (observe) {
+    const file = await exactFile(path, 4096);
+    if (!sameFile(file, original) || !file.bytes.equals(bytes)) throw new Error('Selected publication changed after sync');
+    return file;
   }
 }
 
@@ -629,14 +641,15 @@ const isolatedAuthorities = new WeakMap();
 function verifyInIsolatedContext(context, verify) {
   const authority = isolatedAuthorities.get(context);
   return authority?.boundedVerification
-    ? withIsolatedVerificationDeadline(performance.now() + 480000, verify)
+    ? withIsolatedVerificationDeadline(Math.min(performance.now() + 480000, authority.installerBudget?.deadline ?? Infinity), verify)
     : verify();
 }
 
 async function assertContext(context) {
   const authority = isolatedAuthorities.get(context);
   if (!authority) return;
-  const { release, directories, inputs, releases, observationBudget } = authority;
+  const { release, directories, inputs, releases } = authority;
+  const observationBudget = authority.observationBudget ?? authority.installerBudget;
   requireEqual(await maintenanceFixtureLayout(dirname(dirname(release.fixture.bundle)), context.state), release.fixture);
   for (const [path, identity] of directories) requireEqual(await privateDirectory(path, true), identity);
   for (const [build, input] of inputs) {
@@ -657,6 +670,10 @@ function contextLauncherMode(context, sha256) { return contextLauncher(context, 
 function checkContextLauncher(context, path, sha256, deadline) {
   checkSignature(path, contextLauncher(context, sha256).launcherIdentifier, false, deadline);
 }
+function checkInstallerLauncher(context, path, file, budget) {
+  if (budget) checkObserverLauncher(context, path, file, budget);
+  else checkContextLauncher(context, path, file.sha256);
+}
 function contextPredecessor(context) {
   const authority = isolatedAuthorities.get(context);
   if (!authority) return profileMigrationPredecessor;
@@ -669,6 +686,19 @@ async function contextProfileFormat(context, selected, custody) {
   await assertContext(context);
   const input = authority.inputs.get(selected.build), expected = authority.releases.get(selected.build);
   if (!input || expected.imageSha256 !== selected.imageSha256) throw new Error('Selected isolated release is outside the cohort');
+  if (authority.installerBudget) {
+    // The fixed entry already authenticated the complete four-role cohort.
+    // Bind the installed copy under its original Build guard and budget.
+    const budget = authority.installerBudget;
+    await custody.assertBuild(selected.build);
+    const image = await boundedInstallerFile(join(context.images, `${selected.build}.dmg`), imageLimit, 0o600, budget);
+    const receipt = await privateJson(join(context.receipts, `${selected.build}.json`), 4096, budget);
+    requireEqual(image.sha256, expected.imageSha256);
+    requireEqual(receipt.value, { format: 1, build: expected.build, imageSha256: expected.imageSha256,
+      source: expected.source, payloadDigest: expected.payloadDigest, launcherSha256: expected.launcher.sha256 });
+    await custody.assertBuild(selected.build);
+    return expected.profileFormat;
+  }
   const verified = await verifyInIsolatedContext(context,
     () => verifyIsolatedRelease({ ...input, image: join(context.images, `${selected.build}.dmg`) }));
   requireEqual(await installedImageReceipt(context.support, selected), { format: 1, build: expected.build,
@@ -737,6 +767,8 @@ async function mountIsolatedCandidate(context, release, provider, initialization
   await withLock(provider, join(context.uses, `${release.build}.mount`), async handle => {
     if (initialization) requireEqual(await guardRecord(provider, join(context.uses, `${release.build}.mount`), handle), initialization.guards.mount);
     await assertContext(context);
+    // Signed mount preparation has its own verifier deadline. The installer
+    // work budget accounts for the physical installation evidence.
     const mounted = await verifyInIsolatedContext(context,
       () => prepareIsolatedMount({ ...authority.inputs.get(release.build), image: context.image }));
     requireEqual(mounted, { build: release.build, imageSha256: release.imageSha256,
@@ -789,98 +821,100 @@ async function selectionFile(context) {
     throw new Error('Selection changed during observation');
   return { value, file: fileReference(file) };
 }
-async function stageReleaseAssets(context, release, options, custody, createMountGuard = true) {
+async function stageReleaseAssets(context, release, options, custody, createMountGuard = true, budget = null) {
   await custody.assert();
   const image = await publishExact(context.image, imageLimit, release.imageSha256, async path => {
     await copyFile(options.image, path, constants.COPYFILE_EXCL); await chmod(path, 0o600);
-  }, custody.publication);
+  }, custody.publication, false, budget);
   if (image.identity.mode !== 0o600) throw new Error('Installed image mode differs');
   await checkedGuard(join(context.uses, `${release.build}.mount`), createMountGuard); await syncPath(context.uses);
   const bytes = encode({ format: 1, build: release.build, imageSha256: release.imageSha256,
     source: release.source, payloadDigest: release.payloadDigest, launcherSha256: release.launcher.sha256 });
   const receipt = await publishExact(join(context.receipts, `${release.build}.json`), 4096, hash(bytes),
-    path => writeExclusive(path, bytes), custody.publication);
+    path => writeExclusive(path, bytes), custody.publication, false, budget);
   if (receipt.identity.mode !== 0o600) throw new Error('Installed release receipt mode differs');
   await custody.assert(); return { image: fileReference(image), release: fileReference(receipt) };
 }
 /** Idempotently finish journal-before-launcher preparation while still under
  * the original EX. This helper never switches selection or opens admission. */
-async function prepareMigrationRelease(context, release, options, route, custody, retry = false) {
+async function prepareMigrationRelease(context, release, options, route, custody, retry = false, budget = null) {
   await privateDirectory(context.runtime, true); await privateDirectory(dirname(context.state), true);
   await custody.assert();
   const selected = await selectionFile(context);
   if (canonical(selected.value) !== canonical(route.previous)) throw new Error('Original Browser selection changed');
   const assets = retry ? await existingQualificationReleaseAssets(context, release, custody) :
-    await stageReleaseAssets(context, release, options, custody);
+    await stageReleaseAssets(context, release, options, custody, true, budget);
   const old = route.previous ? await installedImageReceipt(context.support, route.previous) : null;
   const after = { selection: { format: 1, build: release.build, imageSha256: release.imageSha256 },
     launcherSha256: release.launcher.sha256 };
   const before = old ? { selection: route.previous, launcherSha256: old.launcherSha256 } : null;
   let journal = route.pending;
-  let launcher = await optionalFile(context.executable, launcherLimit);
+  let launcher = await optionalFile(context.executable, launcherLimit, budget);
   if (!journal) {
     if (old ? launcher?.sha256 !== old.launcherSha256 : Boolean(launcher)) throw new Error('Original launcher differs');
     if (launcher) {
-      checkContextLauncher(context, context.executable, old.launcherSha256);
+      checkInstallerLauncher(context, context.executable, launcher, budget);
       await publishExact(context.backup, launcherLimit, launcher.sha256,
-        path => writeExclusive(path, launcher.bytes, 0o755), custody.publication);
-    } else if (await optionalFile(context.backup, launcherLimit)) throw new Error('Unexpected first-install launcher backup');
+        path => writeExclusive(path, launcher.bytes, 0o755), custody.publication, false, budget);
+    } else if (await optionalFile(context.backup, launcherLimit, budget)) throw new Error('Unexpected first-install launcher backup');
     const value = { format: 3, aliasBefore: Boolean(await installedAlias(context.alias, context.executable)), before, after,
       migration: { fromProfileFormat: 1, toProfileFormat: 2 } };
     if (!valid('migration.Journal', value)) throw new Error('Invalid maintenance journal');
     const bytes = encode(value);
-    await publishExact(context.journalPath, 16384, hash(bytes), path => writeExclusive(path, bytes), custody.publication);
-    journal = await privateJson(context.journalPath, 16384);
+    await publishExact(context.journalPath, 16384, hash(bytes), path => writeExclusive(path, bytes), custody.publication, false, budget);
+    journal = await privateJson(context.journalPath, 16384, budget);
   }
   if (!valid('migration.Journal', journal.value) || canonical(journal.value.before) !== canonical(before) ||
-      canonical(journal.value.after) !== canonical(after) || !sameFile(await privateJson(context.journalPath, 16384), journal))
+      canonical(journal.value.after) !== canonical(after) || !sameFile(await privateJson(context.journalPath, 16384, budget), journal))
     throw new Error('Original maintenance journal changed');
   if (before) {
-    const backup = await exactFile(context.backup, launcherLimit);
+    const backup = await boundedInstallerFile(context.backup, launcherLimit, 0o755, budget);
     if (backup.sha256 !== before.launcherSha256 || backup.identity.mode !== 0o755) throw new Error('Original launcher backup differs');
-    checkContextLauncher(context, context.backup, before.launcherSha256);
+    checkInstallerLauncher(context, context.backup, backup, budget);
   }
-  launcher = await optionalFile(context.executable, launcherLimit);
+  launcher = await optionalFile(context.executable, launcherLimit, budget);
   if (launcher?.sha256 !== after.launcherSha256) {
     if (retry) throw new Error('Retry requires the original prepared launcher');
     if (before ? launcher?.sha256 !== before.launcherSha256 : Boolean(launcher)) throw new Error('Unknown launcher preparation state');
     await replaceFile(context.executable, release.launcher.bytes, contextLauncherMode(context, release.launcher.sha256));
   }
-  launcher = await exactFile(context.executable, launcherLimit);
+  launcher = await boundedInstallerFile(context.executable, launcherLimit, contextLauncherMode(context, release.launcher.sha256), budget);
   if (launcher.sha256 !== after.launcherSha256 || launcher.identity.mode !== contextLauncherMode(context, release.launcher.sha256)) throw new Error('Prepared launcher differs');
-  checkContextLauncher(context, context.executable, release.launcher.sha256);
+  checkInstallerLauncher(context, context.executable, launcher, budget);
   if (retry) {
     if (!await installedAlias(context.alias, context.executable)) throw new Error('Retry requires the original prepared alias');
   } else await ensureAlias(context.alias, context.executable);
   await custody.assert();
   const current = await selectionFile(context);
-  if (canonical(current) !== canonical(selected) || !sameFile(await privateJson(context.journalPath, 16384), journal))
+  if (canonical(current) !== canonical(selected) || !sameFile(await privateJson(context.journalPath, 16384, budget), journal))
     throw new Error('Maintenance preparation changed original admission');
   return { journal: { ...fileReference(journal), value: journal.value }, guards: custody.guards,
     selection: selected, assets, launcher: fileReference(launcher),
     state: { parent: await privateDirectory(dirname(context.state), true), runtime: await privateDirectory(context.runtime, true) },
-    oldAssets: before ? { image: fileReference(await exactFile(join(context.images, `${before.selection.build}.dmg`), imageLimit)),
-      release: fileReference(await privateJson(join(context.receipts, `${before.selection.build}.json`))),
-      launcher: fileReference(await exactFile(context.backup, launcherLimit)) } : null };
+    oldAssets: before ? { image: fileReference(await boundedInstallerFile(join(context.images, `${before.selection.build}.dmg`), imageLimit, 0o600, budget)),
+      release: fileReference(await privateJson(join(context.receipts, `${before.selection.build}.json`), 8388608, budget)),
+      launcher: fileReference(await boundedInstallerFile(context.backup, launcherLimit, 0o755, budget)) } : null };
 }
 
 /** The signed launcher acquires its OWN EX descriptions. The installer
  * must have left every lock scope before this call: retaining another EX
  * description would conflict with native acquisition, not transfer custody. */
-async function invokeSignedMaintenance(context, release, prepared, provider, engineInterruption = null, retry = false) {
+async function invokeSignedMaintenance(context, release, prepared, provider, interruption = null, retry = false) {
   if ((installerLocks.get(provider) ?? 0) !== 0) throw new Error('Installer custody must end before maintenance handoff');
-  const launcher = await exactFile(context.executable, launcherLimit);
-  const journal = await privateJson(context.journalPath, 16384);
+  const budget = interruption?.budget;
+  const readLauncher = () => boundedInstallerFile(context.executable, launcherLimit, prepared.launcher.identity.mode, budget);
+  const launcher = await readLauncher();
+  const journal = await privateJson(context.journalPath, 16384, budget);
   if (!sameFile(launcher, prepared.launcher) || launcher.sha256 !== release.launcher.sha256 ||
       !sameFile(journal, prepared.journal) || !valid('migration.Journal', journal.value))
     throw new Error('Signed maintenance handoff changed');
-  checkContextLauncher(context, context.executable, release.launcher.sha256);
+  checkInstallerLauncher(context, context.executable, launcher, budget);
   const isolated = isolatedAuthorities.get(context);
   if (retry) await verifyQualificationRetryMount(context, release);
   else await mountIsolatedCandidate(context, release, provider);
   await assertContext(context);
-  if (!sameFile(await exactFile(context.executable, launcherLimit), prepared.launcher) ||
-      !sameFile(await privateJson(context.journalPath, 16384), prepared.journal))
+  if (!sameFile(await readLauncher(), prepared.launcher) ||
+      !sameFile(await privateJson(context.journalPath, 16384, budget), prepared.journal))
     throw new Error('Signed maintenance inputs changed while preparing the mount');
   if ((installerLocks.get(provider) ?? 0) !== 0) throw new Error('Mount custody must end before native handoff');
   // Production accepts no policy/root/runtime/environment selector. Isolated
@@ -888,14 +922,24 @@ async function invokeSignedMaintenance(context, release, prepared, provider, eng
   const args = isolated ? ['--isolated-maintenance-migrate-profiles', '--policy',
     join(release.fixture.bundle, 'Contents/Resources/maintenance-fixture.json'), '--runtime', context.runtime,
     '--bundle', release.fixture.bundle] : ['--maintenance-migrate-profiles'];
-  if (engineInterruption) {
+  if (interruption?.writer === 'engine') {
     if (!isolated) throw new Error('Controlled maintenance requires the authenticated isolated route');
-    return invokeControlledQualificationLauncher(context, release, journal, args, provider, engineInterruption);
+    return invokeControlledQualificationLauncher(context, release, journal, args, provider, interruption);
   }
+  if (interruption) installerInterruptionRemaining(interruption, provider);
   const child = spawnSync(context.executable, args, {
-    env: { PATH: '/usr/bin:/bin', LC_ALL: 'C' }, timeout: 31 * 60 * 1000, maxBuffer: 1048576,
+    env: { PATH: '/usr/bin:/bin', LC_ALL: 'C' }, timeout: controlledMaintenanceLimit, maxBuffer: 1048576,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  if (interruption && (child.error || child.signal || child.status === null)) {
+    // This is diagnostic stderr, never a park frame or a successful retry
+    // result. The controller still needs independent accounting of the tree.
+    await writeObserverResult(process.stderr, { schema: 1, event: 'installer-fixture-quarantine',
+      requestSha256: interruption.requestSha256, nonce: interruption.nonce, reason: 'maintenance-tree-unaccounted',
+      code: child.status ?? null, signal: child.signal ?? null }, interruption.wire);
+    throw new InstallationOperationError('Installer launcher tree is unaccounted for. Quarantine this fixture until the original children are accounted for.', 5);
+  }
+  if (interruption) installerInterruptionRemaining(interruption, provider);
   let result;
   try { result = parseStrictJson(child.stdout ?? Buffer.alloc(0), 1048576); }
   catch (cause) {
@@ -907,8 +951,8 @@ async function invokeSignedMaintenance(context, release, prepared, provider, eng
     const exitCode = !child.error && !child.signal && validResult && result.busy.length ? 4 : 5;
     throw new InstallationOperationError('Signed maintenance did not complete; installation remains closed', exitCode);
   }
-  if ((installerLocks.get(provider) ?? 0) !== 0 || !sameFile(await privateJson(context.journalPath, 16384), journal) ||
-      !sameFile(await exactFile(context.executable, launcherLimit), launcher)) throw new Error('Maintenance handoff continuity changed');
+  if ((installerLocks.get(provider) ?? 0) !== 0 || !sameFile(await privateJson(context.journalPath, 16384, budget), journal) ||
+      !sameFile(await readLauncher(), launcher)) throw new Error('Maintenance handoff continuity changed');
   const accepted = Object.freeze({ ...result, busy: Object.freeze([...result.busy]) });
   nativeResults.add(accepted); return accepted;
 }
@@ -934,6 +978,11 @@ async function observeFile(path, maximum = 8388608n, budget = null) {
       st.gid === first.gid && st.size === first.size && st.mtimeNs === first.mtimeNs && st.ctimeNs === first.ctimeNs;
     if (!same(first) || first.size < 0n || first.size > BigInt(maximum) || !same(await lstat(path, { bigint: true })))
       throw new Error('Unsafe migration evidence');
+    budget?.check();
+    const stamp = observerFileStamp(first);
+    const saved = budget?.observations?.get(path);
+    if (saved?.stamp === stamp && same(await fd.stat({ bigint: true })) && same(await lstat(path, { bigint: true })) &&
+        await realpath(path) === path) return saved.value;
     budget?.check(Number(first.size));
     const sha = createHash('sha256'), buffer = Buffer.alloc(1048576); let count = 0n;
     for (;;) {
@@ -945,8 +994,10 @@ async function observeFile(path, maximum = 8388608n, budget = null) {
     }
     if (count !== first.size || !same(await fd.stat({ bigint: true })) || !same(await lstat(path, { bigint: true })) ||
         await realpath(path) !== path) throw new Error('Migration evidence changed');
-    return { identity: identityOf(first), sha256: sha.digest('hex'), size: String(count),
+    const value = { identity: identityOf(first), sha256: sha.digest('hex'), size: String(count),
       gid: String(first.gid), mtimeNs: String(first.mtimeNs), ctimeNs: String(first.ctimeNs) };
+    budget?.observations?.set(path, { stamp, value });
+    return value;
   } finally { await fd.close(); }
 }
 function evidencePath(context, scope, path) {
@@ -975,8 +1026,8 @@ async function evidenceCollector(context, budget = null) {
     if (files.has(key)) requireEqual(files.get(key), entry);
     files.set(key, entry); if (files.size > 131072) throw new Error('Too many evidence files');
     if (!parse) return observation;
-    budget?.check(Number(observation.size));
-    const decoded = await privateJson(full, maximum);
+    if (!budget?.installer) budget?.check(Number(observation.size));
+    const decoded = await privateJson(full, maximum, budget?.installer ? budget : null);
     if (!sameFile(decoded, observation)) throw new Error('Evidence changed while decoding');
     requireEqual(await observeFile(full, BigInt(maximum), budget), observation);
     return decoded;
@@ -986,17 +1037,18 @@ async function evidenceCollector(context, budget = null) {
     files: [...files.values()].sort((a, b) => `${a.scope}:${a.path}`.localeCompare(`${b.scope}:${b.path}`, 'en')),
   }) };
 }
-async function preparedBindings(context, release, prepared, custody, after = false) {
+async function preparedBindings(context, release, prepared, custody, after = false, budget = null) {
   await custody.assert(); requireEqual(custody.guards, prepared.guards);
   if (prepared.assets.image.sha256 !== release.imageSha256 || prepared.launcher.sha256 !== release.launcher.sha256)
     throw new Error('Reopening references do not name the verified signed candidate');
-  const candidateReceipt = await privateJson(join(context.receipts, `${release.build}.json`));
+  const candidateReceipt = await privateJson(join(context.receipts, `${release.build}.json`), 8388608, budget);
   requireEqual(candidateReceipt.value, { format: 1, build: release.build, imageSha256: release.imageSha256,
     source: release.source, payloadDigest: release.payloadDigest, launcherSha256: release.launcher.sha256 });
-  if (!sameFile(await privateJson(context.journalPath, 16384), prepared.journal) ||
-      !sameFile(await exactFile(context.executable, launcherLimit), prepared.launcher) ||
-      !sameFile(await exactFile(context.image, imageLimit), prepared.assets.image) ||
-      !sameFile(await privateJson(join(context.receipts, `${release.build}.json`)), prepared.assets.release))
+  const launcher = await boundedInstallerFile(context.executable, launcherLimit, prepared.launcher.identity.mode, budget);
+  if (!sameFile(await privateJson(context.journalPath, 16384, budget), prepared.journal) ||
+      !sameFile(launcher, prepared.launcher) ||
+      !sameFile(await boundedInstallerFile(context.image, imageLimit, 0o600, budget), prepared.assets.image) ||
+      !sameFile(await privateJson(join(context.receipts, `${release.build}.json`), 8388608, budget), prepared.assets.release))
     throw new Error('Original installation inputs changed');
   const selected = await selectionFile(context);
   if (after) requireEqual(selected.value, prepared.journal.value.after.selection);
@@ -1012,12 +1064,12 @@ async function preparedBindings(context, release, prepared, custody, after = fal
     const build = before.selection.build;
     const receipt = await installedImageReceipt(context.support, before.selection);
     if (receipt.launcherSha256 !== before.launcherSha256) throw new Error('Original predecessor release differs from journal');
-    if (!sameFile(await exactFile(join(context.images, `${build}.dmg`), imageLimit), prepared.oldAssets.image) ||
-        !sameFile(await privateJson(join(context.receipts, `${build}.json`)), prepared.oldAssets.release) ||
-        !sameFile(await exactFile(context.backup, launcherLimit), prepared.oldAssets.launcher))
+    if (!sameFile(await boundedInstallerFile(join(context.images, `${build}.dmg`), imageLimit, 0o600, budget), prepared.oldAssets.image) ||
+        !sameFile(await privateJson(join(context.receipts, `${build}.json`), 8388608, budget), prepared.oldAssets.release) ||
+        !sameFile(await boundedInstallerFile(context.backup, launcherLimit, 0o755, budget), prepared.oldAssets.launcher))
       throw new Error('Original predecessor artifacts changed');
   }
-  checkContextLauncher(context, context.executable, release.launcher.sha256);
+  checkInstallerLauncher(context, context.executable, launcher, budget);
   if (!await installedAlias(context.alias, context.executable)) throw new Error('Installed alias disappeared');
   await custody.assert();
 }
@@ -1030,10 +1082,10 @@ function targetValue(content, schema) {
 }
 // Read-only semantic reconstruction is shared by fresh completion and recovery.
 // It cannot mint a publication observation or a native success verdict.
-async function collectCompletion(context, release, prepared, result, custody, after = false) {
-  await preparedBindings(context, release, prepared, custody, after);
-  const observation = await collectCompletionEvidence(context, release, prepared, result);
-  await preparedBindings(context, release, prepared, custody, after);
+async function collectCompletion(context, release, prepared, result, custody, after = false, budget = null) {
+  await preparedBindings(context, release, prepared, custody, after, budget);
+  const observation = await collectCompletionEvidence(context, release, prepared, result, budget);
+  await preparedBindings(context, release, prepared, custody, after, budget);
   return observation;
 }
 
@@ -1127,13 +1179,13 @@ async function collectCompletionEvidence(context, release, prepared, result, bud
   requireEqual(done.profiles, completed);
   return { prepared, result, epoch: tx.epoch, root: tx.root, ...collector.finish() };
 }
-async function verifyCompletion(context, release, prepared, result, custody) {
+async function verifyCompletion(context, release, prepared, result, custody, budget = null) {
   if (!nativeResults.has(result)) throw new Error('A genuine signed maintenance return is required');
-  const observation = await collectCompletion(context, release, prepared, result, custody);
+  const observation = await collectCompletion(context, release, prepared, result, custody, false, budget);
   completionObservations.add(observation); return observation;
 }
 
-async function recheckEvidence(context, proof) {
+async function recheckEvidence(context, proof, budget = null) {
   if (!Array.isArray(proof.files) || proof.files.length > 131072 || !Array.isArray(proof.directories) ||
       proof.directories.length > 65536 || !valid('migration.Root', proof.state.root)) throw new Error('Invalid reopening inventory');
   requireEqual(await privateDirectory(dirname(context.state), true), proof.state.parent);
@@ -1144,7 +1196,7 @@ async function recheckEvidence(context, proof) {
     requireEqual(await privateDirectory(context.state, true), proof.state.root.identity);
     const transactionRef = proof.files.find(f => f.scope === 'migration' && /^[0-9a-f]{32}\/transaction\.json$/.test(f.path));
     if (!transactionRef) throw new Error('Reopening transaction missing');
-    const transaction = await privateJson(evidencePath(context, transactionRef.scope, transactionRef.path), transactionLimit);
+    const transaction = await privateJson(evidencePath(context, transactionRef.scope, transactionRef.path), transactionLimit, budget);
     if (!sameFile(transaction, transactionRef) || !valid('migration.Transaction', transaction.value)) throw new Error('Reopening transaction changed');
     requireEqual((await readdir(join(context.state, 'profiles'))).sort(), transaction.value.profiles.map(p => p.id).sort());
     for (const p of transaction.value.profiles) if (!p.targetMarker) await absent(join(context.state, 'profiles', p.id, 'engine.json'));
@@ -1152,6 +1204,7 @@ async function recheckEvidence(context, proof) {
   for (const [entries, isFile] of [[proof.directories, false], [proof.files, true]]) {
     let previous = '';
     for (const entry of entries) {
+      budget?.check();
       const path = evidencePath(context, entry.scope, entry.path), key = `${entry.scope}:${entry.path}`;
       if (previous && previous.localeCompare(key, 'en') >= 0) throw new Error('Reopening inventory is not unique and ordered');
       previous = key;
@@ -1161,7 +1214,7 @@ async function recheckEvidence(context, proof) {
         const maximum = /\/family-(main|primary|custody)\.log$/.test(entry.path) ? 9223372036854775807n :
           /^[0-9a-f]{32}\/transaction\.json$/.test(entry.path) && entry.scope === 'migration' ? BigInt(transactionLimit) : 8388608n;
         const { scope, path: ignored, ...expected } = entry;
-        requireEqual(await observeFile(path, maximum), expected);
+        requireEqual(await observeFile(path, maximum, budget), expected);
       } else {
         if (!keys(entry, ['scope', 'path', 'identity'])) throw new Error('Invalid reopening directory');
         requireEqual(await privateDirectory(path, true), entry.identity);
@@ -1191,26 +1244,33 @@ function validateReopeningProof(context, release, proof) {
   return prepared;
 }
 
-async function readReopeningProof(context, release, custody) {
-  if (!await optionalFile(context.proofPath, proofLimit)) return null;
-  const file = await privateJson(context.proofPath, proofLimit), proof = file.value;
+async function readReopeningProof(context, release, custody, budget = null) {
+  let file;
+  if (budget) {
+    try { file = await privateJson(context.proofPath, proofLimit, budget); }
+    catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  } else {
+    if (!await optionalFile(context.proofPath, proofLimit)) return null;
+    file = await privateJson(context.proofPath, proofLimit);
+  }
+  const proof = file.value;
   const prepared = validateReopeningProof(context, release, proof);
-  const journal = await privateJson(context.journalPath, 16384);
+  const journal = await privateJson(context.journalPath, 16384, budget);
   requireEqual(journal.value, prepared.journal.value);
   const selected = await optionalSelection(context.selectionPath), after = equal(selected, proof.after.selection);
-  await preparedBindings(context, release, prepared, custody, after);
-  await recheckEvidence(context, proof);
-  const actual = await collectCompletion(context, release, prepared, proof.result, custody, after);
+  await preparedBindings(context, release, prepared, custody, after, budget);
+  await recheckEvidence(context, proof, budget);
+  const actual = await collectCompletion(context, release, prepared, proof.result, custody, after, budget);
   requireEqual(actual.epoch, proof.epoch); requireEqual(actual.root, proof.state.root);
   requireEqual(actual.files, proof.files); requireEqual(actual.directories, proof.directories);
-  await recheckRollback(context, proof.rollback, custody, after);
-  if (!sameFile(await privateJson(context.proofPath, proofLimit), file)) throw new Error('Reopening proof changed');
+  await recheckRollback(context, proof.rollback, custody, after, budget);
+  if (!sameFile(await privateJson(context.proofPath, proofLimit, budget), file)) throw new Error('Reopening proof changed');
   return file;
 }
-async function publishReopeningProof(context, release, observation, custody) {
+async function publishReopeningProof(context, release, observation, custody, budget = null) {
   if (!completionObservations.has(observation)) throw new Error('Native completion observation is required');
   const { prepared, result, epoch, root, directories, files } = observation;
-  await preparedBindings(context, release, prepared, custody);
+  await preparedBindings(context, release, prepared, custody, false, budget);
   const proof = { format: 1, kind: 'browser-profile-migration-reopen',
     journal: { path: context.journalPath, ...fileReference(prepared.journal) }, before: prepared.journal.value.before,
     after: prepared.journal.value.after,
@@ -1218,53 +1278,56 @@ async function publishReopeningProof(context, release, observation, custody) {
       aliasBefore: prepared.journal.value.aliasBefore, selectionFile: prepared.selection.file,
       assets: prepared.assets, launcher: prepared.launcher, oldAssets: prepared.oldAssets },
     result, epoch, guards: prepared.guards, state: { ...prepared.state, root }, directories, files,
-    rollback: await observeRollback(context, custody) };
-  await recheckEvidence(context, proof);
-  await recheckRollback(context, proof.rollback, custody);
+    rollback: await observeRollback(context, custody, budget) };
+  await recheckEvidence(context, proof, budget);
+  await recheckRollback(context, proof.rollback, custody, false, budget);
   const bytes = encode(proof); if (bytes.length > proofLimit) throw new Error('Reopening proof exceeds bound');
-  await publishExact(context.proofPath, proofLimit, hash(bytes), path => writeExclusive(path, bytes), custody.publication);
-  return readReopeningProof(context, release, custody);
+  const published = await publishExact(context.proofPath, proofLimit, hash(bytes), path => writeExclusive(path, bytes), custody.publication, Boolean(budget), budget);
+  const readback = await readReopeningProof(context, release, custody, budget);
+  if (budget && !sameFile(readback, published)) throw new Error('New reopening proof changed after publication');
+  return readback;
 }
 
 async function optionalDirectory(path) {
   try { await lstat(path); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   return privateDirectory(path, true);
 }
-async function rollbackInventory(context, name, identity, custody) {
+async function rollbackInventory(context, name, identity, custody, budget = null) {
   const path = join(context.support, name);
   requireEqual(await privateDirectory(path, true), identity);
   const names = (await readdir(path)).sort();
   if (names.length > 4096 || names.some(n => !buildNumber(n))) throw new Error('Unsupported rollback namespace inventory');
   const entries = [];
   for (const build of names) {
-    const launcherPath = join(path, build), launcher = await exactFile(launcherPath, launcherLimit);
+    budget?.check();
+    const launcherPath = join(path, build), launcher = await boundedInstallerFile(launcherPath, launcherLimit, 0o755, budget);
     if (launcher.identity.mode !== 0o755 || launcher.identity.uid !== userInfo().uid) throw new Error('Unsafe archived launcher');
-    const receiptFile = await privateJson(join(context.receipts, `${build}.json`)), receipt = receiptFile.value;
+    const receiptFile = await privateJson(join(context.receipts, `${build}.json`), 8388608, budget), receipt = receiptFile.value;
     const selected = { format: 1, build, imageSha256: receipt.imageSha256 };
     const pinned = contextPredecessor(context);
     if (!pinned || build !== pinned.build || receipt.source !== pinned.source || receipt.imageSha256 !== pinned.imageSha256 ||
         receipt.payloadDigest !== pinned.payloadDigest || receipt.launcherSha256 !== pinned.launcherSha256 ||
         launcher.sha256 !== pinned.launcherSha256 || await contextProfileFormat(context, selected, custody) !== 1)
       throw new Error('Rollback archive is not the supported authentic predecessor');
-    checkContextLauncher(context, launcherPath, launcher.sha256);
-    const image = await exactFile(join(context.images, `${build}.dmg`), imageLimit);
+    checkInstallerLauncher(context, launcherPath, launcher, budget);
+    const image = await boundedInstallerFile(join(context.images, `${build}.dmg`), imageLimit, 0o600, budget);
     if (image.sha256 !== selected.imageSha256) throw new Error('Rollback image changed');
-    entries.push({ build, launcher: { ...fileReference(launcher), size: launcher.bytes.length },
+    entries.push({ build, launcher: { ...fileReference(launcher), size: budget ? Number(launcher.size) : launcher.bytes.length },
       release: fileReference(receiptFile), image: fileReference(image) });
   }
   requireEqual((await readdir(path)).sort(), names);
   requireEqual(await privateDirectory(path, true), identity);
   return entries;
 }
-async function observeRollback(context, custody) {
+async function observeRollback(context, custody, budget = null) {
   await custody.assert(); const parent = await privateDirectory(context.support, true);
   const active = await optionalDirectory(join(context.support, 'rollback-launchers'));
   await absent(join(context.support, 'pre-format-2-rollback-launchers'));
   if (active && active.device !== parent.device) throw new Error('Rollback namespace crossed filesystems');
-  const observation = { parent, active, entries: active ? await rollbackInventory(context, 'rollback-launchers', active, custody) : [] };
+  const observation = { parent, active, entries: active ? await rollbackInventory(context, 'rollback-launchers', active, custody, budget) : [] };
   requireEqual(await privateDirectory(context.support, true), parent); await custody.assert(); return observation;
 }
-async function recheckRollback(context, observation, custody, requireRetired = false) {
+async function recheckRollback(context, observation, custody, requireRetired = false, budget = null) {
   if (!keys(observation, ['parent', 'active', 'entries']) || !Array.isArray(observation.entries) || observation.entries.length > 4096)
     throw new Error('Invalid rollback namespace proof');
   await custody.assert(); requireEqual(await privateDirectory(context.support, true), observation.parent);
@@ -1276,40 +1339,58 @@ async function recheckRollback(context, observation, custody, requireRetired = f
   }
   if (Boolean(active) === Boolean(retired) || (requireRetired && !retired)) throw new Error('Unknown rollback retirement state');
   requireEqual(active ?? retired, observation.active);
-  requireEqual(await rollbackInventory(context, active ? 'rollback-launchers' : 'pre-format-2-rollback-launchers', observation.active, custody), observation.entries);
+  requireEqual(await rollbackInventory(context, active ? 'rollback-launchers' : 'pre-format-2-rollback-launchers', observation.active, custody, budget), observation.entries);
   await custody.assert(); return active ? 'active' : 'retired';
 }
-async function retireRollback(context, proof, custody, afterSelection) {
-  const state = await recheckRollback(context, proof.rollback, custody, afterSelection);
+async function retireRollback(context, proof, custody, afterSelection, budget = null) {
+  const state = await recheckRollback(context, proof.rollback, custody, afterSelection, budget);
   if (state === 'active') {
+    budget?.check();
     custody.publication.provider.retireInstallerRollback(custody.publication.selection,
       JSON.stringify({ parent: proof.rollback.parent, directory: proof.rollback.active }));
   }
-  await recheckRollback(context, proof.rollback, custody, true);
+  await recheckRollback(context, proof.rollback, custody, true, budget);
+  return state === 'active';
 }
 
-async function finalizeMigration(context, release, custody) {
-  let proofFile = await readReopeningProof(context, release, custody);
+async function finalizeMigration(context, release, custody, parks = null, budget = null) {
+  let proofFile = await readReopeningProof(context, release, custody, budget);
   if (!proofFile) throw new Error('No durable native completion proof; admission remains closed');
   const proof = proofFile.value, prepared = proofPrepared(proof);
   let after = equal(await optionalSelection(context.selectionPath), proof.after.selection);
-  await retireRollback(context, proof, custody, after);
-  await preparedBindings(context, release, prepared, custody, after);
-  await recheckEvidence(context, proof);
-  if (!sameFile(await privateJson(context.proofPath, proofLimit), proofFile)) throw new Error('Reopening authority changed');
-  await recheckRollback(context, proof.rollback, custody, true);
-  if (!after) {
-    await replaceFile(context.selectionPath, encode(proof.after.selection), 0o600);
-    after = true;
+  const retired = await retireRollback(context, proof, custody, after, budget);
+  if (parks) {
+    if (!retired || after) throw new Error('Qualification requires the actual original archive retirement');
+    await parks.park('archive-retired');
   }
-  proofFile = await readReopeningProof(context, release, custody);
+  await preparedBindings(context, release, prepared, custody, after, budget);
+  await recheckEvidence(context, proof, budget);
+  if (!sameFile(await privateJson(context.proofPath, proofLimit, budget), proofFile)) throw new Error('Reopening authority changed');
+  await recheckRollback(context, proof.rollback, custody, true, budget);
+  if (!after) {
+    budget?.check();
+    const selected = await replaceFile(context.selectionPath, encode(proof.after.selection), 0o600, Boolean(parks));
+    after = true;
+    if (parks) {
+      await parks.bindSelection(selected);
+      await parks.park('selection');
+    }
+  }
+  proofFile = await readReopeningProof(context, release, custody, budget);
   if (!proofFile) throw new Error('Reopening proof disappeared');
-  await preparedBindings(context, release, prepared, custody, after);
-  await recheckRollback(context, proof.rollback, custody, true);
-  if (!sameFile(await privateJson(context.journalPath, 16384), proof.journal)) throw new Error('Journal changed before final removal');
+  await preparedBindings(context, release, prepared, custody, after, budget);
+  await recheckRollback(context, proof.rollback, custody, true, budget);
+  if (!sameFile(await privateJson(context.journalPath, 16384, budget), proof.journal)) throw new Error('Journal changed before final removal');
   await custody.assert();
-  await unlink(context.journalPath); await syncPath(context.support);
+  if (parks) await parks.beforeUnlink();
+  budget?.check();
+  await unlink(context.journalPath);
+  if (parks) {
+    await parks.park('journal-unlinked');
+    await parks.syncSupport();
+  } else await syncPath(context.support);
   await absent(context.journalPath); await custody.assert();
+  if (parks) await parks.park('journal-removal');
   return installationResult(context, release);
 }
 function installationResult(context, release) {
@@ -1327,48 +1408,56 @@ async function verifySameInstallation(context, release, launcher, format, custod
 }
 
 /** Compatible updates never reuse, remove or reinterpret migration evidence. */
-async function ordinaryInstall(context, release, options, route, custody, retry = null) {
+async function ordinaryInstall(context, release, options, route, custody, retry = null, interruption = null) {
+  const budget = interruption?.budget;
   await custody.assert(); requireEqual(await optionalSelection(context.selectionPath), route.previous);
   if (await installationJournal(context.support)) throw new Error('Pending installation requires recovery first');
   if (retry) {
     await existingQualificationReleaseAssets(context, release, custody);
     await verifyQualificationRetryMount(context, release);
   } else {
-    await stageReleaseAssets(context, release, options, custody);
+    await stageReleaseAssets(context, release, options, custody, true, interruption?.budget);
     await mountIsolatedCandidate(context, release, custody.publication.provider);
   }
   await custody.assert();
   const old = await installedImageReceipt(context.support, route.previous);
-  const current = await exactFile(context.executable, launcherLimit);
+  const current = await boundedInstallerFile(context.executable, launcherLimit, contextLauncherMode(context, old.launcherSha256), budget, true);
   if (current.sha256 !== old.launcherSha256 || current.identity.mode !== contextLauncherMode(context, old.launcherSha256)) throw new Error('Selected launcher changed');
-  checkContextLauncher(context, context.executable, old.launcherSha256);
+  checkInstallerLauncher(context, context.executable, current, budget);
   if (route.kind === 'same') {
     const format = retry ? release.profileFormat : await contextProfileFormat(context, route.previous, custody);
     return verifySameInstallation(context, release, current, format, custody, Boolean(retry));
   }
   // Preserve an earlier conversion backup before reusing the legacy slot for
   // a later compatible transaction. Existing immutable release bytes remain.
-  const prior = await optionalFile(context.backup, launcherLimit);
+  const prior = await optionalFile(context.backup, launcherLimit, budget);
   if (retry?.backup) {
     if (!sameFile(prior, retry.backup) || prior.sha256 !== current.sha256)
       throw new Error('Exact compatible retry backup changed');
     await syncPath(context.backup); await syncPath(context.support);
     if (!sameFile(await exactFile(context.backup, launcherLimit), retry.backup))
       throw new Error('Exact compatible retry backup changed during synchronization');
-  } else if (prior && prior.sha256 === current.sha256) {
-    if (prior.identity.mode !== 0o755 || prior.identity.uid !== userInfo().uid) throw new Error('Unsafe current launcher backup');
-    checkContextLauncher(context, context.backup, current.sha256);
-  } else if (prior) {
-    const pinned = contextPredecessor(context);
-    if (!pinned || prior.sha256 !== pinned.launcherSha256 || prior.identity.mode !== 0o755) throw new Error('Unknown retained launcher backup');
-    checkContextLauncher(context, context.backup, prior.sha256);
-    await publishExact(join(context.receipts, `${pinned.build}.launcher`), launcherLimit, prior.sha256,
-      path => writeExclusive(path, prior.bytes, 0o755), custody.publication);
-    if (!sameFile(await exactFile(context.backup, launcherLimit), prior)) throw new Error('Retained backup changed');
-    await unlink(context.backup); await syncPath(context.support);
+  } else {
+    const publishBackup = async requireNew => {
+      if (prior && prior.sha256 === current.sha256) {
+        if (prior.identity.mode !== 0o755 || prior.identity.uid !== userInfo().uid) throw new Error('Unsafe current launcher backup');
+        checkInstallerLauncher(context, context.backup, prior, budget);
+      } else if (prior) {
+        const pinned = contextPredecessor(context);
+        if (!pinned || prior.sha256 !== pinned.launcherSha256 || prior.identity.mode !== 0o755) throw new Error('Unknown retained launcher backup');
+        checkInstallerLauncher(context, context.backup, prior, budget);
+        await publishExact(join(context.receipts, `${pinned.build}.launcher`), launcherLimit, prior.sha256,
+          path => writeExclusive(path, prior.bytes, 0o755), custody.publication, false, interruption?.budget);
+        if (!sameFile(await exactFile(context.backup, launcherLimit), prior)) throw new Error('Retained backup changed');
+        await unlink(context.backup); await syncPath(context.support);
+      }
+      return publishExact(context.backup, launcherLimit, current.sha256,
+        path => writeExclusive(path, current.bytes, 0o755), custody.publication, requireNew, interruption?.budget);
+    };
+    if (interruption)
+      await compatibleBackupPark(context, release, route, custody, interruption, current, prior, publishBackup);
+    else await publishBackup(false);
   }
-  if (!retry?.backup)
-    await publishExact(context.backup, launcherLimit, current.sha256, path => writeExclusive(path, current.bytes, 0o755), custody.publication);
   const transaction = { format: 2, aliasBefore: Boolean(await installedAlias(context.alias, context.executable)),
     before: { selection: route.previous, launcherSha256: old.launcherSha256 },
     after: { selection: { format: 1, build: release.build, imageSha256: release.imageSha256 }, launcherSha256: release.launcher.sha256 } };
@@ -1412,7 +1501,15 @@ async function installVerifiedRelease(context, release, options, qualification =
   return withLockProvider(release.platform, async provider => {
     const existingOnly = Boolean(qualification?.mode);
     const retry = qualification?.mode === 'retry';
+    const interruption = qualification?.interruption ?? null;
+    const installerInterruption = interruption?.writer === 'installer' ? interruption : null;
     if (qualification?.interruption) bindQualificationInterruption(provider, qualification.interruption);
+    const installerBudget = installerInterruption?.budget ?? null;
+    if (installerBudget) {
+      const authority = isolatedAuthorities.get(context);
+      if (!authority) throw new Error('Installer stops require the fixed isolated authority');
+      authority.installerBudget = installerBudget;
+    }
     // Legacy recovery runs under selection EX before taking any Build EX;
     // its own Build guard must not conflict with a caller-held description.
     const recover = () => withLock(provider, join(context.support, 'selection.lock'),
@@ -1451,8 +1548,8 @@ async function installVerifiedRelease(context, release, options, qualification =
         if (route.kind === 'same' || route.kind === 'ordinary')
           return ordinaryInstall(context, release, options, route, custody, retry ? {
             backup: retryBackup, beginJournal: () => { compatibleStarted = true; },
-          } : null);
-        const proof = await readReopeningProof(context, release, custody);
+          } : null, installerInterruption);
+        const proof = await readReopeningProof(context, release, custody, installerBudget);
         if (proof) {
           if (qualification && !retry) throw new Error('Qualification A requires the original prepared-journal observation');
           if (retry) await verifyQualificationRetryMount(context, release);
@@ -1460,7 +1557,7 @@ async function installVerifiedRelease(context, release, options, qualification =
         }
         if (equal(await optionalSelection(context.selectionPath), route.pending?.value.after.selection))
           throw new Error('After selection without native-bound proof stays closed');
-        prepared = await prepareMigrationRelease(context, release, options, route, custody, retry);
+        prepared = await prepareMigrationRelease(context, release, options, route, custody, retry, installerBudget);
         return null;
       }, !initialJournal && previous?.build !== release.build && (!existingOnly ||
         (qualification.mode === 'interrupt' && qualification.role === 'A')), existingOnly);
@@ -1475,12 +1572,21 @@ async function installVerifiedRelease(context, release, options, qualification =
         const interruption = qualification.mode === 'interrupt';
         await acknowledgeQualificationPreparation(qualification, interruption ? 5 : 3, interruption ? 6 : 4);
       }
-      const engineInterruption = qualification?.interruption?.writer === 'engine' ? qualification.interruption : null;
-      const result = await invokeSignedMaintenance(context, release, prepared, provider, engineInterruption, retry);
+      const result = await invokeSignedMaintenance(context, release, prepared, provider, interruption, retry);
       return await withInstallationGuards(context, provider, previous, release.build, async custody => {
-        const observation = await verifyCompletion(context, release, prepared, result, custody);
-        await publishReopeningProof(context, release, observation, custody);
-        return finalizeMigration(context, release, custody);
+        const observation = await verifyCompletion(context, release, prepared, result, custody, installerBudget);
+        if (!installerInterruption) {
+          await publishReopeningProof(context, release, observation, custody);
+          return finalizeMigration(context, release, custody);
+        }
+        const handles = new Set();
+        try {
+          const parks = await installerMigrationParks(context, release, observation, custody, installerInterruption, handles);
+          await parks.park('final-verification');
+          await parks.bindProof(await publishReopeningProof(context, release, observation, custody, installerBudget));
+          await parks.park('reopening-proof');
+          return await finalizeMigration(context, release, custody, parks, installerBudget);
+        } finally { await closeObserverHandles(handles); }
       }, false, existingOnly);
     } finally {
       // Only legacy transactions may roll back. Format3 persists on every
@@ -1604,10 +1710,7 @@ const engineInterruptionPoints = new Set(['before-transaction', 'transaction-pub
 const installerInterruptionPoints = new Set(['final-verification', 'reopening-proof', 'archive-retired', 'selection',
   'journal-unlinked', 'journal-removal', 'compatible-pre-journal-backup']);
 // A point joins this set in the same source step that binds its actual writer.
-const enabledQualificationInterruptionPoints = new Set(['before-transaction', 'transaction-publication',
-  'current-publication', 'native-rename-excl', 'empty-staging', 'partial-staging', 'staged-record', 'staged-marker',
-  'staged-progress', 'marker-rename', 'marker-durable', 'record-rename', 'record-durable', 'claim-retained',
-  'capture-durable', 'receipt-durable', 'committed-progress', 'completion']);
+const enabledQualificationInterruptionPoints = new Set([...engineInterruptionPoints, ...installerInterruptionPoints]);
 const controlledMaintenanceLimit = 31 * 60 * 1000;
 const controlledCleanupLimit = 30000;
 
@@ -1626,6 +1729,275 @@ function bindQualificationInterruption(provider, interruption) {
   const actor = provider.processProvenance(process.pid);
   wire.qualificationRequire(actor?.pid === process.pid && actor.uid === userInfo().uid && actor.executable === process.execPath);
   interruption.actor = Object.freeze(actor);
+  if (interruption.writer === 'installer') {
+    interruption.deadline = Math.floor(provider.continuousTime() + controlledMaintenanceLimit);
+    const budget = observerBudget(performance.now() + installerInterruptionRemaining(interruption, provider));
+    interruption.budget = Object.freeze({ installer: true, deadline: budget.deadline, observations: new Map(), files: new Map(), check(size = 0) {
+      installerInterruptionRemaining(interruption, provider);
+      budget.check(size);
+    } });
+  }
+}
+
+function installerInterruptionRemaining(interruption, provider) {
+  const remaining = Math.floor(interruption.deadline - provider.continuousTime());
+  if (!(remaining > 0 && remaining <= controlledMaintenanceLimit))
+    throw new InstallationOperationError('Installer interruption deadline expired', 5);
+  return remaining;
+}
+
+function installerInterruptionSocket(fd, access, expected, wire, signal) {
+  const duplicate = openSync('/dev/fd/' + fd, access);
+  try {
+    requireEqual(privateQualificationPipe(duplicate, wire, access), expected);
+    const socket = new Socket({ fd: duplicate, readable: access === constants.O_RDONLY, writable: access === constants.O_WRONLY });
+    return signal ? addAbortSignal(signal, socket) : socket;
+  } catch (error) { closeSync(duplicate); throw error; }
+}
+
+async function parkInstallerInterruption(interruption, point, custody, frame, writerCurrent) {
+  if (interruption?.writer !== 'installer' || interruption.point !== point) return;
+  const { wire, nonce, requestSha256, endpoints } = interruption, { provider } = custody.publication;
+  if (!installerInterruptionPoints.has(point) || interruption.consumed)
+    throw new InstallationOperationError('Installer interruption already attempted or unavailable', 5);
+  interruption.consumed = true;
+  const remaining = Math.min(5000, installerInterruptionRemaining(interruption, provider));
+  const cutoff = Math.min(interruption.deadline, provider.continuousTime() + remaining);
+  const expiry = AbortSignal.timeout(remaining);
+  const budget = observerBudget(performance.now() + remaining);
+  const current = async () => {
+    budget.check();
+    requireEqual(provider.processProvenance(process.pid), interruption.actor);
+    requireEqual(privateQualificationPipe(3, wire, constants.O_RDONLY), endpoints.stop);
+    requireEqual(privateQualificationPipe(4, wire, constants.O_WRONLY), endpoints.event);
+    await custody.assert(); await writerCurrent(budget); await custody.assert();
+    requireEqual(provider.processProvenance(process.pid), interruption.actor);
+    requireEqual(privateQualificationPipe(3, wire, constants.O_RDONLY), endpoints.stop);
+    requireEqual(privateQualificationPipe(4, wire, constants.O_WRONLY), endpoints.event);
+    budget.check();
+    if (expiry.aborted || provider.continuousTime() >= cutoff)
+      throw new InstallationOperationError('Installer writer stop expired', 5);
+  };
+  const { pid, startId, pidVersion } = interruption.actor;
+  wire.qualificationRequire(pid === process.pid && /^(0|[1-9][0-9]{0,19})$/.test(startId) &&
+    Number.isSafeInteger(pidVersion) && pidVersion > 0, 'Installer actor differs');
+  const actor = { pid, startId, pidVersion };
+  await current();
+  const output = installerInterruptionSocket(4, constants.O_WRONLY, endpoints.event, wire, expiry);
+  try {
+    const emit = async value => {
+      wire.qualificationRequire(encode(value).length <= 4096, 'Installer interruption event is too large');
+      await writeObserverResult(output, value, wire);
+    };
+    await emit({ schema: 1, event: 'parked', requestSha256, nonce, point, actor, ...frame });
+    const input = installerInterruptionSocket(3, constants.O_RDONLY, endpoints.stop, wire);
+    const bytes = await readQualificationPipe(input, expiry, 1024, wire);
+    wire.qualificationRequire(bytes.length > 0 && bytes.indexOf(0x0a) === bytes.length - 1, 'Expected one installer stop line', 2);
+    const stop = wire.qualificationJson(bytes, 1024);
+    wire.qualificationKeys(stop, ['schema', 'action', 'requestSha256', 'nonce', 'point']);
+    wire.qualificationRequire(stop.schema === 1 && stop.action === 'interrupt' && stop.requestSha256 === requestSha256 &&
+      stop.nonce === nonce && stop.point === point, 'Installer stop differs from the original request', 2);
+    await current();
+    await emit({ schema: 1, event: 'stop-accepted', requestSha256, nonce, point, actor, stopSha256: hash(bytes) });
+    if (expiry.aborted || provider.continuousTime() >= cutoff) throw new InstallationOperationError('Installer acknowledgement expired', 5);
+    process.kill(process.pid, 'SIGKILL');
+    throw new InstallationOperationError('Installer did not terminate at the approved stop', 5);
+  } finally { output.destroy(); }
+}
+
+function installerArtifact(kind, { identity, size, sha256 }) {
+  return { kind, identity, size, sha256 };
+}
+
+async function boundedInstallerFile(path, maximum, mode, budget, includeBytes = false) {
+  if (!budget) return exactFile(path, maximum);
+  budget.check();
+  const handles = new Set();
+  try {
+    const expectedMode = mode ?? identityOf(await lstat(path, { bigint: true })).mode;
+    if (![0o600, 0o700, 0o755].includes(expectedMode)) throw new Error('Installer observation requires an original management file');
+    const file = await observerFile(await holdObserverPath(handles, path, expectedMode), maximum, budget, { includeBytes });
+    if (file.reference.size === '0') throw new Error('Installer publication evidence is empty');
+    return { ...fileReference(file.reference), size: file.reference.size, ...(includeBytes && { bytes: file.bytes }) };
+  } finally { await closeObserverHandles(handles); }
+}
+
+async function holdInstallerFile(handles, path, maximum, expected, budget, includeBytes = false) {
+  if (!expected) throw new Error('Missing original installer file reference');
+  const record = await holdObserverPath(handles, path, expected.identity.mode);
+  const file = await observerFile(record, maximum, budget, { includeBytes });
+  requireEqual(fileReference(file.reference), fileReference(expected));
+  return file;
+}
+
+async function installerMigrationParks(context, release, observation, custody, interruption, handles) {
+  if (!completionObservations.has(observation) || !isolatedAuthorities.has(context))
+    throw new Error('Installer stops require the actual isolated completion observation');
+  const { prepared } = observation;
+  const budget = interruption.budget;
+  const support = await holdObserverPath(handles, context.support, 0o700, true);
+  const journal = await holdInstallerFile(handles, context.journalPath, 16384, prepared.journal, budget, true);
+  const oldSelection = await holdInstallerFile(handles, context.selectionPath, 4096, prepared.selection.file, budget);
+  const old = contextPredecessor(context);
+  if (!old || !prepared.oldAssets || !prepared.journal.value.before) throw new Error('Original historical migration custody is missing');
+  requireEqual(prepared.journal.value.before.selection, observerSelection(old));
+  const archive = await observeArchive(context, historicalArchive, new Map([[old.build, old]]), handles, budget, custody);
+  if (archive.records.length !== 1) throw new Error('The original historical archive is incomplete');
+  const [archived] = archive.records;
+  requireEqual(fileReference(archived.imageFile), prepared.oldAssets.image);
+  requireEqual(fileReference(archived.releaseFile), prepared.oldAssets.release);
+  await absent(join(context.support, retiredArchive));
+  const expectedRollback = reopeningArchiveView({ support, archive });
+  const initialAssets = [
+    await holdInstallerFile(handles, context.image, imageLimit, prepared.assets.image, budget),
+    await holdInstallerFile(handles, join(context.receipts, release.build + '.json'), 4096, prepared.assets.release, budget),
+    await holdInstallerFile(handles, context.executable, launcherLimit, prepared.launcher, budget),
+    await holdInstallerFile(handles, context.backup, launcherLimit, prepared.oldAssets.launcher, budget),
+  ];
+  const alias = await installedAlias(context.alias, context.executable);
+  if (!alias) throw new Error('Prepared alias disappeared before installer stop');
+  const transactions = observation.files.filter(file => file.scope === 'migration' && /^[0-9a-f]{32}\/transaction\.json$/.test(file.path));
+  if (transactions.length !== 1) throw new Error('Original verified transaction is missing');
+  const [transaction] = transactions, attempt = transaction.path.split('/')[0];
+  const completion = observation.files.find(file => file.scope === 'migration' && file.path === attempt + '/completed.json');
+  if (!completion || completion.sha256 !== observation.result.completionSha256) throw new Error('Original verified completion is missing');
+  const completionFile = await holdInstallerFile(handles, evidencePath(context, 'migration', completion.path),
+    1048576, completion, budget);
+  let proof, selected, journalUnlinked, supportSynced = false;
+  return {
+    async bindProof(file) {
+      if (!file) throw new Error('Actual durable reopening proof is missing');
+      requireEqual(file.value.rollback, expectedRollback);
+      proof = await holdInstallerFile(handles, context.proofPath, proofLimit, file, budget);
+    },
+    async bindSelection(file) {
+      selected = await holdInstallerFile(handles, context.selectionPath, 4096, file, budget, true);
+      requireEqual(parseStrictJson(selected.bytes, 4096), prepared.journal.value.after.selection);
+      if ((await checkObserverPath(oldSelection.record, null)).nlink !== 0n) throw new Error('Original selection was not replaced');
+    },
+    async beforeUnlink() {
+      await recheckObserverFile(journal);
+      await checkObserverPath(support);
+    },
+    async syncSupport() {
+      await checkObserverPath(support);
+      await support.fd.sync();
+      await checkObserverPath(support);
+      supportSynced = true;
+    },
+    async park(point) {
+      if (interruption.point !== point) return;
+      const retired = point !== 'final-verification' && point !== 'reopening-proof';
+      const after = point === 'selection' || point === 'journal-unlinked' || point === 'journal-removal';
+      const unlinked = point === 'journal-unlinked' || point === 'journal-removal';
+      if ((point === 'journal-removal') !== supportSynced || (retired && !proof) || (after && !selected))
+        throw new Error('Installer writer phase has not occurred');
+      if (unlinked) {
+        if ((await checkObserverPath(journal.record, null)).nlink !== 0n) throw new Error('Original journal still has a directory entry');
+        journalUnlinked = await observerFile(journal.record, 16384, budget, { path: null, includeBytes: true });
+        requireEqual(journalUnlinked.reference, journal.reference);
+        if (!journalUnlinked.bytes.equals(journal.bytes)) throw new Error('Unlinked original journal bytes changed');
+      }
+      const activePath = join(context.support, historicalArchive), retiredPath = join(context.support, retiredArchive);
+      const archivePath = retired ? retiredPath : activePath;
+      const archiveFiles = archive.records.flatMap(record => record.files.map(file =>
+        file.record === record.launcher ? { ...file, path: join(archivePath, record.build) } : file));
+      const archiveStamp = observerFileStamp(await checkObserverPath(archive.root, archivePath));
+      const supportStamp = observerFileStamp(await checkObserverPath(support));
+      const artifacts = point === 'final-verification' ? [installerArtifact('completion', completionFile.reference)] :
+        point === 'reopening-proof' ? [installerArtifact('completion', completionFile.reference), installerArtifact('proof', proof.reference)] :
+        point === 'archive-retired' ? [installerArtifact('proof', proof.reference), installerArtifact('retired-directory', {
+          identity: archive.root.identity, size: '0', sha256: hash(canonical(archiveView(archive.records))),
+        })] : [installerArtifact('proof', proof.reference), installerArtifact('selection', selected.reference)];
+      await parkInstallerInterruption(interruption, point, custody, {
+        journal: installerArtifact('journal', journal.reference), attempt, transactionSha256: transaction.sha256,
+        profileSha256: null, artifacts,
+      }, async parkBudget => {
+        requireEqual(custody.guards, prepared.guards);
+        requireEqual(await installedAlias(context.alias, context.executable), alias);
+        for (const file of [...initialAssets, completionFile, after ? selected : oldSelection]) await recheckObserverFile(file);
+        if (proof) await recheckObserverFile(proof);
+        else await absent(context.proofPath);
+        if (unlinked) {
+          await absent(context.journalPath);
+          if ((await checkObserverPath(journal.record, null)).nlink !== 0n) throw new Error('Original journal relinked');
+          await recheckObserverFile(journalUnlinked);
+        } else await recheckObserverFile(journal);
+        await recheckObserverEvidence(context, observation, parkBudget);
+        await absent(retired ? activePath : retiredPath);
+        await recheckObserverArchive(archive.root, archivePath, archive.records, archiveFiles, parkBudget);
+        requireEqual(observerFileStamp(await checkObserverPath(archive.root, archivePath)), archiveStamp);
+        requireEqual(observerFileStamp(await checkObserverPath(support)), supportStamp);
+      });
+    },
+  };
+}
+
+async function compatibleBackupPark(context, release, route, custody, interruption, current, prior, publishBackup) {
+  const authority = isolatedAuthorities.get(context), incumbent = authority?.releases.get(route.previous.build);
+  const historical = contextPredecessor(context);
+  if (interruption.point !== 'compatible-pre-journal-backup' || !incumbent || !historical ||
+      incumbent.profileFormat !== 2 || prior?.sha256 === current.sha256)
+    throw new Error('Qualification requires a new compatible backup of the original selection');
+  const handles = new Set();
+  const budget = interruption.budget;
+  try {
+    await absent(context.journalPath);
+    const support = await holdObserverPath(handles, context.support, 0o700, true);
+    const selected = await observeSelectedRelease(context, incumbent, handles, budget, custody);
+    requireEqual(fileReference(selected.live), fileReference(current));
+    const candidate = await observeReleaseAssets(context, release, handles, budget);
+    const reopening = await observerProofFile(isolatedLayout(incumbent).proofPath, proofLimit, budget, handles);
+    const proof = parseStrictJson(reopening.bytes, proofLimit), prepared = validateReopeningProof(context, incumbent, proof);
+    requireEqual(prepared.guards.selection, custody.guards.selection);
+    requireEqual(prepared.guards.newBuild, custody.guards.oldBuild);
+    requireEqual(prepared.journal.value.before.selection, observerSelection(historical));
+    requireEqual(prepared.launcher, fileReference(selected.live));
+    requireEqual(prepared.assets, { image: fileReference(selected.assets.imageFile),
+      release: fileReference(selected.assets.releaseFile) });
+    const evidence = await collectProvedCompletion(context, incumbent, proof, prepared, budget);
+    const retiredPath = join(context.support, retiredArchive), activePath = join(context.support, historicalArchive);
+    const retired = await holdObserverPath(handles, retiredPath, 0o700, true);
+    requireEqual(proof.rollback.parent, support.identity);
+    requireEqual(proof.rollback.active, retired.identity);
+    requireEqual(proof.rollback.entries.map(entry => entry.build), [historical.build]);
+    const [entry] = proof.rollback.entries;
+    const archiveFiles = [
+      await holdInstallerFile(handles, join(retiredPath, historical.build), launcherLimit, entry.launcher, budget),
+      await holdInstallerFile(handles, join(context.receipts, historical.build + '.json'), 4096, entry.release, budget),
+      await holdInstallerFile(handles, join(context.images, historical.build + '.dmg'), imageLimit, entry.image, budget),
+    ];
+    requireEqual(archiveFiles[0].reference.size, String(entry.launcher.size));
+    if (entry.launcher.sha256 !== historical.launcher.sha256) throw new Error('Original historical archive differs');
+    await absent(activePath);
+    const historicalBackupPath = join(context.receipts, historical.build + '.launcher');
+    const retained = await optionalFile(historicalBackupPath, launcherLimit, budget);
+    if (prior) requireEqual(fileReference(prior), prepared.oldAssets.launcher);
+    else if (!retained) throw new Error('Original historical backup is missing');
+    await recheckObserverArchive(retired, retiredPath, [{ build: historical.build }], archiveFiles, budget);
+    const published = await publishBackup(true);
+    if (published.identity.mode !== 0o755 || published.sha256 !== current.sha256 || published.size !== String(current.bytes.length))
+      throw new Error('New compatible backup is not the exact selected launcher');
+    const backup = await holdInstallerFile(handles, context.backup, launcherLimit, published, budget);
+    const previous = await boundedInstallerFile(historicalBackupPath, launcherLimit, 0o755, budget);
+    if (previous.identity.mode !== 0o755 || previous.sha256 !== historical.launcher.sha256 || (retained && !sameFile(retained, previous)))
+      throw new Error('Historical retained backup differs after compatible publication');
+    const historicalBackup = await holdInstallerFile(handles, historicalBackupPath, launcherLimit, previous, budget);
+    const archiveStamp = observerFileStamp(await checkObserverPath(retired));
+    const supportStamp = observerFileStamp(await checkObserverPath(support));
+    await parkInstallerInterruption(interruption, 'compatible-pre-journal-backup', custody, {
+      journal: null, attempt: null, transactionSha256: null, profileSha256: null,
+      artifacts: [installerArtifact('selection', selected.selection), installerArtifact('compatible-backup', backup.reference)],
+    }, async parkBudget => {
+      await absent(context.journalPath); await absent(activePath);
+      requireEqual(await installedAlias(context.alias, context.executable), selected.alias);
+      for (const file of [...selected.files, ...candidate.files, reopening, backup, historicalBackup]) await recheckObserverFile(file);
+      await recheckObserverEvidence(context, evidence, parkBudget);
+      await recheckObserverArchive(retired, retiredPath, [{ build: historical.build }], archiveFiles, parkBudget);
+      requireEqual(observerFileStamp(await checkObserverPath(retired)), archiveStamp);
+      requireEqual(observerFileStamp(await checkObserverPath(support)), supportStamp);
+    });
+  } finally { await closeObserverHandles(handles); }
 }
 
 async function qualificationInterruptionCapsule(packet) {
@@ -2091,6 +2463,12 @@ async function holdObserverPath(handles, path, mode, directory = false) {
 async function observerFile(record, maximum, budget, { path = record.path, includeBytes = false } = {}) {
   const first = await checkObserverPath(record, path);
   if (first.size < 0n || first.size > BigInt(maximum)) throw new Error('Observer file exceeds its bound');
+  const stamp = observerFileStamp(first), saved = path === null ? null : budget.files?.get(path);
+  budget.check();
+  if (!includeBytes && saved?.stamp === stamp) {
+    requireEqual(observerFileStamp(await checkObserverPath(record, path)), stamp);
+    return { record, path, stamp, reference: { ...saved.reference, path: record.path } };
+  }
   const size = Number(first.size), digest = createHash('sha256'), chunks = [];
   budget.check(size);
   const buffer = Buffer.alloc(Math.min(1024 * 1024, Math.max(size, 1)));
@@ -2104,9 +2482,9 @@ async function observerFile(record, maximum, budget, { path = record.path, inclu
     if (includeBytes) chunks.push(Buffer.from(bytes));
     offset += bytesRead;
   }
-  const stamp = observerFileStamp(first);
   requireEqual(observerFileStamp(await checkObserverPath(record, path)), stamp);
   const reference = { path: record.path, identity: record.identity, size: String(size), sha256: digest.digest('hex') };
+  if (path !== null) budget.files?.set(path, { stamp, reference });
   return { record, path, stamp, reference, ...(includeBytes ? { bytes: Buffer.concat(chunks, size) } : {}) };
 }
 
