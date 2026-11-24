@@ -21,6 +21,7 @@ const arbol = '/Users/msix/repos/sylvan-stack/arbol';
 const plan = 'sagas/sylvan-stack/arbol-format-2-migration/browser-profile-migration/AFM-9.md';
 const node = '/Users/msix/.nvm/versions/node/v24.22.1/bin/node';
 const nodeSha = '6f32069480ec14d52b6d7b1f3c7124cfbbc46203abf5ddf5c65b127435f3f329';
+const systemGit = '/usr/bin/git';
 const sourceFiles = ['README.md', 'baseline.json', 'prepare.py', 'install.py', 'common.patch', 'browser_qualification.py'];
 export const qualificationRoles = Object.freeze(['historical', 'A', 'B', 'C']);
 export const qualificationSha = value => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
@@ -103,7 +104,10 @@ async function ancestors(path) {
 }
 /** Read one original descriptor, streaming large images and retaining no
  * authorization. Empty files in a sealed dependency tree are legitimate. */
-export async function qualificationFile(path, maximum, mode, bytes = false, deadline = Infinity) {
+export function qualificationFile(path, maximum, mode, bytes = false, deadline = Infinity) {
+  return readQualificationFile(path, maximum, mode, bytes, deadline);
+}
+async function readQualificationFile(path, maximum, mode, bytes, deadline, pinSystemGit = false) {
   qualificationRequire(performance.now() < deadline, 'Qualification read deadline exceeded');
   qualificationPath(path); await ancestors(dirname(path));
   qualificationRequire(await realpath(path) === path);
@@ -111,7 +115,12 @@ export async function qualificationFile(path, maximum, mode, bytes = false, dead
   const fd = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const info = await fd.stat({ bigint: true });
-    qualificationRequire(info.isFile() && info.nlink === 1n && info.size >= 0n && info.size <= BigInt(maximum) &&
+    // macOS ships Git as a hard-linked system executable. Only its fixed
+    // producer executable pin can read that root-owned original.
+    const allowedLinks = pinSystemGit
+      ? path === systemGit && info.uid === 0n && (info.mode & 0o111n) !== 0n && info.nlink > 0n
+      : info.nlink === 1n;
+    qualificationRequire(info.isFile() && allowedLinks && info.size >= 0n && info.size <= BigInt(maximum) &&
       [0n, BigInt(userInfo().uid)].includes(info.uid) && !(info.mode & 0o022n) &&
       (mode === undefined || (info.mode & 0o7777n) === BigInt(mode)) && stamp(info) === stamp(await lstat(path, { bigint: true })));
     const digest = createHash('sha256'), chunks = []; let count = 0;
@@ -130,9 +139,9 @@ export async function qualificationFile(path, maximum, mode, bytes = false, dead
     return bytes ? { reference, bytes: Buffer.concat(chunks) } : reference;
   } finally { await fd.close(); }
 }
-async function checkReference(ref, path, maximum, mode, deadline = Infinity) {
+async function checkReference(ref, path, maximum, mode, deadline = Infinity, pinSystemGit = false) {
   qualificationKeys(ref, ['path', 'identity', 'size', 'sha256']);
-  qualificationRequire(equal(ref, await qualificationFile(path, maximum, mode, false, deadline)), 'Pinned qualification file changed');
+  qualificationRequire(equal(ref, await readQualificationFile(path, maximum, mode, false, deadline, pinSystemGit)), 'Pinned qualification file changed');
 }
 async function document(path, limit, mode) {
   const file = await qualificationFile(path, limit, mode, true);
@@ -170,7 +179,7 @@ function command(program, args, deadline, maximum = 16 * 1024 * 1024) {
   qualificationRequire(!result.error && result.status === 0 && result.stderr.length <= 4096, 'Pinned qualification child refused');
   return result.stdout;
 }
-function git(repo, args, deadline) { return command('/usr/bin/git', ['--no-replace-objects', '-C', repo, ...args], deadline); }
+function git(repo, args, deadline) { return command(systemGit, ['--no-replace-objects', '-C', repo, ...args], deadline); }
 /** Original compiler/role validators run in a fixed read-only child so their
  * nested synchronous OS commands cannot overrun this operation's deadline.
  * No eval/import/path/compiled object is accepted over this internal pipe. */
@@ -233,8 +242,9 @@ async function delivery(deadline) {
   qualificationKeys(producer, ['schema', 'kind', 'sourceGit', 'files', 'compileRecord', 'productSources', 'productOutputs', 'compilerInputs', 'roleReviews', 'executables', 'osVersion']);
   qualificationRequire(producer.schema === 1 && producer.kind === 'afm9-browser-producer' && commit(producer.sourceGit));
   qualificationKeys(producer.executables, ['node', 'codesign', 'hdiutil', 'diskutil', 'plutil', 'git']);
-  for (const [name, path] of Object.entries({ node, codesign: '/usr/bin/codesign', hdiutil: '/usr/bin/hdiutil', diskutil: '/usr/sbin/diskutil', plutil: '/usr/bin/plutil', git: '/usr/bin/git' })) {
-    await checkReference(producer.executables[name], path, 256 * 1024 * 1024); qualificationRequire(producer.executables[name].identity.mode & 0o111);
+  for (const [name, path] of Object.entries({ node, codesign: '/usr/bin/codesign', hdiutil: '/usr/bin/hdiutil', diskutil: '/usr/sbin/diskutil', plutil: '/usr/bin/plutil', git: systemGit })) {
+    await checkReference(producer.executables[name], path, 256 * 1024 * 1024, undefined, Infinity, name === 'git');
+    qualificationRequire(producer.executables[name].identity.mode & 0o111);
   }
   qualificationRequire(producer.executables.node.sha256 === nodeSha && equal(producer.osVersion,
     { macOS: command('/usr/bin/sw_vers', ['-productVersion'], deadline).toString().trim(), kernel: kernelRelease(), machine: process.arch === 'arm64' ? 'arm64' : process.arch }));
