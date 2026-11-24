@@ -1,15 +1,17 @@
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { constants } from 'node:fs';
+import { constants, fstatSync } from 'node:fs';
 import { chmod, copyFile, lstat, mkdir, mkdtemp, open, readdir, readlink, realpath, rename, rmdir, symlink,
   unlink } from 'node:fs/promises';
 import { createRequire } from 'node:module';
+import { Socket } from 'node:net';
 import { tmpdir, userInfo } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
+import { addAbortSignal } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { inventory, inventoryDigest } from './package-base.mjs';
 import { assertPhysicalCap, canonical, exactFile, hash, json, profileMigrationPredecessor, privateDirectory, writeExclusive } from './package-host.mjs';
-import { prepareIsolatedMount, verifyIsolatedRelease } from './isolated-release.mjs';
+import { prepareIsolatedMount, verifyIsolatedRelease, withIsolatedVerificationDeadline } from './isolated-release.mjs';
 import { maintenanceFixtureLayout } from './package-host.mjs';
 import installation from '../src/runtime/installation-paths.json' with { type: 'json' };
 import { Ajv2020 } from 'ajv/dist/2020.js';
@@ -402,10 +404,17 @@ async function checkedGuard(path, create = true) {
 }
 
 const installerLocks = new WeakMap();
+class InstallationOperationError extends Error {
+  constructor(message, qualificationExitCode, options) {
+    super(message, options);
+    this.qualificationExitCode = qualificationExitCode;
+  }
+}
+
 async function withLock(provider, path, work, create = true, initializationExisting = false) {
   const expected = await checkedGuard(path, create);
   const held = initializationExisting ? provider.tryExistingInitializationLock(path) : provider.tryLock(path);
-  if (!held) throw new Error('The Browser installation or selected Build is in use');
+  if (!held) throw new InstallationOperationError('The Browser installation or selected Build is in use', 4);
   installerLocks.set(provider, (installerLocks.get(provider) ?? 0) + 1);
   try {
     const current = provider.assertLock(held);
@@ -603,6 +612,11 @@ async function releaseContext(release) {
 // authority. Neither public installer accepts a caller-created context,
 // verifier, native result or completion observation.
 const isolatedAuthorities = new WeakMap();
+function verifyInIsolatedContext(context, verify) {
+  return isolatedAuthorities.get(context)?.boundedVerification
+    ? withIsolatedVerificationDeadline(performance.now() + 480000, verify) : verify();
+}
+
 async function assertContext(context) {
   const authority = isolatedAuthorities.get(context);
   if (!authority) return;
@@ -636,7 +650,8 @@ async function contextProfileFormat(context, selected, custody) {
   await assertContext(context);
   const input = authority.inputs.get(selected.build), expected = authority.releases.get(selected.build);
   if (!input || expected.imageSha256 !== selected.imageSha256) throw new Error('Selected isolated release is outside the cohort');
-  const verified = await verifyIsolatedRelease({ ...input, image: join(context.images, `${selected.build}.dmg`) });
+  const verified = await verifyInIsolatedContext(context,
+    () => verifyIsolatedRelease({ ...input, image: join(context.images, `${selected.build}.dmg`) }));
   requireEqual(await installedImageReceipt(context.support, selected), { format: 1, build: expected.build,
     imageSha256: expected.imageSha256, source: expected.source, payloadDigest: expected.payloadDigest,
     launcherSha256: expected.launcher.sha256 });
@@ -662,7 +677,7 @@ async function isolatedContext(options) {
 }
 /** Private layout factory. Its only historical caller authenticates the fixed
  * four-role authority and performs separate pristine/partial setup checks. */
-async function createIsolatedContext(release, inputs, releases) {
+async function createIsolatedContext(release, inputs, releases, boundedVerification = false) {
   const { fixture } = release, support = join(fixture.fixture, 'support');
   const images = join(support, 'images'), receipts = join(support, 'releases');
   const aliases = join(fixture.fixture, 'aliases'), mount = dirname(fixture.bundle);
@@ -681,7 +696,7 @@ async function createIsolatedContext(release, inputs, releases) {
     image: join(images, `${release.build}.dmg`), selectionPath: join(support, 'selected.json'),
     runtime: fixture.runtime, state: fixture.stateRoot, journalPath: join(support, 'install-transaction.json'),
     backup: join(support, 'install-previous-launcher'), proofPath: join(receipts, `${release.build}.migration.json`) };
-  isolatedAuthorities.set(context, { release, inputs, releases, directories });
+  isolatedAuthorities.set(context, { release, inputs, releases, directories, boundedVerification });
   await assertContext(context);
   return { context, release };
 }
@@ -698,7 +713,8 @@ async function mountIsolatedCandidate(context, release, provider, initialization
   await withLock(provider, join(context.uses, `${release.build}.mount`), async handle => {
     if (initialization) requireEqual(await guardRecord(provider, join(context.uses, `${release.build}.mount`), handle), initialization.guards.mount);
     await assertContext(context);
-    const mounted = await prepareIsolatedMount({ ...authority.inputs.get(release.build), image: context.image });
+    const mounted = await verifyInIsolatedContext(context,
+      () => prepareIsolatedMount({ ...authority.inputs.get(release.build), image: context.image }));
     requireEqual(mounted, { build: release.build, imageSha256: release.imageSha256,
       bundle: release.fixture.bundle, mount: context.mount });
     await assertContext(context);
@@ -847,10 +863,15 @@ async function invokeSignedMaintenance(context, release, prepared, provider) {
   });
   let result;
   try { result = parseStrictJson(child.stdout ?? Buffer.alloc(0), 1048576); }
-  catch { throw new Error('Signed maintenance returned no valid result; installation remains closed'); }
-  if (child.error || child.status !== 0 || !valid('migration.Result', result) || result.completionSha256 === null ||
-      result.diagnostic !== null || result.busy.length || result.converted > 4096 || result.neverOpened > result.converted)
-    throw new Error('Signed maintenance did not complete; installation remains closed');
+  catch (cause) {
+    throw new InstallationOperationError('Signed maintenance returned no valid result; installation remains closed', 5, { cause });
+  }
+  const validResult = valid('migration.Result', result);
+  if (child.error || child.status !== 0 || !validResult || result.completionSha256 === null ||
+      result.diagnostic !== null || result.busy.length || result.converted > 4096 || result.neverOpened > result.converted) {
+    const exitCode = !child.error && !child.signal && validResult && result.busy.length ? 4 : 5;
+    throw new InstallationOperationError('Signed maintenance did not complete; installation remains closed', exitCode);
+  }
   if ((installerLocks.get(provider) ?? 0) !== 0 || !sameFile(await privateJson(context.journalPath, 16384), journal) ||
       !sameFile(await exactFile(context.executable, launcherLimit), launcher)) throw new Error('Maintenance handoff continuity changed');
   const accepted = Object.freeze({ ...result, busy: Object.freeze([...result.busy]) });
@@ -1298,16 +1319,30 @@ export async function installRelease(options) {
   return installVerifiedRelease(context, release, options);
 }
 
-async function installVerifiedRelease(context, release, options) {
+async function recoverCompatibleInstallation(context, provider, release, qualification) {
+  const pending = await installationJournal(context.support);
+  if (!pending || pending.value.format === 3) return;
+  if (qualification) {
+    const predecessor = qualification.predecessor;
+    const before = { selection: { format: 1, build: predecessor.build, imageSha256: predecessor.image.sha256 },
+      launcherSha256: predecessor.launcherSha256 };
+    const after = { selection: { format: 1, build: release.build, imageSha256: release.imageSha256 },
+      launcherSha256: release.launcher.sha256 };
+    if (qualification.role !== 'B' || pending.value.format !== 2 ||
+        !equal(pending.value.before, before) || !equal(pending.value.after, after))
+      throw new Error('Pending installation is outside the fixed qualification route');
+  }
+  await recoverInstall(context, provider);
+}
+
+async function installVerifiedRelease(context, release, options, qualification = null) {
   await assertContext(context);
   return withLockProvider(release.platform, async provider => {
     // Legacy recovery runs under selection EX before taking any Build EX;
     // its own Build guard must not conflict with a caller-held description.
-    await withLock(provider, join(context.support, 'selection.lock'), async () => {
-      const pending = await installationJournal(context.support);
-      if (pending && pending.value.format !== 3)
-        await recoverInstall(context, provider);
-    });
+    const recover = () => withLock(provider, join(context.support, 'selection.lock'),
+      () => recoverCompatibleInstallation(context, provider, release, qualification));
+    await recover();
     const initialJournal = await installationJournal(context.support);
     const previous = initialJournal?.value.format === 3 ? initialJournal.value.before?.selection ?? null :
       await optionalSelection(context.selectionPath);
@@ -1317,9 +1352,13 @@ async function installVerifiedRelease(context, release, options) {
         route = await installationRoute(context, release, custody);
         requireEqual(route.previous, previous);
         if (route.kind === 'legacy') throw new Error('Installation changed while taking original guards');
+        if (qualification) requireQualificationInstallRoute(route, release, qualification);
         if (route.kind === 'same' || route.kind === 'ordinary') return ordinaryInstall(context, release, options, route, custody);
         const proof = await readReopeningProof(context, release, custody);
-        if (proof) return finalizeMigration(context, release, custody);
+        if (proof) {
+          if (qualification) throw new Error('Qualification A requires the original prepared-journal observation');
+          return finalizeMigration(context, release, custody);
+        }
         if (equal(await optionalSelection(context.selectionPath), route.pending?.value.after.selection))
           throw new Error('After selection without native-bound proof stays closed');
         prepared = await prepareMigrationRelease(context, release, options, route, custody);
@@ -1328,6 +1367,13 @@ async function installVerifiedRelease(context, release, options) {
       if (completed) return completed;
       // All installer-held descriptions have closed. Native acquires its own
       // original EX set, and journal3 closes admission throughout the handoff.
+      if (qualification) {
+        await assertContext(context);
+        if ((installerLocks.get(provider) ?? 0) !== 0 ||
+            !sameFile(await privateJson(context.journalPath, 16384), prepared.journal))
+          throw new Error('Original qualification journal is not ready for observation');
+        await acknowledgeQualificationPreparation(qualification);
+      }
       const result = await invokeSignedMaintenance(context, release, prepared, provider);
       return await withInstallationGuards(context, provider, previous, release.build, async custody => {
         const observation = await verifyCompletion(context, release, prepared, result, custody);
@@ -1336,28 +1382,139 @@ async function installVerifiedRelease(context, release, options) {
       });
     } finally {
       // Only legacy transactions may roll back. Format3 persists on every
-      // failure until the exact signed candidate can finish forwards.
-      await withLock(provider, join(context.support, 'selection.lock'), async () => {
-        const pending = await installationJournal(context.support);
-        if (pending && pending.value.format !== 3)
-          await recoverInstall(context, provider);
-      });
+      // failure. Fixed A can leave the observer holding selection EX.
+      if (qualification?.role !== 'A') await recover();
     }
   });
 }
 
+function qualificationReleaseInput({ image, signedReceipt, review }) {
+  return { image, signedReceiptPath: signedReceipt, review };
+}
+
 function fixedQualificationOptions(cohort, role) {
-  const input = name => {
-    const source = cohort.originals[name].input;
-    return { image: source.image, signedReceiptPath: source.signedReceipt, review: source.review };
-  };
+  const input = name => qualificationReleaseInput(cohort.originals[name].input);
   return { ...input(role), predecessors: ['historical', 'A', 'B', 'C'].filter(name => name !== role).map(input) };
+}
+
+function authenticatedQualificationContext(cohort, role) {
+  const originals = Object.values(cohort.originals);
+  const inputs = new Map(originals.map(({ input, release }) => [release.build, qualificationReleaseInput(input)]));
+  const releases = new Map(originals.map(({ release }) => [release.build, release]));
+  return createIsolatedContext(cohort.originals[role].release, inputs, releases, true);
+}
+
+function requireQualificationInstallRoute(route, release, { role, predecessor }) {
+  const followsPredecessor = route.previous?.build === predecessor.build &&
+    route.previous.imageSha256 === predecessor.image.sha256;
+  const allowed = role === 'A' ? route.kind === 'migration' && followsPredecessor :
+    (route.kind === 'ordinary' && followsPredecessor) || (route.kind === 'same' && route.previous.build === release.build);
+  if (!allowed) throw new Error('Installation is outside the fixed qualification route');
+}
+
+function privateQualificationPipe(fd, wire) {
+  let info;
+  try { info = fstatSync(fd, { bigint: true }); } catch {
+    wire.qualificationRequire(false, 'Missing private qualification pipes', 2);
+  }
+  // Darwin anonymous pipes have no directory entry and report mode 0660.
+  wire.qualificationRequire(info.isFIFO() && info.nlink === 0n && info.uid === BigInt(userInfo().uid),
+    'Unsafe qualification pipe', 2);
+  return `${info.dev}:${info.ino}`;
+}
+
+async function readQualificationPipe(input, expiry, limit, wire) {
+  const chunks = [];
+  let size = 0;
+  const stream = addAbortSignal(expiry, input);
+  try {
+    for await (const chunk of stream) {
+      size += chunk.length;
+      wire.qualificationRequire(size <= limit, 'Qualification pipe input too large', 2);
+      chunks.push(chunk);
+    }
+  } catch (cause) {
+    if (cause.exitCode === 2) throw cause;
+    throw new InstallationOperationError('Qualification pipe read stopped', 5, { cause });
+  } finally { stream.destroy(); }
+  return Buffer.concat(chunks, size);
+}
+
+async function acknowledgeQualificationPreparation({ requestSha256, wire }) {
+  const timeout = 120000;
+  const deadline = performance.now() + timeout;
+  const expiry = AbortSignal.timeout(timeout);
+  let bytes;
+  try {
+    const notification = addAbortSignal(expiry, new Socket({ fd: 4, readable: false, writable: true }));
+    try {
+      const message = encode({ schema: 1, phase: 'prepared-journal', requestSha256 });
+      await new Promise((resolve, reject) => {
+        notification.once('error', reject);
+        notification.write(message, error => error ? reject(error) : resolve());
+      });
+    } finally { notification.destroy(); }
+
+    // The harness writes after observing the journal and closes its writer to
+    // frame the single ACK. Reject trailing or duplicate lines.
+    const input = new Socket({ fd: 3, readable: true, writable: false });
+    bytes = await readQualificationPipe(input, expiry, 1024, wire);
+  } catch (cause) {
+    if (cause.exitCode === 2 || cause instanceof InstallationOperationError) throw cause;
+    throw new InstallationOperationError('Prepared-journal acknowledgement transport stopped', 5, { cause });
+  }
+  wire.qualificationRequire(performance.now() < deadline && bytes.length > 0,
+    'Qualification acknowledgement was lost or expired', 5);
+  wire.qualificationRequire(bytes.indexOf(0x0a) === bytes.length - 1,
+    'Expected one qualification acknowledgement line', 2);
+  const value = wire.qualificationJson(bytes, 1024);
+  wire.qualificationKeys(value, ['schema', 'phase', 'requestSha256']);
+  wire.qualificationRequire(value.schema === 1 && value.phase === 'continue' &&
+    value.requestSha256 === requestSha256, 'Qualification acknowledgement differs', 2);
+}
+
+async function qualificationInstallEntry() {
+  const wire = await import('./qualification-authority.mjs');
+  try {
+    wire.qualificationRequire(process.argv.length === 3, 'Invalid fixed install entry', 2);
+    const requestPipe = privateQualificationPipe(0, wire);
+    const bytes = await readQualificationPipe(process.stdin, AbortSignal.timeout(120000), 16384, wire);
+    const value = wire.qualificationJson(bytes);
+    wire.qualificationKeys(value, ['schema', 'action', 'role', 'authoritySha256']);
+    const { role, authoritySha256 } = value;
+    wire.qualificationRequire(value.schema === 1 && value.action === 'install' &&
+      (role === 'A' || role === 'B'), 'Invalid fixed install request', 2);
+    if (role === 'A') {
+      const endpoints = [requestPipe, privateQualificationPipe(3, wire), privateQualificationPipe(4, wire)];
+      wire.qualificationRequire(new Set(endpoints).size === 3, 'Qualification pipes must be distinct', 2);
+    }
+    const before = await wire.authenticateQualification(authoritySha256);
+    const predecessor = before.observation.releases[role === 'A' ? 'historical' : 'A'];
+    const expected = before.observation.releases[role];
+    const options = qualificationReleaseInput(before.originals[role].input);
+    const { context, release } = await authenticatedQualificationContext(before, role);
+    requireEqual(release.fixture.fixture, wire.qualificationFixture);
+    requireEqual(release.build, expected.build);
+    requireEqual(release.imageSha256, expected.image.sha256);
+    requireEqual(release.receiptSha256, expected.signedReceipt.sha256);
+    const result = await installVerifiedRelease(context, release, options,
+      { role, predecessor, requestSha256: hash(bytes), wire });
+    requireEqual(result.build, expected.build);
+    const after = await wire.authenticateQualification(authoritySha256);
+    requireEqual(after.observation, before.observation, 'Qualification authority changed during install');
+    const selected = await fixedQualificationSelection(after, role, true);
+    wire.qualificationOutput({ schema: 1, authoritySha256, selected });
+  } catch (error) {
+    if (error instanceof InstallationOperationError) error.exitCode = error.qualificationExitCode;
+    wire.qualificationFailure(error);
+  }
 }
 
 /** A result is an observation following the real install, not a selector or
  * substitute for the shared owner's common eligibility/lock/postcheck. */
-async function fixedQualificationSelection(cohort, role) {
-  const { context, release } = await isolatedContext(fixedQualificationOptions(cohort, role));
+async function fixedQualificationSelection(cohort, role, authenticated = false) {
+  const { context, release } = authenticated ? await authenticatedQualificationContext(cohort, role) :
+    await isolatedContext(fixedQualificationOptions(cohort, role));
   requireEqual(release.build, cohort.observation.releases[role].build);
   return withLockProvider(release.platform, provider => withInstallationGuards(context, provider, null, release.build, async custody => {
     const selected = { format: 1, build: release.build, imageSha256: release.imageSha256 };
@@ -1552,7 +1709,9 @@ async function qualificationInitializeEntry() {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  if (process.argv[2] === 'qualification-forward-v1') {
+  if (process.argv[2] === 'qualification-install-v1') {
+    await qualificationInstallEntry();
+  } else if (process.argv[2] === 'qualification-forward-v1') {
     await qualificationForwardEntry();
   } else if (process.argv[2] === 'qualification-initialize-v1') {
     await qualificationInitializeEntry();
