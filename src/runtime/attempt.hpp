@@ -351,12 +351,15 @@ inline bool qualificationStagingPoint(id point) {
 inline bool qualificationNativePublicationPoint(id point) {
   return [@[@"record-rename",@"record-durable",@"claim-retained",@"capture-durable",@"receipt-durable"] containsObject:point];
 }
+inline bool qualificationProgressPoint(id point) {
+  return [@[@"committed-progress",@"completion"] containsObject:point];
+}
 inline bool qualificationTransactionStartPoint(id point) {
   return [@[@"before-transaction",@"transaction-publication",@"current-publication",@"native-rename-excl"] containsObject:point] ||
-    qualificationStagingPoint(point) || qualificationNativePublicationPoint(point);
+    qualificationStagingPoint(point) || qualificationNativePublicationPoint(point) || qualificationProgressPoint(point);
 }
 inline bool qualificationEnginePoint(id point) {
-  return qualificationTransactionStartPoint(point) || [@[@"committed-progress",@"completion"] containsObject:point];
+  return qualificationTransactionStartPoint(point);
 }
 inline bool enabledQualificationEnginePoint(id point) {
   // Each writer enables only the point it actually implements.

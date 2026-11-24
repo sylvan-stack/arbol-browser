@@ -5,7 +5,7 @@ import { isDeepStrictEqual } from 'node:util';
 import type { Contract } from '../contracts/generated.js';
 import { validator } from '../contracts/schema.js';
 import { assertMigrationCommitReceipt, assertMigrationCompletionEvidence, assertMigrationInspectionReceipt, assertMigrationRecoveryReceipt,
-  type HeldLock, type MaintenanceScratch, type MaintenanceStagingPoint, type MigrationCommitReceipt,
+  type HeldLock, type MaintenanceProgressPoint, type MaintenanceScratch, type MaintenanceStagingPoint, type MigrationCommitReceipt,
   type MigrationCompletionEvidence, type MigrationInspectionReceipt } from '../runtime/platform.js';
 import { withMigrationInspection } from '../runtime/migration-exit.js';
 import { migrationDirectory, migrationIdentity, migrationValue, readMigrationFile, sameMigrationFile, sameMigrationIdentity,
@@ -219,6 +219,15 @@ export async function assertConvertedMigrationProfile(transaction: MigrationTran
   } else await migrationAbsent(join(owner.path, 'engine.json'));
   if (!sameMigrationIdentity(await migrationDirectory(owner.path), entry.directory)) throw profileUnavailable();
 }
+function parkWrittenProgress(transaction: MigrationTransaction, point: MaintenanceProgressPoint,
+  profileSha256: string | null, { identity, sha256 }: MigrationContent, deadline: number): void {
+  const { custody, platform } = transaction.admission;
+  if (!platform.maintenanceInterruptionMatches?.(custody, point)) return;
+  const park = platform.parkMaintenanceProgress;
+  if (!park) throw profileUnavailable();
+  park.call(platform, custody, point, { attempt: transaction.value.attempt, profileSha256, file: { identity, sha256 } }, deadline);
+  throw profileUnavailable();
+}
 export async function publishMigrationCommitted(transaction: MigrationTransaction, registry: HeldLock, owner: MigrationOwner,
   entry: Entry, receipt: MigrationCommitReceipt, deadline: number): Promise<void> {
   assertMigrationCommitReceipt(receipt, transaction.admission.custody);
@@ -239,8 +248,9 @@ export async function publishMigrationCommitted(transaction: MigrationTransactio
   const committed: Contract<'migration.Committed'> = { format: 1, attempt: transaction.value.attempt,
     profileSha256: entry.pathSha256, receipt: receipt.receipt };
   if (!validator('migration.Committed')(committed)) throw profileUnavailable();
-  await publishMigrationFile(transaction.admission, join(transaction.attempt, 'progress', `${entry.pathSha256}.committed.json`),
+  const file = await publishMigrationFile(transaction.admission, join(transaction.attempt, 'progress', `${entry.pathSha256}.committed.json`),
     Buffer.from(`${JSON.stringify(committed)}\n`), deadline, assert);
+  parkWrittenProgress(transaction, 'committed-progress', entry.pathSha256, file, deadline);
 }
 /** Continuation is only a routing hint. Native independently proves original,
  * mid-pair or converted metadata before the corresponding action. */
@@ -319,7 +329,10 @@ export async function publishMigrationCompletion(transaction: MigrationTransacti
   const completion: Contract<'migration.Completion'> = { format: 1, attempt: transaction.value.attempt,
     transactionSha256: transaction.file.sha256, profiles: items };
   if (!validator('migration.Completion')(completion)) throw profileUnavailable();
-  return publishMigrationFile(transaction.admission, join(transaction.attempt, 'completed.json'), Buffer.from(`${JSON.stringify(completion)}\n`), deadline, assert);
+  const file = await publishMigrationFile(transaction.admission, join(transaction.attempt, 'completed.json'),
+    Buffer.from(`${JSON.stringify(completion)}\n`), deadline, assert);
+  parkWrittenProgress(transaction, 'completion', null, file, deadline);
+  return file;
 }
 export async function cleanMigrationStaging(transaction: MigrationTransaction, deadline: number,
   assertCustody: () => Promise<void>): Promise<void> {

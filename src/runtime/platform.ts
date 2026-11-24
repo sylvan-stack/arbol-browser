@@ -64,6 +64,12 @@ export type MaintenanceInterruptionPoint =
   | 'claim-retained' | 'capture-durable' | 'receipt-durable' | 'committed-progress' | 'completion';
 
 export type MaintenanceTransactionPoint = 'before-transaction' | 'transaction-publication' | 'current-publication';
+export type MaintenanceProgressPoint = 'committed-progress' | 'completion';
+export type MaintenanceProgressWitness = Readonly<{
+  attempt: string;
+  profileSha256: string | null;
+  file: MaintenanceFileEvidence;
+}>;
 export type MaintenanceTransactionWitness = Readonly<{
   attempt: string;
   transaction: MaintenanceFileEvidence;
@@ -344,6 +350,8 @@ export interface PlatformPort {
     witness: MaintenanceTransactionWitness, deadline: number): never;
   parkMaintenanceStaging?(custody: MaintenanceCustody, point: MaintenanceStagingPoint, attempt: string,
     profileSha256: string, staging: MaintenanceFileEvidence['identity'], scratch: MaintenanceScratch | null, deadline: number): never;
+  parkMaintenanceProgress?(custody: MaintenanceCustody, point: MaintenanceProgressPoint,
+    witness: MaintenanceProgressWitness, deadline: number): never;
   observeMaintenanceStateRoot(custody: MaintenanceCustody): MaintenanceStateRoot;
   publishMaintenanceFile(custody: MaintenanceCustody, source: string, destination: string,
     parent: MaintenanceFileEvidence['identity'], file: MaintenanceFileEvidence, deadline: number): void;
@@ -425,6 +433,7 @@ interface NativeSupport {
   bindMaintenanceTransaction?(handle: object, archive: string, registry: object | null, owners: readonly object[], deadline: number): void;
   parkMaintenanceTransaction?(handle: object, point: MaintenanceTransactionPoint, witness: string, deadline: number): never;
   parkMaintenanceStaging?(handle: object, point: MaintenanceStagingPoint, witness: string, deadline: number): never;
+  parkMaintenanceProgress?(handle: object, point: MaintenanceProgressPoint, witness: string, deadline: number): never;
   publishMaintenanceFile?(handle: object, source: string, destination: string, expected: string, deadline: number): void;
   observeMaintenanceStateRoot?(handle: object): string;
   assertMaintenanceStateRoot?(handle: object): void;
@@ -747,6 +756,19 @@ export function loadPlatform(): PlatformPort {
       if (sampled >= deadline) throw unavailable('profile');
       call(() => park(handle, point, JSON.stringify({ attempt, profileSha256, staging, scratch }),
         nativeNow + Math.min(10000, deadline - sampled)));
+      throw unavailable('profile');
+    },
+    parkMaintenanceProgress(custody: MaintenanceCustody, point: MaintenanceProgressPoint,
+      witness: MaintenanceProgressWitness, deadline: number): never {
+      assertMaintenanceCustody(custody);
+      const handle = maintenanceHandles.get(custody), park = native.parkMaintenanceProgress;
+      if (!handle || typeof park !== 'function' || !Number.isFinite(deadline) ||
+          !/^[0-9a-f]{32}$/.test(witness.attempt) || !validator('migration.File')(witness.file) ||
+          (point === 'committed-progress' ? typeof witness.profileSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(witness.profileSha256) :
+            point !== 'completion' || witness.profileSha256 !== null)) throw unavailable('profile');
+      const nativeNow = call(() => native.continuousTime()), sampled = performance.now();
+      if (sampled >= deadline) throw unavailable('profile');
+      call(() => park(handle, point, JSON.stringify(witness), nativeNow + Math.min(10000, deadline - sampled)));
       throw unavailable('profile');
     },
     publishMaintenanceFile(custody: MaintenanceCustody, source: string, destination: string,

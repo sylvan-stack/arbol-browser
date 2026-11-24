@@ -13,6 +13,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <libproc.h>
+#include <map>
 #include <bsm/libbsm.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -715,6 +716,27 @@ struct QualificationStagingWriter {
   NSDictionary* marker = nil;
   NSDictionary* staged = nil;
 };
+struct QualificationProgressProof {
+  NSDictionary* receipt = nil;
+  NSDictionary* receiptsParent = nil;
+  std::vector<std::pair<std::string,struct stat>> files;
+  std::vector<std::pair<std::string,struct stat>> directories;
+  std::vector<std::pair<std::string,struct stat>> unchangedDirectories;
+  std::string staging, absentMarker;
+  struct stat stagingStamp{};
+};
+struct QualificationProgressProfile {
+  std::unique_ptr<QualificationProgressProof> proof;
+  NSDictionary* committed = nil;
+  struct stat committedStamp{};
+};
+struct QualificationProgressWriter {
+  NSArray* profiles = nil;
+  std::map<std::string,QualificationProgressProfile> byHash;
+  NSDictionary* stagingParent = nil;
+  NSDictionary* completion = nil;
+  struct stat completionStamp{};
+};
 struct MaintenanceCustody {
   bool installed = false;
   arbol_attempt::IsolatedMaintenanceAdmission isolated;
@@ -744,6 +766,7 @@ struct MaintenanceCustody {
   std::vector<HeldLock*> interruptionOwners;
   std::set<std::string> interruptionProfileNames;
   QualificationStagingWriter stagingWriter;
+  QualificationProgressWriter progressWriter; // Owning N-API thread only.
   const arbol_attempt::PackagedLayout& layout() const { return installed ? production.layout : isolated.authority.layout; }
   arbol_attempt::MaintenanceGuard& oldGuard() { return installed ? production.oldBuild : isolated.oldBuild; }
   arbol_attempt::MaintenanceGuard& newGuard() { return installed ? production.newBuild : isolated.newBuild; }
@@ -1096,6 +1119,44 @@ static bool prepareQualificationStaging(MaintenanceCustody& custody,const arbol_
   writer.progress=progress+"/"+hash;
   return true;
 }
+static bool prepareQualificationProgress(MaintenanceCustody& custody,const arbol_attempt::MaintenanceFile& file) {
+  using namespace arbol_attempt;
+  auto& writer=custody.progressWriter;
+  NSDictionary* transaction=arbol_exit::strictManagementObject(file.content,qualificationTransactionLimit);
+  NSDictionary* root=transaction[@"root"];
+  if (writer.profiles || !maintenanceStateRoot || !arbol_exit::migrationTransaction(transaction) ||
+      ![transaction[@"attempt"] isEqual:custody.interruptionAttempt] ||
+      ![transaction[@"epoch"] isEqual:custody.epoch] || ![transaction[@"journal"] isEqual:custody.journal().record()] ||
+      ![transaction[@"runtime"] isEqual:maintenanceIdentity(custody.runtime().identity)] ||
+      ![root[@"path"] isEqual:custody.stateRoot()]) return false;
+  if (maintenanceStateRoot->absent) {
+    if (![root[@"initial"] isEqual:@"absent"]) return false;
+  } else if (!custody.interruptionProfiles ||
+      ![root[@"identity"] isEqual:maintenanceIdentity(maintenanceStateRoot->identity)] ||
+      ![root[@"profiles"] isEqual:maintenanceIdentity(custody.interruptionProfiles->identity)] ||
+      !qualificationGuardIdentity(custody.interruptionRegistry,root[@"registry"])) return false;
+  NSMutableArray* profiles=[NSMutableArray new];
+  for (NSDictionary* profile in transaction[@"profiles"]) {
+    NSString* hash=profile[@"pathSha256"];
+    [profiles addObject:hash];
+    writer.byHash.try_emplace(hash.UTF8String);
+  }
+  if (!profiles.count && [custody.interruption[@"point"] isEqual:@"committed-progress"]) return false;
+  writer.profiles=[profiles copy];
+  return true;
+}
+static NSDictionary* qualificationCompletion(const MaintenanceCustody& custody) {
+  const auto& writer=custody.progressWriter;
+  if (!writer.profiles) return nil;
+  NSMutableArray* entries=[NSMutableArray new];
+  for (NSString* hash in writer.profiles) {
+    const auto& profile=writer.byHash.at(hash.UTF8String);
+    if (!profile.proof || !profile.committed) return nil;
+    [entries addObject:@{@"profileSha256":hash,@"receiptSha256":profile.proof->receipt[@"sha256"]}];
+  }
+  return @{@"format":@1,@"attempt":custody.publishedTransactionAttempt,
+    @"transactionSha256":custody.publishedTransaction[@"sha256"],@"profiles":entries};
+}
 
 static napi_value bindMaintenanceTransaction(napi_env env,napi_callback_info info) {
   napi_value args[5],out; size_t count=5; void* raw=nullptr; std::string encoded; double deadline=0;
@@ -1307,6 +1368,126 @@ static napi_value parkMaintenanceStaging(napi_env env,napi_callback_info info) {
   } @catch (NSException*) { return fail(env); } } catch (...) { return fail(env); } }
 }
 
+static bool qualificationProgressCurrent(const QualificationProgressProfile& profile,
+    const arbol_attempt::MaintenanceDirectory& progress,const arbol_attempt::MaintenanceDirectory& receipts,
+    const std::string& hash) {
+  using namespace arbol_attempt;
+  if (!profile.proof || !profile.committed ||
+      ![maintenanceIdentity(receipts.identity) isEqual:profile.proof->receiptsParent]) return false;
+  struct stat named{};
+  if (fstatat(progress.fd,(hash+".committed.json").c_str(),&named,AT_SYMLINK_NOFOLLOW) ||
+      !sameFile(named,profile.committedStamp)) return false;
+  for (const auto& [path, stamp]:profile.proof->files) {
+    if (!arbol_boundary::canonical(path) || lstat(path.c_str(),&named) || !sameFile(stamp,named)) return false;
+  }
+  for (const auto& [path, stamp]:profile.proof->directories) {
+    if (!arbol_boundary::canonical(path) || lstat(path.c_str(),&named) || !S_ISDIR(named.st_mode) ||
+        named.st_dev!=stamp.st_dev || named.st_ino!=stamp.st_ino || named.st_uid!=stamp.st_uid || named.st_mode!=stamp.st_mode)
+      return false;
+  }
+  for (const auto& [path, stamp]:profile.proof->unchangedDirectories) {
+    MaintenanceDirectory directory;
+    if (!directory.openPath(path,maintenanceIdentity(stamp)) || !qualificationDirectoryUnchanged(directory,stamp)) return false;
+  }
+  MaintenanceDirectory staging;
+  return (profile.proof->absentMarker.empty() || qualificationFileAbsent(profile.proof->absentMarker)) &&
+    staging.openPath(profile.proof->staging,maintenanceIdentity(profile.proof->stagingStamp)) &&
+    qualificationDirectoryUnchanged(staging,profile.proof->stagingStamp);
+}
+
+static napi_value parkMaintenanceProgress(napi_env env,napi_callback_info info) {
+  napi_value args[4]; size_t count=4; void* raw=nullptr; std::string point,encoded; double deadline=0;
+  if (napi_get_cb_info(env,info,&count,args,nullptr,nullptr)!=napi_ok || count!=4 ||
+      napi_get_value_external(env,args[0],&raw)!=napi_ok || !raw || raw!=maintenanceCustody || !maintenanceCustody->accepted ||
+      !boundedText(env,args[1],point,48) || !boundedText(env,args[2],encoded) ||
+      napi_get_value_double(env,args[3],&deadline)!=napi_ok || !std::isfinite(deadline) ||
+      deadline<=arbol_boundary::clockMs() || deadline>arbol_boundary::clockMs()+10000) return fail(env);
+  @autoreleasepool { try { @try {
+    using namespace arbol_attempt;
+    auto& custody=*maintenanceCustody;
+    auto& writer=custody.progressWriter;
+    NSString* name=[NSString stringWithUTF8String:point.c_str()];
+    NSDictionary* witness=arbol_exit::strictManagementObject(encoded);
+    if (!qualificationProgressPoint(name) || ![custody.interruption[@"point"] isEqual:name] ||
+        !custody.originalInterruption() || !writer.profiles || !keys(witness,@[@"attempt",@"profileSha256",@"file"]) ||
+        !custody.publishedCurrentParent || !custody.publishedTransactionParent || !custody.publishedProgressParent) return fail(env);
+    NSString* attempt=witness[@"attempt"], *transactionHash=custody.publishedTransaction[@"sha256"];
+    id hash=witness[@"profileSha256"];
+    const bool complete=point=="completion";
+    if (![attempt isEqual:custody.publishedTransactionAttempt] || !qualificationTransactionArchive(custody,attempt,transactionHash) ||
+        !qualificationTransactionGuards(custody) ||
+        (complete ? hash!=NSNull.null : !qualificationDigest(hash) || ![hash isEqual:writer.profiles.firstObject])) return fail(env);
+    NSArray* profiles=complete ? writer.profiles : @[hash];
+    const auto* profile=complete ? nullptr : &writer.byHash.at([hash UTF8String]);
+    if (profile && !profile->proof) return fail(env);
+    NSDictionary* expected=complete ? writer.completion : profile->committed;
+    if (!expected || ![witness[@"file"] isEqual:expected]) return fail(env);
+    const std::string rootPath=custody.runtime().path+"/browser-profile-migration", attemptPath=rootPath+"/"+attempt.UTF8String;
+    const std::string completedPath=attemptPath+"/completed.json", receiptsPath=rootPath+"/receipts";
+    const std::string stagingPath=std::string(custody.stateRoot().fileSystemRepresentation)+"/migration-staged/"+attempt.UTF8String;
+    MaintenanceDirectory root,local,progress,receipts,staging;
+    MaintenanceFile pointer,transaction,output,receipt;
+    struct stat progressStamp{},receiptsStamp{},stagingStamp{};
+    std::set<std::string> progressNames,receiptNames,stagingNames;
+    if (!root.openPath(rootPath,custody.publishedCurrentParent) ||
+        !local.openPath(attemptPath,custody.publishedTransactionParent) ||
+        !progress.openPath(attemptPath+"/progress",custody.publishedProgressParent) ||
+        fstat(progress.fd,&progressStamp) ||
+        !openQualificationFile(pointer,rootPath+"/current",custody.publishedCurrent,limit,deadline,true) ||
+        !qualificationPointer(pointer,attempt,transactionHash) ||
+        !openQualificationFile(transaction,attemptPath+"/transaction.json",custody.publishedTransaction,qualificationTransactionLimit,deadline))
+      return fail(env);
+    if (profiles.count) {
+      const auto& first=writer.byHash.at([profiles.firstObject UTF8String]);
+      if (!first.proof || !receipts.openPath(receiptsPath,first.proof->receiptsParent) || fstat(receipts.fd,&receiptsStamp) ||
+          !writer.stagingParent || !staging.openPath(stagingPath,writer.stagingParent) || fstat(staging.fd,&stagingStamp)) return fail(env);
+      for (NSString* member in profiles) {
+        const std::string leaf=member.UTF8String;
+        progressNames.insert(leaf+".staged.json"); progressNames.insert(leaf+".committed.json");
+        receiptNames.insert(leaf+".json");
+        stagingNames.insert(leaf);
+      }
+    }
+    if (complete) {
+      if (!openQualificationFile(output,completedPath,expected,1048576,deadline,true) ||
+          !sameFile(output.identity,writer.completionStamp) ||
+          ![arbol_exit::strictManagementObject(output.content,1048576) isEqual:qualificationCompletion(custody)]) return fail(env);
+    } else {
+      const std::string leaf=[hash UTF8String];
+      if (!openQualificationFile(output,progress.path+"/"+leaf+".committed.json",expected,limit,deadline) ||
+          !sameFile(output.identity,profile->committedStamp) ||
+          !openQualificationFile(receipt,receipts.path+"/"+leaf+".json",profile->proof->receipt,arbol_exit::exitReceiptLimit,deadline))
+        return fail(env);
+    }
+    const auto current=[&] {
+      if (!qualificationTransactionArchive(custody,attempt,transactionHash) || !qualificationTransactionGuards(custody) ||
+          !root.current() || !local.current() || !progress.current() || !pointer.current() ||
+          !transaction.current() || !output.current() ||
+          (!complete && (!receipt.current() || !qualificationFileAbsent(completedPath)))) return false;
+      if (!profiles.count) {
+        return !writer.stagingParent && qualificationDirectoryNames(progress,{}) && qualificationFileAbsent(receiptsPath) &&
+          qualificationFileAbsent(stagingPath) &&
+          qualificationDirectoryUnchanged(progress,progressStamp);
+      }
+      if (!qualificationDirectoryNames(progress,progressNames) || !qualificationDirectoryNames(receipts,receiptNames) ||
+          !qualificationDirectoryNames(staging,stagingNames)) return false;
+      for (NSString* member in profiles) {
+        if (arbol_boundary::clockMs()>=deadline ||
+            !qualificationProgressCurrent(writer.byHash.at(member.UTF8String),progress,receipts,member.UTF8String)) return false;
+      }
+      return qualificationDirectoryUnchanged(receipts,receiptsStamp) &&
+        qualificationDirectoryUnchanged(progress,progressStamp) &&
+        qualificationDirectoryUnchanged(staging,stagingStamp) && output.current();
+    };
+    NSArray* artifacts=complete ? @[qualificationArtifact(@"completion",output,expected[@"sha256"])] :
+      @[qualificationArtifact(@"receipt",receipt,profile->proof->receipt[@"sha256"]),
+        qualificationArtifact(@"committed",output,expected[@"sha256"])];
+    NSDictionary* frame=@{@"attempt":attempt,@"transactionSha256":transactionHash,@"profileSha256":hash,@"artifacts":artifacts};
+    custody.parkInterruption(name,frame,deadline,current);
+    return fail(env);
+  } @catch (NSException*) { return fail(env); } } catch (...) { return fail(env); } }
+}
+
 // Management publication only; ordinary profile metadata and retained native
 // receipts have their own, stronger publication/permit routes. A single-link
 // inode moves atomically, including when this process dies during publication.
@@ -1331,7 +1512,8 @@ static napi_value publishMaintenanceFile(napi_env env,napi_callback_info info) {
     const bool beforeTransaction=[point isEqual:@"before-transaction"], afterTransaction=[point isEqual:@"transaction-publication"];
     const bool afterCurrent=[point isEqual:@"current-publication"], beforePointerSync=[point isEqual:@"native-rename-excl"];
     const bool stagingControl=qualificationStagingPoint(point);
-    const bool nativeControl=qualificationNativePublicationPoint(point);
+    const bool progressControl=qualificationProgressPoint(point);
+    const bool nativeControl=qualificationNativePublicationPoint(point) || progressControl;
     NSString* transactionAttempt=nil;
     if (qualificationTransactionStartPoint(point) && to=="transaction.json" && within(parentPath,runtimeRoot)) {
       transactionAttempt=[NSString stringWithUTF8String:parentPath.c_str()+runtimeRoot.size()+1];
@@ -1351,15 +1533,20 @@ static napi_value publishMaintenanceFile(napi_env env,napi_callback_info info) {
     NSDictionary* expected=json(encoded);
     if(!keys(expected,@[@"parent",@"file"])||!keys(expected[@"file"],@[@"identity",@"sha256"])||
        !pattern(expected[@"file"][@"sha256"],@"^[0-9a-f]{64}$")) return fail(env);
-    MaintenanceDirectory parent; MaintenanceFile file,transaction;
-    if(!parent.openPath(parentPath,expected[@"parent"])||!file.openPath(source,0600,trackPointer?off_t(limit):1500000000,trackPointer)||
-       file.identity.st_dev!=parent.identity.st_dev||
-       ![maintenanceIdentity(file.identity) isEqual:expected[@"file"][@"identity"]]||
-       ![file.sha256(deadline) isEqual:expected[@"file"][@"sha256"]]) return fail(env);
     NSString* originalAttempt=maintenanceCustody->publishedTransactionAttempt;
     NSDictionary* originalTransaction=maintenanceCustody->publishedTransaction;
     const std::string originalPath=originalAttempt ? runtimeRoot+"/"+originalAttempt.UTF8String : std::string{};
     NSString* progressName=[NSString stringWithUTF8String:to.c_str()];
+    const bool writeCommitted=progressControl && originalAttempt && parentPath==originalPath+"/progress" &&
+      pattern(progressName,@"\\A[0-9a-f]{64}\\.committed\\.json\\z");
+    const bool writeCompletion=progressControl && originalAttempt && parentPath==originalPath && to=="completed.json";
+    const bool progressOutput=writeCommitted || writeCompletion;
+    const off_t maximum=writeCompletion?1048576:(trackPointer||writeCommitted)?off_t(limit):1500000000;
+    MaintenanceDirectory parent; MaintenanceFile file,transaction;
+    if(!parent.openPath(parentPath,expected[@"parent"])||!file.openPath(source,0600,maximum,trackPointer || progressOutput)||
+       file.identity.st_dev!=parent.identity.st_dev||
+       ![maintenanceIdentity(file.identity) isEqual:expected[@"file"][@"identity"]]||
+       ![file.sha256(deadline) isEqual:expected[@"file"][@"sha256"]]) return fail(env);
     const bool nativeProgress=nativeControl && parentPath==originalPath+"/progress" &&
       pattern(progressName,@"\\A[0-9a-f]{64}\\.staged\\.json\\z");
     const std::string nativeStageRoot=originalAttempt ? stagingRoot+"/"+originalAttempt.UTF8String : std::string{};
@@ -1369,23 +1556,46 @@ static napi_value publishMaintenanceFile(napi_env env,napi_callback_info info) {
     if (trackPointer && (!qualificationNonce(originalAttempt) || !originalTransaction || maintenanceCustody->publishedCurrent ||
         !qualificationPointer(file,originalAttempt,originalTransaction[@"sha256"]) ||
         !openQualificationFile(transaction,originalPath+"/transaction.json",originalTransaction,
-          qualificationTransactionLimit,deadline,stagingControl))) return fail(env);
+          qualificationTransactionLimit,deadline,stagingControl || progressControl))) return fail(env);
     MaintenanceDirectory transactionParent,progressParent;
     if (trackPointer && (stagingControl || nativeControl) && (!maintenanceCustody->publishedTransactionParent ||
         !transactionParent.openPath(originalPath,maintenanceCustody->publishedTransactionParent) ||
         (stagingControl && !prepareQualificationStaging(*maintenanceCustody,transaction)) ||
+        (progressControl && !prepareQualificationProgress(*maintenanceCustody,transaction)) ||
         (nativeControl && !progressParent.openPath(originalPath+"/progress")))) return fail(env);
     if (nativeProgress && (!maintenanceCustody->nativeStagedPublications ||
         ![maintenanceIdentity(parent.identity) isEqual:maintenanceCustody->publishedProgressParent])) return fail(env);
     if (nativeRecord && (!maintenanceCustody->nativeStagingParents ||
         maintenanceCustody->nativeStagingParents[nativeStageHash])) return fail(env);
-    const bool stageArtifact=stageRecord || stageMarker || stageProgress || nativeProgress || nativeRecord;
+    auto& progressWriter=maintenanceCustody->progressWriter;
+    MaintenanceDirectory stagingAttempt;
+    if (nativeRecord && progressControl && !stagingAttempt.openPath(nativeStageRoot,progressWriter.stagingParent)) return fail(env);
+    QualificationProgressProfile* committed=nullptr;
+    if (writeCommitted) {
+      NSString* hash=[progressName substringToIndex:64];
+      auto found=progressWriter.byHash.find(hash.UTF8String);
+      if (found==progressWriter.byHash.end() || !found->second.proof || found->second.committed ||
+          ![maintenanceIdentity(parent.identity) isEqual:maintenanceCustody->publishedProgressParent] ||
+          ([point isEqual:@"committed-progress"] && ![hash isEqual:progressWriter.profiles.firstObject])) return fail(env);
+      committed=&found->second;
+      NSDictionary* actual=arbol_exit::strictManagementObject(file.content);
+      NSDictionary* expected=@{@"format":@1,@"attempt":originalAttempt,@"profileSha256":hash,@"receipt":committed->proof->receipt};
+      if (!arbol_exit::migrationFormat(actual[@"format"],1) || ![actual isEqual:expected]) return fail(env);
+    }
+    if (writeCompletion) {
+      NSDictionary* actual=arbol_exit::strictManagementObject(file.content,1048576);
+      if (![point isEqual:@"completion"] || progressWriter.completion ||
+          ![maintenanceIdentity(parent.identity) isEqual:maintenanceCustody->publishedTransactionParent] ||
+          !arbol_exit::migrationFormat(actual[@"format"],1) || ![actual isEqual:qualificationCompletion(*maintenanceCustody)]) return fail(env);
+    }
+    const bool stageArtifact=stageRecord || stageMarker || stageProgress || nativeProgress || nativeRecord || progressOutput;
     NSString* attempt=(trackPointer || stageArtifact)?originalAttempt:transactionAttempt;
     NSString* transactionHash=(trackPointer || stageArtifact)?originalTransaction[@"sha256"]:expected[@"file"][@"sha256"];
     auto current=[&] {
       return custody()&&parent.current()&&file.current()&&(!trackPointer||transaction.current())&&
         (!(trackPointer && (stagingControl || nativeControl)) || transactionParent.current()) &&
         (!(trackPointer && nativeControl) || progressParent.current()) &&
+        (stagingAttempt.fd<0 || stagingAttempt.current()) &&
         (!stageProgress || (writer.progressDirectory.current() &&
            [maintenanceIdentity(parent.identity) isEqual:maintenanceIdentity(writer.progressDirectory.identity)])) &&
         (!attempt || (qualificationTransactionArchive(*maintenanceCustody,attempt,transactionHash) &&
@@ -1435,6 +1645,15 @@ static napi_value publishMaintenanceFile(napi_env env,napi_callback_info info) {
     if (nativeProgress)
       maintenanceCustody->nativeStagedPublications[progressName]=qualificationFileReference(file,expected[@"file"][@"sha256"]);
     if (nativeRecord) maintenanceCustody->nativeStagingParents[nativeStageHash]=maintenanceIdentity(parent.identity);
+    if (stagingAttempt.fd>=0 && !progressWriter.stagingParent) progressWriter.stagingParent=maintenanceIdentity(stagingAttempt.identity);
+    if (committed) {
+      committed->committed=qualificationFileReference(file,expected[@"file"][@"sha256"]);
+      committed->committedStamp=file.identity;
+    }
+    if (writeCompletion) {
+      progressWriter.completion=qualificationFileReference(file,expected[@"file"][@"sha256"]);
+      progressWriter.completionStamp=file.identity;
+    }
     napi_value out; if(napi_get_undefined(env,&out)!=napi_ok) return fail(env); return out;
   } @catch(NSException*) { return fail(env); } } catch(...) { return fail(env); } }
 }
@@ -2982,6 +3201,8 @@ struct ExitInspection {
   NSString* qualificationPoint = nil;
   NSDictionary* qualificationStaged = nil;
   NSDictionary* qualificationStagingParent = nil;
+  std::unique_ptr<QualificationProgressProof> qualificationProgress;
+  QualificationProgressProof* qualificationProofCapture = nullptr; // Stack-scoped in native receipt validation.
   std::thread* thread=nullptr;
   bool within() const { return !cancelled.load(std::memory_order_acquire)&&arbol_boundary::clockMs()<deadline&&
     arbol_boundary::lockIdentity(owner)&&arbol_boundary::lockIdentity(build)&&
@@ -3196,6 +3417,7 @@ static bool receiptFrontier(NSDictionary* capability,NSDictionary* frontier,NSSt
       if(![arbol_attempt::digest(arbol_attempt::bytes(core)) isEqual:stream[@"chain"]]) return false;
     }
     if(fstat(file.fd,&after)||lstat(path.fileSystemRepresentation,&named)||!stamp.is(after)||!stamp.is(named)||!file.finish()) return false;
+    if(job.qualificationProofCapture) job.qualificationProofCapture->files.emplace_back(path.fileSystemRepresentation,after);
   }
   return job.within();
 }
@@ -3266,6 +3488,7 @@ static bool receiptMetadata(NSDictionary* capability,NSDictionary* attempt,ExitI
     !S_ISDIR(child.st_mode)||child.st_dev!=directory.st_dev||![arbol_exit::fileIdentity(child) isEqual:capability[@"directories"][name]]) return false;
   if(lstat(receipt.fileSystemRepresentation,&receiptIdentity)||!S_ISDIR(receiptIdentity.st_mode)||receiptIdentity.st_dev!=directory.st_dev||
      ![arbol_exit::fileIdentity(receiptIdentity) isEqual:capability[@"receiptDirectory"][@"identity"]]) return false;
+  if(job.qualificationProofCapture) job.qualificationProofCapture->directories.emplace_back(receipt.fileSystemRepresentation,receiptIdentity);
   return root.finish()&&job.within();
 }
 static bool receiptMarker(NSDictionary* capability,id expected,ExitInspection& job) {
@@ -3441,7 +3664,13 @@ static bool verifyClosedReceipt(NSDictionary* closed,NSDictionary* __strong& cap
     if(![expected isEqual:marker[@"value"]]||!receiptIdentity(receipt[@"lastHolder"],last,true)||!receiptIdentity(receipt[@"primary"],primary)||
        !arbol_boundary::same(last,primary)||last.group!=(uint32_t)last.pid) return false;
   }
-  return receiptMetadata(capability,closed,job)&&receiptFrontier(capability,frontier,receipt[@"capabilityDigest"],job)&&exitAllOriginalsGone(capability,receipt,job);
+  if(!receiptMetadata(capability,closed,job)||!receiptFrontier(capability,frontier,receipt[@"capabilityDigest"],job)||
+     !exitAllOriginalsGone(capability,receipt,job)) return false;
+  if(auto* proof=job.qualificationProofCapture) {
+    proof->files.emplace_back(path.fileSystemRepresentation,identity);
+    if(clean) proof->files.emplace_back([[parent stringByAppendingPathComponent:@"proof.json"] fileSystemRepresentation],journalIdentity);
+  }
+  return true;
 }
 // A never-used original has a separate witness: no family, flush or clean
 // claim can be inferred from it. Its prior data writer is verified separately.
@@ -3510,6 +3739,7 @@ static bool verifyUnusedReceipt(NSDictionary* closed,NSDictionary* __strong& rec
       ![data[@"profileInstance"] isEqual:closed[@"profileInstance"]]||![data[@"profilePathHash"] isEqual:closed[@"profilePathHash"]]||
       ![@[@"activation.json",@"terminal.json"] containsObject:[data[@"terminal"][@"path"] lastPathComponent]]))) return false;
   NSString* boot=arbol_exit::bootSession(); if(!boot) return false;
+  if(job.qualificationProofCapture) job.qualificationProofCapture->files.emplace_back(path.fileSystemRepresentation,identity);
   if(![boot isEqual:receipt[@"bootSession"]]) return job.within();
   // The full original identity is queried later, independently of the writer's
   // live self observation. PID absence alone is never accepted.
@@ -3577,6 +3807,9 @@ static bool migrationNeverOpened(NSDictionary* receipt,ExitInspection& job) {
     if(receipt[@"originalMarker"]!=NSNull.null||receipt[@"convertedMarker"]!=NSNull.null) return false;
     MaintenanceDirectory profile;
     if(!profile.openPath([job.input[@"profile"] UTF8String],receipt[@"directory"])) return false;
+  auto* proof=job.qualificationProofCapture;
+  struct stat profileStamp{};
+  if(proof&&fstat(profile.fd,&profileStamp)) return false;
     int duplicate=openat(profile.fd,".",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
     if(duplicate<0) return false; DIR* entries=fdopendir(duplicate); if(!entries) { close(duplicate); return false; }
     bool valid=true; size_t count=0; errno=0;
@@ -3590,8 +3823,22 @@ static bool migrationNeverOpened(NSDictionary* receipt,ExitInspection& job) {
       errno=0;
     }
     if(errno||closedir(entries)) valid=false;
-    if(!valid||!emptyNativeDirectory([job.input[@"profile"] stringByAppendingPathComponent:@"data"])||
-       !emptyNativeDirectory([job.input[@"profile"] stringByAppendingPathComponent:@"userData"])||!profile.current()) return false;
+    if(!valid) return false;
+    if(proof) {
+      if(!job.migrated) return false;
+      for(NSString* leaf in @[@"data",@"userData"]) {
+        MaintenanceDirectory child; struct stat stamp{};
+        const std::string path=profile.path+"/"+leaf.UTF8String;
+        NSString* key=[leaf isEqual:@"data"]?@"dataDirectory":@"userDataDirectory";
+        if(!child.openPath(path,job.migrated->chain.entry[key]) || fstat(child.fd,&stamp) ||
+           !qualificationDirectoryNames(child,{}) || !qualificationDirectoryUnchanged(child,stamp)) return false;
+        proof->unchangedDirectories.emplace_back(path,stamp);
+      }
+      if(!qualificationDirectoryUnchanged(profile,profileStamp)) return false;
+      proof->unchangedDirectories.emplace_back(profile.path,profileStamp);
+    } else if(!emptyNativeDirectory([job.input[@"profile"] stringByAppendingPathComponent:@"data"])||
+              !emptyNativeDirectory([job.input[@"profile"] stringByAppendingPathComponent:@"userData"])) return false;
+    if(!profile.current()) return false;
   return job.within();
 }
 
@@ -3743,7 +3990,44 @@ static bool publishMigration(ExitInspection& job,NSDictionary* closed,NSDictiona
   // this transaction-to-receipt path. Ordinary receipt admission requires it.
   RetainedMigrationProof check;
   if(!check.open([NSString stringWithUTF8String:maintenanceCustody->runtime().path.c_str()],maintenanceCustody->stateRoot(),
-       receipt[@"profileSha256"],receipt[@"instance"],false)||!verifyRetainedMigration(check,job)||!current()) return false;
+       receipt[@"profileSha256"],receipt[@"instance"],false)) return false;
+  std::unique_ptr<QualificationProgressProof> proof;
+  if(qualificationProgressPoint(job.qualificationPoint)) proof=std::make_unique<QualificationProgressProof>();
+  {
+    struct CaptureScope {
+      ExitInspection& job;
+      ~CaptureScope() { job.qualificationProofCapture=nullptr; }
+    } captureScope{job};
+    job.qualificationProofCapture=proof.get();
+    if(!verifyRetainedMigration(check,job)||!current()) return false;
+  }
+  if(proof) {
+    // Transfer only bounded inode stamps and the genuine verified receipt
+    // reference. The output roster never retains an FD per proof member.
+    proof->receipt=check.chain.receiptFile.record();
+    proof->receiptsParent=maintenanceIdentity(receipts.identity);
+    for(const auto* file:{&check.chain.receiptFile,&check.captureFile,&check.closedFile,&check.dataFile,
+                          &publication->stagedFile,&publication->recordFile,&publication->markerFile}) {
+      if(file->fd>=0) proof->files.emplace_back(file->path,file->identity);
+    }
+    for(const auto* directory:{&exits,&history,&claims,&captures,&publication->profile}) {
+      if(!directory->current()) return false;
+      proof->directories.emplace_back(directory->path,directory->identity);
+    }
+    if(publication->markerFile.fd<0) proof->absentMarker=publication->profile.path+"/engine.json";
+    for(NSString* leaf in @[@"data",@"userData"]) {
+      struct stat held{};
+      NSString* key=[leaf isEqual:@"data"]?@"dataDirectory":@"userDataDirectory";
+      if(fstatat(publication->profile.fd,leaf.UTF8String,&held,AT_SYMLINK_NOFOLLOW) ||
+         !S_ISDIR(held.st_mode) || ![maintenanceIdentity(held) isEqual:publication->entry[key]]) return false;
+      proof->directories.emplace_back(publication->profile.path+"/"+leaf.UTF8String,held);
+    }
+    proof->staging=publication->staging.path;
+    if(!sameFile(published,check.chain.receiptFile.identity) || !receipts.current() || !check.current() ||
+       fstat(publication->staging.fd,&proof->stagingStamp) || !qualificationDirectoryNames(publication->staging,{}) ||
+       !qualificationDirectoryUnchanged(publication->staging,proof->stagingStamp)) return false;
+    job.qualificationProgress=std::move(proof);
+  }
   job.result=bytes(@{@"format":@1,@"kind":@"migration-committed",@"epoch":maintenanceCustody->epoch,
     @"attempt":receipt[@"attempt"],@"profileInstance":receipt[@"instance"],@"profilePathHash":receipt[@"profileSha256"],
     @"receipt":@{@"identity":maintenanceIdentity(published),@"sha256":hash}});
@@ -4203,7 +4487,8 @@ static napi_value beginExitInspection(napi_env env,napi_callback_info info) {
   } else if(n!=6) return fail(env);
   if(!liveLocks.count(owner)||!liveLocks.count(build)||owner->mode!=LOCK_EX||
      (build->mode!=LOCK_SH&&!(migration&&originalMaintenanceBuildHandle(build)))) return fail(env);
-  if(migration && arbol_attempt::qualificationNativePublicationPoint(maintenanceCustody->interruption[@"point"]) &&
+  if(migration && (arbol_attempt::qualificationNativePublicationPoint(maintenanceCustody->interruption[@"point"]) ||
+     arbol_attempt::qualificationProgressPoint(maintenanceCustody->interruption[@"point"])) &&
      [@[@"migrate-recover",@"migrate-commit"] containsObject:parsed[@"mode"]]) {
     auto& custody=*maintenanceCustody;
     if(!arbol_attempt::qualificationDigest(parsed[@"profilePathHash"]) || !custody.originalInterruption() ||
@@ -4293,6 +4578,12 @@ static napi_value pollExitInspection(napi_env env,napi_callback_info info) {
   int state=job->state.load(std::memory_order_acquire);
   if(state<0||job->cancelled.load(std::memory_order_acquire)||arbol_boundary::clockMs()>=job->deadline) return fail(env);
   if(!state) { napi_value out; napi_get_null(env,&out); return out; }
+  if(job->qualificationProgress) {
+    auto& writer=maintenanceCustody->progressWriter;
+    auto profile=writer.byHash.find([job->input[@"profilePathHash"] UTF8String]);
+    if(profile==writer.byHash.end() || profile->second.proof || !maintenanceCustody->originalInterruption()) return fail(env);
+    profile->second.proof=std::move(job->qualificationProgress);
+  }
   return text(env,job->result);
 }
 static napi_value pollMigrationRecovery(napi_env env,napi_callback_info info) {
@@ -4360,6 +4651,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"bindMaintenanceTransaction",nullptr,bindMaintenanceTransaction,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"parkMaintenanceTransaction",nullptr,parkMaintenanceTransaction,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"parkMaintenanceStaging",nullptr,parkMaintenanceStaging,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"parkMaintenanceProgress",nullptr,parkMaintenanceProgress,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"prepareQualificationInterruptionPipes",nullptr,prepareQualificationInterruptionPipes,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"publishMaintenanceFile",nullptr,publishMaintenanceFile,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"observeMaintenanceStateRoot",nullptr,observeMaintenanceStateRoot,nullptr,nullptr,nullptr,napi_default,nullptr},

@@ -19,7 +19,8 @@ const mercury = '/Volumes/Mercury', archiveRoot = `${mercury}/Arbol`;
 // ARC-5's real archive identity, shared with Arbol database/archive_volume.py.
 const mercuryUUID = 'AE1E97B8-CE93-4019-B6DC-21482165C3F2';
 const transactionLimit = 4096 * (4 * 87384 + 8192) + 65536;
-const nativeInterruptionPoints = ['record-rename', 'record-durable', 'claim-retained', 'capture-durable', 'receipt-durable'] as const;
+const nativeInterruptionPoints = ['record-rename', 'record-durable', 'claim-retained', 'capture-durable', 'receipt-durable',
+  'committed-progress', 'completion'] as const;
 const transactionInterruptionPoints = ['before-transaction', 'transaction-publication', 'current-publication',
   'native-rename-excl', ...maintenanceStagingPoints, ...nativeInterruptionPoints] as const;
 function activeTransactionInterruption({ platform, custody }: MigrationAdmission) {
@@ -256,7 +257,7 @@ export async function createMigrationTransaction(preflight: MigrationPreflight, 
   const needsMarker = stagingPoint === 'staged-marker' || stagingPoint === 'marker-rename' || stagingPoint === 'marker-durable';
   const stagingProfile = stagingPoint ? value.profiles.find(entry => !needsMarker || entry.targetMarker !== null) : undefined;
   if (stagingPoint && !stagingProfile) throw profileUnavailable();
-  if (nativePoint && !value.profiles.some(entry => nativePoint !== 'claim-retained' ||
+  if (nativePoint && nativePoint !== 'completion' && !value.profiles.some(entry => nativePoint !== 'claim-retained' ||
       entry.evidence.closedClaimSha256 !== null || entry.evidence.dataClaimSha256 !== null)) throw profileUnavailable();
   const bytes = Buffer.from(`${JSON.stringify(value)}\n`, 'utf8');
   const archive = await requireMercury(deadline);
