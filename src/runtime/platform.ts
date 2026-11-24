@@ -52,6 +52,12 @@ export interface MaintenanceCustody {
   readonly deadline: number;
   assert(): void;
 }
+
+export type MaintenanceInterruptionPoint =
+  | 'before-transaction' | 'transaction-publication' | 'current-publication' | 'native-rename-excl'
+  | 'empty-staging' | 'partial-staging' | 'staged-record' | 'staged-marker' | 'staged-progress'
+  | 'marker-rename' | 'marker-durable' | 'record-rename' | 'record-durable'
+  | 'claim-retained' | 'capture-durable' | 'receipt-durable' | 'committed-progress' | 'completion';
 export interface MaintenanceStateRoot {
   readonly path: string; readonly initial: 'absent' | 'present';
   readonly identity: MaintenanceFileEvidence['identity'] | null;
@@ -318,6 +324,8 @@ export interface PlatformPort {
   adoptHostBuild(requestPath: string, guard: string, bundle: string): HeldLock;
   adoptInstalledLaunch(bundle: string): { lock: HeldLock; deadline: number };
   adoptMaintenanceCustody(input: IsolatedMaintenanceInput | InstalledMaintenanceInput): MaintenanceCustody;
+  /** Read-only query on an adopted custody. Only the real writer can stop. */
+  maintenanceInterruptionMatches?(custody: MaintenanceCustody, point: MaintenanceInterruptionPoint): boolean;
   observeMaintenanceStateRoot(custody: MaintenanceCustody): MaintenanceStateRoot;
   publishMaintenanceFile(custody: MaintenanceCustody, source: string, destination: string,
     parent: MaintenanceFileEvidence['identity'], file: MaintenanceFileEvidence, deadline: number): void;
@@ -395,6 +403,7 @@ interface NativeSupport {
     handle: object; oldBuild: object | null; newBuild: object; facts: string; remaining: number;
   };
   assertMaintenanceCustody?(handle: object): void;
+  maintenanceInterruptionMatches?(handle: object, point: MaintenanceInterruptionPoint): boolean;
   publishMaintenanceFile?(handle: object, source: string, destination: string, expected: string, deadline: number): void;
   observeMaintenanceStateRoot?(handle: object): string;
   assertMaintenanceStateRoot?(handle: object): void;
@@ -658,6 +667,15 @@ export function loadPlatform(): PlatformPort {
         oldBuild: value.oldBuild === null ? null : guard(value.oldBuild, facts.oldBuildPath!),
         newBuild: guard(value.newBuild, facts.newBuildPath), deadline: began + value.remaining, assert });
       assert(); maintenanceReceipts.add(custody); maintenanceHandles.set(custody, value.handle); return custody;
+    },
+    maintenanceInterruptionMatches(custody: MaintenanceCustody, point: MaintenanceInterruptionPoint): boolean {
+      assertMaintenanceCustody(custody);
+      const handle = maintenanceHandles.get(custody), matches = native.maintenanceInterruptionMatches;
+      if (!handle || typeof matches !== 'function') throw unavailable('profile');
+      const value = call(() => matches(handle, point));
+      if (typeof value !== 'boolean') throw unavailable('profile');
+      assertMaintenanceCustody(custody);
+      return value;
     },
     publishMaintenanceFile(custody: MaintenanceCustody, source: string, destination: string,
       parent: MaintenanceFileEvidence['identity'], file: MaintenanceFileEvidence, deadline: number): void {

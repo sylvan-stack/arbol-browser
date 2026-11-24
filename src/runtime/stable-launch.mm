@@ -13,6 +13,7 @@ public:
   FD(const FD&) = delete;
   ~FD() { if (value_ >= 0) close(value_); }
   int get() const { return value_; }
+  bool closeNow() { const int held=value_; value_=-1; return held<0 || close(held)==0; }
 };
 
 int openInstalledFile(const std::string& path) {
@@ -112,9 +113,65 @@ NSString* imageDigest(int fd, const std::string& path, const struct stat& image,
 using arbol_attempt::diskImageTool;
 using arbol_attempt::mountedImage;
 
+bool originalQualificationProducer(NSDictionary* control) {
+  NSDictionary* parent=control[@"parent"];
+  return [parent[@"pid"] intValue]==getppid() && arbol_attempt::qualificationProducer(parent);
+}
+
+int waitControlledMaintenance(pid_t child, const PackagedLayout& layout, NSDictionary* launcher,
+                              NSDictionary* control, bool handoff) {
+  using namespace arbol_attempt;
+  const double deadline=[control[@"deadline"] doubleValue];
+  int status=0; pid_t waited=0;
+  bool waitOnly=false, signalAttempted=false;
+  NSDictionary* actor=nil;
+  try { @try {
+    NSDictionary* record=processRecord(child);
+    if (process(record) && [record[@"pid"] intValue]==child &&
+        [record[@"executable"] isEqual:[NSString stringWithUTF8String:layout.engine.c_str()]] &&
+        [record[@"parentStartId"] isEqual:launcher[@"startId"]] && [record[@"parentPidVersion"] isEqual:launcher[@"pidVersion"]])
+      actor=qualificationActor(record);
+    if (actor && handoff) {
+      while (clockMs()<deadline && originalQualificationProducer(control)) {
+        waited=waitpid(child,&status,WNOHANG);
+        if (waited==child) { waitOnly=clockMs()<deadline && originalQualificationProducer(control); break; }
+        if (waited<0 && errno!=EINTR) break;
+        usleep(10000);
+      }
+    }
+  } @catch (NSException*) {} } catch (...) {}
+
+  // Only an original direct child still owned by waitpid is signalable. Mark
+  // cleanup even if it exits between the nonblocking wait and the signal.
+  const double cleanupDeadline=std::min(deadline,clockMs())+qualificationCleanupMs;
+  if (waited!=child) {
+    while (clockMs()<cleanupDeadline) {
+      waited=waitpid(child,&status,WNOHANG);
+      if (waited==child || (waited<0 && errno!=EINTR)) break;
+      if (!waited && !signalAttempted) { signalAttempted=true; (void)kill(child,SIGKILL); }
+      usleep(10000);
+    }
+  }
+  if (waited!=child || !actor || (!WIFEXITED(status) && !WIFSIGNALED(status))) return 4;
+  const bool signaled=WIFSIGNALED(status);
+  const int observed=signaled ? WTERMSIG(status) : WEXITSTATUS(status);
+  NSDictionary* event=@{@"schema":@1,@"event":@"worker-reaped",@"requestSha256":control[@"requestSha256"],
+    @"nonce":control[@"nonce"],@"actor":actor,@"disposition":signaled?@"signaled":@"exited",@"status":@(observed),
+    @"supervisor":signalAttempted?@"cleanup-signal":@"wait-only"};
+  const double reportDeadline=std::min(cleanupDeadline,clockMs()+5000);
+  if (![qualificationPipe(qualificationInstallerEventDescriptor,O_WRONLY) isEqual:control[@"eventPipe"]] ||
+      !writeQualificationEvent(qualificationInstallerEventDescriptor,event,reportDeadline)) return 4;
+  // A natural exit can race expiry or a failed handoff before any signal.
+  // Preserve the actual reap and separately report an incomplete launcher.
+  if (!waitOnly && !signalAttempted) return 4;
+  return signaled ? 128+observed : observed;
+}
+
 template<class Admission>
 int maintenanceChild(Admission& admission, const PackagedLayout& layout, const std::string& launcher,
-                     const std::string& homePath, const std::vector<std::string>& arguments, double deadline) {
+                     const std::string& homePath, const std::vector<std::string>& arguments, double deadline,
+                     NSDictionary* qualification = nil) {
+  using namespace arbol_attempt;
   const std::string& bundle = layout.bundle;
   NSDictionary* self = arbol_attempt::processRecord(getpid());
   if (!self || ![self[@"executable"] isEqual:[NSString stringWithUTF8String:launcher.c_str()]] ||
@@ -125,6 +182,11 @@ int maintenanceChild(Admission& admission, const PackagedLayout& layout, const s
     @"newBuildLock":arbol_boundary::capsuleLock(admission.newBuild.lock),
     @"journalPath":[NSString stringWithUTF8String:admission.journal.path.c_str()],@"journal":admission.journal.record(),
     @"bundle":[NSString stringWithUTF8String:bundle.c_str()]};
+  if (qualification) {
+    NSMutableDictionary* controlled=[packet mutableCopy];
+    controlled[@"format"]=@2; controlled[@"kind"]=@"qualification-maintenance"; controlled[@"qualification"]=qualification;
+    packet=controlled;
+  }
   FD capsule(arbol_boundary::capsuleDescriptor(arbol_attempt::bytes(packet)));
   posix_spawn_file_actions_t actions;
   if (capsule.get() < 0 || posix_spawn_file_actions_init(&actions)) return 4;
@@ -134,6 +196,17 @@ int maintenanceChild(Admission& admission, const PackagedLayout& layout, const s
     copies.map(actions,capsule.get(),arbol_attempt::maintenanceCapsuleDescriptor);
   if (mapped && admission.oldBuild.lock.fd >= 0)
     mapped = copies.map(actions,admission.oldBuild.lock.fd,arbol_attempt::maintenanceOldDescriptor);
+  // SpawnCopies deliberately reserves targets through 14. Duplicate the
+  // additional event source above all targets using the same isolation rule.
+  FD eventCopy(qualification ? fcntl(qualificationInstallerEventDescriptor,F_DUPFD_CLOEXEC,64) : -1);
+  if (qualification) mapped = mapped && eventCopy.get()>=0 &&
+    copies.map(actions,qualificationInstallerStopDescriptor,qualificationStopDescriptor) &&
+    !posix_spawn_file_actions_adddup2(&actions,eventCopy.get(),qualificationEventDescriptor) &&
+    !posix_spawn_file_actions_addinherit_np(&actions,STDIN_FILENO) &&
+    !posix_spawn_file_actions_addinherit_np(&actions,STDOUT_FILENO) &&
+    !posix_spawn_file_actions_addinherit_np(&actions,STDERR_FILENO) &&
+    originalQualificationProducer(qualification) &&
+    qualificationPipes(qualificationInstallerStopDescriptor,qualificationInstallerEventDescriptor,qualification);
   if (!mapped || !admission.current() || !arbol_attempt::currentProcess(self,true) || clockMs() >= deadline) {
     posix_spawn_file_actions_destroy(&actions); return 4;
   }
@@ -144,9 +217,18 @@ int maintenanceChild(Admission& admission, const PackagedLayout& layout, const s
   for (const auto& value : arguments) args.push_back((char*)value.c_str());
   args.push_back(nullptr);
   pid_t child = 0;
-  int result = posix_spawn(&child,layout.engine.c_str(),&actions,nullptr,args.data(),environment);
-  posix_spawn_file_actions_destroy(&actions); copies.closeCopies();
+  posix_spawnattr_t attr;
+  const bool attrReady=qualification && !posix_spawnattr_init(&attr);
+  const bool spawnReady=!qualification || (attrReady && !posix_spawnattr_setflags(&attr,POSIX_SPAWN_CLOEXEC_DEFAULT));
+  int result = spawnReady ? posix_spawn(&child,layout.engine.c_str(),&actions,qualification?&attr:nullptr,args.data(),environment) : EINVAL;
+  if (attrReady) posix_spawnattr_destroy(&attr);
+  posix_spawn_file_actions_destroy(&actions); const bool copiesClosed=copies.closeCopies();
   if (result) return 4;
+  if (qualification) {
+    const bool stopClosed=close(qualificationInstallerStopDescriptor)==0;
+    const bool eventCopyClosed=eventCopy.closeNow();
+    return waitControlledMaintenance(child,layout,self,qualification,stopClosed&&copiesClosed&&eventCopyClosed);
+  }
   // Original exclusive descriptions remain held across every child outcome.
   // The format-3 journal continues to close admission after any failure.
   int status = 0; pid_t waited;
@@ -157,14 +239,26 @@ int maintenanceChild(Admission& admission, const PackagedLayout& layout, const s
 
 // Qualification supplies a sealed policy in an already mounted, independently
 // signed isolated candidate. Only explicit maintenance arguments are passed.
-int isolatedMaintenance(int argc, const char* argv[], double deadline) {
+int isolatedMaintenance(int argc, const char* argv[], double deadline, bool controlled = false) {
   if (arbol_attempt::profileFormat != 2 || argc != 8 || strcmp(argv[2],"--policy") ||
       strcmp(argv[4],"--runtime") || strcmp(argv[6],"--bundle")) return 4;
   const std::string policy = argv[3], runtime = argv[5], bundle = argv[7];
+  NSDictionary* qualification=nil;
+  if (controlled) {
+    using namespace arbol_attempt;
+    const std::string root=qualificationFixture;
+    if (runtime!=root+"/runtime" || !within(bundle,root+"/arbol-browser")) return 4;
+    qualification=readQualificationInstallerCapsule();
+    if (!qualification || !enabledQualificationEnginePoint(qualification[@"point"]) ||
+        !originalQualificationProducer(qualification) ||
+        !qualificationPipes(qualificationInstallerStopDescriptor,qualificationInstallerEventDescriptor,qualification,true)) return 4;
+    deadline=std::min(deadline,[qualification[@"deadline"] doubleValue]);
+  }
   arbol_attempt::IsolatedMaintenanceAdmission admission;
   if (!admission.admit(policy,runtime,bundle,deadline)) return 4;
+  if (qualification && !arbol_attempt::qualificationInterruptionBinding(qualification,admission)) return 4;
   return maintenanceChild(admission,admission.authority.layout,admission.authority.launcherPath,
-    admission.authority.fixture.path,{"--isolated-policy",policy,"--runtime",runtime},deadline);
+    admission.authority.fixture.path,{"--isolated-policy",policy,"--runtime",runtime},deadline,qualification);
 }
 int installedMaintenance(int argc, double deadline) {
   if (arbol_attempt::profileFormat != 2 || argc != 2) return 4;
@@ -299,6 +393,8 @@ int launch(int argc, const char* argv[], double deadline) {
 
 int main(int argc, const char* argv[]) {
   @autoreleasepool { @try {
+    if (argc > 1 && !strcmp(argv[1],"--isolated-qualification-interrupt"))
+      return isolatedMaintenance(argc,argv,clockMs() + 60000,true);
     if (argc > 1 && !strcmp(argv[1],"--isolated-maintenance-migrate-profiles"))
       return isolatedMaintenance(argc,argv,clockMs() + 60000);
     if (argc > 1 && !strcmp(argv[1],"--maintenance-migrate-profiles"))

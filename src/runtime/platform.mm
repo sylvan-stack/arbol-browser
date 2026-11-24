@@ -551,6 +551,24 @@ static napi_value processProvenance(napi_env env, napi_callback_info info) {
     return out;
   } @catch (NSException*) { return fail(env); } }
 }
+static napi_value prepareQualificationInterruptionPipes(napi_env env, napi_callback_info info) {
+  using namespace arbol_attempt;
+  napi_value arg,out; bool preparation=false;
+  if (profileFormat!=2 || !argument(env,info,&arg) || napi_get_value_bool(env,arg,&preparation)!=napi_ok) return fail(env);
+  @autoreleasepool { @try {
+    if (!qualificationProducer(processRecord(getpid()))) return fail(env);
+    NSMutableSet* originals=[NSMutableSet new];
+    const int last=preparation?qualificationPreparationEventDescriptor:qualificationInstallerEventDescriptor;
+    for (int fd=qualificationInstallerStopDescriptor; fd<=last; ++fd) {
+      const bool reading=fd==qualificationInstallerStopDescriptor || fd==qualificationPreparationAckDescriptor;
+      NSString* identity=qualificationPipe(fd,reading?O_RDONLY:O_WRONLY,true);
+      if (!identity || [originals containsObject:identity]) return fail(env);
+      [originals addObject:identity];
+    }
+    if (napi_get_boolean(env,true,&out)!=napi_ok) return fail(env);
+    return out;
+  } @catch(NSException*) { return fail(env); } }
+}
 static bool attemptAt(const arbol_attempt::Location& at, NSDictionary* value) {
   return arbol_attempt::record(value) && at.path.substr(at.path.rfind('/')+1) == std::string([value[@"profilePathHash"] UTF8String]).substr(0,32);
 }
@@ -698,6 +716,9 @@ struct MaintenanceCustody {
   HeldLock* oldBuild = nullptr;
   HeldLock* newBuild = nullptr;
   bool accepted = false;
+  NSDictionary* interruption = nil;
+  NSDictionary* interruptionWorker = nil;
+  std::atomic<bool> interruptionConsumed{false};
   const arbol_attempt::PackagedLayout& layout() const { return installed ? production.layout : isolated.authority.layout; }
   arbol_attempt::MaintenanceGuard& oldGuard() { return installed ? production.oldBuild : isolated.oldBuild; }
   arbol_attempt::MaintenanceGuard& newGuard() { return installed ? production.newBuild : isolated.newBuild; }
@@ -710,6 +731,49 @@ struct MaintenanceCustody {
   NSString* launcherDigest() const { return installed ? production.launcherDigest : isolated.authority.launcherDigest; }
   NSString* stateRoot() { return arbol_attempt::policyStateRoot(arbol_attempt::json(hostPolicy().content),layout()); }
   bool current() const { return installed ? production.current() && installedRuntime.current() : isolated.current(); }
+  bool originalInterruption() const {
+    using namespace arbol_attempt;
+    if (!interruption || installed) return false;
+    NSDictionary* producer=interruption[@"parent"];
+    return arbol_boundary::clockMs()<[interruption[@"deadline"] doubleValue] &&
+      [parent[@"pid"] intValue]==getppid() && currentProcess(parent) && currentProcess(interruptionWorker,true) &&
+      [parent[@"parentStartId"] isEqual:producer[@"startId"]] && [parent[@"parentPidVersion"] isEqual:producer[@"pidVersion"]] &&
+      qualificationProducer(producer) && qualificationInterruptionBinding(interruption,isolated) &&
+      qualificationPipes(qualificationStopDescriptor,qualificationEventDescriptor,interruption);
+  }
+  // Used only by checked writer boundaries. A false return aborts the active
+  // writer. Unarmed and nonmatching points leave its ordinary path unchanged.
+  bool parkInterruption(NSString* point, NSDictionary* witness, double writerDeadline,
+                       const std::function<bool()>& writerCurrent) {
+    using namespace arbol_attempt;
+    if (!interruption || ![interruption[@"point"] isEqual:point]) return true;
+    const double now=arbol_boundary::clockMs();
+    const double deadline=std::min({now+5000,writerDeadline,[interruption[@"deadline"] doubleValue]});
+    if (!accepted || !enabledQualificationEnginePoint(point) || !std::isfinite(writerDeadline) || deadline<=now ||
+        interruptionConsumed.exchange(true) || !originalInterruption() || !writerCurrent() ||
+        !keys(witness,@[@"attempt",@"transactionSha256",@"profileSha256",@"artifacts"]) ||
+        !qualificationNonce(witness[@"attempt"]) || !qualificationDigest(witness[@"transactionSha256"]) ||
+        (witness[@"profileSha256"]!=NSNull.null && !qualificationDigest(witness[@"profileSha256"])) ||
+        ![witness[@"artifacts"] isKindOfClass:NSArray.class] || [witness[@"artifacts"] count]>8) return false;
+    NSDictionary* actor=qualificationActor(interruptionWorker), *reference=journal().record();
+    NSString* size=[NSString stringWithUTF8String:std::to_string(journal().identity.st_size).c_str()];
+    NSDictionary* observed=@{@"kind":@"journal",@"identity":reference[@"identity"],@"size":size,@"sha256":reference[@"sha256"]};
+    NSDictionary* notice=@{@"schema":@1,@"event":@"parked",@"requestSha256":interruption[@"requestSha256"],
+      @"nonce":interruption[@"nonce"],@"point":point,@"actor":actor,@"journal":observed,@"attempt":witness[@"attempt"],
+      @"transactionSha256":witness[@"transactionSha256"],@"profileSha256":witness[@"profileSha256"],@"artifacts":witness[@"artifacts"]};
+    if (!writeQualificationEvent(qualificationEventDescriptor,notice,deadline)) return false;
+    const std::string raw=readQualificationStop(qualificationStopDescriptor,deadline);
+    NSDictionary* stop=qualificationObject(raw,1024); uint64_t schema=0;
+    if (!keys(stop,@[@"schema",@"action",@"requestSha256",@"nonce",@"point"]) || !uintNumber(stop[@"schema"],schema) || schema!=1 ||
+        ![stop[@"action"] isEqual:@"interrupt"] || ![stop[@"requestSha256"] isEqual:interruption[@"requestSha256"]] ||
+        ![stop[@"nonce"] isEqual:interruption[@"nonce"]] || ![stop[@"point"] isEqual:point] ||
+        !originalInterruption() || !writerCurrent() || arbol_boundary::clockMs()>=deadline) return false;
+    NSDictionary* acknowledgement=@{@"schema":@1,@"event":@"stop-accepted",@"requestSha256":interruption[@"requestSha256"],
+      @"nonce":interruption[@"nonce"],@"point":point,@"actor":actor,@"stopSha256":digest(raw)};
+    if (!writeQualificationEvent(qualificationEventDescriptor,acknowledgement,deadline)) return false;
+    (void)kill(getpid(),SIGKILL);
+    return false;
+  }
 };
 static MaintenanceCustody* maintenanceCustody = nullptr;
 struct MaintenanceStateRoot {
@@ -788,12 +852,17 @@ static napi_value adoptMaintenanceCustody(napi_env env, napi_callback_info info)
   maintenanceCustody = new MaintenanceCustody;
   auto* custody = maintenanceCustody; custody->installed = layout.installed;
   @autoreleasepool { try { @try {
-    NSDictionary* packet = arbol_attempt::readMaintenanceCapsule();
+    NSDictionary* packet = arbol_attempt::readMaintenanceCapsule(!custody->installed);
     const int parentPid = getppid();
     NSDictionary* parent = arbol_attempt::processRecord(parentPid);
     NSDictionary* self = arbol_attempt::processRecord(getpid());
     if (!packet || !parent || !self || parentPid <= 1 || ![packet[@"parent"] isEqual:parent] ||
         ![packet[@"bundle"] isEqual:[NSString stringWithUTF8String:bundle.c_str()]] ) return fail(env);
+    NSDictionary* interruption=packet[@"qualification"];
+    if (interruption && (!arbol_attempt::enabledQualificationEnginePoint(interruption[@"point"]) ||
+        runtime!=std::string(arbol_attempt::qualificationFixture)+"/runtime" ||
+        !arbol_attempt::qualificationPipes(arbol_attempt::qualificationStopDescriptor,arbol_attempt::qualificationEventDescriptor,interruption,true)))
+      return fail(env);
     if (custody->installed) {
       NSString* home = arbol_attempt::physicalAccountHome();
       NSString* installedRuntime = [[home stringByAppendingPathComponent:@ARBOL_INSTALLATION_ROOT] stringByAppendingPathComponent:@"runtime"];
@@ -806,6 +875,10 @@ static napi_value adoptMaintenanceCustody(napi_env env, napi_callback_info info)
         getppid() != parentPid || !arbol_attempt::currentProcess(parent) || !arbol_attempt::currentProcess(self,true) ||
         !custody->current()) return fail(env);
     custody->parent = parent;
+    if (interruption) {
+      custody->interruption=interruption; custody->interruptionWorker=self;
+      if (!custody->originalInterruption()) return fail(env);
+    }
     // Recovery re-adopts new process descriptions under the same durable
     // admission. Parent identity and deadline remain independently enforced;
     // the durable epoch binds exact journal bytes and original lock records.
@@ -859,6 +932,20 @@ static napi_value assertMaintenanceCustody(napi_env env, napi_callback_info info
         !arbol_attempt::currentProcess(maintenanceCustody->parent)) return fail(env);
     napi_value result; if (napi_get_undefined(env,&result) != napi_ok) return fail(env); return result;
   } @catch (NSException*) { return fail(env); } } catch (...) { return fail(env); } }
+}
+
+static napi_value maintenanceInterruptionMatches(napi_env env, napi_callback_info info) {
+  napi_value args[2], out; size_t count=2; void* raw=nullptr; std::string point;
+  if (napi_get_cb_info(env,info,&count,args,nullptr,nullptr)!=napi_ok || count!=2 ||
+      napi_get_value_external(env,args[0],&raw)!=napi_ok || !raw || raw!=maintenanceCustody || !maintenanceCustody->accepted ||
+      !boundedText(env,args[1],point) || point.size()>48) return fail(env);
+  @autoreleasepool { @try {
+    NSString* name=[NSString stringWithUTF8String:point.c_str()];
+    if (!arbol_attempt::qualificationEnginePoint(name)) return fail(env);
+    const bool matches=maintenanceCustody->interruption && [maintenanceCustody->interruption[@"point"] isEqual:name];
+    if ((matches && !maintenanceCustody->originalInterruption()) || napi_get_boolean(env,matches,&out)!=napi_ok) return fail(env);
+    return out;
+  } @catch(NSException*) { return fail(env); } }
 }
 
 // Management publication only; ordinary profile metadata and retained native
@@ -3712,6 +3799,8 @@ static napi_value init(napi_env env, napi_value exports) {
     {"adoptInstalledLaunch",nullptr,adoptInstalledLaunch,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"adoptMaintenanceCustody",nullptr,adoptMaintenanceCustody,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"assertMaintenanceCustody",nullptr,assertMaintenanceCustody,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"maintenanceInterruptionMatches",nullptr,maintenanceInterruptionMatches,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"prepareQualificationInterruptionPipes",nullptr,prepareQualificationInterruptionPipes,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"publishMaintenanceFile",nullptr,publishMaintenanceFile,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"observeMaintenanceStateRoot",nullptr,observeMaintenanceStateRoot,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"assertMaintenanceStateRoot",nullptr,assertMaintenanceStateRoot,nullptr,nullptr,nullptr,napi_default,nullptr},

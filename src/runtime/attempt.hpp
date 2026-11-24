@@ -336,6 +336,126 @@ inline std::string bytes(NSDictionary* object) {
 // not confer maintenance authority. SpawnCopies duplicates above these slots.
 inline constexpr int maintenanceSelectionDescriptor = 10, maintenanceOldDescriptor = 11,
   maintenanceNewDescriptor = 12, maintenanceCapsuleDescriptor = 13;
+inline constexpr int qualificationStopDescriptor = 14, qualificationEventDescriptor = 15;
+inline constexpr int qualificationInstallerStopDescriptor = 3, qualificationInstallerEventDescriptor = 4,
+  qualificationPreparationAckDescriptor = 5, qualificationPreparationEventDescriptor = 6,
+  qualificationInstallerCapsuleDescriptor = 7;
+inline constexpr const char* qualificationFixture = "/Users/msix/Builds/afm9-rollback-plan.49cXVsFk/qualification/fixture";
+inline constexpr const char* qualificationNode = "/Users/msix/.nvm/versions/node/v24.22.1/bin/node";
+inline constexpr double qualificationMaintenanceMs = 31 * 60 * 1000, qualificationCleanupMs = 30000;
+
+inline bool qualificationEnginePoint(id point) {
+  return [@[@"before-transaction",@"transaction-publication",@"current-publication",@"native-rename-excl",
+    @"empty-staging",@"partial-staging",@"staged-record",@"staged-marker",@"staged-progress",@"marker-rename",
+    @"marker-durable",@"record-rename",@"record-durable",@"claim-retained",@"capture-durable",@"receipt-durable",
+    @"committed-progress",@"completion"] containsObject:point];
+}
+inline bool enabledQualificationEnginePoint(id point) {
+  // Each writer enables only the point it actually implements.
+  return [@[] containsObject:point];
+}
+inline bool qualificationDigest(id value) { return pattern(value,@"\\A[0-9a-f]{64}\\z"); }
+inline bool qualificationNonce(id value) { return pattern(value,@"\\A[0-9a-f]{32}\\z"); }
+inline bool qualificationProducer(NSDictionary* record) {
+  return process(record) && [record[@"executable"] isEqual:[NSString stringWithUTF8String:qualificationNode]] &&
+    arbol_boundary::canonical(qualificationNode) && currentProcess(record);
+}
+inline NSDictionary* qualificationActor(NSDictionary* record) {
+  return process(record) ? @{@"pid":record[@"pid"],@"startId":record[@"startId"],@"pidVersion":record[@"pidVersion"]} : nil;
+}
+
+// Qualification frames contain only objects, strings and unsigned integers.
+// Check decoded keys before Foundation can collapse duplicate spellings.
+inline NSDictionary* qualificationObject(const std::string& raw, size_t maximum) {
+  if (raw.empty() || raw.size() > maximum || raw.back() != '\n' || raw.find('\n') != raw.size()-1 ||
+      raw.find('\0') != std::string::npos || raw.compare(0,3,"\xef\xbb\xbf") == 0) return nil;
+  size_t at = 0;
+  auto space = [&] { while (at < raw.size() && (raw[at]==' ' || raw[at]=='\t' || raw[at]=='\r')) ++at; };
+  auto readString = [&]() -> NSString* {
+    if (at >= raw.size() || raw[at] != '"') return nil;
+    const size_t begin = at++;
+    while (at < raw.size()) {
+      const unsigned char c = raw[at++];
+      if (c < 0x20) return nil;
+      if (c == '\\') { if (at >= raw.size()) return nil; ++at; continue; }
+      if (c != '"') continue;
+      id decoded = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:raw.data()+begin length:at-begin]
+        options:NSJSONReadingFragmentsAllowed error:nil];
+      if (![decoded isKindOfClass:NSString.class] || ![decoded dataUsingEncoding:NSUTF8StringEncoding allowLossyConversion:NO]) return nil;
+      NSString* value=decoded;
+      for (NSUInteger i=0; i<value.length; ++i) if (![value characterAtIndex:i]) return nil;
+      return value;
+    }
+    return nil;
+  };
+  std::function<bool(unsigned)> value = [&](unsigned depth) {
+    space(); if (depth > 16 || at >= raw.size()) return false;
+    if (raw[at] == '"') return readString() != nil;
+    if (raw[at] == '{') {
+      ++at; space(); NSMutableSet* names=[NSMutableSet new];
+      if (at < raw.size() && raw[at] == '}') { ++at; return true; }
+      for (;;) {
+        space(); NSString* name=readString();
+        if (!name || [names containsObject:name]) return false;
+        [names addObject:name]; space();
+        if (at >= raw.size() || raw[at++] != ':' || !value(depth+1)) return false;
+        space(); if (at >= raw.size()) return false;
+        const char next=raw[at++]; if (next == '}') return true; if (next != ',') return false;
+      }
+    }
+    if (raw[at] == '0') { ++at; return true; }
+    if (raw[at] < '1' || raw[at] > '9') return false;
+    while (at < raw.size() && raw[at] >= '0' && raw[at] <= '9') ++at;
+    return true;
+  };
+  if (!value(0)) return nil;
+  space(); return at == raw.size()-1 ? json(raw) : nil;
+}
+
+inline NSString* qualificationPipe(int fd, int access, bool prepare = false) {
+  struct stat st{};
+  const int flags=fcntl(fd,F_GETFL), descriptor=fcntl(fd,F_GETFD);
+  if (flags < 0 || descriptor < 0 || (flags & O_ACCMODE) != access || fstat(fd,&st) ||
+      !S_ISFIFO(st.st_mode) || st.st_uid != geteuid() || st.st_nlink != 0) return nil;
+  if (prepare && (fcntl(fd,F_SETFD,descriptor|FD_CLOEXEC) || fcntl(fd,F_SETFL,flags|O_NONBLOCK) ||
+      (access==O_WRONLY && fcntl(fd,F_SETNOSIGPIPE,1)))) return nil;
+  return [NSString stringWithUTF8String:(std::to_string(uint64_t(st.st_dev))+":"+std::to_string(uint64_t(st.st_ino))).c_str()];
+}
+inline bool qualificationPipes(int stop, int event, NSDictionary* packet, bool prepare = false) {
+  NSString* reader=qualificationPipe(stop,O_RDONLY,prepare), *writer=qualificationPipe(event,O_WRONLY,prepare);
+  return reader && writer && ![reader isEqual:writer] && [reader isEqual:packet[@"stopPipe"]] && [writer isEqual:packet[@"eventPipe"]];
+}
+inline bool qualificationPoll(int fd, short events, double deadline) {
+  while (arbol_boundary::clockMs() < deadline) {
+    const double left=deadline-arbol_boundary::clockMs(); if (left <= 0) return false;
+    pollfd p{fd,events,0}; int n=poll(&p,1,int(std::ceil(std::min(left,double(INT_MAX)))));
+    if (n > 0) return !(p.revents&(POLLERR|POLLNVAL)) && (p.revents & (events|(events==POLLIN?POLLHUP:0)));
+    if (!n || errno != EINTR) return false;
+  }
+  return false;
+}
+inline bool writeQualificationEvent(int fd, NSDictionary* event, double deadline) {
+  const std::string raw=bytes(event);
+  if (raw.empty() || raw.size()>4096) return false;
+  size_t at=0;
+  while (at<raw.size() && qualificationPoll(fd,POLLOUT,deadline)) {
+    const ssize_t n=write(fd,raw.data()+at,raw.size()-at);
+    if (n>0) at+=size_t(n);
+    else if (!n || (errno!=EINTR && errno!=EAGAIN && errno!=EWOULDBLOCK)) return false;
+  }
+  return at==raw.size() && arbol_boundary::clockMs()<deadline;
+}
+inline std::string readQualificationStop(int fd, double deadline) {
+  std::string raw; char block[256];
+  while (qualificationPoll(fd,POLLIN,deadline)) {
+    const ssize_t n=read(fd,block,sizeof(block));
+    if (!n) return arbol_boundary::clockMs()<deadline ? raw : std::string{};
+    if (n<0) { if (errno==EINTR || errno==EAGAIN || errno==EWOULDBLOCK) continue; return {}; }
+    if (raw.size()+size_t(n)>1024) return {};
+    raw.append(block,size_t(n));
+  }
+  return {};
+}
 inline bool within(const std::string& child, const std::string& parent) {
   return child.size() > parent.size() && child.compare(0, parent.size(), parent) == 0 && child[parent.size()] == '/';
 }
@@ -884,27 +1004,64 @@ struct InstalledMaintenanceAdmission {
     return arbol_boundary::clockMs() < deadline && current();
   }
 };
-inline NSDictionary* readMaintenanceCapsule() {
-  const int fd = maintenanceCapsuleDescriptor; struct stat before{}, after{};
+inline std::string readAnonymousMaintenanceCapsule(int fd) {
+  struct stat before{}, after{};
   const int flags = fcntl(fd,F_GETFL);
   if (flags < 0 || (flags & O_ACCMODE) != O_RDONLY || fcntl(fd,F_SETFD,FD_CLOEXEC) ||
       fstat(fd,&before) || !S_ISREG(before.st_mode) || before.st_uid != geteuid() || before.st_nlink != 0 ||
-      (before.st_mode & 07777) != 0600 || before.st_size < 1 || before.st_size > off_t(limit)) return nil;
+      (before.st_mode & 07777) != 0600 || before.st_size < 1 || before.st_size > off_t(limit)) return {};
   std::string raw(size_t(before.st_size),'\0'); size_t at = 0;
   while (at < raw.size()) {
     ssize_t n = pread(fd,raw.data()+at,raw.size()-at,off_t(at));
-    if (n > 0) at += size_t(n); else if (n != -1 || errno != EINTR) return nil;
+    if (n > 0) at += size_t(n); else if (n != -1 || errno != EINTR) return {};
   }
   if (fstat(fd,&after) || after.st_nlink != 0 || before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
       before.st_mode != after.st_mode || before.st_uid != after.st_uid || before.st_size != after.st_size ||
       before.st_mtimespec.tv_sec != after.st_mtimespec.tv_sec || before.st_mtimespec.tv_nsec != after.st_mtimespec.tv_nsec ||
-      before.st_ctimespec.tv_sec != after.st_ctimespec.tv_sec || before.st_ctimespec.tv_nsec != after.st_ctimespec.tv_nsec || close(fd)) return nil;
-  NSDictionary* p = json(raw); uint64_t format = 0;
-  if (!keys(p,@[@"format",@"kind",@"parent",@"deadline",@"selectionLock",@"oldBuildLock",@"newBuildLock",@"journalPath",@"journal",@"bundle"]) ||
-      !uintNumber(p[@"format"],format) || format != 1 || ![p[@"kind"] isEqual:@"maintenance"] || !process(p[@"parent"]) ||
+      before.st_ctimespec.tv_sec != after.st_ctimespec.tv_sec || before.st_ctimespec.tv_nsec != after.st_ctimespec.tv_nsec || close(fd)) return {};
+  return raw;
+}
+inline bool qualificationInterruptionPacket(NSDictionary* p) {
+  uint64_t schema=0, cutoff=0;
+  if (!keys(p,@[@"schema",@"kind",@"parent",@"requestSha256",@"nonce",@"point",@"stopPipe",@"eventPipe",@"journal",@"build",@"imageSha256",@"deadline"]) ||
+      !uintNumber(p[@"schema"],schema) || schema!=1 || ![p[@"kind"] isEqual:@"qualification-interrupt"] ||
+      !process(p[@"parent"]) || !qualificationEnginePoint(p[@"point"]) ||
+      !qualificationDigest(p[@"requestSha256"]) || !qualificationNonce(p[@"nonce"]) ||
+      !pattern(p[@"stopPipe"],@"\\A[0-9]{1,20}:[0-9]{1,20}\\z") || !pattern(p[@"eventPipe"],@"\\A[0-9]{1,20}:[0-9]{1,20}\\z") ||
+      [p[@"stopPipe"] isEqual:p[@"eventPipe"]] || !pattern(p[@"build"],@"\\A[1-9a-f][0-9a-f]{0,15}\\z") || [p[@"build"] isEqual:@"1"] ||
+      !qualificationDigest(p[@"imageSha256"]) || !uintNumber(p[@"deadline"],cutoff) ||
+      !keys(p[@"journal"],@[@"identity",@"sha256"]) || !qualificationDigest(p[@"journal"][@"sha256"])) return false;
+  NSDictionary* identity=p[@"journal"][@"identity"]; uint64_t uid=0,mode=0;
+  const double remaining=double(cutoff)-arbol_boundary::clockMs();
+  return remaining>0 && remaining<=qualificationMaintenanceMs && keys(identity,@[@"device",@"inode",@"uid",@"mode"]) &&
+    pattern(identity[@"device"],@"\\A[0-9]{1,20}\\z") && pattern(identity[@"inode"],@"\\A[0-9]{1,20}\\z") &&
+    uintNumber(identity[@"uid"],uid) && uid==geteuid() && uintNumber(identity[@"mode"],mode) && mode==0600;
+}
+inline bool qualificationInterruptionBinding(NSDictionary* packet, const IsolatedMaintenanceAdmission& admission) {
+  NSDictionary* journal=admission.journalObject;
+  return admission.authority.fixture.path==qualificationFixture && admission.oldBuild.lock.fd>=0 &&
+    [journal[@"before"][@"selection"][@"build"] isEqual:@"1"] &&
+    [packet[@"journal"] isEqual:admission.journal.record()] &&
+    [packet[@"build"] isEqual:journal[@"after"][@"selection"][@"build"]] &&
+    [packet[@"imageSha256"] isEqual:journal[@"after"][@"selection"][@"imageSha256"]] && admission.current();
+}
+inline NSDictionary* readQualificationInstallerCapsule() {
+  NSDictionary* p=qualificationObject(readAnonymousMaintenanceCapsule(qualificationInstallerCapsuleDescriptor),limit);
+  return qualificationInterruptionPacket(p) ? p : nil;
+}
+inline NSDictionary* readMaintenanceCapsule(bool isolated = false) {
+  const std::string raw=readAnonymousMaintenanceCapsule(maintenanceCapsuleDescriptor);
+  NSDictionary* p=json(raw); uint64_t format=0;
+  if (!uintNumber(p[@"format"],format) || !process(p[@"parent"]) ||
       ![p[@"deadline"] isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)p[@"deadline"]) == CFBooleanGetTypeID()) return nil;
   const double remaining = [p[@"deadline"] doubleValue] - arbol_boundary::clockMs();
-  return std::isfinite(remaining) && remaining > 0 && remaining <= 60000 ? p : nil;
+  if (!std::isfinite(remaining) || remaining<=0 || remaining>60000) return nil;
+  NSArray* ordinary=@[@"format",@"kind",@"parent",@"deadline",@"selectionLock",@"oldBuildLock",@"newBuildLock",@"journalPath",@"journal",@"bundle"];
+  if (format==1) return keys(p,ordinary) && [p[@"kind"] isEqual:@"maintenance"] ? p : nil;
+  NSDictionary* control=p[@"qualification"];
+  return isolated && format==2 && [p[@"kind"] isEqual:@"qualification-maintenance"] &&
+    keys(p,[ordinary arrayByAddingObject:@"qualification"]) && bytes(p)==raw && qualificationInterruptionPacket(control) &&
+    [p[@"deadline"] doubleValue]<=[control[@"deadline"] doubleValue] ? p : nil;
 }
 struct Location {
   int directory = -1, lock = -1; struct stat identity{}, lockIdentity{}; std::string path;
