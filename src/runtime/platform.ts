@@ -58,6 +58,13 @@ export type MaintenanceInterruptionPoint =
   | 'empty-staging' | 'partial-staging' | 'staged-record' | 'staged-marker' | 'staged-progress'
   | 'marker-rename' | 'marker-durable' | 'record-rename' | 'record-durable'
   | 'claim-retained' | 'capture-durable' | 'receipt-durable' | 'committed-progress' | 'completion';
+
+export type MaintenanceTransactionPoint = 'before-transaction' | 'transaction-publication' | 'current-publication';
+export type MaintenanceTransactionWitness = Readonly<{
+  attempt: string;
+  transaction: MaintenanceFileEvidence;
+  current: MaintenanceFileEvidence | null;
+}>;
 export interface MaintenanceStateRoot {
   readonly path: string; readonly initial: 'absent' | 'present';
   readonly identity: MaintenanceFileEvidence['identity'] | null;
@@ -326,6 +333,11 @@ export interface PlatformPort {
   adoptMaintenanceCustody(input: IsolatedMaintenanceInput | InstalledMaintenanceInput): MaintenanceCustody;
   /** Read-only query on an adopted custody. Only the real writer can stop. */
   maintenanceInterruptionMatches?(custody: MaintenanceCustody, point: MaintenanceInterruptionPoint): boolean;
+  bindMaintenanceTransaction?(custody: MaintenanceCustody, attempt: string, archive: MaintenanceFileEvidence,
+    registry: HeldLock | null, owners: readonly HeldLock[], deadline: number): void;
+  /** Native resolves the fixed transaction paths and checks the actual files. */
+  parkMaintenanceTransaction?(custody: MaintenanceCustody, point: MaintenanceTransactionPoint,
+    witness: MaintenanceTransactionWitness, deadline: number): never;
   observeMaintenanceStateRoot(custody: MaintenanceCustody): MaintenanceStateRoot;
   publishMaintenanceFile(custody: MaintenanceCustody, source: string, destination: string,
     parent: MaintenanceFileEvidence['identity'], file: MaintenanceFileEvidence, deadline: number): void;
@@ -404,6 +416,8 @@ interface NativeSupport {
   };
   assertMaintenanceCustody?(handle: object): void;
   maintenanceInterruptionMatches?(handle: object, point: MaintenanceInterruptionPoint): boolean;
+  bindMaintenanceTransaction?(handle: object, archive: string, registry: object | null, owners: readonly object[], deadline: number): void;
+  parkMaintenanceTransaction?(handle: object, point: MaintenanceTransactionPoint, witness: string, deadline: number): never;
   publishMaintenanceFile?(handle: object, source: string, destination: string, expected: string, deadline: number): void;
   observeMaintenanceStateRoot?(handle: object): string;
   assertMaintenanceStateRoot?(handle: object): void;
@@ -676,6 +690,40 @@ export function loadPlatform(): PlatformPort {
       if (typeof value !== 'boolean') throw unavailable('profile');
       assertMaintenanceCustody(custody);
       return value;
+    },
+    bindMaintenanceTransaction(custody: MaintenanceCustody, attempt: string, archive: MaintenanceFileEvidence,
+      registry: HeldLock | null, owners: readonly HeldLock[], deadline: number): void {
+      assertMaintenanceCustody(custody);
+      const handle = maintenanceHandles.get(custody), bind = native.bindMaintenanceTransaction;
+      const registryHandle = registry === null ? null : locks.get(registry);
+      if (!handle || typeof bind !== 'function' || registryHandle === undefined || owners.length > 4096 ||
+          !/^[0-9a-f]{32}$/.test(attempt) || !validator('migration.File')(archive) || !Number.isFinite(deadline))
+        throw unavailable('profile');
+      const ownerHandles = owners.map(owner => {
+        const value = locks.get(owner);
+        if (!value) throw unavailable('profile');
+        return value;
+      });
+      const nativeNow = call(() => native.continuousTime()), sampled = performance.now();
+      if (sampled >= deadline) throw unavailable('profile');
+      call(() => bind(handle, JSON.stringify({ attempt, archive }), registryHandle, ownerHandles,
+        nativeNow + Math.min(10000, deadline - sampled)));
+      assertMaintenanceCustody(custody);
+    },
+    parkMaintenanceTransaction(custody: MaintenanceCustody, point: MaintenanceTransactionPoint,
+      witness: MaintenanceTransactionWitness, deadline: number): never {
+      assertMaintenanceCustody(custody);
+      const handle = maintenanceHandles.get(custody), park = native.parkMaintenanceTransaction;
+      if (!handle || typeof park !== 'function' || !Number.isFinite(deadline) ||
+          !/^[0-9a-f]{32}$/.test(witness.attempt) || !validator('migration.File')(witness.transaction) ||
+          (point === 'current-publication' ? !validator('migration.File')(witness.current) : witness.current !== null))
+        throw unavailable('profile');
+      const encoded = JSON.stringify({ attempt: witness.attempt, transaction: witness.transaction, current: witness.current });
+      const nativeNow = call(() => native.continuousTime()), sampled = performance.now();
+      if (sampled >= deadline) throw unavailable('profile');
+      call(() => park(handle, point, encoded, nativeNow + Math.min(10000, deadline - sampled)));
+      // A valid stop terminates the parked writer. A return is never progress.
+      throw unavailable('profile');
     },
     publishMaintenanceFile(custody: MaintenanceCustody, source: string, destination: string,
       parent: MaintenanceFileEvidence['identity'], file: MaintenanceFileEvidence, deadline: number): void {

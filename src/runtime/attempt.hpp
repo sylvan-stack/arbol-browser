@@ -352,7 +352,7 @@ inline bool qualificationEnginePoint(id point) {
 }
 inline bool enabledQualificationEnginePoint(id point) {
   // Each writer enables only the point it actually implements.
-  return [@[] containsObject:point];
+  return [@[@"before-transaction",@"transaction-publication",@"current-publication",@"native-rename-excl"] containsObject:point];
 }
 inline bool qualificationDigest(id value) { return pattern(value,@"\\A[0-9a-f]{64}\\z"); }
 inline bool qualificationNonce(id value) { return pattern(value,@"\\A[0-9a-f]{32}\\z"); }

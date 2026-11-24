@@ -7,16 +7,21 @@ import { performance } from 'node:perf_hooks';
 import { isDeepStrictEqual } from 'node:util';
 import type { Contract } from '../contracts/generated.js';
 import { validator } from '../contracts/schema.js';
+import type { MaintenanceTransactionPoint } from '../runtime/platform.js';
 import { assertMigrationAdmission, type MigrationAdmission } from './migration-admission.js';
-import { assertMigrationPreflight, type MigrationPreflight } from './migration-preflight.js';
+import { assertMigrationPreflight, withMigrationRegistry, type MigrationPreflight } from './migration-preflight.js';
 import { migrationDirectory, migrationIdentity, migrationDigest, migrationValue, readMigrationFile, sameMigrationFile,
-  sameMigrationIdentity, type MigrationContent, type MigrationIdentity } from './migration-owner.js';
+  sameMigrationIdentity, withMigrationOwner, type MigrationContent, type MigrationFile, type MigrationIdentity } from './migration-owner.js';
 import { missing, ownerUid, profileUnavailable, syncDirectory } from './paths.js';
 
 const mercury = '/Volumes/Mercury', archiveRoot = `${mercury}/Arbol`;
 // ARC-5's real archive identity, shared with Arbol database/archive_volume.py.
 const mercuryUUID = 'AE1E97B8-CE93-4019-B6DC-21482165C3F2';
 const transactionLimit = 4096 * (4 * 87384 + 8192) + 65536;
+const earlyInterruptionPoints = ['before-transaction', 'transaction-publication', 'current-publication', 'native-rename-excl'] as const;
+function activeEarlyInterruption({ platform, custody }: MigrationAdmission) {
+  return earlyInterruptionPoints.find(point => platform.maintenanceInterruptionMatches?.(custody, point));
+}
 export class MigrationArchiveUnavailable extends Error {
   readonly code = 'archive_unavailable';
   constructor() { super('The verified Mercury archive is unavailable.'); }
@@ -68,7 +73,7 @@ export async function publishMigrationFile(admission: MigrationAdmission, path: 
 interface Archive {
   assert(): Promise<void>;
   ensure(path: string): Promise<void>;
-  write(path: string, bytes: Uint8Array): Promise<void>;
+  write(path: string, bytes: Uint8Array): Promise<MigrationFile>;
   read(path: string, limit: number): Promise<Buffer>;
   close(): Promise<void>;
 }
@@ -128,10 +133,12 @@ async function requireMercury(deadline: number): Promise<Archive> {
           if (!held.isFile() || held.nlink !== 1n || held.dev !== original.dev || !named || held.ino !== named.ino || held.size !== BigInt(bytes.byteLength)) refuse();
           const read = Buffer.alloc(bytes.byteLength); let at = 0;
           while (at < read.length) { const part = await fd.read(read, at, read.length - at, at); if (!part.bytesRead) refuse(); at += part.bytesRead; }
-          if (migrationDigest(read) !== migrationDigest(bytes)) refuse();
+          const sha256=migrationDigest(read);
+          if (sha256 !== migrationDigest(bytes)) refuse();
           const parent = await open(dirname(target), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
           try { await parent.sync(); } finally { await parent.close(); }
           await assert();
+          return { identity: migrationIdentity(held), sha256 };
         } finally { await fd.close(); }
       },
       async read(target, limit) {
@@ -189,6 +196,7 @@ export async function readMigrationTransaction(admission: MigrationAdmission, de
   await admission.assert(deadline);
   const facts = admission.custody.facts, root = join(facts.runtime, 'browser-profile-migration'), path = join(root, 'current');
   try { await lstat(path); } catch (error) { if (missing(error)) return null; throw error; }
+  if (activeEarlyInterruption(admission)) throw profileUnavailable();
   const rootIdentity = await migrationDirectory(root), current = await readMigrationFile(path, 16384);
   const pointer = migrationValue(current, 16384) as { format?: unknown; attempt?: unknown; transactionSha256?: unknown };
   if (!pointer || Object.keys(pointer).sort().join(',') !== 'attempt,format,transactionSha256' || pointer.format !== 1 ||
@@ -236,17 +244,41 @@ export async function createMigrationTransaction(preflight: MigrationPreflight, 
       await archive.write(join(folder, 'profile.json'), Buffer.from(entry.originalRecord.base64, 'base64'));
       if (entry.originalMarker) await archive.write(join(folder, 'engine.json'), Buffer.from(entry.originalMarker.base64, 'base64'));
     }
-    await archive.write(join(backup, 'transaction.json'), bytes);
+    const archived = await archive.write(join(backup, 'transaction.json'), bytes);
     await preflight.assertOriginals(deadline); await archive.assert();
+    const { platform, custody } = admission, interception = activeEarlyInterruption(admission);
+    if (interception) {
+      const bind = platform.bindMaintenanceTransaction;
+      if (!bind) throw profileUnavailable();
+      const registry = preflight.root.initial === 'absent' ? null : await withMigrationRegistry(preflight, deadline, held => held);
+      const owners = [];
+      for (const { owner } of preflight.profiles) owners.push(await withMigrationOwner(owner, platform, custody, held => held));
+      await preflight.assertOriginals(deadline); await archive.assert();
+      bind.call(platform, custody, id, archived, registry, owners, deadline);
+    }
+    const park = async (point: MaintenanceTransactionPoint, transaction: MigrationFile, current: MigrationFile | null = null) => {
+      if (interception !== point) return;
+      const stop = platform.parkMaintenanceTransaction;
+      if (!stop) throw profileUnavailable();
+      await preflight.assertOriginals(deadline); await archive.assert();
+      // The native writer resolves paths and creates every frame from the
+      // retained archive, live guards and actual writer file references.
+      const reference = ({ identity, sha256 }: MigrationFile): MigrationFile => ({ identity, sha256 });
+      stop.call(platform, custody, point, { attempt: id, transaction: reference(transaction), current: current && reference(current) }, deadline);
+      throw profileUnavailable();
+    };
+    await park('before-transaction', archived);
     const assert = async () => { await preflight.assertOriginals(deadline); await archive.assert(); await migrationAbsent(join(root, 'current')); };
     await ensureMigrationDirectory(root, assert); await migrationAbsent(attempt);
     await ensureMigrationDirectory(attempt, assert); await ensureMigrationDirectory(join(attempt, 'progress'), assert);
     const file = await publishMigrationFile(admission, join(attempt, 'transaction.json'), bytes, deadline, assert);
     await archive.assert(); await preflight.assertOriginals(deadline);
+    await park('transaction-publication', file);
     // After the pointer is visible it cannot be required absent by the final
     // assertion. Exact transaction/admission and native custody remain held.
-    await publishMigrationFile(admission, join(root, 'current'), Buffer.from(`${JSON.stringify({ format: 1, attempt: id, transactionSha256: file.sha256 })}\n`),
+    const current = await publishMigrationFile(admission, join(root, 'current'), Buffer.from(`${JSON.stringify({ format: 1, attempt: id, transactionSha256: file.sha256 })}\n`),
       deadline, async () => { await preflight.assertOriginals(deadline); await archive.assert(); });
+    await park('current-publication', file, current);
     const transaction = await readMigrationTransaction(admission, deadline); if (!transaction) throw profileUnavailable();
     return transaction;
   } finally { await archive.close(); }

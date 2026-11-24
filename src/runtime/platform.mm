@@ -8,6 +8,7 @@
 #include <spawn.h>
 #include <set>
 #include <sys/file.h>
+#include <sys/attr.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -719,6 +720,16 @@ struct MaintenanceCustody {
   NSDictionary* interruption = nil;
   NSDictionary* interruptionWorker = nil;
   std::atomic<bool> interruptionConsumed{false};
+  NSString* publishedTransactionAttempt = nil;
+  NSDictionary* publishedTransaction = nil;
+  NSDictionary* publishedCurrent = nil;
+  NSString* interruptionAttempt = nil;
+  NSString* interruptionArchiveDigest = nil;
+  std::unique_ptr<arbol_attempt::MaintenanceFile> interruptionArchive;
+  std::unique_ptr<arbol_attempt::MaintenanceDirectory> interruptionProfiles;
+  HeldLock* interruptionRegistry = nullptr;
+  std::vector<HeldLock*> interruptionOwners;
+  std::set<std::string> interruptionProfileNames;
   const arbol_attempt::PackagedLayout& layout() const { return installed ? production.layout : isolated.authority.layout; }
   arbol_attempt::MaintenanceGuard& oldGuard() { return installed ? production.oldBuild : isolated.oldBuild; }
   arbol_attempt::MaintenanceGuard& newGuard() { return installed ? production.newBuild : isolated.newBuild; }
@@ -776,6 +787,10 @@ struct MaintenanceCustody {
   }
 };
 static MaintenanceCustody* maintenanceCustody = nullptr;
+static bool qualificationFileAbsent(const std::string& path);
+static bool earlyQualificationPoint(id point) {
+  return [@[@"before-transaction",@"transaction-publication",@"current-publication",@"native-rename-excl"] containsObject:point];
+}
 struct MaintenanceStateRoot {
   arbol_attempt::MaintenanceDirectory parent;
   int fd = -1; std::string path, leaf; struct stat identity{};
@@ -877,7 +892,8 @@ static napi_value adoptMaintenanceCustody(napi_env env, napi_callback_info info)
     custody->parent = parent;
     if (interruption) {
       custody->interruption=interruption; custody->interruptionWorker=self;
-      if (!custody->originalInterruption()) return fail(env);
+      if (!custody->originalInterruption() || (earlyQualificationPoint(interruption[@"point"]) &&
+          !qualificationFileAbsent(custody->runtime().path+"/browser-profile-migration/current"))) return fail(env);
     }
     // Recovery re-adopts new process descriptions under the same durable
     // admission. Parent identity and deadline remain independently enforced;
@@ -948,6 +964,183 @@ static napi_value maintenanceInterruptionMatches(napi_env env, napi_callback_inf
   } @catch(NSException*) { return fail(env); } }
 }
 
+static constexpr off_t qualificationTransactionLimit=4096LL*(4*87384+8192)+65536;
+static constexpr const char* qualificationMercury="/Volumes/Mercury";
+static constexpr const char* qualificationMercuryArchive="/Volumes/Mercury/Arbol/backups/browser-profile-format-2/";
+
+static NSDictionary* qualificationFileReference(const arbol_attempt::MaintenanceFile& file, NSString* sha256) {
+  return @{@"identity":arbol_attempt::maintenanceIdentity(file.identity),@"sha256":sha256};
+}
+static NSDictionary* qualificationArtifact(NSString* kind,const arbol_attempt::MaintenanceFile& file,NSString* sha256) {
+  return @{@"kind":kind,@"identity":arbol_attempt::maintenanceIdentity(file.identity),@"sha256":sha256,
+    @"size":[NSString stringWithUTF8String:std::to_string(file.identity.st_size).c_str()]};
+}
+static bool qualificationFileAbsent(const std::string& path) {
+  std::string resolved; struct stat named{};
+  return arbol_attempt::physicalFuturePath(path,resolved) && resolved==path && lstat(path.c_str(),&named)<0 && errno==ENOENT;
+}
+static bool qualificationMercuryFile(const arbol_attempt::MaintenanceFile& file) {
+  struct statfs held{},named{};
+  if (!file.current() || fstatfs(file.fd,&held) || statfs(qualificationMercury,&named) ||
+      strcmp(held.f_mntonname,qualificationMercury) || strcmp(named.f_mntonname,qualificationMercury) ||
+      memcmp(&held.f_fsid,&named.f_fsid,sizeof(held.f_fsid))) return false;
+  struct attrlist attrs{}; attrs.bitmapcount=ATTR_BIT_MAP_COUNT; attrs.volattr=ATTR_VOL_INFO|ATTR_VOL_UUID;
+  struct { uint32_t length; unsigned char uuid[16]; } reply{};
+  if (fgetattrlist(file.fd,&attrs,&reply,sizeof(reply),0) || reply.length!=sizeof(reply)) return false;
+  NSUUID* volume=[[NSUUID alloc] initWithUUIDBytes:reply.uuid];
+  return [volume.UUIDString isEqual:@"AE1E97B8-CE93-4019-B6DC-21482165C3F2"] && file.current();
+}
+static bool openQualificationFile(arbol_attempt::MaintenanceFile& file,const std::string& path,NSDictionary* expected,
+                                  off_t maximum,double deadline, bool readBytes=false) {
+  using namespace arbol_attempt;
+  return arbol_exit::migrationFile(expected) && qualificationDigest(expected[@"sha256"]) &&
+    file.openPath(path,0600,maximum,readBytes) && [maintenanceIdentity(file.identity) isEqual:expected[@"identity"]] &&
+    [file.sha256(deadline) isEqual:expected[@"sha256"]];
+}
+static bool qualificationPointer(const arbol_attempt::MaintenanceFile& file,NSString* attempt,NSString* transactionSha256) {
+  using namespace arbol_attempt;
+  NSDictionary* value=qualificationObject(file.content,limit); uint64_t format=0;
+  return keys(value,@[@"format",@"attempt",@"transactionSha256"]) && uintNumber(value[@"format"],format) && format==1 &&
+    [value[@"attempt"] isEqual:attempt] && [value[@"transactionSha256"] isEqual:transactionSha256];
+}
+
+static bool qualificationGuard(HeldLock* handle,const std::string& path) {
+  if (!handle || !liveLocks.count(handle) || handle->mode!=LOCK_EX || handle->path!=path) return false;
+  const arbol_boundary::Lock lock{handle->fd,path,uint64_t(handle->dev),handle->ino,geteuid(),0600,LOCK_EX};
+  return arbol_boundary::lockIdentity(lock);
+}
+static bool earlyQualificationGuards(const MaintenanceCustody& custody) {
+  const auto* state=maintenanceStateRoot;
+  if (!state || !state->current()) return false;
+  if (state->absent) return !custody.interruptionProfiles && !custody.interruptionRegistry && custody.interruptionOwners.empty();
+  if (!custody.interruptionProfiles || !custody.interruptionProfiles->current() ||
+      !qualificationGuard(custody.interruptionRegistry,state->path+"/registry.lock")) return false;
+  for (auto* owner:custody.interruptionOwners) {
+    if (!liveLocks.count(owner) || !qualificationGuard(owner,owner->path)) return false;
+  }
+  const int fd=openat(custody.interruptionProfiles->fd,".",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+  if (fd<0) return false;
+  DIR* directory=fdopendir(fd);
+  if (!directory) { close(fd); return false; }
+  std::set<std::string> seen; bool valid=true;
+  for (;;) {
+    errno=0; const auto* entry=readdir(directory);
+    if (!entry) { valid=valid&&!errno; break; }
+    const std::string name=entry->d_name;
+    if (name=="." || name=="..") continue;
+    if (!custody.interruptionProfileNames.count(name) || !seen.insert(name).second) { valid=false; break; }
+  }
+  return !closedir(directory) && valid && seen==custody.interruptionProfileNames && custody.interruptionProfiles->current();
+}
+static bool earlyQualificationArchive(const MaintenanceCustody& custody,NSString* attempt,NSString* sha256) {
+  return custody.interruptionArchive && [attempt isEqual:custody.interruptionAttempt] &&
+    [sha256 isEqual:custody.interruptionArchiveDigest] && qualificationMercuryFile(*custody.interruptionArchive);
+}
+
+static napi_value bindMaintenanceTransaction(napi_env env,napi_callback_info info) {
+  napi_value args[5],out; size_t count=5; void* raw=nullptr; std::string encoded; double deadline=0;
+  if (napi_get_cb_info(env,info,&count,args,nullptr,nullptr)!=napi_ok || count!=5 ||
+      napi_get_value_external(env,args[0],&raw)!=napi_ok || !raw || raw!=maintenanceCustody || !maintenanceCustody->accepted ||
+      !boundedText(env,args[1],encoded) || napi_get_value_double(env,args[4],&deadline)!=napi_ok || !std::isfinite(deadline) ||
+      deadline<=arbol_boundary::clockMs() || deadline>arbol_boundary::clockMs()+10000) return fail(env);
+  @autoreleasepool { try { @try {
+    using namespace arbol_attempt;
+    auto& custody=*maintenanceCustody;
+    auto* state=maintenanceStateRoot;
+    if (!earlyQualificationPoint(custody.interruption[@"point"]) || custody.interruptionArchive ||
+        !custody.originalInterruption() || !state || !state->current() ||
+        !qualificationFileAbsent(custody.runtime().path+"/browser-profile-migration/current")) return fail(env);
+    NSDictionary* witness=arbol_exit::strictManagementObject(encoded);
+    if (!keys(witness,@[@"attempt",@"archive"]) || !qualificationNonce(witness[@"attempt"])) return fail(env);
+    NSString* attempt=witness[@"attempt"];
+    bool array=false; uint32_t size=0;
+    if (napi_is_array(env,args[3],&array)!=napi_ok || !array || napi_get_array_length(env,args[3],&size)!=napi_ok || size>4096)
+      return fail(env);
+    if (state->absent) {
+      napi_valuetype registryType;
+      if (size || napi_typeof(env,args[2],&registryType)!=napi_ok || registryType!=napi_null) return fail(env);
+    } else {
+      void* handle=nullptr;
+      if (napi_get_value_external(env,args[2],&handle)!=napi_ok ||
+          !qualificationGuard(static_cast<HeldLock*>(handle),state->path+"/registry.lock")) return fail(env);
+      custody.interruptionRegistry=static_cast<HeldLock*>(handle);
+      const std::string profiles=state->path+"/profiles", prefix=profiles+"/", suffix="/owner.lock";
+      custody.interruptionProfiles=std::make_unique<MaintenanceDirectory>();
+      if (!custody.interruptionProfiles->openPath(profiles) || custody.interruptionProfiles->identity.st_dev!=state->identity.st_dev)
+        return fail(env);
+      for (uint32_t i=0;i<size;++i) {
+        napi_value element;
+        if (napi_get_element(env,args[3],i,&element)!=napi_ok || napi_get_value_external(env,element,&handle)!=napi_ok) return fail(env);
+        auto* owner=static_cast<HeldLock*>(handle);
+        if (!liveLocks.count(owner) || owner->path.size()<=prefix.size()+suffix.size() ||
+            owner->path.compare(0,prefix.size(),prefix) || owner->path.compare(owner->path.size()-suffix.size(),suffix.size(),suffix))
+          return fail(env);
+        const std::string profile=owner->path.substr(prefix.size(),owner->path.size()-prefix.size()-suffix.size());
+        if (!pattern([NSString stringWithUTF8String:profile.c_str()],@"\\A[a-z](?:[a-z0-9-]{0,62}[a-z0-9])?\\z") ||
+            !custody.interruptionProfileNames.insert(profile).second || !qualificationGuard(owner,prefix+profile+suffix)) return fail(env);
+        custody.interruptionOwners.push_back(owner);
+      }
+    }
+    auto archive=std::make_unique<MaintenanceFile>();
+    const std::string path=std::string(qualificationMercuryArchive)+attempt.UTF8String+"/transaction.json";
+    if (!openQualificationFile(*archive,path,witness[@"archive"],qualificationTransactionLimit,deadline) ||
+        !qualificationMercuryFile(*archive) || !earlyQualificationGuards(custody) ||
+        !custody.originalInterruption() || arbol_boundary::clockMs()>=deadline) return fail(env);
+    custody.interruptionAttempt=attempt; custody.interruptionArchiveDigest=witness[@"archive"][@"sha256"];
+    custody.interruptionArchive=std::move(archive);
+    return napi_get_undefined(env,&out)==napi_ok ? out : fail(env);
+  } @catch (NSException*) { return fail(env); } } catch (...) { return fail(env); } }
+}
+
+// Branded JS preflight holds the registry and original owners throughout this
+// synchronous call. Only a matching adopted interruption can reach the pipe.
+// Recover every observable reference independently from its fixed writer path.
+static napi_value parkMaintenanceTransaction(napi_env env,napi_callback_info info) {
+  napi_value args[4]; size_t count=4; void* raw=nullptr;
+  std::string point,encoded; double deadline=0;
+  if (napi_get_cb_info(env,info,&count,args,nullptr,nullptr)!=napi_ok || count!=4 ||
+      napi_get_value_external(env,args[0],&raw)!=napi_ok || !raw || raw!=maintenanceCustody || !maintenanceCustody->accepted ||
+      !boundedText(env,args[1],point,48) || !boundedText(env,args[2],encoded) ||
+      napi_get_value_double(env,args[3],&deadline)!=napi_ok || !std::isfinite(deadline) ||
+      deadline<=arbol_boundary::clockMs() || deadline>arbol_boundary::clockMs()+10000) return fail(env);
+  @autoreleasepool { try { @try {
+    using namespace arbol_attempt;
+    const bool archive=point=="before-transaction", afterTransaction=point=="transaction-publication", afterCurrent=point=="current-publication";
+    if (!archive&&!afterTransaction&&!afterCurrent) return fail(env);
+    NSString* name=[NSString stringWithUTF8String:point.c_str()];
+    auto& custody=*maintenanceCustody;
+    if (![custody.interruption[@"point"] isEqual:name] || !custody.originalInterruption()) return fail(env);
+    NSDictionary* request=arbol_exit::strictManagementObject(encoded);
+    if (!keys(request,@[@"attempt",@"transaction",@"current"]) || !qualificationNonce(request[@"attempt"]) ||
+        (!afterCurrent && request[@"current"]!=NSNull.null)) return fail(env);
+    NSString* attempt=request[@"attempt"];
+    NSDictionary* original=request[@"transaction"], *current=request[@"current"];
+    if (!arbol_exit::migrationFile(original) || !earlyQualificationArchive(custody,attempt,original[@"sha256"]) ||
+        !earlyQualificationGuards(custody) || ![custody.interruptionArchive->sha256(deadline) isEqual:original[@"sha256"]]) return fail(env);
+    const std::string root=custody.runtime().path+"/browser-profile-migration", currentPath=root+"/current";
+    const std::string localPath=root+"/"+attempt.UTF8String+"/transaction.json";
+    if (archive ? bool(custody.publishedTransaction) :
+        (![attempt isEqual:custody.publishedTransactionAttempt] || ![original isEqual:custody.publishedTransaction])) return fail(env);
+    if (afterCurrent ? ![current isEqual:custody.publishedCurrent] : bool(custody.publishedCurrent)) return fail(env);
+    MaintenanceFile local,pointer;
+    const MaintenanceFile& transaction=archive ? *custody.interruptionArchive : local;
+    if ((archive ? ![qualificationFileReference(transaction,original[@"sha256"]) isEqual:original] :
+         !openQualificationFile(local,localPath,original,qualificationTransactionLimit,deadline)) ||
+        (afterCurrent && (!openQualificationFile(pointer,currentPath,current,limit,deadline,true) ||
+         !qualificationPointer(pointer,attempt,original[@"sha256"])))) return fail(env);
+    const auto writerCurrent=[&] {
+      return transaction.current() && (afterCurrent ? pointer.current() : qualificationFileAbsent(currentPath)) &&
+        earlyQualificationArchive(custody,attempt,original[@"sha256"]) && earlyQualificationGuards(custody) &&
+        (!archive || qualificationFileAbsent(localPath));
+    };
+    NSArray* artifacts=@[qualificationArtifact(archive?@"mercury-transaction":@"transaction",transaction,original[@"sha256"])];
+    if (afterCurrent) artifacts=[artifacts arrayByAddingObject:qualificationArtifact(@"current",pointer,current[@"sha256"])];
+    NSDictionary* witness=@{@"attempt":attempt,@"transactionSha256":original[@"sha256"],@"profileSha256":NSNull.null,@"artifacts":artifacts};
+    custody.parkInterruption(name,witness,deadline,writerCurrent);
+    return fail(env);
+  } @catch(NSException*) { return fail(env); } } catch (...) { return fail(env); } }
+}
+
 // Management publication only; ordinary profile metadata and retained native
 // receipts have their own, stronger publication/permit routes. A single-link
 // inode moves atomically, including when this process dies during publication.
@@ -967,6 +1160,17 @@ static napi_value publishMaintenanceFile(napi_env env,napi_callback_info info) {
       return fail(env);
     const std::string parentPath=source.substr(0,a),from=source.substr(a+1),to=destination.substr(b+1);
     const std::string runtimeRoot=maintenanceCustody->runtime().path+"/browser-profile-migration";
+    NSString* point=maintenanceCustody->interruption[@"point"];
+    const bool currentPointer=destination==runtimeRoot+"/current";
+    const bool beforeTransaction=[point isEqual:@"before-transaction"], afterTransaction=[point isEqual:@"transaction-publication"];
+    const bool afterCurrent=[point isEqual:@"current-publication"], beforePointerSync=[point isEqual:@"native-rename-excl"];
+    NSString* transactionAttempt=nil;
+    if ((beforeTransaction || afterTransaction || afterCurrent || beforePointerSync) && to=="transaction.json" && within(parentPath,runtimeRoot)) {
+      transactionAttempt=[NSString stringWithUTF8String:parentPath.c_str()+runtimeRoot.size()+1];
+      if (!qualificationNonce(transactionAttempt) || beforeTransaction || maintenanceCustody->publishedTransaction) return fail(env);
+    }
+    if (currentPointer && (beforeTransaction || afterTransaction)) return fail(env);
+    const bool trackPointer=currentPointer && (afterCurrent || beforePointerSync);
     NSString* state=maintenanceCustody->stateRoot(); if(!path(state)) return fail(env);
     const std::string stagingRoot=std::string(state.fileSystemRepresentation)+"/migration-staged";
     if((parentPath!=runtimeRoot&&!within(parentPath,runtimeRoot)&&!within(parentPath,stagingRoot))||
@@ -975,12 +1179,26 @@ static napi_value publishMaintenanceFile(napi_env env,napi_callback_info info) {
     NSDictionary* expected=json(encoded);
     if(!keys(expected,@[@"parent",@"file"])||!keys(expected[@"file"],@[@"identity",@"sha256"])||
        !pattern(expected[@"file"][@"sha256"],@"^[0-9a-f]{64}$")) return fail(env);
-    MaintenanceDirectory parent; MaintenanceFile file;
-    if(!parent.openPath(parentPath,expected[@"parent"])||!file.openPath(source,0600,1500000000)||
+    MaintenanceDirectory parent; MaintenanceFile file,transaction;
+    if(!parent.openPath(parentPath,expected[@"parent"])||!file.openPath(source,0600,trackPointer?off_t(limit):1500000000,trackPointer)||
        file.identity.st_dev!=parent.identity.st_dev||
        ![maintenanceIdentity(file.identity) isEqual:expected[@"file"][@"identity"]]||
        ![file.sha256(deadline) isEqual:expected[@"file"][@"sha256"]]) return fail(env);
-    auto current=[&] { return custody()&&parent.current()&&file.current()&&arbol_boundary::clockMs()<deadline; };
+    NSString* originalAttempt=maintenanceCustody->publishedTransactionAttempt;
+    NSDictionary* originalTransaction=maintenanceCustody->publishedTransaction;
+    if (trackPointer && (!qualificationNonce(originalAttempt) || !originalTransaction || maintenanceCustody->publishedCurrent ||
+        !qualificationPointer(file,originalAttempt,originalTransaction[@"sha256"]) ||
+        !openQualificationFile(transaction,runtimeRoot+"/"+originalAttempt.UTF8String+"/transaction.json",originalTransaction,
+          qualificationTransactionLimit,deadline))) return fail(env);
+    NSString* attempt=trackPointer?originalAttempt:transactionAttempt;
+    NSString* transactionHash=trackPointer?originalTransaction[@"sha256"]:expected[@"file"][@"sha256"];
+    auto current=[&] {
+      return custody()&&parent.current()&&file.current()&&(!trackPointer||transaction.current())&&
+        (!attempt || (earlyQualificationArchive(*maintenanceCustody,attempt,transactionHash) && earlyQualificationGuards(*maintenanceCustody)))&&
+        arbol_boundary::clockMs()<deadline;
+    };
+    if (trackPointer && beforePointerSync && (!current() ||
+        ![maintenanceCustody->interruptionArchive->sha256(deadline) isEqual:transactionHash])) return fail(env);
     if(!current()||fsync(file.fd)||fcntl(file.fd,F_FULLFSYNC)||!current()||
        renameatx_np(parent.fd,from.c_str(),parent.fd,to.c_str(),RENAME_EXCL)) return fail(env);
     struct stat held{},named{},old{};
@@ -990,9 +1208,23 @@ static napi_value publishMaintenanceFile(napi_env env,napi_callback_info info) {
     struct stat renamedExpected=file.identity; renamedExpected.st_ctimespec=held.st_ctimespec;
     if(!sameFile(renamedExpected,held)||![maintenanceIdentity(held) isEqual:expected[@"file"][@"identity"]]) return fail(env);
     file.path=destination; file.identity=held;
-    errno=0; if(!fstatat(parent.fd,from.c_str(),&old,AT_SYMLINK_NOFOLLOW)||errno!=ENOENT) return fail(env);
+    auto temporaryGone=[&] { errno=0; return fstatat(parent.fd,from.c_str(),&old,AT_SYMLINK_NOFOLLOW)<0 && errno==ENOENT; };
+    if (!temporaryGone()) return fail(env);
+    if (currentPointer && beforePointerSync) {
+      NSArray* artifacts=@[qualificationArtifact(@"transaction",transaction,originalTransaction[@"sha256"]),
+        qualificationArtifact(@"current",file,expected[@"file"][@"sha256"])];
+      NSDictionary* witness=@{@"attempt":originalAttempt,@"transactionSha256":originalTransaction[@"sha256"],
+        @"profileSha256":NSNull.null,@"artifacts":artifacts};
+      maintenanceCustody->parkInterruption(@"native-rename-excl",witness,deadline,[&]{return current()&&temporaryGone();});
+      return fail(env);
+    }
     if(!current()||![file.sha256(deadline) isEqual:expected[@"file"][@"sha256"]]||
        fsync(file.fd)||fcntl(file.fd,F_FULLFSYNC)||fsync(parent.fd)||!current()) return fail(env);
+    if (transactionAttempt) {
+      maintenanceCustody->publishedTransactionAttempt=transactionAttempt;
+      maintenanceCustody->publishedTransaction=qualificationFileReference(file,expected[@"file"][@"sha256"]);
+    }
+    if (trackPointer) maintenanceCustody->publishedCurrent=qualificationFileReference(file,expected[@"file"][@"sha256"]);
     napi_value out; if(napi_get_undefined(env,&out)!=napi_ok) return fail(env); return out;
   } @catch(NSException*) { return fail(env); } } catch(...) { return fail(env); } }
 }
@@ -3800,6 +4032,8 @@ static napi_value init(napi_env env, napi_value exports) {
     {"adoptMaintenanceCustody",nullptr,adoptMaintenanceCustody,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"assertMaintenanceCustody",nullptr,assertMaintenanceCustody,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"maintenanceInterruptionMatches",nullptr,maintenanceInterruptionMatches,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"bindMaintenanceTransaction",nullptr,bindMaintenanceTransaction,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"parkMaintenanceTransaction",nullptr,parkMaintenanceTransaction,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"prepareQualificationInterruptionPipes",nullptr,prepareQualificationInterruptionPipes,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"publishMaintenanceFile",nullptr,publishMaintenanceFile,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"observeMaintenanceStateRoot",nullptr,observeMaintenanceStateRoot,nullptr,nullptr,nullptr,napi_default,nullptr},
