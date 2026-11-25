@@ -346,7 +346,8 @@ export async function integrateTrustedShell(port: NativeShellPort, prepared: Hos
     };
     const proof = await prepareStartupConstructionSnapshot(prepared.custody, boundary.native.trust, 'window', onClose, deadline);
     host = modules.windows.createWindowHost(sessions, boundary, onClose, proof);
-    const registration = modules.ipc.registerShellIPC(host, tabs, guardedAuthority);
+    const registration = modules.ipc.registerShellIPC(host, tabs, guardedAuthority,
+      { custody: prepared.custody, platform: ownership.prepared.platform });
     // Return the actual registered hidden resources before any asynchronous
     // loading. Assembly must bind ownership/window closure first, then await
     // registration.load and genuine lifecycle.ready before showing the shell.

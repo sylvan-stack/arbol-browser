@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type { Contract } from '../contracts/generated.js';
+import type { ProfileNavigationRequest } from '../host/profile-navigation.js';
 
 /** Bundled CJS for the sandbox. Never expose ipcRenderer, native objects or arbitrary channels. */
 contextBridge.exposeInMainWorld('browserShell', Object.freeze({
@@ -10,4 +11,5 @@ contextBridge.exposeInMainWorld('browserShell', Object.freeze({
     return () => ipcRenderer.removeListener('browser-shell:state', listener);
   },
   resync: () => ipcRenderer.invoke('browser-shell:state'),
+  profiles: (request: ProfileNavigationRequest) => ipcRenderer.invoke('browser-shell:profiles', request),
 }));

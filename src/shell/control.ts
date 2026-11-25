@@ -1,10 +1,12 @@
 import type { Contract } from '../contracts/generated.js';
+import type { ProfileNavigationRequest, ProfileNavigationState } from '../host/profile-navigation.js';
 type State = Contract<'browser.ShellEvent'>;
 type Request = Contract<'browser.ShellRequest'>;
 interface ShellBridge {
   request(request: Request): Promise<Contract<'browser.ShellSuccess'> | Contract<'browser.ShellFailure'>>;
   subscribe(receive: (state: State) => void): () => void;
   resync(): Promise<State>;
+  profiles(request: ProfileNavigationRequest): Promise<ProfileNavigationState | { error: string } | null>;
 }
 declare global { interface Window { browserShell: ShellBridge } }
 const api = window.browserShell;
@@ -15,6 +17,43 @@ let state: State | undefined, selected = '', synchronized = false, pending = 0, 
 let syncTask: Promise<void> | undefined, newestRevision = 0, selecting = false;
 let tabOrder: string[] = [], focusKey = '';
 const requests = new Set<string>();
+const profilePanel = element('profile-panel'), profilePicker = element<HTMLSelectElement>('profile-select');
+const profileName = element<HTMLInputElement>('profile-id'), profileStatus = element('profile-status');
+let profiles: ProfileNavigationState | undefined, changingProfile = false;
+
+function profileLabel(id: string): string {
+  if (id === 'default') return 'Default';
+  if (/^seqoya-[0-9a-f]{32}$/.test(id)) return `Seqoya · ${id.slice(-8)}`;
+  return id.split('-').map(word => word ? word[0]!.toUpperCase() + word.slice(1) : '').join(' ');
+}
+function renderProfiles(): void {
+  profilePicker.disabled = changingProfile || !profiles;
+  profileName.disabled = changingProfile || !profiles;
+  button('profile-add').disabled = profileName.disabled;
+  button('profile-open').disabled = profilePicker.disabled || !profilePicker.value || profilePicker.value === profiles?.current;
+}
+async function profileAction(request: ProfileNavigationRequest): Promise<void> {
+  if (changingProfile) return;
+  changingProfile = true; renderProfiles();
+  profileStatus.textContent = request.method === 'open' ? 'Opening profile…' : request.method === 'create' ? 'Creating profile…' : 'Loading profiles…';
+  try {
+    const result = await api.profiles(request);
+    if (!result) { profilePanel.hidden = true; button('profiles').hidden = true; return; }
+    if ('error' in result) { profileStatus.textContent = result.error; return; }
+    profiles = result;
+    const previous = request.method === 'create' ? request.profile : profilePicker.value;
+    profilePicker.replaceChildren(...result.profiles.map(entry => {
+      const option = document.createElement('option');
+      option.value = entry.id;
+      option.textContent = (entry.label ?? profileLabel(entry.id)) + (entry.id === result.current ? ' (current)' : '');
+      return option;
+    }));
+    profilePicker.value = result.profiles.some(entry => entry.id === previous) ? previous : result.current;
+    if (request.method === 'create') profileName.value = '';
+    profileStatus.textContent = request.method === 'open' ? 'Profile window opened.' : request.method === 'create' ? 'Profile created.' : '';
+  } catch { profileStatus.textContent = 'Could not load or change the Browser profiles.'; }
+  finally { changingProfile = false; renderProfiles(); }
+}
 const current = () => state?.tabs.find(tab => tab.tab === selected);
 const problem = (text: string) => { element('problem').textContent = text; };
 function accept(value: State, snapshot = false) {
@@ -96,6 +135,20 @@ function render() {
   if (focusKey) [...document.querySelectorAll<HTMLElement>('[data-key]')].find(node => node.dataset.key === focusKey)?.focus();
 }
 button('new').onclick = () => { void send('new_tab'); };
+button('profiles').onclick = () => {
+  profilePanel.hidden = !profilePanel.hidden;
+  button('profiles').setAttribute('aria-expanded', String(!profilePanel.hidden));
+  if (!profilePanel.hidden) void profileAction({ method: 'list' });
+};
+profilePicker.onchange = renderProfiles;
+button('profile-open').onclick = () => {
+  const profile = profiles?.profiles.find(entry => entry.id === profilePicker.value);
+  if (profile) void profileAction({ method: 'open', profile: profile.id, instance: profile.instance });
+};
+element<HTMLFormElement>('profile-create').onsubmit = event => {
+  event.preventDefault();
+  void profileAction({ method: 'create', profile: profileName.value.trim() });
+};
 button('close-window').onclick = () => { void send('close_window'); };
 button('close-tab').onclick = () => { void send('close_tab'); };
 for (const method of ['back', 'forward', 'reload', 'take'] as const) button(method).onclick = () => { void send(method); };
@@ -106,4 +159,4 @@ for (const method of ['share', 'return'] as const) button(method).onclick = () =
 client.onchange = render;
 element<HTMLFormElement>('navigate').onsubmit = event => { event.preventDefault(); void send('user_navigate', { url: address.value }); };
 api.subscribe(value => accept(value));
-render(); void resync();
+renderProfiles(); render(); void resync();

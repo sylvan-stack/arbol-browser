@@ -2,6 +2,9 @@ import { ipcMain, type IpcMainInvokeEvent, type WebContents } from 'electron';
 import type { Contract } from '../contracts/generated.js';
 import { validator } from '../contracts/schema.js';
 import { invalidInput, publicFailure, unavailable } from '../contracts/errors.js';
+import type { HostCustody } from '../runtime/custody.js';
+import type { PlatformPort } from '../runtime/platform.js';
+import { createProfileNavigation, type ProfileNavigation } from './profile-navigation.js';
 import { assertWindowHost, shellURL, type WindowHost } from './windows.js';
 import { assertTabRegistry, refused, userURL, type TabRegistry, type TabTarget } from './tabs.js';
 
@@ -32,6 +35,7 @@ interface Registration {
   authority: ShellAuthority;
   snapshot(): Event;
   dispatch(request: Request): Promise<Result>;
+  profiles?: ProfileNavigation;
 }
 const registrations = new WeakMap<ShellRegistration, Registration>();
 const senders = new Map<WebContents, Registration>();
@@ -73,6 +77,25 @@ function installTransport() {
     if (args.length) throw invalidInput();
     return current.snapshot();
   });
+  ipcMain.handle('browser-shell:profiles', async (event, request: unknown) => {
+    const current = authenticated(event);
+    if (!current.profiles) return null;
+    const check = () => {
+      if (authenticated(event) !== current) throw unavailable('browser');
+      current.authority.assertOperational();
+      if ((request as { method?: unknown } | null)?.method !== 'list' && !current.host.window.isFocused())
+        throw refused('control_refused');
+    };
+    check();
+    try {
+      const state = await current.profiles(request, check);
+      if (authenticated(event) !== current) throw unavailable('browser');
+      return state;
+    } catch (error) {
+      if (authenticated(event) !== current) throw unavailable('browser');
+      return { error: publicFailure(error).detail.message };
+    }
+  });
   installed = true;
 }
 export function assertShellRegistration(value: ShellRegistration, host: WindowHost): void {
@@ -81,7 +104,8 @@ export function assertShellRegistration(value: ShellRegistration, host: WindowHo
   host.assertHealthy(); current.authority.assertReady();
 }
 /** Called only by trusted main-process assembly with a real authority. No fallback is supplied. */
-export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority: ShellAuthority): ShellRegistration {
+export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority: ShellAuthority,
+  profileSource?: { custody: HostCustody; platform: PlatformPort }): ShellRegistration {
   assertWindowHost(host); assertTabRegistry(tabs); host.assertHealthy(); authority.assertReady();
   if (senders.has(host.shell.webContents)) throw unavailable('browser');
   let revision = 0, loaded = false, prepared = false, disposed = false;
@@ -99,7 +123,8 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
     if (!eventShape(value)) throw unavailable('browser');
     return value;
   };
-  const current: Registration = { host, authority, snapshot,
+  const profiles = profileSource && createProfileNavigation(profileSource.custody, profileSource.platform);
+  const current: Registration = { host, authority, snapshot, ...(profiles ? { profiles } : {}),
     async dispatch(request): Promise<Result> {
       host.assertHealthy(); authority.assertReady();
       if (ids.has(request.id) || ids.size >= 65536) throw refused('control_refused', 'Reopen the browser window to establish a fresh shell connection.');

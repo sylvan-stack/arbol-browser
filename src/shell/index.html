@@ -10,7 +10,12 @@
 </head>
 <body>
   <header aria-label="Trusted browser controls">
-    <div class="heading"><strong>Arbol Browser</strong><button id="new">New tab</button><button id="close-window">Close window</button></div>
+    <div class="heading"><strong>Arbol Browser</strong><button id="profiles" aria-controls="profile-panel" aria-expanded="false">Profiles</button><button id="new">New tab</button><button id="close-window">Close window</button></div>
+    <section id="profile-panel" aria-label="Browser profiles" hidden>
+      <div class="row"><label for="profile-select">Profile</label><select id="profile-select"></select><button id="profile-open">Open profile</button></div>
+      <form id="profile-create"><label for="profile-id">New profile</label><input id="profile-id" autocomplete="off" maxlength="64" placeholder="work-account" spellcheck="false" required pattern="[a-z](?:[a-z0-9\-]{0,62}[a-z0-9])?" title="Use lowercase letters, digits and hyphens."><button id="profile-add" type="submit">Create</button></form>
+      <p id="profile-status" role="status" aria-live="polite"></p>
+    </section>
     <nav id="tabs" aria-label="Browser tabs"></nav>
     <form id="navigate"><label for="address">Open address</label><input id="address" type="url" autocomplete="off" spellcheck="false" placeholder="https://example.com"><button id="go" type="submit">Go</button></form>
     <div class="row" id="history"><button id="back">Back</button><button id="forward">Forward</button><button id="reload">Reload</button><button id="close-tab">Close tab</button></div>

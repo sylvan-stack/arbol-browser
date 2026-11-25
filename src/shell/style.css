@@ -15,5 +15,7 @@ select { max-width: 100%; }
 p { margin: 6px 0; overflow-wrap: anywhere; }
 #privacy { color: var(--muted); font-size: 12px; }
 #problem { color: #ffb6b0; }
+#profile-panel { border: 1px solid var(--border); border-radius: 9px; padding: 8px; margin-bottom: 8px; }
+#profile-status { color: var(--muted); }
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto; } }
