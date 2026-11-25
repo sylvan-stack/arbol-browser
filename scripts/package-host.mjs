@@ -535,7 +535,8 @@ export async function prepareUnsignedHost({ out, buildRoot, stateRoot, runtimeAr
   const copy = { recursive: true, force: false, errorOnExist: true, verbatimSymlinks: true };
   await cp(join(root, 'dist/lib'), join(payload, 'lib'), copy);
   await cp(join(root, 'dist/native'), join(payload, 'native'), {
-    ...copy, filter: path => Boolean(maintenanceFixture) || path !== join(root, 'dist/native/stable-launch'),
+    ...copy, filter: path => (Boolean(maintenanceFixture) || path !== join(root, 'dist/native/stable-launch')) &&
+      (purpose !== 'production' || path !== join(root, 'dist/native/watchdog')),
   });
   for (const name of ['cli', 'host']) await cp(join(root, 'dist', name, 'main.mjs'), join(payload, 'lib', name, 'main.mjs'), copy);
   await mkdir(join(payload, 'runtime')); await cp(join(stock, 'Electron.app'), join(payload, 'runtime/Electron.app'), copy);

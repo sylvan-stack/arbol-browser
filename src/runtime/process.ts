@@ -365,8 +365,12 @@ export function createProductionProcessIntegration(host: VerifiedHost, selection
   assertPlatform(platform); assertProductionExitAuthority(exits); assertVerifiedHostMetadata(host, now() + 5000);
   if (host.identity.layout.build !== selection.build || host.identity.layout.buildRoot !== selection.directory ||
       selection.guard !== host.identity.layout.guard) throw unavailable('browser');
+  const assertAppAvailable = () => {
+    if (host.identity.layout.scope === 'installed' && !platform.browserAppAvailable?.()) throw unavailable('browser');
+  };
   return Object.freeze({
     async assertAdmissionAvailable(deadline = now() + 5000) {
+      assertAppAvailable();
       if (openCutoff === undefined) return host.assertTrusted(deadline);
       const cutoff = Math.min(deadline, openCutoff);
       await assertHostStartupContinuity(host, cutoff, cutoff);
@@ -376,6 +380,7 @@ export function createProductionProcessIntegration(host: VerifiedHost, selection
       noteOpenCommand(observation, 'open-current-signed-start');
       if (signal?.aborted) throw unavailable('browser');
       assertTime(deadline);
+      assertAppAvailable();
       await assertHostStartupContinuity(host, deadline, deadline);
       if (signal?.aborted) throw unavailable('browser');
       if (profile.paths.state !== host.policy.stateRoot) throw unavailable('profile');

@@ -9,7 +9,10 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/proc.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/wait.h>
+#include <pwd.h>
 #include <spawn.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -171,12 +174,13 @@ inline bool executable(const Identity& id, std::string& path) {
   audit_token_t token{}; token.val[5] = (uint32_t)id.pid; token.val[7] = (uint32_t)id.version; char bytes[PROC_PIDPATHINFO_MAXSIZE]{};
   if (proc_pidpath_audittoken(&token, bytes, sizeof(bytes)) <= 0 || bytes[0] != '/' || current(id) != 1) return false; path = bytes; return canonical(path);
 }
-inline bool signature(const std::string& path, bool jit) {
+inline bool signature(const std::string& path, bool jit, bool application=false) {
   CFStringRef s = CFStringCreateWithCString(nullptr, path.c_str(), kCFStringEncodingUTF8);
   CFURLRef url = s ? CFURLCreateWithFileSystemPath(nullptr, s, kCFURLPOSIXPathStyle, false) : nullptr;
   SecStaticCodeRef code = nullptr; SecRequirementRef req = nullptr; CFDictionaryRef info = nullptr;
   bool valid = url && SecStaticCodeCreateWithPath(url, kSecCSDefaultFlags, &code) == errSecSuccess &&
-    SecRequirementCreateWithString(CFSTR("anchor apple generic and certificate leaf[subject.OU] = \"7V372XL59S\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"), kSecCSDefaultFlags, &req) == errSecSuccess &&
+    SecRequirementCreateWithString(application ? CFSTR("anchor apple generic and certificate leaf[subject.OU] = \"7V372XL59S\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and identifier \"com.sylvan-stack.arbol\"") :
+      CFSTR("anchor apple generic and certificate leaf[subject.OU] = \"7V372XL59S\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"), kSecCSDefaultFlags, &req) == errSecSuccess &&
     SecStaticCodeCheckValidity(code, kSecCSStrictValidate | kSecCSCheckAllArchitectures, req) == errSecSuccess && SecCodeCopySigningInformation(code, kSecCSSigningInformation, &info) == errSecSuccess;
   if (valid) {
     CFTypeRef f = CFDictionaryGetValue(info, kSecCodeInfoFlags), team = CFDictionaryGetValue(info, kSecCodeInfoTeamIdentifier), timestamp = CFDictionaryGetValue(info, kSecCodeInfoTimestamp); uint32_t flags = 0;
@@ -260,6 +264,49 @@ inline bool lockIdentity(const Lock& lock) {
     S_ISREG(d.st_mode) && S_ISREG(p.st_mode) && d.st_nlink == 1 && p.st_nlink == 1 && d.st_uid == lock.uid && lock.uid == geteuid() &&
     (d.st_mode & 07777) == lock.mode && lock.mode == 0600 && (uint64_t)d.st_dev == lock.device && d.st_ino == lock.inode && d.st_dev == p.st_dev && d.st_ino == p.st_ino;
 }
+inline std::string appHome() {
+  passwd account{},*resolved=nullptr; char buffer[16384];
+  if(getuid()!=geteuid()||getpwuid_r(geteuid(),&account,buffer,sizeof(buffer),&resolved)||resolved!=&account||
+     account.pw_uid!=geteuid()||!account.pw_dir||!canonical(account.pw_dir)) return {};
+  return account.pw_dir;
+}
+inline const std::string& supervisorExecutable() {
+  static const std::string path=[] {
+    auto home=appHome();
+    return home.empty()?std::string{}:home+"/Applications/Seqoya Lab/Seqoya Lab.app/Contents/MacOS/Seqoya Lab";
+  }();
+  return path;
+}
+// The shared gate serializes startup with App departure. The kernel reports
+// the live listener's identity. The socket carries no command or credentials.
+inline Lock appAdmission(Identity& app) {
+  const auto home=appHome(); if(home.empty()) return {};
+  const auto directory=home+"/.arbol/app", endpoint=directory+"/browser-supervisor-v1.sock";
+  std::string gate=directory+"/browser-start.lock"; struct stat held{}, node{};
+  int fd=open(gate.c_str(),O_RDWR|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK);
+  if(fd<0) return {};
+  auto refuse=[&] { close(fd); return Lock{}; };
+  if(fstat(fd,&held)||flock(fd,LOCK_SH|LOCK_NB)) return refuse();
+  Lock lock{fd,gate,(uint64_t)held.st_dev,held.st_ino,held.st_uid,0600,LOCK_SH};
+  sockaddr_un address{};
+  if(!lockIdentity(lock)||endpoint.size()>=sizeof(address.sun_path)||!canonical(endpoint)||
+     lstat(endpoint.c_str(),&node)||!S_ISSOCK(node.st_mode)||node.st_uid!=geteuid()||(node.st_mode&07777)!=0600) return refuse();
+  address.sun_family=AF_UNIX; std::memcpy(address.sun_path,endpoint.c_str(),endpoint.size()+1);
+  address.sun_len=SUN_LEN(&address);
+  int socketFd=socket(AF_UNIX,SOCK_STREAM,0);
+  if(socketFd<0) return refuse();
+  audit_token_t token{}; socklen_t size=sizeof(token);
+  bool valid=!fcntl(socketFd,F_SETFD,FD_CLOEXEC)&&!fcntl(socketFd,F_SETFL,O_NONBLOCK)&&
+    !connect(socketFd,(sockaddr*)&address,address.sun_len)&&!
+    getsockopt(socketFd,SOL_LOCAL,LOCAL_PEERTOKEN,&token,&size)&&size==sizeof(token);
+  close(socketFd);
+  if(!valid||audit_token_to_euid(token)!=geteuid()||observe(audit_token_to_pid(token),app)!=1||
+     app.version!=audit_token_to_pidversion(token)) return refuse();
+  std::string executablePath;
+  if(!executable(app,executablePath)||executablePath!=supervisorExecutable()||!privateAncestors(executablePath)||
+     !signature(executablePath,false,true)||current(app)!=1||!lockIdentity(lock)) return refuse();
+  return lock;
+}
 // Every child mapping first duplicates its actual source ABOVE all reserved
 // targets. Ordered dup2 actions must never overwrite a later source descriptor.
 class SpawnCopies {
@@ -297,7 +344,7 @@ struct ChildExecReadback {
   bool active() const { const double limit=liveCutoff(); return clockMs()<limit; }
 };
 struct Context {
-  Identity main, primary, custody; bool authenticated=false, cleanupOnly=false, primaryOutside=false,familyUncertain=false; std::string bundle, digest; int session = 0; Lock owner, build;
+  Identity main, primary, custody, app; bool authenticated=false, cleanupOnly=false, primaryOutside=false,familyUncertain=false; std::string bundle, digest; int session = 0; Lock owner, build;
   std::map<OriginalKey,Identity> seen;
   std::map<OriginalKey,OriginalExit> exits;
   double lastFullCensus=0; bool fullCensusValid=false,originalGroupRetired=false,groupPending=false;
@@ -341,7 +388,14 @@ struct Context {
     return true;
   }
   std::string engine() const { return bundle + "/Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron"; }
-  std::string helper() const { return bundle + "/Contents/Resources/browser/native/watchdog"; }
+  bool ownerRunning() const {
+    if(!app.pid) return true;
+    Identity observed; Info details{};
+    return observe(app.pid,observed,&details)==1&&same(app,observed)&&
+      details.bsd.pbi_status!=SZOMB&&!(details.bsd.pbi_flags&PROC_FLAG_INEXIT);
+  }
+  std::string helper() const { return app.pid?supervisorExecutable():bundle + "/Contents/Resources/browser/native/watchdog"; }
+  bool helperSignature(const std::string& path) const { return signature(path,false,app.pid!=0); }
   unsigned engineRole(const std::string& path) const {
     unsigned role=0;
     for(const char* suffix:{""," (Renderer)"," (GPU)"," (Plugin)"}) {
@@ -374,13 +428,14 @@ struct Context {
     if(primaryMode) { if(!same(producer,main)) return false; primary=self; }
     else primary=producer,custody=self;
     std::string path; Identity actual;
-    if(observe(self.pid,actual)!=1||!same(self,actual)||actual.group!=main.group||!executable(self,path)||path!=helper()||!signature(path,false)) return false;
+    if(observe(self.pid,actual)!=1||!same(self,actual)||actual.group!=main.group||!executable(self,path)||path!=helper()||!helperSignature(path)) return false;
     Info producerInfo{}; Identity producerNow; int parentState=observe(producer.pid,producerNow,&producerInfo);
     if(parentState<0||(parentState==1&&producerNow.start==producer.start&&!same(producer,producerNow))) return false;
     // A kernel zombie may already have no task/image. Its exact identity plus
     // stable original-parent version grants cleanup, never live readiness.
     if(parentState==1&&same(producer,producerNow)&&producerInfo.bsd.pbi_status!=SZOMB) {
-      if(birth.unique.parent!=producer.start||!executable(producer,path)||path!=(primaryMode?engine():helper())||!signature(path,primaryMode)) return false;
+      if(birth.unique.parent!=producer.start||!executable(producer,path)||path!=(primaryMode?engine():helper())||
+         !(primaryMode?signature(path,true):helperSignature(path))) return false;
     }
     authenticated=true; cleanupOnly=true; seen.emplace(key(main),main); return true;
   }
@@ -388,7 +443,7 @@ struct Context {
     Identity now; std::string path;
     return id.pid > 1 && observe(id.pid, now) == 1 && same(id, now) && now.uid == main.uid && now.group == (anchor ? main.group : (uint32_t)id.pid) &&
       getsid(id.pid) == session && executable(now, path) && path == helper() &&
-      (retained ? retained->verifies(path) && current(id) == 1 : signature(path, false));
+      (retained ? retained->verifies(path) && current(id) == 1 : helperSignature(path));
   }
   bool primaryMonitor(const ReadOnlyMonitorImage* retained = nullptr) {
     Identity now;
@@ -409,7 +464,7 @@ struct Context {
       int state=observe(pids[i],id,&info); if(!state) continue; if(state<0) return false;
       if(id.uid!=main.uid||info.unique.parent!=main.start||info.unique.originalParentVersion!=main.version) continue;
       if(executable(id,path)&&path==helper()) {
-        if(getsid(id.pid)!=session||(id.group!=main.group&&id.group!=(uint32_t)id.pid)||!signature(path,false)) return false;
+        if(getsid(id.pid)!=session||(id.group!=main.group&&id.group!=(uint32_t)id.pid)||!helperSignature(path)) return false;
         found=id; ++count;
       }
     }
@@ -715,8 +770,9 @@ inline NSDictionary* capsuleLock(const Lock& lock) {
 }
 inline std::string capsuleBytes(const Context& c,bool primary) {
   @autoreleasepool { @try {
-    NSDictionary* value=@{@"format":@2,@"mode":primary?@"primary":@"custody",@"producerRole":primary?@"main":@"primary",@"producer":capsuleIdentity(primary?c.main:c.primary),
-      @"candidateSnapshotDigest":[NSString stringWithUTF8String:c.digest.c_str()],@"bundle":[NSString stringWithUTF8String:c.bundle.c_str()],@"main":capsuleIdentity(c.main,c.session),@"locks":@{@"owner":capsuleLock(c.owner),@"build":capsuleLock(c.build)}};
+    NSMutableDictionary* value=[@{@"format":c.app.pid?@3:@2,@"mode":primary?@"primary":@"custody",@"producerRole":primary?@"main":@"primary",@"producer":capsuleIdentity(primary?c.main:c.primary),
+      @"candidateSnapshotDigest":[NSString stringWithUTF8String:c.digest.c_str()],@"bundle":[NSString stringWithUTF8String:c.bundle.c_str()],@"main":capsuleIdentity(c.main,c.session),@"locks":@{@"owner":capsuleLock(c.owner),@"build":capsuleLock(c.build)}} mutableCopy];
+    if(c.app.pid) value[@"app"]=capsuleIdentity(c.app);
     NSData* data=[NSJSONSerialization dataWithJSONObject:value options:0 error:nil];
     if(!data||!data.length||data.length>16384) return {}; return std::string((const char*)data.bytes,data.length);
   } @catch(NSException*) { return {}; } }

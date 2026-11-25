@@ -1,7 +1,7 @@
 /** Private protocol-1 client. No stop/disarm export or finally-based release. */
 import { Socket } from 'node:net';
 import { isMainThread } from 'node:worker_threads';
-import { assertCandidateTrust, refuse, type CandidateTrust } from './manifest.js';
+import { assertCandidateTrust, productionPublisher, refuse, type CandidateTrust } from './manifest.js';
 import { assertWatchdogCustody, type WatchdogCustody, type HostLossStage } from '../runtime/platform.js';
 export type ProfileFatalCause = Extract<HostLossStage, `native_${string}`>;
 export interface NativeWatchdog {
@@ -20,7 +20,8 @@ export async function startNativeWatchdog(trust: CandidateTrust, custody: Watchd
   if (attempted || !isMainThread || process.type !== 'browser') refuse();
   attempted = true; assertCandidateTrust(trust); assertWatchdogCustody(custody);
   const launch = custody.now();
-  if (!trust.manifest.files['Contents/Resources/browser/native/watchdog']) refuse();
+  if (trust.manifest.bundleIdentifier !== productionPublisher.bundleIdentifier &&
+      !trust.manifest.files['Contents/Resources/browser/native/watchdog']) refuse();
   let phase: 'starting' | 'armed' | 'fatal' = 'starting', terminating = false, sequence = 0n;
   let buffer = '', lastAck = launch;
   let firstLoss: HostLossStage | undefined;

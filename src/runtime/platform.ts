@@ -353,6 +353,7 @@ export interface PlatformPort {
   retireCloseBudget(budget: CloseBudget): Promise<void>;
   processProvenance(pid: number): ProcessProvenance | null;
   requestProfileOpen?(profile: string, instance: string): boolean;
+  browserAppAvailable?(): boolean;
   activateProfileWindow?(peer: ProcessIdentity): boolean;
   seqoyaBackendArguments?(peer: ProcessIdentity, runtime: string, entry: string, lock: string): boolean;
   /** Private fixed claim.json transaction, only under the genuine claim.lock.
@@ -429,6 +430,7 @@ interface NativeSupport {
   continuousTime(): number;
   processProvenance(pid: number): ProcessProvenance | null;
   requestProfileOpen?(profile: string, instance: string): boolean;
+  browserAppAvailable?(): boolean;
   activateProfileWindow?(pid: number, startId: string): boolean;
   seqoyaBackendArguments?(pid: number, start: string, runtime: string, entry: string, lock: string): boolean;
   readLaunchAttempt(handle: object): string | null;
@@ -1075,6 +1077,9 @@ export function loadPlatform(): PlatformPort {
           !/^[1-9][0-9]{0,19}$/.test(value.startId) || !/^(0|[1-9][0-9]{0,19})$/.test(value.parentStartId) ||
           typeof value.executable !== 'string' || !isAbsolute(value.executable) || value.executable.includes('\0')) throw unavailable('profile');
       return Object.freeze({ ...value });
+    },
+    browserAppAvailable(): boolean {
+      return typeof native.browserAppAvailable === 'function' && call(() => native.browserAppAvailable!()) === true;
     },
     requestProfileOpen(profile: string, instance: string): boolean {
       return typeof native.requestProfileOpen === 'function' &&

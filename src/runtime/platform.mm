@@ -1845,6 +1845,7 @@ struct SessionUseNative;
 struct WebsiteSessionNative;
 struct Custody {
   arbol_boundary::Context context; int capsule=-1; bool bound=false,continuousBuild=false,hostRequired=false,spawned=false;
+  arbol_boundary::Lock appStartup;
   arbol_boundary::ReadOnlyMonitorImage monitorImage;
   arbol_exit::HostCapability finalization;
   int reader=-1,writer=-1; bool endpointsPublished=false;
@@ -2002,6 +2003,13 @@ static arbol_boundary::Lock duplicateHeld(HeldLock* held) {
   int fd = fcntl(held->fd,F_DUPFD_CLOEXEC,10); if (fd < 0) return {};
   return {fd,held->path,(uint64_t)st.st_dev,st.st_ino,st.st_uid,0600,held->mode};
 }
+static napi_value browserAppAvailable(napi_env env, napi_callback_info) {
+  arbol_boundary::Identity app;
+  auto admission=arbol_boundary::appAdmission(app);
+  const bool ready=admission.fd>=0 && !close(admission.fd);
+  napi_value out; if(napi_get_boolean(env,ready,&out)!=napi_ok) return fail(env);
+  return out;
+}
 static napi_value prepareWatchdogCustody(napi_env env, napi_callback_info info) {
   napi_value args[4]; size_t n = 4; std::string bundle; char digest[65]{}; size_t length = 0; void *a = nullptr, *b = nullptr;
   if (custodyAttempted) return fail(env); custodyAttempted = true;
@@ -2018,10 +2026,13 @@ static napi_value prepareWatchdogCustody(napi_env env, napi_callback_info info) 
     adoptedNoUse->bindOwner(c->context.owner);
     if(!adoptedNoUse->matches(bundle,digest,c->context.build)) return fail(env);
   }
+  arbol_attempt::PackagedLayout layout;
+  const bool installed=arbol_attempt::packagedLayout(bundle,layout)&&layout.installed;
+  if(installed) c->appStartup=arbol_boundary::appAdmission(c->context.app);
   c->context.session=getsid(0);
-  bool valid=arbol_boundary::observe(getpid(),c->context.main)==1 && c->context.initial();
+  bool valid=(!installed||c->appStartup.fd>=0) && arbol_boundary::observe(getpid(),c->context.main)==1 && c->context.initial();
   if(valid) { c->capsule=arbol_boundary::capsuleDescriptor(arbol_boundary::capsuleBytes(c->context,true)); valid=c->capsule>=0; }
-  if (!valid) { if(c->context.owner.fd>=0) close(c->context.owner.fd); if(c->context.build.fd>=0) close(c->context.build.fd); delete c; return fail(env); }
+  if (!valid) { if(c->appStartup.fd>=0) close(c->appStartup.fd); if(c->context.owner.fd>=0) close(c->context.owner.fd); if(c->context.build.fd>=0) close(c->context.build.fd); delete c; return fail(env); }
   nativeCustodies.insert(c); napi_value out;
   if(napi_create_external(env,c,nullptr,nullptr,&out)!=napi_ok) return fail(env); return out;
 }
@@ -2203,7 +2214,7 @@ static napi_value captureWatchdog(napi_env env,napi_callback_info info) {
   auto* c=custodyArgument(env,args[0]); if(!c||!c->spawned||!c->endpointsPublished||c->bound||!c->context.primary.pid||pid!=c->context.primary.pid||
     arbol_boundary::observe(pid,child,&detail)!=1||!arbol_boundary::same(c->context.primary,child)||child.uid!=geteuid()||
     detail.unique.parent!=c->context.main.start||detail.unique.originalParentVersion!=c->context.main.version||
-    !arbol_boundary::executable(child,path)||path!=c->context.helper()||!arbol_boundary::signature(path,false)||
+    !arbol_boundary::executable(child,path)||path!=c->context.helper()||!c->context.helperSignature(path)||
     (!c->context.monitor(child,true)&&!c->context.monitor(child,false))) return fail(env);
   // Confirmation only: never replace the native spawn's original from a PID.
   napi_value out; napi_get_undefined(env,&out); return out;
@@ -2708,6 +2719,11 @@ static napi_value publishHostReady(napi_env env,napi_callback_info info) {
        managementBefore.st_dev!=managementAfter.st_dev||managementBefore.st_ino!=managementAfter.st_ino||
        !arbol_attempt::unchanged(claim.at)||!c->finalization.ready(c->context)||state->fatal.load(std::memory_order_acquire)||
        arbol_boundary::clockMs()>=deadline||!ready.finish()||!published.finish()) return reject();
+    if(c->context.app.pid) {
+      if(!c->context.ownerRunning()||!arbol_boundary::lockIdentity(c->appStartup)) return reject();
+      const int fd=c->appStartup.fd; c->appStartup.fd=-1;
+      if(close(fd)) return reject();
+    }
     napi_value out; napi_get_undefined(env,&out); return out;
   } catch(...) { return reject(); } } @catch(NSException*) { return reject(); } }
 }
@@ -4583,7 +4599,7 @@ static napi_value beginExitInspection(napi_env env,napi_callback_info info) {
        ![c->finalization.value()[@"attempt"][@"profile"] isEqual:job->input[@"profile"]]||
        ![arbol_boundary::capsuleLock(c->context.owner) isEqual:arbol_boundary::capsuleLock(job->owner)]) continue;
     auto& copy=job->hostContext; copy.main=c->context.main; copy.primary=c->context.primary; copy.custody=c->context.custody;
-    copy.bundle=c->context.bundle; copy.digest=c->context.digest; copy.session=c->context.session;
+    copy.bundle=c->context.bundle; copy.digest=c->context.digest; copy.session=c->context.session; copy.app=c->context.app;
     copy.owner=c->context.owner; copy.build=c->context.build; copy.authenticated=c->context.authenticated; copy.primaryOutside=c->context.primaryOutside;
     job->hostState=c->finalization.shared(); job->hostCapability=c->finalization.value();
   }
@@ -4691,6 +4707,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"continuousTime",nullptr,continuousTime,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"processProvenance",nullptr,processProvenance,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"requestProfileOpen",nullptr,requestProfileOpen,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"browserAppAvailable",nullptr,browserAppAvailable,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"activateProfileWindow",nullptr,activateProfileWindow,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"seqoyaBackendArguments",nullptr,seqoyaBackendArguments,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"readLaunchAttempt",nullptr,readLaunchAttempt,nullptr,nullptr,nullptr,napi_default,nullptr},

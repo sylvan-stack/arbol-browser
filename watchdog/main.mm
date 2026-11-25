@@ -49,7 +49,14 @@ static std::string startup(double deadline) {
 static Context record(const std::string& raw,bool primary,Identity& producer) {
   NSData* bytes=[NSData dataWithBytes:raw.data() length:raw.size()];
   NSDictionary* value=[NSJSONSerialization JSONObjectWithData:bytes options:0 error:nil]; Context c;
-  if(!keys(value,@[@"format",@"mode",@"producerRole",@"producer",@"candidateSnapshotDigest",@"bundle",@"main",@"locks"])||![value[@"format"] isEqual:@2]||![value[@"mode"] isEqual:primary?@"primary":@"custody"]||![value[@"producerRole"] isEqual:primary?@"main":@"primary"]||![value[@"bundle"] isKindOfClass:[NSString class]]||![value[@"candidateSnapshotDigest"] isKindOfClass:[NSString class]]||[value[@"candidateSnapshotDigest"] length]!=64||!keys(value[@"locks"],@[@"owner",@"build"])||!identityRecord(value[@"main"],c.main,&c.session)||!identityRecord(value[@"producer"],producer)||!lockRecord(value[@"locks"][@"owner"],3,c.owner)||!lockRecord(value[@"locks"][@"build"],4,c.build)) throw 4;
+  NSArray* fields=@[@"format",@"mode",@"producerRole",@"producer",@"candidateSnapshotDigest",@"bundle",@"main",@"locks"];
+#ifdef ARBOL_APP_WATCHDOG_ENTRY
+  if(!keys(value,[fields arrayByAddingObject:@"app"])||![value[@"format"] isEqual:@3]||
+     !identityRecord(value[@"app"],c.app)||c.app.uid!=geteuid()) throw 4;
+#else
+  if(!keys(value,fields)||![value[@"format"] isEqual:@2]) throw 4;
+#endif
+  if(![value[@"mode"] isEqual:primary?@"primary":@"custody"]||![value[@"producerRole"] isEqual:primary?@"main":@"primary"]||![value[@"bundle"] isKindOfClass:[NSString class]]||![value[@"candidateSnapshotDigest"] isKindOfClass:[NSString class]]||[value[@"candidateSnapshotDigest"] length]!=64||!keys(value[@"locks"],@[@"owner",@"build"])||!identityRecord(value[@"main"],c.main,&c.session)||!identityRecord(value[@"producer"],producer)||!lockRecord(value[@"locks"][@"owner"],3,c.owner)||!lockRecord(value[@"locks"][@"build"],4,c.build)) throw 4;
   std::string digest=[value[@"candidateSnapshotDigest"] UTF8String]; for(char ch:digest) if(!((ch>='0'&&ch<='9')||(ch>='a'&&ch<='f'))) throw 4;
   c.bundle=[value[@"bundle"] UTF8String]; c.digest=digest; if(!primary) c.primary=producer; return c;
 }
@@ -397,6 +404,7 @@ struct Deadline {
   for(;;) {
     childExecReadback.expires=0;
     double now=clockMs();
+    if(!c.ownerRunning()) deadline.lost(now);
     if(!watch.poll()) { deadline.lost(now); poison(cap,arbol_exit::watchLoss); }
     if(cap) {
       if(!cap->present()) deadline.lost(now);
@@ -525,7 +533,7 @@ static Channel launchCustody(Context& c,double deadline,arbol_exit::HostCapabili
     if(!lines.empty()) throw 4; usleep(1000); }
 }
 static bool liveStart(Context& c,double deadline,arbol_exit::HostCapability* cap) {
-  return clockMs()<deadline&&c.initial()&&lockIdentity(c.owner)&&lockIdentity(c.build)&&
+  return clockMs()<deadline&&c.ownerRunning()&&c.initial()&&lockIdentity(c.owner)&&lockIdentity(c.build)&&
     (!cap||(cap->present()&&cap->metadata()&&!cap->shared()->fatal.load(std::memory_order_acquire)));
 }
 static int runPrimary(Context& c,double deadline,arbol_exit::ExitWatch& watch,arbol_exit::HostCapability* cap) {
@@ -569,7 +577,14 @@ static int runCustody(Context& c,double deadline,arbol_exit::ExitWatch& watch,ar
   protocolLoop(c,pair,false,deadline-1000,watch,cap);
 }
 
+#ifdef ARBOL_APP_WATCHDOG_ENTRY
+extern "C" int arbol_browser_watchdog_main(int argc,const char* argv[]) {
+  // Direct shell invocations have no inherited anonymous startup capsule.
+  struct stat capsule{};
+  if(fstat(5,&capsule)||!S_ISREG(capsule.st_mode)||capsule.st_nlink) return 4;
+#else
 int main(int argc,const char* argv[]) {
+#endif
   signal(SIGPIPE,SIG_IGN); double deadline=clockMs()+1000; Context c; bool parsed=false,hostWanted=argc==3; arbol_exit::ExitWatch watch; arbol_exit::HostCapability hostCap;
   Identity birth; Info birthInfo{}; int birthSession=getsid(0); bool birthValid=observe(getpid(),birth,&birthInfo)==1;
   @autoreleasepool {
