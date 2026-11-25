@@ -347,7 +347,10 @@ int launch(int argc, const char* argv[], double deadline) {
   if (arbol_attempt::profileFormat == 2) {
     arbol_attempt::MaintenanceFile metadata;
     if (!metadata.openPath(layout.payload + "/metadata.json",0600,1048576,true)) return 4;
-    NSDictionary* value=arbol_attempt::json(metadata.content),*component=value[@"component"];
+    NSData* bytes = [NSData dataWithBytes:metadata.content.data() length:metadata.content.size()];
+    id value = [NSJSONSerialization JSONObjectWithData:bytes options:0 error:nil];
+    if (![value isKindOfClass:NSDictionary.class]) return 4;
+    NSDictionary* component = value[@"component"];
     uint64_t contract=0,profile=0;
     if (!arbol_attempt::keys(component,@[@"name",@"version",@"build",@"contract",@"profileFormat"]) ||
         ![component[@"name"] isEqual:@"arbol-browser"] || ![component[@"build"] isEqual:build] ||
