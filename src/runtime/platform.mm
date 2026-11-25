@@ -555,6 +555,34 @@ static napi_value processProvenance(napi_env env, napi_callback_info info) {
     return out;
   } @catch (NSException*) { return fail(env); } }
 }
+static napi_value requestProfileOpen(napi_env env, napi_callback_info info) {
+  napi_value args[2], out; size_t count = 2;
+  std::string profile, instance;
+  if (napi_get_cb_info(env, info, &count, args, nullptr, nullptr) != napi_ok || count != 2 ||
+      !boundedText(env, args[0], profile, 64) || !boundedText(env, args[1], instance, 26)) return fail(env);
+  @autoreleasepool { @try {
+    NSString* id = [NSString stringWithUTF8String:profile.c_str()];
+    NSString* key = [NSString stringWithUTF8String:instance.c_str()];
+    if (![NSThread isMainThread] || !NSApp ||
+        !arbol_attempt::pattern(id, @"^[a-z]([a-z0-9-]{0,62}[a-z0-9])?$") ||
+        !arbol_attempt::pattern(key, @"^prf_[A-Za-z0-9_-]{22}$")) return fail(env);
+    NSString* engine = arbol_attempt::processRecord(getpid())[@"executable"];
+    NSString* suffix = @"/Contents/Resources/browser/runtime/Electron.app/Contents/MacOS/Electron";
+    if (![engine hasSuffix:suffix]) return fail(env);
+    NSString* bundle = [engine substringToIndex:engine.length-suffix.length];
+    arbol_attempt::PackagedLayout layout;
+    if (!arbol_attempt::packagedLayout(bundle.fileSystemRepresentation, layout) || !layout.installed) return fail(env);
+    NSWorkspaceOpenConfiguration* config = [NSWorkspaceOpenConfiguration configuration];
+    config.createsNewApplicationInstance = YES;
+    config.activates = NO;
+    config.addsToRecentItems = NO;
+    config.arguments = @[@"--arbol-profile-open", id, key];
+    config.environment = @{};
+    [[NSWorkspace sharedWorkspace] openApplicationAtURL:[NSURL fileURLWithPath:bundle] configuration:config completionHandler:nil];
+    if (napi_get_boolean(env, true, &out) != napi_ok) return fail(env);
+    return out;
+  } @catch(NSException*) { return fail(env); } }
+}
 static napi_value activateProfileWindow(napi_env env, napi_callback_info info) {
   napi_value args[2], out; size_t count = 2, length = 0; int pid;
   char start[21]{};
@@ -4662,6 +4690,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"assertMaintenanceStateRoot",nullptr,assertMaintenanceStateRoot,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"continuousTime",nullptr,continuousTime,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"processProvenance",nullptr,processProvenance,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"requestProfileOpen",nullptr,requestProfileOpen,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"activateProfileWindow",nullptr,activateProfileWindow,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"seqoyaBackendArguments",nullptr,seqoyaBackendArguments,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"readLaunchAttempt",nullptr,readLaunchAttempt,nullptr,nullptr,nullptr,napi_default,nullptr},

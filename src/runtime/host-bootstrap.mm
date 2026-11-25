@@ -162,12 +162,40 @@ static bool payload(NSString* bundle, NSDictionary* manifest) {
   }
   return [actual isEqual:files];
 }
+// LaunchServices supplies a new independent process. The fixed signed shim
+// still owns selection, profile-instance checks and ordinary open admission.
+static int openInstalledProfile(const arbol_attempt::PackagedLayout& layout, NSString* bundle, const char* profile, const char* instance) {
+  NSString* id = [NSString stringWithUTF8String:profile];
+  NSString* key = [NSString stringWithUTF8String:instance];
+  struct statfs volume{};
+  if (!layout.installed || !arbol_attempt::pattern(id, @"^[a-z]([a-z0-9-]{0,62}[a-z0-9])?$") ||
+      !arbol_attempt::pattern(key, @"^prf_[A-Za-z0-9_-]{22}$") ||
+      !safeDirectory(bundle, false) || statfs(bundle.fileSystemRepresentation, &volume) ||
+      !(volume.f_flags & MNT_RDONLY) || strcmp(volume.f_fstypename, "apfs") || layout.buildRoot + "/app" != volume.f_mntonname ||
+      !signature(bundle, true, false, true)) return 4;
+  NSString* home = arbol_attempt::physicalAccountHome();
+  if (!home) return 4;
+  std::string launcher = arbol_attempt::stableLauncherPath(home);
+  NSString* path = [NSString stringWithUTF8String:launcher.c_str()];
+  struct stat file{};
+  if (!safeDirectory(path.stringByDeletingLastPathComponent, false) ||
+      !arbol_boundary::canonical(launcher) || lstat(launcher.c_str(), &file) || !S_ISREG(file.st_mode) ||
+      file.st_uid != geteuid() || (file.st_mode & 07777) != 0755 || file.st_nlink != 1 ||
+      !arbol_attempt::signedIdentity(launcher, @"com.sylvan-stack.arbol-browser.launcher") || !inTime()) return 4;
+  const char* arguments[] = {launcher.c_str(), "open", "--profile", profile, "--profile-instance", instance, nullptr};
+  std::string homeEnvironment = "HOME=" + std::string(home.fileSystemRepresentation);
+  const char* environment[] = {homeEnvironment.c_str(), "PATH=/usr/bin:/bin", "TMPDIR=/private/tmp", nullptr};
+  execve(launcher.c_str(), const_cast<char* const*>(arguments), const_cast<char* const*>(environment));
+  return 4;
+}
 int main(int argc, const char* argv[]) {
   @autoreleasepool {
     arbol_exit::NoUseOriginal noUse;
     try { @try {
       expiry=arbol_boundary::clockMs()+60000;
-      if (argc != 3 || strcmp(argv[1], "--arbol-host-request") || argv[2][0] != '/' || getppid() != 1 || setpgid(0, 0) || getpgrp() != getpid()) return 4;
+      const bool profileOpen = argc == 4 && !strcmp(argv[1], "--arbol-profile-open");
+      if ((!profileOpen && (argc != 3 || strcmp(argv[1], "--arbol-host-request") || argv[2][0] != '/')) ||
+          getppid() != 1 || setpgid(0, 0) || getpgrp() != getpid()) return 4;
       NSOperatingSystemVersion os = NSProcessInfo.processInfo.operatingSystemVersion;
       if (os.majorVersion != 27 || os.minorVersion != 0 || os.patchVersion != 1 || sizeof(void*) != 8) return 4;
       NSString* bundle = NSBundle.mainBundle.bundlePath;
@@ -175,6 +203,7 @@ int main(int argc, const char* argv[]) {
       if (!arbol_attempt::packagedLayout(bundle.fileSystemRepresentation,layout)) return 4;
       arbol_boundary::Lock build;
       if (!arbol_attempt::openBuild(bundle.fileSystemRepresentation,build)) return 4;
+      if (profileOpen) return openInstalledProfile(layout, bundle, argv[2], argv[3]);
       // Read only authenticated private control metadata here, release the
       // short lock during signature work, then compare the exact version again.
       std::string initialRaw; NSDictionary* initial=nil; arbol_attempt::PackagedLayout initialLayout;

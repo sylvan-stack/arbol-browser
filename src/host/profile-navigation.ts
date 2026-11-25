@@ -1,7 +1,5 @@
-import { execFile } from 'node:child_process';
-import { userInfo } from 'node:os';
-import { dirname, join } from 'node:path';
-import { promisify } from 'node:util';
+import { join } from 'node:path';
+import { setTimeout } from 'node:timers/promises';
 import { invalidInput, unavailable } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
 import { createProfile, managedProfiles } from '../profiles/create.js';
@@ -9,9 +7,9 @@ import { registryLock } from '../profiles/locking.js';
 import { profileId, profilePaths, profileUnavailable, statOrAbsent } from '../profiles/paths.js';
 import { readJson, readProfile } from '../profiles/records.js';
 import { assertHostCustody, type HostCustody } from '../runtime/custody.js';
-import { readRuntime, recordProcess, runtimeLocation } from '../runtime/instance.js';
-import installation from '../runtime/installation-paths.json' with { type: 'json' };
+import { assertTime, now, originalAlive, readRuntime, recordProcess, runtimeLocation, startupDeadline, token } from '../runtime/instance.js';
 import type { PlatformPort } from '../runtime/platform.js';
+import { connectRuntime } from '../runtime/transport.js';
 
 export type ProfileNavigationRequest = { method: 'list' } |
   { method: 'create'; profile: string } |
@@ -26,7 +24,6 @@ export interface ProfileNavigationState {
   readonly profiles: readonly ProfileNavigationEntry[];
 }
 export type ProfileNavigation = (raw: unknown, assertCurrent: () => void, isFocused: () => boolean) => Promise<ProfileNavigationState>;
-const execute = promisify(execFile);
 const openResult = validator('wire.OpenResult');
 const instancePattern = /^prf_[A-Za-z0-9_-]{22}$/;
 
@@ -57,8 +54,7 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
   const selected = custody.instance.owner.profile;
   const state = custody.host.policy.stateRoot;
   if (selected.paths.state !== state) throw profileUnavailable();
-  const home = userInfo().homedir;
-  const launcher = join(home, dirname(dirname(join(...installation.stableBuilds))), 'bin', 'arbol-browser');
+  const selection = { ...custody.build.selection, explicit: true };
   let changing = false;
 
   async function list(check: () => void): Promise<ProfileNavigationState> {
@@ -76,6 +72,38 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
         return { id: record.id, instance: record.instance, ...(name?.instance === record.instance ? { label: name.label } : {}) };
       }) };
     } finally { registry.release(); }
+  }
+
+  async function open(id: string, instance: string, check: () => void, isFocused: () => boolean): Promise<void> {
+    const profile = await readProfile(profilePaths(id, state));
+    if (profile.record.instance !== instance) throw profileUnavailable();
+    const deadline = startupDeadline();
+    let requested = false;
+    for (;;) {
+      assertTime(deadline);
+      const location = await runtimeLocation(profile);
+      const runtime = location && await readRuntime(location);
+      check();
+      if (location && runtime?.phase === 'ready' && originalAlive(runtime, platform)) {
+        const client = await connectRuntime(location, runtime, 'management', selection, platform, deadline);
+        try {
+          check();
+          const reply = await client.call({ wire: 1, id: token('req'), method: 'open', params: {} }, Math.min(deadline, now() + 15000));
+          if (!openResult(reply) || reply.profile !== id || reply.process !== runtime.pid || reply.instance !== runtime.instance)
+            throw unavailable('browser');
+          check();
+          if (isFocused()) platform.activateProfileWindow?.(recordProcess(runtime));
+          return;
+        } finally { client.close(); }
+      }
+      if (!requested) {
+        // LaunchServices starts the ordinary signed command outside the Browser's
+        // guarded engine family. Direct child processes are reserved for Chromium.
+        if (!platform.requestProfileOpen?.(id, instance)) throw unavailable('browser');
+        requested = true;
+      }
+      await setTimeout(Math.min(75, Math.max(1, deadline - now())));
+    }
   }
 
   return async (raw, assertCurrent, isFocused) => {
@@ -101,21 +129,7 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
         if (!snapshot.profiles.some(profile => profile.id === id && profile.instance === instance)) throw profileUnavailable();
         if ((await readProfile(selected.paths)).record.instance !== selected.record.instance) throw profileUnavailable();
         check();
-        if (id !== selected.record.id) {
-          const result = await execute(launcher, ['open', '--profile', id, '--profile-instance', instance], {
-            cwd: home, env: { HOME: home, PATH: '/usr/bin:/bin' }, timeout: 65000, maxBuffer: 16 * 1024,
-          });
-          const reply: unknown = JSON.parse(result.stdout);
-          if (!openResult(reply) || reply.profile !== id) throw unavailable('browser');
-          const destination = await readProfile(profilePaths(id, state));
-          if (destination.record.instance !== instance) throw profileUnavailable();
-          const location = await runtimeLocation(destination);
-          const runtime = location && await readRuntime(location);
-          if (!runtime || runtime.phase !== 'ready' || runtime.pid !== reply.process || runtime.instance !== reply.instance)
-            throw unavailable('browser');
-          check();
-          if (isFocused()) platform.activateProfileWindow?.(recordProcess(runtime));
-        }
+        if (id !== selected.record.id) await open(id, instance, check, isFocused);
       }
       return await list(check);
     } finally { changing = false; }
