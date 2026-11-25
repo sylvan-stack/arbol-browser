@@ -1,15 +1,16 @@
 /** Explicit AFM-9 case scheduler. Importing executes nothing. A partial result
  * never constitutes the complete D44 gate or installed production evidence. */
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, chmod, lstat, readdir } from 'node:fs/promises';
+import { mkdtemp, chmod, lstat, readdir } from 'node:fs/promises';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
-import { canonical, exactFile, json, privateDirectory } from '../../scripts/package-host.mjs';
+import { execFileSync } from 'node:child_process';
+import { canonical, command, exactFile, json, privateDirectory } from '../../scripts/package-host.mjs';
 import { verifyIsolatedRelease } from '../../scripts/isolated-release.mjs';
 import { installIsolatedRelease } from '../../scripts/install-release.mjs';
 import { inventory } from '../../scripts/package-base.mjs';
-import { assertFixture, authenticateInputs, evidence, harnessIdentity, metadataSnapshot, recordedChild } from '../support/migration-fixture.mjs';
+import { assertFixture, authenticateInputs, evidence, harnessIdentity, historicalInputs, metadataSnapshot, recordedChild } from '../support/migration-fixture.mjs';
 import { loopback, until, family } from '../support/control.mjs';
 
 const self = fileURLToPath(import.meta.url);
@@ -63,6 +64,56 @@ async function caseDirectory(record, name) {
 
 async function absent(path) {
   await assert.rejects(lstat(path), error => error.code === 'ENOENT');
+}
+
+function fileIdentity(stat) {
+  return { device: String(stat.dev), inode: String(stat.ino), uid: Number(stat.uid), mode: Number(stat.mode & 0o7777n) };
+}
+
+async function mercuryBackup(chain, snapshot) {
+  const mount = '/Volumes/Mercury';
+  const volume = async () => {
+    const xml = command('/usr/sbin/diskutil', ['info', '-plist', mount]);
+    const info = JSON.parse(execFileSync('/usr/bin/plutil', ['-convert', 'json', '-o', '-', '--', '-'], {
+      input: xml, timeout: 10000, maxBuffer: 1048576, env: { PATH: '/usr/bin:/bin' },
+    }));
+    assert.equal(info.VolumeUUID, historicalInputs.volumeUUID);
+    const stat = await lstat(mount, { bigint: true });
+    assert.ok(stat.isDirectory());
+    return { uuid: info.VolumeUUID, identity: fileIdentity(stat) };
+  };
+  const originalVolume = await volume();
+  const directory = join(mount, 'Arbol/backups/browser-profile-format-2', chain.transaction.value.attempt);
+  const backup = await privateDirectory(directory, true);
+  assert.equal(backup.device, originalVolume.identity.device);
+  const profiles = chain.transaction.value.profiles;
+  const originals = new Map(snapshot.profiles.map(profile => [profile.id, profile]));
+  assert.deepEqual(profiles.map(row => row.id).sort(), [...originals.keys()].sort());
+  for (const row of profiles) assert.match(row.pathSha256, /^[a-f0-9]{64}$/);
+  assert.deepEqual((await readdir(directory)).sort(), ['transaction.json', ...profiles.map(row => row.pathSha256)].sort());
+  const read = async (path, maximum, expected) => {
+    const file = await exactFile(path, maximum);
+    assert.equal(file.sha256, expected); assert.equal(file.identity.mode, 0o600);
+    assert.equal(file.identity.device, backup.device); assert.equal(file.identity.uid, process.getuid());
+    return { identity: file.identity, sha256: file.sha256 };
+  };
+  const transaction = await read(join(directory, 'transaction.json'), 8 * 1024 * 1024, chain.transaction.sha256);
+  const archived = [];
+  for (const row of profiles) {
+    const folder = join(directory, row.pathSha256), original = originals.get(row.id);
+    assert.equal((await privateDirectory(folder, true)).device, backup.device);
+    assert.deepEqual((await readdir(folder)).sort(), original['engine.json'] ? ['engine.json', 'profile.json'] : ['profile.json']);
+    const record = await read(join(folder, 'profile.json'), 65536, original['profile.json'].sha256);
+    assert.equal(record.sha256, row.originalRecord.sha256);
+    assert.deepEqual(row.originalRecord.identity, original['profile.json'].identity);
+    const marker = original['engine.json'] ? await read(join(folder, 'engine.json'), 65536, original['engine.json'].sha256) : null;
+    assert.equal(marker?.sha256 ?? null, row.originalMarker?.sha256 ?? null);
+    assert.deepEqual(row.originalMarker?.identity ?? null, original['engine.json']?.identity ?? null);
+    archived.push({ id: row.id, record, marker });
+  }
+  assert.deepEqual(await privateDirectory(directory, true), backup);
+  assert.deepEqual(await volume(), originalVolume);
+  return { volume: originalVolume, directory: backup, transaction, profiles: archived };
 }
 
 /** Independent terminal observation only, never a native completion token. */
@@ -160,28 +211,47 @@ async function finishCase(record, artifact, c, passed, result) {
   return evidence(c.output, 'result', { result, coverage, scope: 'Only named disposable cases; AFM-9 incomplete' });
 }
 
-export async function absentRootJourney(record, artifact) {
-  const c = await context(record, artifact, 'absent-root');
+async function zeroProfileJourney(record, artifact, initial) {
+  const absentRoot = initial === 'absent', name = absentRoot ? 'absent-root' : 'empty-registry';
+  const c = await context(record, artifact, name);
   try {
     assert.equal(artifact.profileFormat, 2);
-    const before = await metadataSnapshot(record, artifact.build); assert.equal(before.root, null);
+    const layout = await assertFixture(record, artifact.build);
+    const before = await metadataSnapshot(record, artifact.build);
+    const existingRegistryGuard = async () => {
+      const stat = await lstat(join(layout.stateRoot, 'registry.lock'), { bigint: true });
+      assert.ok(stat.isFile() && stat.nlink === 1n && stat.uid === BigInt(process.getuid()) && (stat.mode & 0o7777n) === 0o600n);
+      return fileIdentity(stat);
+    };
+    assert.deepEqual(before.profiles, []);
+    if (absentRoot) assert.equal(before.root, null);
+    else assert.ok(before.root && before.registry, 'This journey needs an independently prepared empty registry');
+    const guard = absentRoot ? null : await existingRegistryGuard();
     for (const name of ['support/selected.json', 'support/install-transaction.json',
       `support/releases/${artifact.build}.migration.json`, 'runtime/browser-profile-migration/current'])
       await absent(join(record.fixture, name));
-    await evidence(c.output, 'before', before);
+    await evidence(c.output, 'before', { ...before, guard });
     const installed = await installerAttempt(record, artifact);
     const chain = await completionChain(record, artifact);
-    assert.equal(chain.transaction.value.root.initial, 'absent');
+    assert.equal(chain.transaction.value.root.initial, initial);
+    assert.deepEqual(chain.transaction.value.root.identity, before.root);
+    assert.deepEqual(chain.transaction.value.root.profiles, before.registry ?? null);
+    assert.deepEqual(chain.transaction.value.root.registry, guard);
     assert.deepEqual(chain.transaction.value.profiles, []); assert.equal(chain.proof.value.result.converted, 0);
     assert.equal(chain.proof.value.before, null); await evidence(c.output, 'completion-chain', chain);
-    const after = await metadataSnapshot(record, artifact.build); assert.equal(after.root, null);
+    await evidence(c.output, 'mercury-backup', await mercuryBackup(chain, before));
+    const after = await metadataSnapshot(record, artifact.build); assert.deepEqual(after, before);
     const info = await cli(record, artifact, c.output, 'info', ['info']); assert.equal(info.profileFormat, 2);
     const list = await cli(record, artifact, c.output, 'list', ['profiles', 'list']); assert.deepEqual(list.profiles, []);
     assert.deepEqual(await metadataSnapshot(record, artifact.build), after);
-    await evidence(c.output, 'after', after);
-    return await finishCase(record, artifact, c, ['preservation/absent-root'], { installed, info, count: list.profiles.length });
+    if (!absentRoot) assert.deepEqual(await existingRegistryGuard(), guard);
+    await evidence(c.output, 'after', { ...after, guard });
+    return await finishCase(record, artifact, c, ['preservation/' + name], { installed, info, count: list.profiles.length });
   } catch (error) { await evidence(c.output, 'failure', { error: String(error.stack ?? error), status: 'failed-or-unqualified' }); throw error; }
 }
+
+export const absentRootJourney = (record, artifact) => zeroProfileJourney(record, artifact, 'absent');
+export const emptyRegistryJourney = (record, artifact) => zeroProfileJourney(record, artifact, 'present');
 
 export async function creationReplayJourney(record, artifact) {
   const c = await context(record, artifact, 'creation-replay');
@@ -226,6 +296,14 @@ export async function populatedPreservationJourney(record, predecessor, successo
   const profiles = ['default', 'afm9-alternate'];
   const neverOpened = 'afm9-never-opened';
   const call = args => cli(record, selected, c.output, 'page-' + (++sequence), args);
+  const openPage = async (phase, seed = false) => {
+    for (const profile of profiles) {
+      const value = profile + '-fictional';
+      await call(['open', '--profile', profile, '--url', page.url(profile + '-' + phase, seed ? value : undefined)]);
+    }
+    await until(() => profiles.every(profile => page.observations.some(row => row.name === profile + '-' + phase &&
+      row.stored === profile + '-fictional' && row.cookie === 'fictional=' + profile + '-fictional')));
+  };
   const closed = async () => {
     for (const profile of profiles) await call(['close', '--profile', profile]);
     const buildRoot = dirname(dirname(record.layouts[selected.build].bundle));
@@ -234,14 +312,19 @@ export async function populatedPreservationJourney(record, predecessor, successo
   try {
     await call(['profiles', 'create', profiles[1]]);
     await call(['profiles', 'create', neverOpened]);
-    for (const profile of profiles) await call(['open', '--profile', profile, '--url', page.url(profile + '-seed', profile + '-fictional')]);
-    await until(() => profiles.every(profile => page.observations.some(row => row.name === profile + '-seed' &&
-      row.stored === profile + '-fictional' && row.cookie === 'fictional=' + profile + '-fictional')));
+    await openPage('seed', true);
+    await closed();
+    await openPage('predecessor-reopen');
     await closed();
     const before = await preservationSnapshot(record, predecessor.build);
     await assertNeverOpened(record, predecessor.build, before, neverOpened);
     await evidence(c.output, 'before', before);
     await installerAttempt(record, successor, [predecessor]); selected = successor;
+    const chain = await completionChain(record, successor);
+    assert.deepEqual(chain.transaction.value.root.identity, before.root);
+    assert.deepEqual(chain.transaction.value.root.profiles, before.registry);
+    assert.deepEqual(chain.proof.value.before.selection, { format: 1, build: predecessor.build, imageSha256: predecessor.imageSha256 });
+    await evidence(c.output, 'mercury-backup', await mercuryBackup(chain, before));
     const after = await preservationSnapshot(record, successor.build);
     const unopenedAfter = await assertNeverOpened(record, successor.build, after, neverOpened);
     assert.deepEqual(after.profiles.map(row => row.id), before.profiles.map(row => row.id));
@@ -255,9 +338,7 @@ export async function populatedPreservationJourney(record, predecessor, successo
       }
     }
     await evidence(c.output, 'converted-before-reopen', after);
-    for (const profile of profiles) await call(['open', '--profile', profile, '--url', page.url(profile + '-restored')]);
-    await until(() => profiles.every(profile => page.observations.some(row => row.name === profile + '-restored' &&
-      row.stored === profile + '-fictional' && row.cookie === 'fictional=' + profile + '-fictional')));
+    await openPage('restored');
     await closed();
     const settled = await preservationSnapshot(record, successor.build);
     assert.deepEqual(await assertNeverOpened(record, successor.build, settled, neverOpened), unopenedAfter);
@@ -268,7 +349,7 @@ export async function populatedPreservationJourney(record, predecessor, successo
     try { await closed(); } finally { await page.close(); }
   }
   return finishCase(record, successor, c,
-    ['preservation/default', 'preservation/alternate', 'preservation/never-opened'], outcome);
+    ['preservation/default', 'preservation/alternate', 'preservation/never-opened', 'archives/mercury-original-backup'], outcome);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === self) {
