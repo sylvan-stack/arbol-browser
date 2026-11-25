@@ -2,7 +2,7 @@
  * performs I/O. A delivery declaration is necessary, never signed authority. */
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { constants, fstatSync } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync } from 'node:fs';
 import { lstat, open, readdir, readlink, realpath } from 'node:fs/promises';
 import { release as kernelRelease, userInfo } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
@@ -338,9 +338,21 @@ export async function authenticateQualification(authoritySha256) {
 }
 
 export async function qualificationInput(names, internalCompilerPipe = false) {
-  const pipe = fstatSync(0);
-  qualificationRequire(pipe.uid === userInfo().uid && ((pipe.isFIFO() && !(pipe.mode & 0o077)) ||
+  const pipe = fstatSync(0, { bigint: true });
+  const anonymous = pipe.isFIFO() && pipe.nlink === 0n && pipe.dev === 0n;
+  qualificationRequire(pipe.uid === BigInt(userInfo().uid) && (anonymous ||
     (internalCompilerPipe && pipe.isSocket())), 'Missing private request pipe', 2);
+  if (anonymous) {
+    // Darwin anonymous pipes report mode 0660 regardless of umask. Its
+    // /dev/fd duplicate can request read access only from the actual read end.
+    let duplicate;
+    try { duplicate = openSync('/dev/fd/0', constants.O_RDONLY); }
+    catch { qualificationRequire(false, 'Qualification request pipe is not readable', 2); }
+    try {
+      const held = fstatSync(duplicate, { bigint: true });
+      qualificationRequire(held.dev === pipe.dev && held.ino === pipe.ino, 'Qualification request pipe identity changed', 2);
+    } finally { closeSync(duplicate); }
+  }
   const chunks = []; let size = 0;
   const timer = setTimeout(() => process.stdin.destroy(new Error('Qualification request deadline exceeded')), 120000);
   try {
