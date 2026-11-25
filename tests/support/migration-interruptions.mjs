@@ -2,10 +2,11 @@
 import assert from 'node:assert/strict';
 import { lstat, open, readdir } from 'node:fs/promises';
 import { constants } from 'node:fs';
-import { join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { canonical, exactFile, hash, privateDirectory } from '../../scripts/package-host.mjs';
-import { qualificationJson, qualificationKeys, qualificationSha } from '../../scripts/qualification-authority.mjs';
+import { qualificationDirectory, qualificationFixture, qualificationJson, qualificationKeys, qualificationRoles,
+  qualificationSha } from '../../scripts/qualification-authority.mjs';
 import { assertFixture, evidence } from './migration-fixture.mjs';
 
 const points = [
@@ -45,23 +46,60 @@ const hex32 = value => typeof value === 'string' && /^[a-f0-9]{32}$/.test(value)
 const decimal = value => typeof value === 'string' && /^(0|[1-9][0-9]{0,19})$/.test(value);
 const positiveInteger = value => Number.isSafeInteger(value) && value > 0;
 const encode = value => Buffer.from(JSON.stringify(value) + '\n');
+const refusalLine = Buffer.from('Fixed qualification operation refused; preserve its original evidence.\n');
+const qualificationImages = qualificationRoles.map(role => join(qualificationDirectory, 'qualification/artifacts', role, 'ArbolBrowser.dmg'));
 
 function frame(bytes, limit) {
   assert.ok(Buffer.isBuffer(bytes) && bytes.length > 1 && bytes.indexOf(0x0a) === bytes.length - 1, 'Expected one EOF-framed line');
   return qualificationJson(bytes, limit);
 }
 
-function eventLines(bytes, count) {
-  assert.ok(Buffer.isBuffer(bytes) && bytes.length <= count * 4096);
+function linesOf(bytes, maximum) {
+  assert.ok(Buffer.isBuffer(bytes) && bytes.length <= maximum);
   const lines = [];
   for (let start = 0; start < bytes.length;) {
     const end = bytes.indexOf(0x0a, start);
-    assert.ok(end >= start && lines.length < count);
+    assert.ok(end >= start, 'Expected complete diagnostic or event lines');
     lines.push(bytes.subarray(start, end + 1));
     start = end + 1;
   }
-  assert.equal(lines.length, count);
   return lines;
+}
+
+function interruptionDiagnostics(bytes, { refusal = false, launcher = null, reauthenticated = false } = {}) {
+  const lines = linesOf(bytes, 4096);
+  if (refusal) assert.ok(lines.pop()?.equals(refusalLine), 'Expected fixed qualification refusal diagnostic');
+  if (launcher) assert.deepEqual(frame(lines.pop(), 4096), launcher);
+  let pending = null;
+  const diagnostics = [], attachments = [];
+  for (const line of lines) {
+    const event = frame(line, 4096);
+    qualificationKeys(event, ['phase', 'image', 'mount']);
+    const { phase, image, mount } = event;
+    assert.ok(typeof image === 'string' && (qualificationImages.includes(image) ||
+      (dirname(image) === join(qualificationFixture, 'support/images') && /^[1-9a-f][0-9a-f]{0,15}\.dmg$/.test(basename(image)))));
+    assert.ok(typeof mount === 'string' && mount.startsWith('/') && resolve(mount) === mount &&
+      /^arbol-browser-isolated-release-[A-Za-z0-9]{6}$/.test(basename(mount)));
+    if (phase === 'owned-image-attach') {
+      assert.equal(pending, null, 'An additional attachment preceded the original cleanup');
+      pending = { image, mount };
+      attachments.push(image);
+    } else {
+      assert.equal(phase, 'owned-image-cleaned', 'An unaccounted image mapping leaves this fixture unavailable');
+      assert.deepEqual(pending, { image, mount }, 'Owned cleanup differs from its original attach');
+      pending = null;
+    }
+    diagnostics.push(event);
+  }
+  assert.equal(pending, null, 'An original image attachment has no cleanup observation');
+  const count = qualificationImages.length;
+  assert.deepEqual(attachments.slice(0, count), qualificationImages);
+  if (reauthenticated) assert.deepEqual(attachments.slice(-count), qualificationImages);
+  assert.ok(attachments.length >= count * (reauthenticated ? 2 : 1));
+  const intermediate = reauthenticated ? attachments.slice(count, -count) : attachments.slice(count);
+  assert.ok(intermediate.every(image => !qualificationImages.includes(image)));
+  if (refusal && !launcher) assert.deepEqual(intermediate, []);
+  return diagnostics;
 }
 
 function validateActor(actor) {
@@ -125,9 +163,11 @@ export function interruptionStop(requestBytes, parkedBytes, installerPid) {
 export function verifyInterruptionTranscript(requestBytes, eventBytes, writtenStop, installer) {
   const { boundary } = interruptRequest(requestBytes);
   const engine = boundary.writer === 'engine';
-  const [notice, acknowledgement, reap] = eventLines(eventBytes, engine ? 3 : 2);
+  const lines = linesOf(eventBytes, (engine ? 3 : 2) * 4096);
+  assert.equal(lines.length, engine ? 3 : 2);
+  const [notice, acknowledgement, reap] = lines;
   const { parked, stopBytes } = interruptionStop(requestBytes, notice, installer.pid);
-  assert.ok(installer.complete && !installer.supervisorSignal && Buffer.isBuffer(installer.stdout) && !installer.stdout.length);
+  assert.ok(installer.complete === true && installer.supervisorSignal === false && Buffer.isBuffer(installer.stdout) && !installer.stdout.length);
   assert.ok(Buffer.isBuffer(writtenStop) && writtenStop.equals(stopBytes));
   const { requestSha256, nonce, actor, point } = parked;
   const accepted = frame(acknowledgement, 4096);
@@ -135,19 +175,17 @@ export function verifyInterruptionTranscript(requestBytes, eventBytes, writtenSt
   if (!engine) {
     assert.equal(installer.signal, 'SIGKILL');
     assert.equal(installer.code, null);
-    assert.ok(Buffer.isBuffer(installer.stderr) && !installer.stderr.length);
-    return { parked, accepted, reaped: null, launcher: null };
+    const diagnostics = interruptionDiagnostics(installer.stderr);
+    return { parked, accepted, reaped: null, launcher: null, diagnostics };
   }
   const reaped = frame(reap, 4096);
   assert.deepEqual(reaped, { schema: 1, event: 'worker-reaped', requestSha256, nonce, actor,
     disposition: 'signaled', status: 9, supervisor: 'wait-only' });
   assert.equal(installer.code, 5);
   assert.equal(installer.signal, null);
-  const [launcherLine, failure] = eventLines(installer.stderr, 2);
-  assert.ok(failure.equals(Buffer.from('Fixed qualification operation refused; preserve its original evidence.\n')));
-  const launcher = frame(launcherLine, 4096);
-  assert.deepEqual(launcher, { schema: 1, event: 'launcher-exit', requestSha256, nonce, code: 137, signal: null, complete: true });
-  return { parked, accepted, reaped, launcher };
+  const launcher = { schema: 1, event: 'launcher-exit', requestSha256, nonce, code: 137, signal: null, complete: true };
+  const diagnostics = interruptionDiagnostics(installer.stderr, { refusal: true, launcher });
+  return { parked, accepted, reaped, launcher, diagnostics };
 }
 
 /** Require the actual retry result or the precise request-bound mismatch.
@@ -156,7 +194,7 @@ export function verifyInterruptionRetry(requestBytes, installer, expectedBuild) 
   const request = frame(requestBytes, 16384);
   qualificationKeys(request, ['schema', 'action', 'role', 'authoritySha256']);
   assert.ok(request.schema === 1 && request.action === 'retry' && ['A', 'B'].includes(request.role) && qualificationSha(request.authoritySha256));
-  assert.ok(installer.complete && !installer.supervisorSignal && installer.signal === null);
+  assert.ok(positiveInteger(installer.pid) && installer.complete === true && installer.supervisorSignal === false && installer.signal === null);
   const result = frame(installer.stdout, 65536);
   if (expectedBuild === null) {
     assert.equal(request.role, 'B');
@@ -167,7 +205,8 @@ export function verifyInterruptionRetry(requestBytes, installer, expectedBuild) 
     assert.equal(installer.code, 0);
     assert.deepEqual(result, { schema: 1, authoritySha256: request.authoritySha256, selected: expectedBuild });
   }
-  return result;
+  const diagnostics = interruptionDiagnostics(installer.stderr, { refusal: expectedBuild === null, reauthenticated: expectedBuild !== null });
+  return { result, diagnostics };
 }
 
 /** Snapshot only fixed fixture management namespaces, never website storage.
