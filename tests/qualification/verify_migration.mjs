@@ -1,7 +1,7 @@
 /** Explicit AFM-9 case scheduler. Importing executes nothing. A partial result
  * never constitutes the complete D44 gate or installed production evidence. */
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, chmod, lstat } from 'node:fs/promises';
+import { mkdir, mkdtemp, chmod, lstat, readdir } from 'node:fs/promises';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
@@ -100,6 +100,20 @@ async function preservationSnapshot(record, build) {
   for (const row of snapshot.profiles)
     row.userData = await privateDirectory(join(layout.stateRoot, 'profiles', row.id, 'userData'), true);
   return snapshot;
+}
+
+async function assertNeverOpened(record, build, snapshot, id) {
+  const profile = snapshot.profiles.find(row => row.id === id);
+  assert.ok(profile, 'Expected the original never-opened profile');
+  assert.equal(profile['engine.json'], null);
+  const layout = await assertFixture(record, build);
+  const directory = join(layout.stateRoot, 'profiles', id);
+  for (const name of ['data', 'userData', 'logs']) {
+    const path = join(directory, name);
+    await privateDirectory(path, true);
+    assert.deepEqual(await readdir(path), [], `Never-opened profile has entries in ${name}`);
+  }
+  return profile;
 }
 
 /** Real shared installer in a separate process; input is reauthenticated by
@@ -210,6 +224,7 @@ export async function populatedPreservationJourney(record, predecessor, successo
   const page = await loopback({ output: c.output });
   let selected = predecessor, sequence = 0, outcome;
   const profiles = ['default', 'afm9-alternate'];
+  const neverOpened = 'afm9-never-opened';
   const call = args => cli(record, selected, c.output, 'page-' + (++sequence), args);
   const closed = async () => {
     for (const profile of profiles) await call(['close', '--profile', profile]);
@@ -218,17 +233,23 @@ export async function populatedPreservationJourney(record, predecessor, successo
   };
   try {
     await call(['profiles', 'create', profiles[1]]);
+    await call(['profiles', 'create', neverOpened]);
     for (const profile of profiles) await call(['open', '--profile', profile, '--url', page.url(profile + '-seed', profile + '-fictional')]);
     await until(() => profiles.every(profile => page.observations.some(row => row.name === profile + '-seed' &&
       row.stored === profile + '-fictional' && row.cookie === 'fictional=' + profile + '-fictional')));
-    await closed(); const before = await preservationSnapshot(record, predecessor.build); await evidence(c.output, 'before', before);
+    await closed();
+    const before = await preservationSnapshot(record, predecessor.build);
+    await assertNeverOpened(record, predecessor.build, before, neverOpened);
+    await evidence(c.output, 'before', before);
     await installerAttempt(record, successor, [predecessor]); selected = successor;
     const after = await preservationSnapshot(record, successor.build);
+    const unopenedAfter = await assertNeverOpened(record, successor.build, after, neverOpened);
     assert.deepEqual(after.profiles.map(row => row.id), before.profiles.map(row => row.id));
     for (let i = 0; i < before.profiles.length; i++) {
       const a = before.profiles[i], b = after.profiles[i]; assert.deepEqual(a.directory, b.directory); assert.deepEqual(a.data, b.data);
       assert.deepEqual(a.userData, b.userData);
-      for (const name of ['profile.json', 'engine.json']) {
+      const records = a.id === neverOpened ? ['profile.json'] : ['profile.json', 'engine.json'];
+      for (const name of records) {
         assert.ok(a[name] && b[name]); assert.equal(a[name].value.format, 1); assert.equal(b[name].value.format, 2);
         assert.deepEqual({ ...a[name].value, format: 2 }, b[name].value);
       }
@@ -237,13 +258,17 @@ export async function populatedPreservationJourney(record, predecessor, successo
     for (const profile of profiles) await call(['open', '--profile', profile, '--url', page.url(profile + '-restored')]);
     await until(() => profiles.every(profile => page.observations.some(row => row.name === profile + '-restored' &&
       row.stored === profile + '-fictional' && row.cookie === 'fictional=' + profile + '-fictional')));
-    await closed(); outcome = { pageObservations: page.observations };
+    await closed();
+    const settled = await preservationSnapshot(record, successor.build);
+    assert.deepEqual(await assertNeverOpened(record, successor.build, settled, neverOpened), unopenedAfter);
+    outcome = { pageObservations: page.observations, neverOpenedPreserved: true };
   } catch (error) { await evidence(c.output, 'failure', { error: String(error.stack ?? error), status: 'failed-or-unqualified' }); throw error; }
   finally {
     // Actual supported close only. Never reinterpret a failed close as success.
     try { await closed(); } finally { await page.close(); }
   }
-  return finishCase(record, successor, c, ['preservation/default', 'preservation/alternate'], outcome);
+  return finishCase(record, successor, c,
+    ['preservation/default', 'preservation/alternate', 'preservation/never-opened'], outcome);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === self) {
