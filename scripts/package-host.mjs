@@ -32,9 +32,13 @@ export const profileMigrationPredecessor = Object.freeze({
   launcherSha256: '1cb4b88f12fe7f8c157c272cf284f0effa798fa74ad1338e9826851304501bcf',
 });
 const readableDataEpochs = Object.freeze([1]);
+// Signed format-2 Build f uses the same pinned Electron/Chromium data epoch.
+const productionFormat2Predecessor = '2f5768753521620b7fe65f0726fc4898df44abb781d1e1adc0bf86cbb4f5f70d';
 function predecessorReaderKeys(scope) {
-  return ['production', 'isolated'].includes(scope)
+  const keys = ['production', 'isolated'].includes(scope)
     ? [`host-${scope}:1:${profileMigrationPredecessor.productDigest}`] : [];
+  if (scope === 'production') keys.push(`host-production:1:${productionFormat2Predecessor}`);
+  return keys;
 }
 export const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 export const canonical = value => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
