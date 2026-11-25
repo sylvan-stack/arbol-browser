@@ -3,7 +3,7 @@ import type { Contract } from '../contracts/generated.js';
 import type { RuntimeClient } from './transport.js';
 
 export interface Stdio { stdin: Readable; stdout: Writable; stderr: Writable }
-export interface OpenOptions { profile: string; url?: string }
+export interface OpenOptions { profile: string; url?: string; profileInstance?: string }
 export interface AgentAttachment {
   readonly profile: string;
   readonly label: string;

@@ -3,7 +3,7 @@ import { validator } from '../contracts/schema.js';
 
 export type Command =
   | { kind: 'info' }
-  | { kind: 'open'; profile: string; url?: string }
+  | { kind: 'open'; profile: string; url?: string; profileInstance?: string }
   | { kind: 'close'; profile: string }
   | { kind: 'agent'; profile: string; label: string }
   | { kind: 'agent-describe' }
@@ -13,6 +13,7 @@ export type Command =
 const profileId = validator('browser.ProfileId');
 const clientLabel = validator('browser.ClientLabel');
 const creationRequest = /^create_[A-Za-z0-9_-]{22}$/;
+const profileInstance = /^prf_[A-Za-z0-9_-]{22}$/;
 
 /** Command-supplied navigation uses the agent URL policy, including Unicode bounds. */
 function checkedUrl(value: string): string {
@@ -34,7 +35,7 @@ export function parse(args: readonly string[]): Command {
   for (let i = 0; i < args.length; i++) {
     const word = args[i]!;
     if (!word.startsWith('-')) { words.push(word); continue; }
-    if (!['--profile', '--url', '--creation-request', '--delete-data', '--contract', '--label', '--describe'].includes(word))
+    if (!['--profile', '--profile-instance', '--url', '--creation-request', '--delete-data', '--contract', '--label', '--describe'].includes(word))
       throw invalidInput();
     let value: string | true = true;
     if (word !== '--delete-data' && word !== '--describe') {
@@ -55,11 +56,16 @@ export function parse(args: readonly string[]): Command {
   const [command, subcommand, id] = words;
   if (command === 'info' && words.length === 1) { allowed(); return { kind: 'info' }; }
   if ((command === 'open' || command === 'close') && words.length === 1) {
-    allowed('--profile', ...(command === 'open' ? ['--url'] : []));
+    allowed('--profile', ...(command === 'open' ? ['--url', '--profile-instance'] : []));
     const profile = selectedProfile(options.get('--profile') ?? 'default');
     if (command === 'open') {
       const url = options.get('--url');
-      return { kind: 'open', profile, ...(typeof url === 'string' ? { url: checkedUrl(url) } : {}) };
+      const instance = options.get('--profile-instance');
+      if (instance !== undefined && (!options.has('--profile') || typeof instance !== 'string' ||
+          instance.length !== 26 || !profileInstance.test(instance)))
+        throw invalidInput();
+      return { kind: 'open', profile, ...(typeof url === 'string' ? { url: checkedUrl(url) } : {}),
+        ...(typeof instance === 'string' ? { profileInstance: instance } : {}) };
     }
     return { kind: 'close', profile };
   }

@@ -271,11 +271,14 @@ export function createProcessService(options: { selection: BuildSelection; platf
       noteOpenCommand(options.observation, 'open-dispatch-admission-trust');
       await within(deadline, () => integration.assertAdmissionAvailable(deadline));
       noteOpenCommand(options.observation, 'open-profile-selection');
-      const profile = await within(deadline, () => selectProfile(input.profile, options.platform(), { state, createDefault: true, deadline: contentionDeadline }));
+      const profile = await within(deadline, () => selectProfile(input.profile, options.platform(),
+        { state, createDefault: input.profileInstance === undefined, deadline: contentionDeadline }));
+      if (input.profileInstance !== undefined && profile.record.instance !== input.profileInstance) throw profileUnavailable();
       noteOpenCommand(options.observation, 'open-current-signed-start');
       const attached = await acquireWithin(deadline,
         () => integration.start(profile, 'management', deadline, contentionDeadline), result => result.client.close());
       try {
+        if (input.profileInstance !== undefined && attached.record.profileInstance !== input.profileInstance) throw profileUnavailable();
         noteOpenCommand(options.observation, 'open-reply');
         const result = await attached.client.call({ wire: 1, id: token('req'), method: 'open',
           params: input.url === undefined ? {} : { url: input.url } }, Math.min(deadline, now() + 15000)) as Contract<'wire.OpenResult'>;
