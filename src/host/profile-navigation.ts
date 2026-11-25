@@ -87,6 +87,7 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
       const runtime = location && await readRuntime(location);
       check();
       if (location && runtime?.phase === 'ready' && originalAlive(runtime, platform)) {
+        if (runtime.build !== selection.build) throw unavailable('browser');
         await attempts.admitted(profile, runtime, deadline);
         const client = await connectRuntime(location, runtime, 'management', selection, platform, deadline);
         try {

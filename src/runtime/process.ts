@@ -289,6 +289,9 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
               host.identity.layout.guard === admitted.buildGuard &&
               host.signed.snapshotDigest === admitted.candidateDigest && host.identity.sourceDigest === admitted.sourceDigest &&
               host.identity.productDigest === admitted.productDigest;
+            // Signature-tool processes are outside the guarded engine family.
+            // Only the standalone CLI may verify another Build this way.
+            if (!sameHost && process.type === 'browser') throw unavailable('browser');
             const originalHost = sameHost ? host : await authorities.verifyPackagedHost(selected,
               layout.payload, deadline);
             if (originalHost.signed.snapshotDigest !== admitted.candidateDigest || originalHost.identity.sourceDigest !== admitted.sourceDigest ||
