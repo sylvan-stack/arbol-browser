@@ -5,7 +5,6 @@ import { assertProductionSessions, type ProfileSessions } from '../profiles/sess
 import type { HostCustody } from '../runtime/custody.js';
 import { assertNativeFailureBoundary } from '../runtime/bootstrap.js';
 import { assertNativeFeatures } from '../native/features.js';
-import { assertSystemClipboardProtection, type SystemClipboardProtection } from '../runtime/platform.js';
 import { staleSnapshot, type RecoveryTransition, type TabAuthority } from './authority.js';
 import { physicalFrames, type HostDocument, type HostDocuments } from './documents.js';
 import type { InspectionFrame, PageReadiness } from './readiness.js';
@@ -50,10 +49,7 @@ function acknowledge(value: unknown): void {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length) throw staleSnapshot();
 }
 
-/** ABR-30 installs the genuine native process protection before any Session,
- * chrome or website, then binds this original-page provider. Consent handlers
- * alone never enforce transient-activation script copy/cut. This constructor
- * requires the native handle; no caller-created flag can open admission. */
+/** Bind capability handlers to the verified website session and original page. */
 export class HostCapabilities {
   private readonly records = new Map<TabTarget, PageRecord>();
   private readonly contents = new WeakMap<WebContents, PageRecord>();
@@ -65,7 +61,7 @@ export class HostCapabilities {
   private readonly extensionList;
   private readonly removeDocuments: () => void;
   constructor(readonly authority: TabAuthority, readonly documents: HostDocuments, readonly readiness: PageReadiness,
-    readonly sessions: ProfileSessions, readonly custody: HostCustody, private readonly clipboardProtection: SystemClipboardProtection,
+    readonly sessions: ProfileSessions, readonly custody: HostCustody,
     private readonly userPolicy?: UserPermissionPolicy) {
     if (authority.documents !== documents || readiness.documents !== documents || readiness.boundary !== authority.boundary ||
         sessions.website === sessions.shell || installed.has(sessions.website)) throw unavailableBoundary();
@@ -127,7 +123,6 @@ export class HostCapabilities {
     try {
       assertNativeFailureBoundary(this.authority.boundary); assertNativeFeatures();
       assertProductionSessions(this.sessions, this.custody); this.authority.assertHealthy();
-      assertSystemClipboardProtection(this.clipboardProtection, this.custody);
       const website = this.sessions.website;
       if (website.setPermissionRequestHandler !== this.requestHandler || website.setPermissionCheckHandler !== this.checkHandler ||
           website.setDisplayMediaRequestHandler !== this.captureHandler || website.extensions !== this.extensions ||
@@ -333,12 +328,10 @@ export class HostCapabilities {
     }
     if (seen.size !== receipt.frames.length) throw unavailableBoundary(); guard(); this.original(record);
   }
-  /** The exact process guard is a capability prerequisite, not action/grant
-   * authority. Original document/frame/chooser and execution guards still own
-   * page admission. ABR-30 separately refuses Browser-owned destructive Cut. */
+  /** Recheck the current document and its original frame and chooser coverage. */
   assertAgentAdmission(receipt: HostDocument, frames: readonly InspectionFrame[], guard: () => void): void {
     this.assertChooserCoverage(receipt, frames, guard);
-    guard(); assertSystemClipboardProtection(this.clipboardProtection, this.custody); guard();
+    guard();
     this.documents.assertCurrent(this.documents.target(receipt), receipt);
   }
   close(): void {

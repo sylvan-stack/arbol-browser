@@ -1,5 +1,4 @@
 import type { ArmedHostSnapshot, HostCustody } from '../runtime/custody.js';
-import type { SystemClipboardProtection } from '../runtime/platform.js';
 import type { ProfileSessions } from '../profiles/session.js';
 import { webFrameMain, type WebContents } from 'electron';
 import { performance } from 'node:perf_hooks';
@@ -305,7 +304,7 @@ export interface RendererControl {
  * Native custody and owned metadata. There is no EngineAuthority, normal launch
  * path, permissive engine operation or dependency on a later Tools adapter. */
 export function createRendererControl(boundary: NativeFailureBoundary, identity: ControlIdentity,
-  protection: { sessions: ProfileSessions; custody: HostCustody; clipboard: SystemClipboardProtection },
+  protection: { sessions: ProfileSessions; custody: HostCustody },
   proof: ArmedHostSnapshot): RendererControl {
   assertNativeFailureBoundary(boundary);
   if (identity.contract !== 1 || !validator('browser.ProfileId')(identity.profile) ||
@@ -371,7 +370,7 @@ export function createRendererControl(boundary: NativeFailureBoundary, identity:
     preparePage);
   documents.bind(ownership.authority, readiness, fault => health.failed(fault));
   capabilities = new HostCapabilities(ownership.authority, documents, readiness, protection.sessions,
-    protection.custody, protection.clipboard);
+    protection.custody);
   inspection = createInspectionTools(ownership.authority, documents, readiness);
   mutation = createTrustedActionTools(inspection.inspection);
   dispatchTools = createHostToolOperations({ inspection: inspection.agent, mutation: mutation.agent });

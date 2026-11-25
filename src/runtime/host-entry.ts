@@ -17,7 +17,7 @@ import { noteHostStartup, prepareHostCustody, abortUnadmittedHost, type HostCust
 import type { NativeBoundaryPreparation } from './bootstrap.js';
 import type { NativeWatchdog } from '../native/watchdog.js';
 import type { OwnerLease } from '../profiles/locking.js';
-import type { PriorMarkerExpectation, SystemClipboardProtection } from './platform.js';
+import type { PriorMarkerExpectation } from './platform.js';
 
 export interface HostRequest { readonly request: string; readonly profile: ProfileSnapshot; readonly selection: BuildSelection }
 export async function consumeHostRequest(args: readonly string[], packagedBuild: string, directory: string): Promise<HostRequest> {
@@ -194,7 +194,7 @@ function installApplicationMenu(): () => void {
 async function assembleAfterReady(prepared: HostPreparation, sessions: ProfileSessions,
   boundary: import('./bootstrap.js').NativeFailureBoundary, request: HostRequest,
   state: ActualHostAssembly, deadline: number, platform: import('./platform.js').PlatformPort,
-  clipboard: SystemClipboardProtection, assertMenuInstalled: () => void): Promise<void> {
+  assertMenuInstalled: () => void): Promise<void> {
   assertOwnedHost(prepared); assertTime(deadline);
   const bootstrapURL = new URL('./bootstrap.js', import.meta.url).href;
   const lifecycleURL = new URL('./lifecycle.js', import.meta.url).href;
@@ -212,7 +212,7 @@ async function assembleAfterReady(prepared: HostPreparation, sessions: ProfileSe
   try {
     current(); sessionModule.assertProductionSessions(sessions, prepared.custody);
     noteHostStartup(prepared.custody, 'host-control-prepare-before');
-    const control = await bootstrap.prepareRendererControl(boundary, prepared, request.selection, sessions, clipboard, deadline);
+    const control = await bootstrap.prepareRendererControl(boundary, prepared, request.selection, sessions, deadline);
     noteHostStartup(prepared.custody, 'host-control-prepare-after');
     state.control = control; current();
     noteHostStartup(prepared.custody, 'host-shell-port-before');
@@ -329,7 +329,6 @@ export async function runHostEntry(): Promise<void> {
       hidePages() { const window = state.shell?.host.window; if (window && !window.isDestroyed()) window.hide(); },
     });
     boundary = await owned.installNative(effects, deadline);
-    const clipboard = await native.platform.protectSystemClipboard(owned.custody, deadline);
     if (app.isReady()) return owned.custody.terminate();
     const assertMenuInstalled = installApplicationMenu();
     noteHostStartup(owned.custody, 'engine-authority');
@@ -349,7 +348,7 @@ export async function runHostEntry(): Promise<void> {
         noteHostStartup(prepared.custody, 'host-session-bind-after');
         assertTime(deadline); prepared.custody.assertRetained();
         if (state.closed) return prepared.custody.terminate();
-        await assembleAfterReady(prepared, sessions, installed, request, state, deadline, native.platform, clipboard, assertMenuInstalled);
+        await assembleAfterReady(prepared, sessions, installed, request, state, deadline, native.platform, assertMenuInstalled);
       } catch { state.closed = true; return installed.fatal.fail('native_boundary_unavailable'); }
     }, () => installed.fatal.fail('native_boundary_unavailable'));
   } catch (error) {

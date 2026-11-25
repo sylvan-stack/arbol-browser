@@ -17,7 +17,7 @@ const names = ['src/runtime/platform.mm', 'src/runtime/host-launch.mm', 'src/run
 const installationConsumers = new Set([...names, 'watchdog/main.mm']);
 const installationSource = 'src/runtime/installation-paths.json';
 const productionPublisherSource = 'native/production-publisher-requirement.json';
-const closure = [...names, 'src/runtime/platform.ts', 'src/runtime/system-clipboard.hpp', 'src/runtime/attempt.hpp', 'watchdog/boundary.hpp', 'watchdog/exit.hpp',
+const closure = [...names, 'src/runtime/platform.ts', 'src/runtime/attempt.hpp', 'watchdog/boundary.hpp', 'watchdog/exit.hpp',
   'package.json', 'arbol-build.json', installationSource, 'native/publisher-requirement.json', productionPublisherSource, 'scripts/compile-platform.mjs'];
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 async function installationInput() {

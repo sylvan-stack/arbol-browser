@@ -7,7 +7,6 @@ import { unavailable } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
 import type { Contract } from '../contracts/generated.js';
 import { assertActualSessionFactory, consumeActualSessionSeal, type ActualSessionFactory, type ActualSessionSeal } from '../profiles/session.js';
-import { assertHostCustody, type HostCustody } from './custody.js';
 
 export interface FileIdentity { readonly device: string; readonly inode: string; readonly uid: number }
 export interface ProcessIdentity { readonly pid: number; readonly uid: number; readonly startId: string }
@@ -220,15 +219,6 @@ const custodyReceipts = new WeakSet<object>();
 export function assertWatchdogCustody(value: WatchdogCustody): void {
   if (!custodyReceipts.has(value)) throw unavailable('browser');
 }
-/** Native-verified process-lifetime protection, not a clipboard operation or
- * a caller-created readiness fact. The handle stays inside this provider. */
-export interface SystemClipboardProtection { readonly scope: 'browser-general-pasteboard' }
-const clipboardProtections = new WeakMap<SystemClipboardProtection, { custody: HostCustody; check: () => void }>();
-export function assertSystemClipboardProtection(value: SystemClipboardProtection, custody: HostCustody): void {
-  const actual = clipboardProtections.get(value);
-  if (!actual || actual.custody !== custody) throw unavailable('browser');
-  actual.check();
-}
 const hostLossStages = Object.freeze(['watchdog-spawn-loss', 'watchdog-readiness-loss', 'watchdog-pipe-error', 'watchdog-pipe-end', 'watchdog-ack-malformed', 'watchdog-ack-order', 'watchdog-ack-expiry', 'watchdog-custody-refusal', 'watchdog-termination', 'watchdog-transport-loss', 'native_integrity_unavailable', 'native_retirement_unavailable', 'native_watchdog_unavailable', 'native_boundary_unavailable'] as const);
 export type HostLossStage = typeof hostLossStages[number];
 const hostStartupStages = Object.freeze(['arm-readback', 'native-install-snapshot', 'native-feature-addon-preflight',
@@ -321,8 +311,6 @@ export type HostStartupStage = typeof hostStartupStages[number];
 export interface PlatformPort {
   /** Warning-only finite local milestone on the genuine original native handle. */
   noteHostStartup(custody: WatchdogCustody, stage: HostStartupStage): void;
-  /** Before app readiness, actual Sessions and all chrome/website creation. */
-  protectSystemClipboard(custody: HostCustody, deadline: number): Promise<SystemClipboardProtection>;
   /** Actual held owner and independently verified OLD Build; native claims,
    * complete receipts, physical metadata/marker/frontiers and full original
    * absence are verified off the caller event loop under the original bound. */
@@ -391,9 +379,6 @@ export interface PlatformPort {
 }
 interface NativeSupport {
   noteHostStartup?(custody: object, stage: number): void;
-  beginHostClipboard(custody: object): object;
-  finishHostClipboard(custody: object, preparation: object): boolean;
-  assertHostClipboard(custody: object, preparation: object): void;
   beginExitInspection(owner: object, build: object, input: string, nativeDeadline: number, data: object | null, next: object | null,
     registry?: object, maintenance?: object): object;
   pollExitInspection(handle: object): string | null;
@@ -477,8 +462,6 @@ export function loadPlatform(): PlatformPort {
     native = createRequire(import.meta.url)(fileURLToPath(new URL('../../native/platform.node', import.meta.url)));
     for (const name of ['publishHostReady', 'beginExitInspection', 'pollExitInspection', 'cancelExitInspection', 'beginHostSessionUse', 'acceptHostSessionUse', 'abortHostSessionUse', 'recordPagesRetired', 'recordDOMRequested', 'recordCookieAcknowledged', 'recordQuitIntended', 'captureCloseBudget', 'beginCloseStamp', 'pollCloseStamp', 'cancelCloseStamp', 'beginCloseRetirement', 'pollCloseRetirement', 'consumeCloseRequest', 'armLocalClose', 'beginHostMarkerMutation', 'acceptHostMarkerMutation', 'assertHostMarker', 'abortHostMarkerMutation', 'latchWatchdogFatal', 'prepareHostFinalization', 'spawnWatchdog', 'assertHostFinalization', 'adoptHostBuild', 'terminateAdoptedHost', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
       if (typeof native[name] !== 'function') throw new Error('Missing process support');
-    for (const name of ['beginHostClipboard', 'finishHostClipboard', 'assertHostClipboard'] as const)
-      if (typeof native[name] !== 'function') throw new Error('Missing clipboard protection');
   } catch { throw unavailable('profile'); }
   const call = <T>(operation: () => T): T => {
     try { return operation(); } catch { throw unavailable('profile'); }
@@ -489,7 +472,6 @@ export function loadPlatform(): PlatformPort {
   const custodyHandles = new WeakMap<WatchdogCustody, object>();
   const maintenanceHandles = new WeakMap<MaintenanceCustody, object>();
   const maintenanceBuildHandles = new WeakMap<MaintenanceGuard, object>();
-  let clipboardAttempted = false;
   const clockBudget = (value: CloseBudget): CloseBudget => {
     if (!value || ![value.received, value.grace, value.overall].every(n => Number.isFinite(n) && n > 0) ||
         Math.abs(value.grace - value.received - 5000) > 0.001 || Math.abs(value.overall - value.received - 8000) > 0.001)
@@ -594,50 +576,6 @@ export function loadPlatform(): PlatformPort {
         const handle = custodyHandles.get(custody), index = hostStartupStages.indexOf(stage);
         if (handle && index >= 0 && typeof native.noteHostStartup === 'function') native.noteHostStartup(handle, index);
       } catch { /* Warning-only: preserve the actual operation and its error. */ }
-    },
-    async protectSystemClipboard(custody: HostCustody, deadline: number): Promise<SystemClipboardProtection> {
-      assertHostCustody(custody);
-      const actual = hostHandover;
-      if (clipboardAttempted || !actual?.prepared || !actual.consumed || process.type !== 'browser' ||
-          custody.host.signed.bundle !== actual.bundle || custody.host.signed.snapshotDigest !== actual.digest ||
-          !Number.isFinite(deadline) || performance.now() >= deadline) throw unavailable('browser');
-      clipboardAttempted = true;
-      const handle = custodyHandles.get(actual.custody); if (!handle) return custody.terminate();
-      const current = () => {
-        assertHostCustody(custody);
-        if (hostHandover !== actual || !actual.prepared || !actual.consumed ||
-            custody.host.signed.bundle !== actual.bundle || custody.host.signed.snapshotDigest !== actual.digest)
-          throw unavailable('browser');
-      };
-      let actualApp: typeof import('electron').app | undefined;
-      let isReady: (() => boolean) | undefined;
-      const preparing = () => {
-        current();
-        if (performance.now() >= deadline || (actualApp && (actualApp.isReady !== isReady || isReady!.call(actualApp))))
-          throw unavailable('browser');
-      };
-      try {
-        preparing();
-        const address = 'electron';
-        const actual = await import(address) as typeof import('electron');
-        actualApp = actual.app;
-        if (!actualApp || typeof actualApp.isReady !== 'function') throw unavailable('browser');
-        isReady = actualApp.isReady; preparing();
-        preparing(); await custody.host.assertTrusted(deadline); preparing();
-        // Source hashing/signature verification runs in the retained native
-        // worker. The real host heartbeat continues through every await.
-        const preparation = call(() => native.beginHostClipboard(handle)); preparing();
-        for (;;) {
-          preparing(); const ready = call(() => native.finishHostClipboard(handle, preparation)); preparing();
-          if (ready === true) break;
-          if (ready !== false) throw unavailable('browser');
-          await setTimeout(Math.min(20, Math.max(1, deadline - performance.now()))); preparing();
-        }
-        const check = () => { current(); call(() => native.assertHostClipboard(handle, preparation)); current(); };
-        check();
-        const protection: SystemClipboardProtection = Object.freeze({ scope: 'browser-general-pasteboard' });
-        clipboardProtections.set(protection, { custody, check }); return protection;
-      } catch { return custody.terminate(); }
     },
     adoptHostBuild(requestPath: string, guard: string, bundle: string): HeldLock {
       if (process.type !== 'browser' || ![requestPath, guard, bundle].every(path => isAbsolute(path) && !path.includes('\0')))
