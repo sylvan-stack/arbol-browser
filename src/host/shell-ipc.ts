@@ -83,12 +83,12 @@ function installTransport() {
     const check = () => {
       if (authenticated(event) !== current) throw unavailable('browser');
       current.authority.assertOperational();
-      if ((request as { method?: unknown } | null)?.method !== 'list' && !current.host.window.isFocused())
-        throw refused('control_refused');
     };
-    check();
     try {
-      const state = await current.profiles(request, check);
+      check();
+      const isFocused = () => current.host.window.isFocused();
+      if ((request as { method?: unknown } | null)?.method !== 'list' && !isFocused()) throw refused('control_refused');
+      const state = await current.profiles(request, check, isFocused);
       if (authenticated(event) !== current) throw unavailable('browser');
       return state;
     } catch (error) {

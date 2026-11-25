@@ -1,5 +1,6 @@
 // Private process support only (BRW-0.14, BRW-1.7, BRW-3.11), not native input ABI.
 #import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
 #include <node_api.h>
 #include <os/log.h>
 #include "../../watchdog/boundary.hpp"
@@ -553,6 +554,31 @@ static napi_value processProvenance(napi_env env, napi_callback_info info) {
       if (!property(env,out,key.UTF8String,text(env,[record[key] UTF8String]))) return fail(env);
     return out;
   } @catch (NSException*) { return fail(env); } }
+}
+static napi_value activateProfileWindow(napi_env env, napi_callback_info info) {
+  napi_value args[2], out; size_t count = 2, length = 0; int pid;
+  char start[21]{};
+  if (napi_get_cb_info(env, info, &count, args, nullptr, nullptr) != napi_ok || count != 2 ||
+      !integer(env, args[0], &pid) || pid < 2 || pid == getpid() ||
+      napi_get_value_string_utf8(env, args[1], start, sizeof(start), &length) != napi_ok) return fail(env);
+  bool allowed = false;
+  @autoreleasepool {
+    if ([NSThread isMainThread] && NSApp.active) {
+      NSRunningApplication* target = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+      NSRunningApplication* current = NSRunningApplication.currentApplication;
+      arbol_boundary::Identity identity;
+      char ownPath[PROC_PIDPATHINFO_MAXSIZE]{}, targetPath[PROC_PIDPATHINFO_MAXSIZE]{};
+      if (target && !target.terminated && proc_pidpath(getpid(), ownPath, sizeof(ownPath)) > 0 &&
+          proc_pidpath(pid, targetPath, sizeof(targetPath)) > 0 && !strcmp(ownPath, targetPath) &&
+          arbol_boundary::observe(pid, identity) == 1 && identity.uid == geteuid() &&
+          std::to_string(identity.start) == std::string_view(start, length)) {
+        [NSApp yieldActivationToApplication:target];
+        allowed = [target activateFromApplication:current options:0];
+      }
+    }
+  }
+  if (napi_get_boolean(env, allowed, &out) != napi_ok) return fail(env);
+  return out;
 }
 // Reads one fixed same-user process invocation. Never returns argv or environment.
 static napi_value seqoyaBackendArguments(napi_env env, napi_callback_info info) {
@@ -4636,6 +4662,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"assertMaintenanceStateRoot",nullptr,assertMaintenanceStateRoot,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"continuousTime",nullptr,continuousTime,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"processProvenance",nullptr,processProvenance,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"activateProfileWindow",nullptr,activateProfileWindow,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"seqoyaBackendArguments",nullptr,seqoyaBackendArguments,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"readLaunchAttempt",nullptr,readLaunchAttempt,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"canonicalMigrationClaimDigest",nullptr,canonicalMigrationClaimDigest,nullptr,nullptr,nullptr,napi_default,nullptr},

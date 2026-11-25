@@ -6,9 +6,10 @@ import { invalidInput, unavailable } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
 import { createProfile, managedProfiles } from '../profiles/create.js';
 import { registryLock } from '../profiles/locking.js';
-import { profileId, profileUnavailable, statOrAbsent } from '../profiles/paths.js';
+import { profileId, profilePaths, profileUnavailable, statOrAbsent } from '../profiles/paths.js';
 import { readJson, readProfile } from '../profiles/records.js';
 import { assertHostCustody, type HostCustody } from '../runtime/custody.js';
+import { readRuntime, recordProcess, runtimeLocation } from '../runtime/instance.js';
 import installation from '../runtime/installation-paths.json' with { type: 'json' };
 import type { PlatformPort } from '../runtime/platform.js';
 
@@ -24,7 +25,7 @@ export interface ProfileNavigationState {
   readonly current: string;
   readonly profiles: readonly ProfileNavigationEntry[];
 }
-export type ProfileNavigation = (raw: unknown, assertCurrent: () => void) => Promise<ProfileNavigationState>;
+export type ProfileNavigation = (raw: unknown, assertCurrent: () => void, isFocused: () => boolean) => Promise<ProfileNavigationState>;
 const execute = promisify(execFile);
 const openResult = validator('wire.OpenResult');
 const instancePattern = /^prf_[A-Za-z0-9_-]{22}$/;
@@ -77,7 +78,7 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
     } finally { registry.release(); }
   }
 
-  return async (raw, assertCurrent) => {
+  return async (raw, assertCurrent, isFocused) => {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw invalidInput();
     const request = raw as Record<string, unknown>;
     const keys = Object.keys(request).sort().join(',');
@@ -106,6 +107,14 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
           });
           const reply: unknown = JSON.parse(result.stdout);
           if (!openResult(reply) || reply.profile !== id) throw unavailable('browser');
+          const destination = await readProfile(profilePaths(id, state));
+          if (destination.record.instance !== instance) throw profileUnavailable();
+          const location = await runtimeLocation(destination);
+          const runtime = location && await readRuntime(location);
+          if (!runtime || runtime.phase !== 'ready' || runtime.pid !== reply.process || runtime.instance !== reply.instance)
+            throw unavailable('browser');
+          check();
+          if (isFocused()) platform.activateProfileWindow?.(recordProcess(runtime));
         }
       }
       return await list(check);
