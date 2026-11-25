@@ -1,21 +1,174 @@
-/** AFM-9 external durable-state observations. No fabricated crash state,
- * native proof, signal-by-PID guessing, or claim that polling proves fsync. */
+/** AFM-9 signed interruption wire and independent durable-state observations. */
 import assert from 'node:assert/strict';
 import { lstat, open, readdir } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { canonical, exactFile, hash, privateDirectory } from '../../scripts/package-host.mjs';
+import { qualificationJson, qualificationKeys, qualificationSha } from '../../scripts/qualification-authority.mjs';
 import { assertFixture, evidence } from './migration-fixture.mjs';
 
-export const interruptionBoundaries = Object.freeze([
-  'before-transaction', 'transaction-publication', 'current-publication', 'native-rename-excl',
-  'empty-staging', 'partial-staging', 'staged-progress', 'marker-rename', 'record-rename',
-  'capture-receipt', 'committed-progress', 'completion', 'final-verification', 'reopening',
-  'selection', 'journal-removal', 'compatible-pre-journal-backup',
-].map(boundary => Object.freeze({ boundary, status: 'unqualified',
-  dependency: 'Reviewed isolated-only coordination at the actual signed durable operation with original process/custody binding',
-  pollingEstablishesBoundary: false })));
+const points = [
+  // Point, writer, per-profile frame, required artifact kinds in wire order.
+  ['before-transaction', 'engine', false, ['mercury-transaction']],
+  ['transaction-publication', 'engine', false, ['transaction']],
+  ['current-publication', 'engine', false, ['transaction', 'current']],
+  ['native-rename-excl', 'engine', false, ['transaction', 'current']],
+  ['empty-staging', 'engine', true, ['scratch']],
+  ['partial-staging', 'engine', true, ['scratch']],
+  ['staged-record', 'engine', true, ['staged-record']],
+  ['staged-marker', 'engine', true, ['staged-marker']],
+  ['staged-progress', 'engine', true, ['staged-progress']],
+  ['marker-rename', 'engine', true, ['staged-progress', 'marker']],
+  ['marker-durable', 'engine', true, ['staged-progress', 'marker']],
+  ['record-rename', 'engine', true, ['staged-progress', 'record']],
+  ['record-durable', 'engine', true, ['staged-progress', 'record']],
+  ['claim-retained', 'engine', true, ['retained-claim']],
+  ['capture-durable', 'engine', true, ['capture']],
+  ['receipt-durable', 'engine', true, ['receipt']],
+  ['committed-progress', 'engine', true, ['receipt', 'committed']],
+  ['completion', 'engine', false, ['completion']],
+  ['final-verification', 'installer', false, ['completion']],
+  ['reopening-proof', 'installer', false, ['completion', 'proof']],
+  ['archive-retired', 'installer', false, ['proof', 'retired-directory']],
+  ['selection', 'installer', false, ['proof', 'selection']],
+  ['journal-unlinked', 'installer', false, ['proof', 'selection']],
+  ['journal-removal', 'installer', false, ['proof', 'selection']],
+  ['compatible-pre-journal-backup', 'installer', false, ['selection', 'compatible-backup']],
+];
+export const interruptionBoundaries = Object.freeze(points.map(([boundary, writer, perProfile, artifacts]) => Object.freeze({
+  boundary, writer, role: boundary === 'compatible-pre-journal-backup' ? 'B' : 'A', perProfile,
+  artifacts: Object.freeze(artifacts), status: 'unqualified', pollingEstablishesBoundary: false,
+})));
+
+const hex32 = value => typeof value === 'string' && /^[a-f0-9]{32}$/.test(value);
+const decimal = value => typeof value === 'string' && /^(0|[1-9][0-9]{0,19})$/.test(value);
+const positiveInteger = value => Number.isSafeInteger(value) && value > 0;
+const encode = value => Buffer.from(JSON.stringify(value) + '\n');
+
+function frame(bytes, limit) {
+  assert.ok(Buffer.isBuffer(bytes) && bytes.length > 1 && bytes.indexOf(0x0a) === bytes.length - 1, 'Expected one EOF-framed line');
+  return qualificationJson(bytes, limit);
+}
+
+function eventLines(bytes, count) {
+  assert.ok(Buffer.isBuffer(bytes) && bytes.length <= count * 4096);
+  const lines = [];
+  for (let start = 0; start < bytes.length;) {
+    const end = bytes.indexOf(0x0a, start);
+    assert.ok(end >= start && lines.length < count);
+    lines.push(bytes.subarray(start, end + 1));
+    start = end + 1;
+  }
+  assert.equal(lines.length, count);
+  return lines;
+}
+
+function validateActor(actor) {
+  qualificationKeys(actor, ['pid', 'startId', 'pidVersion']);
+  assert.ok(positiveInteger(actor.pid) && decimal(actor.startId) && positiveInteger(actor.pidVersion));
+}
+
+function validateArtifact(value, kind, empty = false) {
+  qualificationKeys(value, ['kind', 'identity', 'size', 'sha256']);
+  const { identity, size, sha256 } = value;
+  qualificationKeys(identity, ['device', 'inode', 'uid', 'mode']);
+  const mode = kind === 'retired-directory' ? 0o700 : kind === 'compatible-backup' ? 0o755 : 0o600;
+  assert.equal(value.kind, kind);
+  assert.ok(decimal(identity.device) && decimal(identity.inode) && identity.inode !== '0');
+  assert.equal(identity.uid, process.getuid());
+  assert.equal(identity.mode, mode);
+  assert.ok(decimal(size) && qualificationSha(sha256));
+  assert.equal(size === '0', empty || kind === 'retired-directory');
+  if (empty) assert.equal(sha256, hash(''));
+}
+
+function interruptRequest(bytes) {
+  const value = frame(bytes, 16384);
+  qualificationKeys(value, ['schema', 'action', 'role', 'authoritySha256', 'point']);
+  const boundary = interruptionBoundaries.find(row => row.boundary === value.point);
+  assert.ok(value.schema === 1 && value.action === 'interrupt' && boundary?.role === value.role && qualificationSha(value.authoritySha256));
+  return { value, boundary };
+}
+
+/** Validate the first real writer frame before replying on its original stop pipe. */
+export function interruptionStop(requestBytes, parkedBytes, installerPid) {
+  const { value, boundary } = interruptRequest(requestBytes);
+  const parked = frame(parkedBytes, 4096);
+  qualificationKeys(parked, ['schema', 'event', 'requestSha256', 'nonce', 'point', 'actor', 'journal',
+    'attempt', 'transactionSha256', 'profileSha256', 'artifacts']);
+  const requestSha256 = hash(requestBytes);
+  assert.ok(parked.schema === 1 && parked.event === 'parked' && parked.point === value.point &&
+    parked.requestSha256 === requestSha256 && hex32(parked.nonce) && positiveInteger(installerPid));
+  validateActor(parked.actor);
+  assert.equal(parked.actor.pid === installerPid, boundary.writer === 'installer');
+  if (boundary.role === 'A') {
+    validateArtifact(parked.journal, 'journal');
+    assert.ok(hex32(parked.attempt) && qualificationSha(parked.transactionSha256));
+  } else {
+    assert.equal(parked.journal, null);
+    assert.equal(parked.attempt, null);
+    assert.equal(parked.transactionSha256, null);
+  }
+  assert.ok(boundary.perProfile ? qualificationSha(parked.profileSha256) : parked.profileSha256 === null);
+  assert.ok(Array.isArray(parked.artifacts) && parked.artifacts.length === boundary.artifacts.length);
+  for (const [index, kind] of boundary.artifacts.entries()) {
+    const artifact = parked.artifacts[index];
+    validateArtifact(artifact, kind, value.point === 'empty-staging');
+    if (kind === 'transaction' || kind === 'mercury-transaction') assert.equal(artifact.sha256, parked.transactionSha256);
+  }
+  return { parked, stopBytes: encode({ schema: 1, action: 'interrupt', requestSha256, nonce: parked.nonce, point: value.point }) };
+}
+
+/** Inspect bytes and wait status captured by the direct spawning controller.
+ * The returned transcript still requires the independent restart oracles. */
+export function verifyInterruptionTranscript(requestBytes, eventBytes, writtenStop, installer) {
+  const { boundary } = interruptRequest(requestBytes);
+  const engine = boundary.writer === 'engine';
+  const [notice, acknowledgement, reap] = eventLines(eventBytes, engine ? 3 : 2);
+  const { parked, stopBytes } = interruptionStop(requestBytes, notice, installer.pid);
+  assert.ok(installer.complete && !installer.supervisorSignal && Buffer.isBuffer(installer.stdout) && !installer.stdout.length);
+  assert.ok(Buffer.isBuffer(writtenStop) && writtenStop.equals(stopBytes));
+  const { requestSha256, nonce, actor, point } = parked;
+  const accepted = frame(acknowledgement, 4096);
+  assert.deepEqual(accepted, { schema: 1, event: 'stop-accepted', requestSha256, nonce, point, actor, stopSha256: hash(writtenStop) });
+  if (!engine) {
+    assert.equal(installer.signal, 'SIGKILL');
+    assert.equal(installer.code, null);
+    assert.ok(Buffer.isBuffer(installer.stderr) && !installer.stderr.length);
+    return { parked, accepted, reaped: null, launcher: null };
+  }
+  const reaped = frame(reap, 4096);
+  assert.deepEqual(reaped, { schema: 1, event: 'worker-reaped', requestSha256, nonce, actor,
+    disposition: 'signaled', status: 9, supervisor: 'wait-only' });
+  assert.equal(installer.code, 5);
+  assert.equal(installer.signal, null);
+  const [launcherLine, failure] = eventLines(installer.stderr, 2);
+  assert.ok(failure.equals(Buffer.from('Fixed qualification operation refused; preserve its original evidence.\n')));
+  const launcher = frame(launcherLine, 4096);
+  assert.deepEqual(launcher, { schema: 1, event: 'launcher-exit', requestSha256, nonce, code: 137, signal: null, complete: true });
+  return { parked, accepted, reaped, launcher };
+}
+
+/** Require the actual retry result or the precise request-bound mismatch.
+ * Callers compare protected before/after observations independently. */
+export function verifyInterruptionRetry(requestBytes, installer, expectedBuild) {
+  const request = frame(requestBytes, 16384);
+  qualificationKeys(request, ['schema', 'action', 'role', 'authoritySha256']);
+  assert.ok(request.schema === 1 && request.action === 'retry' && ['A', 'B'].includes(request.role) && qualificationSha(request.authoritySha256));
+  assert.ok(installer.complete && !installer.supervisorSignal && installer.signal === null);
+  const result = frame(installer.stdout, 65536);
+  if (expectedBuild === null) {
+    assert.equal(request.role, 'B');
+    assert.equal(installer.code, 3);
+    assert.deepEqual(result, { schema: 1, requestSha256: hash(requestBytes), refusal: 'pending-journal-candidate-mismatch' });
+  } else {
+    assert.match(expectedBuild, /^[1-9a-f][0-9a-f]{0,15}$/);
+    assert.equal(installer.code, 0);
+    assert.deepEqual(result, { schema: 1, authoritySha256: request.authoritySha256, selected: expectedBuild });
+  }
+  return result;
+}
 
 /** Snapshot only fixed fixture management namespaces, never website storage.
  * Races are errors; a series of snapshots is not an atomic custody proof. */
