@@ -15,6 +15,7 @@ import publisher from '../native/production-publisher-requirement.json' with { t
 
 const payloadPath = 'Contents/Resources/browser';
 const launcherPath = `${payloadPath}/native/stable-launch`;
+const isolatedWatchdogPath = `${payloadPath}/native/watchdog`;
 const identity = 'F1B6782A3BACC18E73FE08CA424C0A81450A982C';
 const productionResources = new Set(['Contents/Info.plist', 'Contents/Resources/publisher-requirement.json']);
 const compilationRecords = new Set([
@@ -92,9 +93,9 @@ export async function prepareReleasePayload({ out, buildRoot, runtimeArchive }) 
   const staged = await prepareUnsignedHost({ out: bundle, buildRoot, stateRoot, runtimeArchive, purpose: 'blocked' });
   if (staged.record.component.contract !== 1 || staged.record.component.profileFormat !== 2)
     throw new Error('Release payload must select profile format2');
-  const compilerFiles = Object.keys(staged.record.files).filter(compilationOnly);
-  const excluded = new Set([...compilerFiles, ...await removeVendorDevelopmentFiles(bundle, staged.record)]);
-  for (const file of compilerFiles) await unlink(join(bundle, file));
+  const stagingFiles = Object.keys(staged.record.files).filter(file => file === isolatedWatchdogPath || compilationOnly(file));
+  const excluded = new Set([...stagingFiles, ...await removeVendorDevelopmentFiles(bundle, staged.record)]);
+  for (const file of stagingFiles) await unlink(join(bundle, file));
   const production = { ...staged.record, delivery: 'production',
     buildRoot: join(...installation.stableBuilds, basename(buildRoot)),
     stateRoot: join(installation.root, installation.browser) };
