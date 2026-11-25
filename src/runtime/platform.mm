@@ -10,6 +10,7 @@
 #include <sys/file.h>
 #include <sys/attr.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <libproc.h>
@@ -25,6 +26,7 @@
 #include <dirent.h>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 #include "system-clipboard.hpp"
 
@@ -552,6 +554,53 @@ static napi_value processProvenance(napi_env env, napi_callback_info info) {
       if (!property(env,out,key.UTF8String,text(env,[record[key] UTF8String]))) return fail(env);
     return out;
   } @catch (NSException*) { return fail(env); } }
+}
+// Reads one fixed same-user process invocation. Never returns argv or environment.
+static napi_value seqoyaBackendArguments(napi_env env, napi_callback_info info) {
+  napi_value args[5], out; size_t count = 5; int pid; std::string start, runtime, entry, lock;
+  if (napi_get_cb_info(env,info,&count,args,nullptr,nullptr)!=napi_ok || count!=5 ||
+      !integer(env,args[0],&pid) || pid<2 || !string(env,args[1],start) ||
+      !string(env,args[2],runtime) || !string(env,args[3],entry) || !string(env,args[4],lock)) return fail(env);
+  const auto matches = [&]() -> bool {
+    @autoreleasepool { @try {
+      NSDictionary* before=arbol_attempt::processRecord(pid);
+      if (!arbol_attempt::process(before) || start!=[before[@"startId"] UTF8String] ||
+          runtime!=[before[@"executable"] UTF8String]) return false;
+      int mib[3]={CTL_KERN,KERN_PROCARGS2,pid};
+      std::vector<char> buffer(256*1024); size_t len=buffer.size();
+      if (sysctl(mib,3,buffer.data(),&len,nullptr,0) || len<=sizeof(int) || len>buffer.size()) return false;
+      int argc=0; memcpy(&argc,buffer.data(),sizeof(argc));
+      if (argc!=5) return false;
+      const char* cursor=buffer.data()+sizeof(argc); const char* end=buffer.data()+len;
+      const auto read=[&](std::string_view& field) {
+        if (cursor>=end) return false;
+        const auto* zero=static_cast<const char*>(memchr(cursor,0,static_cast<size_t>(end-cursor)));
+        if (!zero) return false;
+        field=std::string_view(cursor,static_cast<size_t>(zero-cursor)); cursor=zero+1; return true;
+      };
+      std::string_view field;
+      if (!read(field) || field!=runtime) return false;
+      while (cursor<end && !*cursor) ++cursor;
+      const std::string_view expected[]={runtime,"-I","-B",entry,"backend"};
+      for (const auto arg:expected) if (!read(field) || field!=arg) return false;
+      const int lockFd=open(lock.c_str(),O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
+      if (lockFd<0) return false;
+      struct stat held{}, named{};
+      const bool owned=fstat(lockFd,&held)==0 && lstat(lock.c_str(),&named)==0 && S_ISREG(held.st_mode) &&
+        held.st_uid==geteuid() && held.st_nlink==1 && (held.st_mode&07777)==0600 &&
+        held.st_dev==named.st_dev && held.st_ino==named.st_ino;
+      const bool locked=owned && flock(lockFd,LOCK_EX|LOCK_NB)!=0 && (errno==EWOULDBLOCK || errno==EAGAIN);
+      char pidRecord[64]={};
+      const ssize_t bytes=locked?pread(lockFd,pidRecord,sizeof(pidRecord),0):-1;
+      close(lockFd);
+      const std::string expectedPid="{\"pid\": "+std::to_string(pid)+"}\n";
+      if (bytes!=static_cast<ssize_t>(expectedPid.size()) || memcmp(pidRecord,expectedPid.data(),expectedPid.size())) return false;
+      NSDictionary* after=arbol_attempt::processRecord(pid);
+      return after && [after isEqualToDictionary:before];
+    } @catch(NSException*) { return false; } }
+  };
+  if (napi_get_boolean(env,matches(),&out)!=napi_ok) return fail(env);
+  return out;
 }
 static napi_value prepareQualificationInterruptionPipes(napi_env env, napi_callback_info info) {
   using namespace arbol_attempt;
@@ -4658,6 +4707,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"assertMaintenanceStateRoot",nullptr,assertMaintenanceStateRoot,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"continuousTime",nullptr,continuousTime,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"processProvenance",nullptr,processProvenance,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"seqoyaBackendArguments",nullptr,seqoyaBackendArguments,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"readLaunchAttempt",nullptr,readLaunchAttempt,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"canonicalMigrationClaimDigest",nullptr,canonicalMigrationClaimDigest,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"writeLaunchAttempt",nullptr,writeLaunchAttempt,nullptr,nullptr,nullptr,napi_default,nullptr},

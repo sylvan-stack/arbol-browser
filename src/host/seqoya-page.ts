@@ -15,7 +15,7 @@ const active = new WeakSet<WindowHost>();
 const redirect = (provider: SeqoyaProvider, target: URL, address: string): boolean => {
   try {
     const url = new URL(address);
-    return url.origin === target.origin && !url.username && !url.password &&
+    return url.origin === target.origin && !url.username && !url.password && !url.search && !url.hash &&
       (url.pathname === target.pathname || url.pathname === target.pathname + '/' ||
        (provider === 'claude/anthropic' && url.pathname === '/new'));
   } catch {

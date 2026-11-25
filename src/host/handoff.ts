@@ -317,6 +317,7 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
   const authority = new TabAuthority(boundary, documents, proof, operation);
   let phase: 'prepared' | 'live' | 'closed' = 'prepared';
   let registry: TabRegistry | undefined, runtime: HostLifecycle | undefined, everBound = false;
+  let presented = false;
   const windows = new Map<WindowHost, ShellRegistration>();
   const contexts = new Map<string, ConnectionContext>(), attempted = new WeakSet<ConnectionContext>();
   const disconnected = new WeakSet<ConnectionContext>(), cleanups = new Map<string, Promise<void>>();
@@ -579,7 +580,6 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
     openAdmission() {
       prepared(); if (phase !== 'prepared' || !runtime || runtime.phase !== 'ready' || !registry || windows.size === 0) throw unavailable('browser');
       phase = 'live';
-      for (const [host, registration] of windows) { live(); assertShellRegistration(registration, host); registration.show(); }
     },
     closeAdmission() {
       if (phase === 'closed') return;
@@ -678,6 +678,10 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
       if (context.attachment) contexts.set(context.attachment.id, context);
       opens.set(context, new Map()); requests.set(context, new Map()); staged.set(context, new Map()); delivery.enroll(context);
       if (context.attachment && contexts.get(context.attachment.id) !== context) throw unavailable('browser');
+      if (context.attachment && !presented) {
+        for (const [host, registration] of windows) { live(); assertShellRegistration(registration, host); registration.show(); }
+        presented = true;
+      }
     },
     authorize,
     closeManagement(context, request, write) {
@@ -712,6 +716,7 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
           const registration = windows.get(host);
           if (!registration) throw unavailable('browser');
           assertShellRegistration(registration, host); registration.show();
+          presented = true;
           const info = operations.info();
           value = { profile: info.profile, instance: info.instance, process: process.pid, alreadyRunning: true };
           proof = { kind: 'management', method: 'open' };

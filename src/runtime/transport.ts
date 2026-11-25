@@ -1,4 +1,5 @@
 import { createServer, createConnection, type Socket, type Server } from 'node:net';
+import { constants, closeSync, fstatSync, lstatSync, openSync, readSync, realpathSync } from 'node:fs';
 import { chmod, lstat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -101,10 +102,44 @@ function writeFrame(socket: Socket, bytes: Buffer, maximum = 8 * 1024 * 1024, gu
   socket.write(bytes);
 }
 
+function readBackendRecord(path: string, maximum: number, writable: number): string {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const original = fstatSync(fd);
+    if (!original.isFile() || original.uid !== ownerUid() || original.nlink !== 1 ||
+        (original.mode & writable) !== 0 || original.size < 1 || original.size > maximum) throw unavailable('browser');
+    const bytes = Buffer.alloc(maximum + 1);
+    const size = readSync(fd, bytes, 0, bytes.length, 0);
+    const named = lstatSync(path);
+    if (size !== original.size || size !== named.size || named.ino !== original.ino || named.dev !== original.dev ||
+        named.mtimeMs !== original.mtimeMs) throw unavailable('browser');
+    return bytes.subarray(0, size).toString('utf8');
+  } finally { closeSync(fd); }
+}
+
+function assertSeqoyaBackend(platform: PlatformPort, home: string, runtime: string, socket: ProcessIdentity): void {
+  const stable = join(home, '.local/lib/sylvan-stack/arbol/stable/arbol');
+  const launcher = join(home, 'Applications/Arbol/bin/arbol');
+  const selections = readBackendRecord(launcher, 16_384, 0o022).split('\n').filter(line => line.startsWith('# stable-payload '));
+  if (selections.length !== 1) throw unavailable('browser');
+  const selected = selections[0]!.slice('# stable-payload '.length);
+  const build = selected.slice(stable.length + 1);
+  if (!/^[1-9a-f][0-9a-f]{0,15}$/.test(build) || selected !== join(stable, build) || realpathSync(selected) !== selected)
+    throw unavailable('browser');
+  const record: unknown = JSON.parse(readBackendRecord(join(home, 'Builds/registries/arbol/arbol', build, 'build.json'), 16_384, 0o077));
+  if (!plain(record) || record.component !== 'arbol' || record.build !== build || record.status !== 'working' ||
+      record.installationLayout !== 2 || typeof record.promotedAt !== 'string') throw unavailable('browser');
+  const lockPath = join(runtime, 'backend.lock');
+  const python = join(selected, 'runtime/python/bin/python3.14'), entry = join(selected, 'bin/arbol_entry.py');
+  if (realpathSync(python) !== python || realpathSync(entry) !== entry ||
+      platform.seqoyaBackendArguments?.(socket, python, entry, lockPath) !== true)
+    throw unavailable('browser');
+}
+
 /** Confirm the current proof at the Backend that issued this single-use claim. */
 export async function admitSeqoyaCapture(platform: PlatformPort, binding: Pick<RuntimeRecord, 'profile' | 'profileInstance'>,
   params: SeqoyaParameters, deadline: number, stage: 'check' | 'claim', signal?: AbortSignal): Promise<void> {
-  const root = join(homedir(), '.arbol'), runtime = join(root, 'runtime'), path = join(runtime, 'seqoya.sock');
+  const home = homedir(), root = join(home, '.arbol'), runtime = join(root, 'runtime'), path = join(runtime, 'seqoya.sock');
   for (const folder of [root, runtime]) {
     const info = await lstat(folder);
     if (!info.isDirectory() || info.uid !== ownerUid() || (info.mode & 0o077) !== 0) throw unavailable('browser');
@@ -124,7 +159,11 @@ export async function admitSeqoyaCapture(platform: PlatformPort, binding: Pick<R
     }
     signal?.addEventListener('abort', cancel, { once: true });
     socket.once('connect', () => {
-      try { connected = peer(socket, platform); } catch { cancel(); }
+      try {
+        const current = peer(socket, platform);
+        assertSeqoyaBackend(platform, home, runtime, current);
+        connected = current;
+      } catch { cancel(); }
     });
     frames(socket, seqoyaUsageLimit, value => {
       try {
@@ -136,6 +175,9 @@ export async function admitSeqoyaCapture(platform: PlatformPort, binding: Pick<R
             params: { ...params, profile: binding.profile, instance: binding.profileInstance } }, seqoyaUsageLimit);
           return;
         }
+        const named = lstatSync(path);
+        if (!named.isSocket() || named.dev !== info.dev || named.ino !== info.ino) return cancel();
+        assertSeqoyaBackend(platform, home, runtime, connected);
         finish(value.type === 'reply' && value.id === id && value.error === undefined && plain(value.result) &&
           Object.keys(value.result).length === 1 && value.result.admitted === true);
       } catch { cancel(); }
