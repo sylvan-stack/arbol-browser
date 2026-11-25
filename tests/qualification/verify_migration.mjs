@@ -11,6 +11,7 @@ import { verifyIsolatedRelease } from '../../scripts/isolated-release.mjs';
 import { installIsolatedRelease } from '../../scripts/install-release.mjs';
 import { inventory } from '../../scripts/package-base.mjs';
 import { assertFixture, authenticateInputs, evidence, harnessIdentity, historicalInputs, metadataSnapshot, recordedChild } from '../support/migration-fixture.mjs';
+import { interruptionBoundaries } from '../support/migration-interruptions.mjs';
 import { loopback, until, family } from '../support/control.mjs';
 
 const self = fileURLToPath(import.meta.url);
@@ -22,10 +23,8 @@ const groups = {
     'duplicate-key', 'mixed-pair', 'incompatible-dirty-engine', 'busy-owner', 'busy-native', 'legacy-65536-boundary'],
   writers: ['stable', 'pinned', 'direct-historical-payload', 'rehearsal', 'stale-selection', 'delayed-start',
     'pending-start', 'surviving-helper', 'concurrent-create', 'concurrent-remove', 'empty-registry-create'],
-  recovery: ['before-transaction', 'transaction-publication', 'current-publication', 'native-rename-excl',
-    'empty-staging', 'partial-staging', 'staged-progress', 'marker-rename', 'record-rename', 'capture-receipt',
-    'committed-progress', 'completion', 'final-verification', 'reopening', 'selection', 'journal-removal',
-    'same-input-twice', 'mismatched-input-twice', 'completed-retry', 'old-old', 'old-record-new-marker',
+  recovery: [...interruptionBoundaries.filter(point => point.role === 'A').map(point => point.boundary),
+    'same-input-twice', 'mismatched-input-twice', 'completed-retry', 'generic-isolated-completed-retry', 'old-old', 'old-record-new-marker',
     'fully-published', 'absent-marker', 'zero-profile', 'absent-root', 'unknown-chain', 'substituted-chain',
     'unlisted-profile', 'new-record-old-marker', 'incomplete-proof'],
   archives: ['mercury-original-backup', 'unavailable-archive', 'old-payload-pruning', 'copied-receipt',
@@ -34,20 +33,29 @@ const groups = {
   binding: ['original-active', 'creation-replay', 'retired', 'replaced', 'ambiguous', 'unavailable', 'needs-rebind', 'known-restore'],
   installed: ['exact-image', 'selected-build', 'info', 'inventory-count', 'list', 'creation-replay', 'old-writer', 'catalog'],
 };
-export const caseInventory = Object.freeze(Object.entries(groups).flatMap(([group, names]) => names.map(name => ({
-  id: `${group}/${name}`, group,
-  oracle: group === 'preservation' ? 'Independent metadata identities, exact preserved values and page-visible fictional state where applicable' :
-    group === 'admission' || group === 'writers' ? 'Named route reaches its intended refusal with unchanged metadata and native data-directory identity' :
-    group === 'recovery' ? 'Authenticated exact durable boundary, real process death, original chain and two exact/mismatched retries' :
-    group === 'archives' ? 'Actual Mercury identity and original backup or native rederived receipt proof' :
-    group === 'rollback' ? 'Accepted shared dispatcher with authentic selected history, distinct eligible sources and retained images' :
-    group === 'binding' ? 'Supported external authority with redacted tuple equality/disposition' : 'Ordinary installed signed entry and exact catalog agreement',
-  dependency: group === 'binding' ? 'ABR17–19 external authority and known-restore' :
-    group === 'rollback' ? 'AFM-9 step5.1.6 accepted shared dispatcher and exact source grants' :
-    group === 'installed' ? 'All applicable signed disposable gates and coordinated closed installation' :
-    group === 'recovery' ? 'Exact isolated observation/coordination mechanism; polling is insufficient' :
-    'Exact signed fixture and case-specific preparation; unscheduled until independently reviewed',
-}))));
+export const caseInventory = Object.freeze(Object.entries(groups).flatMap(([group, names]) => names.map(name => {
+  const point = interruptionBoundaries.find(row => row.boundary === name);
+  const genericRetry = name === 'generic-isolated-completed-retry';
+  return Object.freeze({
+    id: `${group}/${name}`, group,
+    ...(point && { point: point.boundary, role: point.role, writer: point.writer, perProfile: point.perProfile, artifacts: point.artifacts }),
+    oracle: point ? 'Exact writer frame, actual stop and wait, matching physical artifacts, and recognized restart under original custody' :
+      genericRetry ? 'Unchanged completion chain, selection and profile metadata across two attempts of the generic isolated installer' :
+      group === 'preservation' ? 'Independent metadata identities, exact preserved values and page-visible fictional state where applicable' :
+      group === 'admission' || group === 'writers' ? 'Named route reaches its intended refusal with unchanged metadata and native data-directory identity' :
+      group === 'recovery' ? 'Authenticated exact durable boundary, real process death, original chain and two exact/mismatched retries' :
+      group === 'archives' ? 'Actual Mercury identity and original backup or native rederived receipt proof' :
+      group === 'rollback' ? 'Accepted shared dispatcher with authentic selected history, distinct eligible sources and retained images' :
+      group === 'binding' ? 'Supported external authority with redacted tuple equality/disposition' : 'Ordinary installed signed entry and exact catalog agreement',
+    dependency: group === 'binding' || (group === 'preservation' && name === 'bound') ? 'ABR17–19 external authority and known-restore' :
+      point ? 'Fixed four-role signed producer, original custody, and independent observations for this writer' :
+      genericRetry ? 'Independently authenticated generic isolated release with an existing completion chain' :
+      group === 'rollback' ? 'AFM-9 step5.1.6 accepted shared dispatcher and exact source grants' :
+      group === 'installed' ? 'All applicable signed disposable gates and coordinated closed installation' :
+      group === 'recovery' ? 'Exact isolated observation/coordination mechanism; polling is insufficient' :
+      'Exact signed fixture and case-specific preparation; unscheduled until independently reviewed',
+  });
+})));
 
 async function authenticatedFixture(record, artifact) {
   const release = await verifyIsolatedRelease(artifact.options), layout = await assertFixture(record, release.build);
@@ -282,7 +290,7 @@ export async function completedRetryJourney(record, artifact, predecessors = [])
     }
     const after = await metadataSnapshot(record, artifact.build); assert.deepEqual(after, before);
     await evidence(c.output, 'metadata', { before, after });
-    return await finishCase(record, artifact, c, ['recovery/completed-retry'], { attempts });
+    return await finishCase(record, artifact, c, ['recovery/generic-isolated-completed-retry'], { attempts });
   } catch (error) { await evidence(c.output, 'failure', { error: String(error.stack ?? error), status: 'failed-or-unqualified' }); throw error; }
 }
 
