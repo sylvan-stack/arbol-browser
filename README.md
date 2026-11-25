@@ -111,7 +111,7 @@ To save a display name before signing in, use
 | Checkout | `~/repos/sylvan-stack/arbol-browser`, shared `main` |
 | Code repository | `sylvan-stack/arbol-browser` |
 | Specifications | `~/Artifacts/arbol-browser/specs/README.md`, accepted BRW-0 through BRW-4 |
-| Protocols | Browser contract 1; profile format 1; private native ABI 1 (not implemented here) |
+| Protocols | Browser contract 1, production profile format 2 and private native ABI 1 |
 
 ## Compile and package a candidate
 
@@ -222,47 +222,38 @@ original Build guard to the embedded CLI. It uses the installed image and
 selection even when `~/Builds` is unavailable. `-v <build>` accepts only the
 selected stable Build. Browser profile state lives in `~/.arbol/browser`.
 
-A release Build consumes a published commit with exact production source
-admission. It runs the declared `promotionUnitTests` selection, which is
-currently empty. Reuse the signed candidate for the intended revision when
-its recorded promotion checks and artifact still apply. Choose tests beyond
-that selection only for an explicitly requested [verification run](TESTS.md).
+A local release uses a clean checkout of the exact published production
+source and its admission commit. With an empty `promotionUnitTests`
+selection, the Common Build produces the signed disk image and launcher.
+Use a separate, explicitly requested verification run for Browser checks.
 
 ```sh
 browser_run=$(forester builds run arbol-browser -- sh -eu -c 'printf "%s\n" "$BUILD_DIR"')
-forester builds keep --minutes 60 "$browser_run"
+forester builds keep --minutes 30 "$browser_run"
 mkdir -m 700 "$browser_run/registry" "$browser_run/bin"
 "$HOME/Applications/Arbol/bin/arbol-builds" build arbol-browser --repo "$reviewed_source_checkout" \
   --registry-dir "$browser_run/registry" --bin-dir "$browser_run/bin" \
   --browser-release "$release_review_commit"
 ```
 
-Forester allocates and tracks the private run. The Common Build reserves the
-canonical production number. Its record gives the declared unit selection,
-check results, and paths and SHA-256 digests for `release-<build>/ArbolBrowser.dmg`
-and `signed-release.json`. Match the exact image and source to the working
-Build record before promotion. The receipt binds the signed app inventory,
-source, runtime and publisher. ABR-25 submits the exact image to Apple and
-staples the accepted ticket. The standalone artifact verifier
-`tests/qualification/verify_release.mjs` checks the original and delivered
-images, Apple result and log, ticket and Gatekeeper, then writes `delivery.json`.
+The working Build record identifies the exact image and signed receipt in
+the `release-<build>` folder. Use those two files with the local installer.
+It verifies the expected Developer ID publisher and the complete signed
+inventory. External distribution has a separate notarization procedure.
 
 ```sh
-node scripts/install-release.mjs verify --image "$delivered_image" \
-  --signed-receipt "$signed_receipt" --delivery-receipt "$delivery_receipt"
-node scripts/install-release.mjs install --image "$delivered_image" \
-  --signed-receipt "$signed_receipt" --delivery-receipt "$delivery_receipt"
+node scripts/install-release.mjs install --image "$signed_image" \
+  --signed-receipt "$signed_receipt"
 "$HOME/Applications/Arbol/bin/arbol-builds" browser-release inspect
+"$HOME/Applications/Arbol Browser/bin/arbol-browser" info
 ```
 
-Installation checks the stapled ticket and exact extracted signed inventory
-before updating the selection. An upgrade waits for the previous Build to be
-unused. If an installation is interrupted, rerun the installer with the exact
-verified delivery so it can recover the transaction before proceeding. An older
-image may remain in managed support while an existing profile still needs its
-verified exit or data-writer evidence. The prior-exit verifier can remount that
-image at its original path. Forester uses Arbol's guarded retirement operation
-to remove an image after the profile references and Build users are gone.
+The installer waits for the previous Build to be unused before changing the
+selection. After an interruption, rerun it with the same image and receipt
+to resume the existing transaction. A referenced predecessor image may
+remain in managed support for profile data recovery. Forester uses the
+guarded Arbol retirement operation after its profile references and users
+have cleared.
 
 ## Optional runtime verification
 
