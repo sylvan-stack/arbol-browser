@@ -2020,10 +2020,13 @@ static napi_value prepareHostFinalization(napi_env env,napi_callback_info info) 
     const double readDeadline=std::min(deadline,[attempt[@"expires"] doubleValue]);
     NSDictionary* policy=sealedObject(c,SignedObjectPurpose::policy,policyDigest,readDeadline,actualPolicy);
     NSDictionary* compatibility=sealedObject(c,SignedObjectPurpose::compatibility,compatibilityDigest,readDeadline,actualCompatibility);
-    if(!policy||!compatibility||actualPolicy!=policyDigest||actualCompatibility!=compatibilityDigest||
+    arbol_attempt::PackagedLayout layout;
+    if(!arbol_attempt::claimedLayout(attempt,layout)) return fail(env);
+    NSString* stateRoot=arbol_attempt::policyStateRoot(policy,layout);
+    if(!stateRoot||![stateRoot isEqual:[attempt[@"profile"] stringByDeletingLastPathComponent].stringByDeletingLastPathComponent]||
+       !compatibility||actualPolicy!=policyDigest||actualCompatibility!=compatibilityDigest||
        ![policy[@"compatibilityDigest"] isEqual:[NSString stringWithUTF8String:compatibilityDigest.c_str()]]||
        ![attempt[@"candidateDigest"] isEqual:[NSString stringWithUTF8String:c->context.digest.c_str()]]||
-       ![policy[@"build"] isEqual:attempt[@"build"]]||![policy[@"buildRoot"] isEqual:attempt[@"buildRoot"]]||
        ![policy[@"sourceDigest"] isEqual:attempt[@"sourceDigest"]]||![policy[@"productDigest"] isEqual:attempt[@"productDigest"]]||
        !arbol_boundary::lockIdentity(c->context.owner)||!arbol_boundary::lockIdentity(c->context.build)||
        !c->finalization.metadata()||arbol_boundary::clockMs()>=readDeadline) return fail(env);
