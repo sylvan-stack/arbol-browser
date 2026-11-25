@@ -13,6 +13,7 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <pwd.h>
+#include <poll.h>
 #include <spawn.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -174,12 +175,23 @@ inline bool executable(const Identity& id, std::string& path) {
   audit_token_t token{}; token.val[5] = (uint32_t)id.pid; token.val[7] = (uint32_t)id.version; char bytes[PROC_PIDPATHINFO_MAXSIZE]{};
   if (proc_pidpath_audittoken(&token, bytes, sizeof(bytes)) <= 0 || bytes[0] != '/' || current(id) != 1) return false; path = bytes; return canonical(path);
 }
+inline CFStringRef appRequirement() {
+  return CFSTR("anchor apple generic and certificate leaf[subject.OU] = \"7V372XL59S\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and identifier \"com.sylvan-stack.arbol\"");
+}
+inline bool liveApplicationCode(NSDictionary* attributes) {
+  SecCodeRef code=nullptr; SecRequirementRef requirement=nullptr;
+  bool valid=SecRequirementCreateWithString(appRequirement(),kSecCSDefaultFlags,&requirement)==errSecSuccess&&
+    SecCodeCopyGuestWithAttributes(nullptr,(__bridge CFDictionaryRef)attributes,kSecCSDefaultFlags,&code)==errSecSuccess&&
+    SecCodeCheckValidity(code,kSecCSDefaultFlags,requirement)==errSecSuccess;
+  if(code) CFRelease(code); if(requirement) CFRelease(requirement);
+  return valid;
+}
 inline bool signature(const std::string& path, bool jit, bool application=false) {
   CFStringRef s = CFStringCreateWithCString(nullptr, path.c_str(), kCFStringEncodingUTF8);
   CFURLRef url = s ? CFURLCreateWithFileSystemPath(nullptr, s, kCFURLPOSIXPathStyle, false) : nullptr;
   SecStaticCodeRef code = nullptr; SecRequirementRef req = nullptr; CFDictionaryRef info = nullptr;
   bool valid = url && SecStaticCodeCreateWithPath(url, kSecCSDefaultFlags, &code) == errSecSuccess &&
-    SecRequirementCreateWithString(application ? CFSTR("anchor apple generic and certificate leaf[subject.OU] = \"7V372XL59S\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and identifier \"com.sylvan-stack.arbol\"") :
+    SecRequirementCreateWithString(application ? appRequirement() :
       CFSTR("anchor apple generic and certificate leaf[subject.OU] = \"7V372XL59S\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"), kSecCSDefaultFlags, &req) == errSecSuccess &&
     SecStaticCodeCheckValidity(code, kSecCSStrictValidate | kSecCSCheckAllArchitectures, req) == errSecSuccess && SecCodeCopySigningInformation(code, kSecCSSigningInformation, &info) == errSecSuccess;
   if (valid) {
@@ -299,12 +311,20 @@ inline Lock appAdmission(Identity& app) {
   bool valid=!fcntl(socketFd,F_SETFD,FD_CLOEXEC)&&!fcntl(socketFd,F_SETFL,O_NONBLOCK)&&
     !connect(socketFd,(sockaddr*)&address,address.sun_len)&&!
     getsockopt(socketFd,SOL_LOCAL,LOCAL_PEERTOKEN,&token,&size)&&size==sizeof(token);
+  // A live acknowledgement also proves that the App recorded the Browser
+  // admission before possibly taking the exclusive startup gate for quit.
+  unsigned char acknowledgement=0; pollfd ready{socketFd,POLLIN,0};
+  if(valid) valid=poll(&ready,1,250)==1&&(ready.revents&POLLIN)&&
+    recv(socketFd,&acknowledgement,1,0)==1&&acknowledgement==1;
   close(socketFd);
   if(!valid||audit_token_to_euid(token)!=geteuid()||observe(audit_token_to_pid(token),app)!=1||
      app.version!=audit_token_to_pidversion(token)) return refuse();
   std::string executablePath;
-  if(!executable(app,executablePath)||executablePath!=supervisorExecutable()||!privateAncestors(executablePath)||
-     !signature(executablePath,false,true)||current(app)!=1||!lockIdentity(lock)) return refuse();
+  @autoreleasepool {
+    auto* attributes=@{(__bridge NSString*)kSecGuestAttributeAudit:[NSData dataWithBytes:&token length:sizeof(token)]};
+    if(!executable(app,executablePath)||executablePath!=supervisorExecutable()||!privateAncestors(executablePath)||
+       !liveApplicationCode(attributes)||!signature(executablePath,false,true)||current(app)!=1||!lockIdentity(lock)) return refuse();
+  }
   return lock;
 }
 // Every child mapping first duplicates its actual source ABOVE all reserved
@@ -395,7 +415,15 @@ struct Context {
       details.bsd.pbi_status!=SZOMB&&!(details.bsd.pbi_flags&PROC_FLAG_INEXIT);
   }
   std::string helper() const { return app.pid?supervisorExecutable():bundle + "/Contents/Resources/browser/native/watchdog"; }
-  bool helperSignature(const std::string& path) const { return signature(path,false,app.pid!=0); }
+  bool helperSignature(const Identity& process, const std::string& path) const {
+    if(!app.pid) return signature(path,false);
+    // Query the loaded image and bracket the PID lookup with the captured
+    // kernel start ID and exec version. The installed App path is writable.
+    @autoreleasepool {
+      auto* attributes=@{(__bridge NSString*)kSecGuestAttributePid:@(process.pid)};
+      return current(process)==1&&liveApplicationCode(attributes)&&signature(path,false,true)&&current(process)==1;
+    }
+  }
   unsigned engineRole(const std::string& path) const {
     unsigned role=0;
     for(const char* suffix:{""," (Renderer)"," (GPU)"," (Plugin)"}) {
@@ -428,14 +456,14 @@ struct Context {
     if(primaryMode) { if(!same(producer,main)) return false; primary=self; }
     else primary=producer,custody=self;
     std::string path; Identity actual;
-    if(observe(self.pid,actual)!=1||!same(self,actual)||actual.group!=main.group||!executable(self,path)||path!=helper()||!helperSignature(path)) return false;
+    if(observe(self.pid,actual)!=1||!same(self,actual)||actual.group!=main.group||!executable(self,path)||path!=helper()||!helperSignature(self,path)) return false;
     Info producerInfo{}; Identity producerNow; int parentState=observe(producer.pid,producerNow,&producerInfo);
     if(parentState<0||(parentState==1&&producerNow.start==producer.start&&!same(producer,producerNow))) return false;
     // A kernel zombie may already have no task/image. Its exact identity plus
     // stable original-parent version grants cleanup, never live readiness.
     if(parentState==1&&same(producer,producerNow)&&producerInfo.bsd.pbi_status!=SZOMB) {
       if(birth.unique.parent!=producer.start||!executable(producer,path)||path!=(primaryMode?engine():helper())||
-         !(primaryMode?signature(path,true):helperSignature(path))) return false;
+         !(primaryMode?signature(path,true):helperSignature(producer,path))) return false;
     }
     authenticated=true; cleanupOnly=true; seen.emplace(key(main),main); return true;
   }
@@ -443,7 +471,7 @@ struct Context {
     Identity now; std::string path;
     return id.pid > 1 && observe(id.pid, now) == 1 && same(id, now) && now.uid == main.uid && now.group == (anchor ? main.group : (uint32_t)id.pid) &&
       getsid(id.pid) == session && executable(now, path) && path == helper() &&
-      (retained ? retained->verifies(path) && current(id) == 1 : helperSignature(path));
+      (retained && !app.pid ? retained->verifies(path) && current(id) == 1 : helperSignature(id,path));
   }
   bool primaryMonitor(const ReadOnlyMonitorImage* retained = nullptr) {
     Identity now;
@@ -464,7 +492,7 @@ struct Context {
       int state=observe(pids[i],id,&info); if(!state) continue; if(state<0) return false;
       if(id.uid!=main.uid||info.unique.parent!=main.start||info.unique.originalParentVersion!=main.version) continue;
       if(executable(id,path)&&path==helper()) {
-        if(getsid(id.pid)!=session||(id.group!=main.group&&id.group!=(uint32_t)id.pid)||!helperSignature(path)) return false;
+        if(getsid(id.pid)!=session||(id.group!=main.group&&id.group!=(uint32_t)id.pid)||!helperSignature(id,path)) return false;
         found=id; ++count;
       }
     }

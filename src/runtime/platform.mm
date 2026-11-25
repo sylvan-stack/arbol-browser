@@ -2214,7 +2214,7 @@ static napi_value captureWatchdog(napi_env env,napi_callback_info info) {
   auto* c=custodyArgument(env,args[0]); if(!c||!c->spawned||!c->endpointsPublished||c->bound||!c->context.primary.pid||pid!=c->context.primary.pid||
     arbol_boundary::observe(pid,child,&detail)!=1||!arbol_boundary::same(c->context.primary,child)||child.uid!=geteuid()||
     detail.unique.parent!=c->context.main.start||detail.unique.originalParentVersion!=c->context.main.version||
-    !arbol_boundary::executable(child,path)||path!=c->context.helper()||!c->context.helperSignature(path)||
+    !arbol_boundary::executable(child,path)||path!=c->context.helper()||!c->context.helperSignature(child,path)||
     (!c->context.monitor(child,true)&&!c->context.monitor(child,false))) return fail(env);
   // Confirmation only: never replace the native spawn's original from a PID.
   napi_value out; napi_get_undefined(env,&out); return out;
