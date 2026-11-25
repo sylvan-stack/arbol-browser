@@ -1,6 +1,7 @@
 import type { Readable, Writable } from 'node:stream';
 import type { Contract } from '../contracts/generated.js';
 import type { RuntimeClient } from './transport.js';
+import type { SeqoyaParameters, SeqoyaResult } from './seqoya-wire.js';
 
 export interface Stdio { stdin: Readable; stdout: Writable; stderr: Writable }
 export interface OpenOptions { profile: string; url?: string; profileInstance?: string }
@@ -14,6 +15,7 @@ export interface AgentAttachment {
 export interface ProcessPort {
   open(options: OpenOptions): Promise<Contract<'wire.OpenResult'>>;
   close(profile: string): Promise<Contract<'wire.CloseResult'>>;
+  captureSeqoya?(input: SeqoyaParameters & { profile: string; profileInstance: string; deadline: number }): Promise<SeqoyaResult>;
   /** Owns one authenticated client. Releasing it leaves the Browser host running. */
   attachAgent(input: AgentAttachment): Promise<RuntimeClient>;
 }

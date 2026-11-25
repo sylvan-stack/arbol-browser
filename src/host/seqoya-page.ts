@@ -1,23 +1,9 @@
 import type { WebContents } from 'electron';
 import { now } from '../runtime/instance.js';
+import { seqoyaDestinations, type SeqoyaProvider } from '../runtime/seqoya-wire.js';
 import { assertWindowHost, type WindowHost } from './windows.js';
 
-const destinations = {
-  'codex/chatgpt': 'https://chatgpt.com/settings/usage',
-  'pi/chatgpt': 'https://chatgpt.com/settings/usage',
-  'claude/anthropic': 'https://claude.ai/settings/usage',
-  'pi/kimi-coding': 'https://www.kimi.ai/code/console',
-  'pi/deepseek': 'https://platform.deepseek.com/usage',
-  'mimo/xiaomi': 'https://platform.xiaomimimo.com/console/plan-manage',
-  'pi/zai': 'https://z.ai/manage-apikey/coding-plan/personal/my-plan',
-  'pi/minimax': 'https://platform.minimax.io/console/usage',
-} as const;
-
-export type SeqoyaProvider = keyof typeof destinations;
-
-export function isSeqoyaProvider(value: unknown): value is SeqoyaProvider {
-  return typeof value === 'string' && Object.hasOwn(destinations, value);
-}
+export type { SeqoyaProvider } from '../runtime/seqoya-wire.js';
 
 export class SeqoyaPageRefusal extends Error {
   constructor(readonly code: 'deferred' | 'dashboard_unavailable' | 'authentication_required') {
@@ -48,7 +34,7 @@ export async function readSeqoyaPage<T>(
   if (!Number.isFinite(deadline) || deadline <= now() || signal.aborted) {
     throw new SeqoyaPageRefusal('dashboard_unavailable');
   }
-  const target = new URL(destinations[provider]);
+  const target = new URL(seqoyaDestinations[provider]);
   const page = host.createPage();
   active.add(host);
   const contents = page.view.webContents;

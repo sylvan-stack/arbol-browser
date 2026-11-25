@@ -13,6 +13,7 @@ import type { CommandPorts, Stdio, PackageMetadata } from '../runtime/ports.js';
 import { buildLocation, consumePackagedSelection, packagedLayout, type BuildSelection } from '../runtime/selection.js';
 import type { VerifiedHost } from '../runtime/authorities.js';
 import type { HeldLock, PlatformPort } from '../runtime/platform.js';
+import { isSeqoyaResult, seqoyaClaimPattern } from '../runtime/seqoya-wire.js';
 
 const coldStages = ['package-metadata', 'selected-build', 'runtime-imports', 'signed-bundle',
   'signed-policy-metadata-compatibility', 'isolated-roots', 'build-guard', 'initial-verified-host',
@@ -145,6 +146,22 @@ export async function componentInfo(): Promise<Contract<'profile2.ComponentInfo'
   return info;
 }
 
+async function readSeqoyaClaim(input: Stdio['stdin']): Promise<string> {
+  let contents = Buffer.alloc(0);
+  const timer = setTimeout(() => input.destroy(), 2000);
+  try {
+    for await (const bytes of input) {
+      const chunk = Buffer.from(bytes);
+      if (contents.length + chunk.length > 44) throw unavailable('browser');
+      contents = Buffer.concat([contents, chunk]);
+    }
+    if (contents.length !== 44 || contents[43] !== 10) throw unavailable('browser');
+    const claim = contents.subarray(0, 43).toString('utf8');
+    if (!seqoyaClaimPattern.test(claim)) throw unavailable('browser');
+    return claim;
+  } finally { clearTimeout(timer); }
+}
+
 export async function runCli(args: readonly string[], ports: CommandPorts = defaultPorts,
   io: Stdio = process): Promise<ExitCode> {
   const commandCutoff = performance.now() + 60000;
@@ -153,6 +170,7 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
   let installed: InstalledLaunch | undefined;
   try {
     const command = parse(args);
+    const claim = command.kind === 'seqoya-usage' ? await readSeqoyaClaim(io.stdin) : undefined;
     if (command.kind === 'agent-describe') {
       io.stdout.write(`${JSON.stringify(describeAgentTools())}\n`);
       return 0;
@@ -183,7 +201,8 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
     // Info retains the real installed launcher capsule and complete signed
     // image/policy/guard admission. The verifier alone observes root absence.
     if (ports === defaultPorts) installed = await installedLaunch(commandCutoff);
-    const openCutoff = ports === defaultPorts && command.kind === 'open' ? installed?.deadline ?? commandCutoff : undefined;
+    const openCutoff = ports === defaultPorts && (command.kind === 'open' || command.kind === 'seqoya-usage')
+      ? installed?.deadline ?? commandCutoff : undefined;
     if (ports === defaultPorts && (command.kind === 'open' || command.kind === 'profiles-create'))
       observation = { stage: 'package-metadata' };
     let activePorts = ports;
@@ -201,6 +220,10 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
       case 'info': result = installed?.host.identity.component ?? await componentInfo(); check = validator(managementResults.info); break;
       case 'open': result = await activePorts.process.open(command); check = validator('wire.OpenResult'); break;
       case 'close': result = await activePorts.process.close(command.profile); check = validator('wire.CloseResult'); break;
+      case 'seqoya-usage':
+        if (!installed || !claim || !activePorts.process.captureSeqoya) throw unavailable('browser');
+        result = await activePorts.process.captureSeqoya({ ...command, claim, deadline: openCutoff ?? commandCutoff });
+        check = isSeqoyaResult; break;
       case 'profiles-list': result = await activePorts.profiles.list(); check = validator(managementResults.list); break;
       case 'profiles-create':
         result = await activePorts.profiles.create(command.profile, command.creationRequest);

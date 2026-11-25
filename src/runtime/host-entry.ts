@@ -230,7 +230,27 @@ async function assembleAfterReady(prepared: HostPreparation, sessions: ProfileSe
     noteHostStartup(prepared.custody, 'host-control-bind-after');
     noteHostStartup(prepared.custody, 'host-listeners-before');
     const transport = await transports.listenProtectedTransport(prepared.instance.location, prepared.instance.record, platform,
-      control.ownership.dispatch);
+      control.ownership.dispatch, async (params, captureDeadline, signal) => {
+        const runtime = state.runtime;
+        if (!runtime) return { status: 'dashboard_unavailable' };
+        const currentRecord = prepared.instance.record;
+        const { SeqoyaPageRefusal } = await import('../host/seqoya-page.js');
+        const { captureSeqoyaUsage } = await import('../host/seqoya-usage.js');
+        const ownerBusy = () => shell.tabs.all().some(tab => control.ownership.lifecycle.state(tab).handoff !== 'idle');
+        try {
+          runtime.assertAdmission(); prepared.custody.assertRetained();
+          await transports.admitSeqoyaCapture(platform, currentRecord, params, captureDeadline, 'claim', signal);
+          runtime.assertAdmission(); prepared.custody.assertRetained();
+          if (prepared.instance.record !== currentRecord) return { status: 'dashboard_unavailable' };
+          const reading = await captureSeqoyaUsage(shell.host, params.provider, captureDeadline, signal, ownerBusy);
+          runtime.assertAdmission(); prepared.custody.assertRetained();
+          if (prepared.instance.record !== currentRecord || signal.aborted || shell.host.hasForegroundWork() || ownerBusy())
+            return { status: 'deferred' };
+          return { status: 'read', reading };
+        } catch (error) {
+          return { status: error instanceof SeqoyaPageRefusal ? error.code : 'dashboard_unavailable' };
+        }
+      });
     noteHostStartup(prepared.custody, 'host-listeners-after');
     state.transport = transport; current();
     const shutdown = sessionModule.productionSessionShutdown(sessions, prepared.custody);

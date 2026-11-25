@@ -1,10 +1,12 @@
 import { invalidInput } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
+import { isSeqoyaProvider, seqoyaProfilePattern, type SeqoyaProvider } from '../runtime/seqoya-wire.js';
 
 export type Command =
   | { kind: 'info' }
   | { kind: 'open'; profile: string; url?: string; profileInstance?: string }
   | { kind: 'close'; profile: string }
+  | { kind: 'seqoya-usage'; profile: string; profileInstance: string; provider: SeqoyaProvider }
   | { kind: 'agent'; profile: string; label: string }
   | { kind: 'agent-describe' }
   | { kind: 'profiles-list' }
@@ -29,13 +31,13 @@ function checkedUrl(value: string): string {
 
 export function parse(args: readonly string[]): Command {
   // Command comes first; leading Build selection belongs to the common launcher.
-  if (!['info', 'open', 'close', 'agent', 'profiles'].includes(args[0] ?? '')) throw invalidInput();
+  if (!['info', 'open', 'close', 'agent', 'profiles', 'seqoya-usage'].includes(args[0] ?? '')) throw invalidInput();
   const words: string[] = [];
   const options = new Map<string, string | true>();
   for (let i = 0; i < args.length; i++) {
     const word = args[i]!;
     if (!word.startsWith('-')) { words.push(word); continue; }
-    if (!['--profile', '--profile-instance', '--url', '--creation-request', '--delete-data', '--contract', '--label', '--describe'].includes(word))
+    if (!['--profile', '--profile-instance', '--url', '--creation-request', '--delete-data', '--contract', '--label', '--describe', '--provider'].includes(word))
       throw invalidInput();
     let value: string | true = true;
     if (word !== '--delete-data' && word !== '--describe') {
@@ -55,6 +57,13 @@ export function parse(args: readonly string[]): Command {
   };
   const [command, subcommand, id] = words;
   if (command === 'info' && words.length === 1) { allowed(); return { kind: 'info' }; }
+  if (command === 'seqoya-usage' && words.length === 1) {
+    allowed('--profile', '--profile-instance', '--provider');
+    const profile = options.get('--profile'), instance = options.get('--profile-instance'), provider = options.get('--provider');
+    if (typeof profile !== 'string' || !seqoyaProfilePattern.test(profile) ||
+        typeof instance !== 'string' || !profileInstance.test(instance) || !isSeqoyaProvider(provider)) throw invalidInput();
+    return { kind: 'seqoya-usage', profile, profileInstance: instance, provider };
+  }
   if ((command === 'open' || command === 'close') && words.length === 1) {
     allowed('--profile', ...(command === 'open' ? ['--url', '--profile-instance'] : []));
     const profile = selectedProfile(options.get('--profile') ?? 'default');

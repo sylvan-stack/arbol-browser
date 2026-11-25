@@ -1,5 +1,7 @@
 import { createServer, createConnection, type Socket, type Server } from 'node:net';
-import { chmod } from 'node:fs/promises';
+import { chmod, lstat } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import type { Contract, ContractTypes } from '../contracts/generated.js';
 import { validator, bundles } from '../contracts/schema.js';
 import { BrowserFailure, unavailable, publicFailure, type BrowserError } from '../contracts/errors.js';
@@ -9,6 +11,8 @@ import { assertSocket, now, token, originalAlive, sameProcess, recordProcess,
   type RuntimeRecord, type RuntimeLocation } from './instance.js';
 import { noteHostStartup } from './custody.js';
 import { expectedBuild, type BuildSelection } from './selection.js';
+import { isSeqoyaReply, isSeqoyaRequest, isSeqoyaResult, plain, seqoyaUsageLimit,
+  type SeqoyaParameters, type SeqoyaReply, type SeqoyaRequest, type SeqoyaResult } from './seqoya-wire.js';
 
 export type Endpoint = 'agent' | 'management';
 export type Request = Contract<'wire.ToolRequest'> | Contract<'wire.ManagementRequest'>;
@@ -95,6 +99,48 @@ function writeFrame(socket: Socket, bytes: Buffer, maximum = 8 * 1024 * 1024, gu
   if (socket.destroyed) throw unavailable('browser');
   // No serialization, provider callback or await after this exact-byte guard.
   socket.write(bytes);
+}
+
+/** Confirm the current proof at the Backend that issued this single-use claim. */
+export async function admitSeqoyaCapture(platform: PlatformPort, binding: Pick<RuntimeRecord, 'profile' | 'profileInstance'>,
+  params: SeqoyaParameters, deadline: number, stage: 'check' | 'claim', signal?: AbortSignal): Promise<void> {
+  const root = join(homedir(), '.arbol'), runtime = join(root, 'runtime'), path = join(runtime, 'seqoya.sock');
+  for (const folder of [root, runtime]) {
+    const info = await lstat(folder);
+    if (!info.isDirectory() || info.uid !== ownerUid() || (info.mode & 0o077) !== 0) throw unavailable('browser');
+  }
+  const info = await lstat(path);
+  if (!info.isSocket() || info.uid !== ownerUid() || (info.mode & 0o077) !== 0 || signal?.aborted || now() >= deadline)
+    throw unavailable('browser');
+  await new Promise<void>((resolve, reject) => {
+    const socket = createConnection(path), id = token('req');
+    let connected: ProcessIdentity | undefined, hello = false, finished = false;
+    const wait = setTimeout(cancel, Math.min(5000, Math.max(1, deadline - now())));
+    function cancel() { finish(false); }
+    function finish(accepted: boolean) {
+      if (finished) return;
+      finished = true; clearTimeout(wait); signal?.removeEventListener('abort', cancel); socket.destroy();
+      if (accepted) resolve(); else reject(unavailable('browser'));
+    }
+    signal?.addEventListener('abort', cancel, { once: true });
+    socket.once('connect', () => {
+      try { connected = peer(socket, platform); } catch { cancel(); }
+    });
+    frames(socket, seqoyaUsageLimit, value => {
+      try {
+        if (!connected || !sameProcess(connected, peer(socket, platform)) || !plain(value) || now() >= deadline) return cancel();
+        if (!hello) {
+          if (value.type !== 'hello' || value.bridge !== 2 || !plain(value.installation)) return cancel();
+          hello = true;
+          write(socket, { type: 'call', id, method: 'seqoya.browser.usage.' + stage,
+            params: { ...params, profile: binding.profile, instance: binding.profileInstance } }, seqoyaUsageLimit);
+          return;
+        }
+        finish(value.type === 'reply' && value.id === id && value.error === undefined && plain(value.result) &&
+          Object.keys(value.result).length === 1 && value.result.admitted === true);
+      } catch { cancel(); }
+    }, cancel);
+  });
 }
 function resultValidator(request: Request): (value: unknown) => boolean {
   if (request.method === 'open') return validator('wire.OpenResult');
@@ -196,14 +242,16 @@ export function listenTransport(location: RuntimeLocation, record: RuntimeRecord
   return listenServer(location, record, platform, dispatch);
 }
 /** Production assembly must choose this entry, with every real protected port. */
+type PrivateUsage = (params: SeqoyaParameters, deadline: number, signal: AbortSignal) => Promise<SeqoyaResult>;
 export function listenProtectedTransport(location: RuntimeLocation, record: RuntimeRecord, platform: PlatformPort,
-  dispatch: ProtectedDispatchPort): Promise<TransportServer> {
+  dispatch: ProtectedDispatchPort, privateUsage?: PrivateUsage): Promise<TransportServer> {
   for (const method of ['enroll', 'guardControl', 'commitResponse', 'redactedFailure', 'forget', 'authorize', 'execute', 'disconnect', 'cancel', 'fatal'] as const)
     if (typeof dispatch[method] !== 'function') throw unavailable('browser');
-  return listenServer(location, record, platform, dispatch, dispatch);
+  return listenServer(location, record, platform, dispatch, dispatch, privateUsage);
 }
 async function listenServer(location: RuntimeLocation, record: RuntimeRecord, platform: PlatformPort,
-  dispatch: DispatchPort | ProtectedDispatchPort, protectedPort?: ProtectedDispatchPort): Promise<TransportServer> {
+  dispatch: DispatchPort | ProtectedDispatchPort, protectedPort?: ProtectedDispatchPort,
+  privateUsage?: PrivateUsage): Promise<TransportServer> {
   let admission = false, sealed = false, agents = 0, management = 0;
   const connections = new Set<() => void>(), retainedCloseStops = new Map<() => void, () => void>(), servers: Server[] = [], scheduler = new Scheduler();
   let fatalLatched = false;
@@ -222,6 +270,7 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
     let closeDrain: NodeJS.Timeout | undefined;
     let helloTimer: NodeJS.Timeout, heartbeat: NodeJS.Timeout;
     let pingId: string | undefined, lastPong = now();
+    let usageStarted = false;
     const stop = () => {
       if (dead) return; dead = true; connections.delete(stop); retainedCloseStops.delete(stop); clearTimeout(closeDrain);
       if (context) managementConnections.delete(context);
@@ -327,6 +376,26 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
         }
         if (sealed || !admission) throw unavailable('browser');
         checkPeer();
+        if (isSeqoyaRequest(value)) {
+          if (endpoint !== 'management' || !privateUsage || usageStarted || seen.has(value.id) || seen.size >= 65536)
+            throw unavailable('browser');
+          usageStarted = true; seen.add(value.id);
+          const id = value.id, deadline = now() + 35_000;
+          void (async () => {
+            let result: SeqoyaResult;
+            try { result = await privateUsage(value.params, deadline, connection.signal); }
+            catch { result = { status: 'dashboard_unavailable' }; }
+            try {
+              if (!isSeqoyaResult(result)) throw unavailable('browser');
+              const reply: SeqoyaReply = { wire: 1, id, method: 'seqoya-usage-result', result };
+              writeFrame(socket, Buffer.from(JSON.stringify(reply) + '\n', 'utf8'), seqoyaUsageLimit, () => {
+                checkPeer();
+                if (dead || sealed || !admission || connection.signal.aborted || now() >= deadline) throw unavailable('browser');
+              });
+            } catch { stop(); }
+          })();
+          return;
+        }
         if (validator('wire.Response')(value)) {
           if (!pingId || value.id !== pingId || !value.ok || Object.keys(value.result).length) throw unavailable('browser');
           pingId = undefined; lastPong = now(); return;
@@ -496,6 +565,12 @@ export interface RuntimeClient {
   cancel(requestId: string, deadline?: number): Promise<Contract<'wire.CancelResult'>>;
   close(): void;
 }
+const usageCalls = new WeakMap<RuntimeClient, (params: SeqoyaParameters, deadline: number) => Promise<SeqoyaResult>>();
+export function requestSeqoyaUsage(client: RuntimeClient, params: SeqoyaParameters, deadline: number): Promise<SeqoyaResult> {
+  const call = usageCalls.get(client);
+  if (!call) return Promise.reject(unavailable('browser'));
+  return call(params, deadline);
+}
 export type RuntimeTermination = 'lost' | 'malformed' | 'refused' | 'timeout' | 'client-closed';
 const terminations = new WeakMap<RuntimeClient, () => RuntimeTermination | undefined>();
 export function runtimeTermination(client: RuntimeClient): RuntimeTermination | undefined {
@@ -596,7 +671,7 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
             if (!pingId) { pingId = token('req'); seen.add(pingId); write(socket, { wire: 1, id: pingId, method: 'ping', params: {} }); }
           } catch { stop(); }
         }, 2000);
-        const send = (request: Request | Contract<'wire.Cancel'>, limit: number, check: (value: unknown) => boolean,
+        const send = (request: Request | SeqoyaRequest | Contract<'wire.Cancel'>, limit: number, check: (value: unknown) => boolean,
           cancel?: PendingReply['cancel']): Promise<unknown> => {
           const maximum = request.method === 'cancel' ? 64 : 32;
           if (endpoint === 'agent' && seen.size >= 65536) stop();
@@ -622,6 +697,11 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
               endpoint === 'agent' ? { id: requestId, original: pending.get(requestId) } : undefined) as Promise<Contract<'wire.CancelResult'>>;
           },
         });
+        if (endpoint === 'management') usageCalls.set(client, (params, limit) => {
+          const request: SeqoyaRequest = { wire: 1, id: token('req'), method: 'seqoya-usage', params };
+          if (!isSeqoyaRequest(request)) return Promise.reject(unavailable('browser'));
+          return send(request, limit, isSeqoyaResult) as Promise<SeqoyaResult>;
+        });
         if (endpoint === 'management') actualCloseClients.set(client, async (budget, limit) => {
           if (dead || closeRequest || pending.size || now() >= limit) return { kind: 'refused', error: unavailable('browser') };
           const request: Extract<Request, { method: 'close' }> = { wire: 1, id: token('req'), method: 'close', params: {} };
@@ -644,6 +724,11 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
       if (validator('wire.Ping')(value)) {
         if (seen.has(value.id) || seen.size >= 65536) throw unavailable('browser');
         seen.add(value.id); write(socket, { wire: 1, id: value.id, ok: true, result: {} }); return;
+      }
+      if (endpoint === 'management' && isSeqoyaReply(value)) {
+        const entry = pending.get(value.id);
+        if (!entry || entry.check !== isSeqoyaResult) throw unavailable('browser');
+        pending.delete(value.id); clearTimeout(entry.timer); entry.resolve(value.result); return;
       }
       if (!validator('wire.Response')(value)) throw unavailable('browser');
       if (value.id === pingId) {

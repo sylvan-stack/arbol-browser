@@ -9,7 +9,7 @@ import { isProductionExitAuthority, type ProductionExitAuthority } from './exit.
 import { archiveRemovedRuntime, assertProductionCloseReady } from './process.js';
 import { assertPlatform, type PlatformPort, type GroupProcess } from './platform.js';
 import type { BuildSelection } from './selection.js';
-import { requestManagementClose, reserveManagementClose, openProtectedReady, connectRuntime, type Request, type ManagementCloseOpportunity, type RuntimeClient, type Endpoint, type TransportServer, type ConnectionContext } from './transport.js';
+import { admitSeqoyaCapture, requestManagementClose, requestSeqoyaUsage, reserveManagementClose, openProtectedReady, connectRuntime, type Request, type ManagementCloseOpportunity, type RuntimeClient, type Endpoint, type TransportServer, type ConnectionContext } from './transport.js';
 import { runtimeLocation, readRuntime, originalAlive, now, startupDeadline, neverOpenedExit,
   token, assertTime, type RuntimeRecord, type PreviousExit } from './instance.js';
 import { assertProfile, type ProfileSnapshot } from '../profiles/records.js';
@@ -305,6 +305,26 @@ export function createProcessService(options: { selection: BuildSelection; platf
           return await closeProductionProfile(profile, options.selection, platform, options.exits, command, options.closeHost);
         return await closeProfile(profile, options.selection, platform, options.exits, deadline);
       } finally { if (command) await platform.retireCloseBudget(command.native); }
+    },
+    async captureSeqoya(input) {
+      const integration = options.integration;
+      if (!integration) throw unavailable('browser');
+      const deadline = Math.min(input.deadline, options.openCutoff ?? Infinity);
+      const contentionDeadline = Math.min(deadline, now() + 10_000);
+      assertTime(deadline);
+      await integration.assertAdmissionAvailable(deadline);
+      const platform = options.platform();
+      const scope = { provider: input.provider, claim: input.claim };
+      await admitSeqoyaCapture(platform, input, scope, deadline, 'check');
+      const profile = await selectProfile(input.profile, platform, { state, deadline: contentionDeadline });
+      if (profile.record.instance !== input.profileInstance) throw profileUnavailable();
+      const { client, record } = await acquireWithin(deadline, () => integration.start(profile, 'management',
+        deadline, contentionDeadline), result => result.client.close());
+      try {
+        if (record.profileInstance !== input.profileInstance || client.hello.profileInstance !== input.profileInstance)
+          throw profileUnavailable();
+        return await requestSeqoyaUsage(client, scope, deadline);
+      } finally { client.close(); }
     },
     async attachAgent(input) {
       const integration = options.integration;
