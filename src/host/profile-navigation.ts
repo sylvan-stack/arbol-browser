@@ -9,6 +9,7 @@ import { readJson, readProfile } from '../profiles/records.js';
 import { assertHostCustody, type HostCustody } from '../runtime/custody.js';
 import { assertTime, now, originalAlive, readRuntime, recordProcess, runtimeLocation, startupDeadline, token } from '../runtime/instance.js';
 import type { PlatformPort } from '../runtime/platform.js';
+import { createLaunchTransactions } from '../runtime/process.js';
 import { connectRuntime } from '../runtime/transport.js';
 
 export type ProfileNavigationRequest = { method: 'list' } |
@@ -55,6 +56,7 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
   const state = custody.host.policy.stateRoot;
   if (selected.paths.state !== state) throw profileUnavailable();
   const selection = { ...custody.build.selection, explicit: true };
+  const attempts = createLaunchTransactions(custody.host, platform);
   let changing = false;
 
   async function list(check: () => void): Promise<ProfileNavigationState> {
@@ -85,8 +87,10 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
       const runtime = location && await readRuntime(location);
       check();
       if (location && runtime?.phase === 'ready' && originalAlive(runtime, platform)) {
+        await attempts.admitted(profile, runtime, deadline);
         const client = await connectRuntime(location, runtime, 'management', selection, platform, deadline);
         try {
+          await attempts.admitted(profile, runtime, deadline);
           check();
           const reply = await client.call({ wire: 1, id: token('req'), method: 'open', params: {} }, Math.min(deadline, now() + 15000));
           if (!openResult(reply) || reply.profile !== id || reply.process !== runtime.pid || reply.instance !== runtime.instance)
