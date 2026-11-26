@@ -1854,7 +1854,7 @@ struct WebsiteSessionNative;
 struct Custody {
   arbol_boundary::Context context; int capsule=-1; bool bound=false,continuousBuild=false,hostRequired=false,spawned=false;
   arbol_boundary::Lock appStartup;
-  arbol_boundary::ReadOnlyMonitorImage monitorImage;
+  arbol_boundary::ReadOnlyExecutableImage monitorImage;
   arbol_exit::HostCapability finalization;
   int reader=-1,writer=-1; bool endpointsPublished=false;
   RetainedPipe retainedReader,retainedWriter;

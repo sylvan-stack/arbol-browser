@@ -1524,7 +1524,7 @@ public:
   bool publishDirtyMonitor(arbol_boundary::Context& c) { return publishDirtyTerminal(c,false); }
   bool publishDirtyMain(arbol_boundary::Context& c) { return publishDirtyTerminal(c,true); }
   bool terminalUnresolved() const { return terminalUnresolved_; }
-  bool held(arbol_boundary::Context& c,const arbol_boundary::ReadOnlyMonitorImage* retained=nullptr) const {
+  bool held(arbol_boundary::Context& c,const arbol_boundary::ReadOnlyExecutableImage* retained=nullptr) const {
     return present()&&exclusiveWriter()&&state_->enrolled.load(std::memory_order_acquire)==7&&
       state_->main.is(c.main)&&state_->primary.is(c.primary)&&state_->custody.is(c.custody)&&
       arbol_boundary::current(c.main)==1&&arbol_boundary::current(c.primary)==1&&arbol_boundary::current(c.custody)==1&&

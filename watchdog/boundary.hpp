@@ -273,9 +273,9 @@ public:
     }
   }
 };
-// Constructed for the signed main's bound watchdogs only. Writable storage
-// keeps live publisher verification. A lost retained proof cannot be renewed.
-class ReadOnlyMonitorImage final {
+// Each role verifies its executable before retaining the original read-only
+// file and mount. Writable storage keeps the full publisher verification.
+class ReadOnlyExecutableImage final {
   int fd_ = -1;
   bool accepted_ = false;
   std::string path_;
@@ -301,21 +301,21 @@ class ReadOnlyMonitorImage final {
       !fcntl(fd_, F_GETPATH, openedPath) && path_ == openedPath;
   }
 public:
-  ReadOnlyMonitorImage() = default;
-  ReadOnlyMonitorImage(const ReadOnlyMonitorImage&) = delete;
-  ReadOnlyMonitorImage& operator=(const ReadOnlyMonitorImage&) = delete;
-  ~ReadOnlyMonitorImage() { if (fd_ >= 0) close(fd_); }
+  ReadOnlyExecutableImage() = default;
+  ReadOnlyExecutableImage(const ReadOnlyExecutableImage&) = delete;
+  ReadOnlyExecutableImage& operator=(const ReadOnlyExecutableImage&) = delete;
+  ~ReadOnlyExecutableImage() { if (fd_ >= 0) close(fd_); }
 
-  bool capture(const std::string& path) {
+  bool capture(const std::string& path, bool jit = false) {
     if (fd_ >= 0 || !canonical(path) || statfs(path.c_str(), &mount_)) return false;
     if (!sameMount(mount_)) return true;
     path_ = path;
     fd_ = open(path_.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
-    if (fd_ < 0 || fstat(fd_, &file_) || !current() || !signature(path_, false) || !current()) return false;
+    if (fd_ < 0 || fstat(fd_, &file_) || !current() || !signature(path_, jit) || !current()) return false;
     accepted_ = true;
     return true;
   }
-  const ReadOnlyMonitorImage* retained() const { return accepted_ ? this : nullptr; }
+  const ReadOnlyExecutableImage* retained() const { return accepted_ ? this : nullptr; }
   bool verifies(const std::string& path) const { return accepted_ && path == path_ && current(); }
 };
 inline bool signalExact(const Identity& id, int sig) {
@@ -434,6 +434,7 @@ struct Context {
   std::map<int,std::shared_ptr<KernelAnswer>> groupGaps;
   FamilyCapture* family=nullptr; // actual native capability owns its lifetime
   mutable std::shared_ptr<const AppSupervisorImage> appMonitorImages[2];
+  std::shared_ptr<const ReadOnlyExecutableImage> engineImage;
   void uncertainFamily(unsigned callerLine=__builtin_LINE()) {
     familyUncertain=true;
     if(family) family->refuse(callerLine,FatalSource::boundaryHeader);
@@ -507,13 +508,24 @@ struct Context {
     return main.pid>1&&main.group==(uint32_t)main.pid&&main.uid==geteuid()&&canonical(bundle)&&bundle.size()>4&&bundle.substr(bundle.size()-4)==".app"&&
       owner.heldMode==LOCK_EX&&build.heldMode==LOCK_SH&&lockIdentity(owner)&&lockIdentity(build)&&(owner.device!=build.device||owner.inode!=build.inode);
   }
+  bool engineSignature(const Identity& process, const std::string& path) {
+    if(!same(process,main)||path!=engine()) return false;
+    if(engineImage) return engineImage->verifies(path)&&current(process)==1;
+    auto original=std::make_shared<ReadOnlyExecutableImage>();
+    if(!original->capture(path,true)) return false;
+    if(!original->retained()) return signature(path,true)&&current(process)==1;
+    if(!original->verifies(path)||current(process)!=1) return false;
+    engineImage=std::move(original);
+    return true;
+  }
   bool initial() {
     Identity id; std::string path;
     if(getpid()==main.pid) {
       std::string expected="1:"+std::to_string(main.pid)+":"+std::to_string(main.start)+":"+std::to_string(main.group)+":"+std::to_string(session)+":"+std::to_string(main.uid);
       const char* record=getenv("ARBOL_BROWSER_BOOTSTRAP"); if(!record || expected!=record) return false;
     }
-    bool valid=foundation()&&observe(main.pid,id)==1&&same(main,id)&&id.group==main.group&&getsid(main.pid)==session&&executable(id,path)&&path==engine()&&signature(path,true);
+    bool valid=foundation()&&observe(main.pid,id)==1&&same(main,id)&&id.group==main.group&&getsid(main.pid)==session&&
+      executable(id,path)&&engineSignature(id,path);
     if(valid) { authenticated=true; seen.emplace(key(main),main); } // later death never erases custody
     return valid&&!cleanupOnly;
   }
@@ -533,17 +545,17 @@ struct Context {
     // stable original-parent version grants cleanup, never live readiness.
     if(parentState==1&&same(producer,producerNow)&&producerInfo.bsd.pbi_status!=SZOMB) {
       if(birth.unique.parent!=producer.start||!executable(producer,path)||path!=(primaryMode?engine():helper())||
-         !(primaryMode?signature(path,true):helperSignature(producer,path))) return false;
+         !(primaryMode?engineSignature(producer,path):helperSignature(producer,path))) return false;
     }
     authenticated=true; cleanupOnly=true; seen.emplace(key(main),main); return true;
   }
-  bool monitor(const Identity& id, bool anchor, const ReadOnlyMonitorImage* retained = nullptr) const {
+  bool monitor(const Identity& id, bool anchor, const ReadOnlyExecutableImage* retained = nullptr) const {
     Identity now; std::string path;
     return id.pid > 1 && observe(id.pid, now) == 1 && same(id, now) && now.uid == main.uid && now.group == (anchor ? main.group : (uint32_t)id.pid) &&
       getsid(id.pid) == session && executable(now, path) && path == helper() &&
       (retained && !app.pid ? retained->verifies(path) && current(id) == 1 : helperSignature(id,path));
   }
-  bool primaryMonitor(const ReadOnlyMonitorImage* retained = nullptr) {
+  bool primaryMonitor(const ReadOnlyExecutableImage* retained = nullptr) {
     Identity now;
     if(observe(primary.pid,now)!=1||!same(primary,now)) return false;
     if(now.group==main.group) return !primaryOutside&&monitor(primary,true,retained);
