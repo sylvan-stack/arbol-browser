@@ -71,6 +71,101 @@ inline bool signedLauncher(const audit_token_t& token, NSDictionary* starter) {
   return valid && arbol_attempt::currentProcess(launcher) && arbol_attempt::currentProcess(starter);
 }
 
+inline std::string provisionalEndpoint(const std::string& requestPath) {
+  NSString* path = [NSString stringWithUTF8String:requestPath.c_str()];
+  NSString* name = path.lastPathComponent;
+  const auto home = arbol_boundary::appHome();
+  if (home.empty() || !arbol_attempt::path(path) ||
+      !arbol_attempt::pattern(name, @"^launch-req_[A-Za-z0-9_-]{22}\\.json$")) return {};
+  return home + "/.arbol/app/browser-start-" + [name.stringByDeletingPathExtension UTF8String] + ".sock";
+}
+
+inline NSDictionary* signedProvisionalPeer(int fd, const std::string& executable, NSString* identifier) {
+  audit_token_t token{};
+  if (!peerToken(fd,token)) return nil;
+  NSDictionary* process = arbol_attempt::processRecord(audit_token_to_pid(token));
+  if (!process || [process[@"pidVersion"] intValue] != audit_token_to_pidversion(token) ||
+      ![process[@"executable"] isEqual:[NSString stringWithUTF8String:executable.c_str()]]) return nil;
+  NSString* anchor = [@ARBOL_PRODUCTION_PUBLISHER_REQUIREMENT stringByAppendingFormat:@" and identifier \"%@\"",identifier];
+  NSDictionary* attributes = @{(__bridge NSString*)kSecGuestAttributeAudit:[NSData dataWithBytes:&token length:sizeof(token)]};
+  SecCodeRef code = nullptr;
+  SecRequirementRef requirement = nullptr;
+  const bool valid = SecCodeCopyGuestWithAttributes(nullptr,(__bridge CFDictionaryRef)attributes,kSecCSDefaultFlags,&code)==errSecSuccess &&
+    SecRequirementCreateWithString((__bridge CFStringRef)anchor,kSecCSDefaultFlags,&requirement)==errSecSuccess &&
+    SecCodeCheckValidity(code,kSecCSDefaultFlags,requirement)==errSecSuccess;
+  if (requirement) CFRelease(requirement);
+  if (code) CFRelease(code);
+  return valid && arbol_attempt::currentProcess(process) ? process : nil;
+}
+
+class ProvisionalClaimOffer {
+  Descriptor listener_;
+  std::string path_;
+  struct stat original_{};
+  bool owns_ = false;
+public:
+  ProvisionalClaimOffer() = default;
+  ProvisionalClaimOffer(const ProvisionalClaimOffer&) = delete;
+  ~ProvisionalClaimOffer() {
+    struct stat named{};
+    if (owns_ && !lstat(path_.c_str(),&named) && S_ISSOCK(named.st_mode) &&
+        original_.st_dev==named.st_dev && original_.st_ino==named.st_ino) (void)unlink(path_.c_str());
+  }
+  bool listenFor(const std::string& requestPath) {
+    path_ = provisionalEndpoint(requestPath);
+    sockaddr_un addr{};
+    if (!address(path_,addr)) return false;
+    listener_.reset(socket(AF_UNIX,SOCK_STREAM,0));
+    const int fd = listener_.get();
+    if (fd<0 || fcntl(fd,F_SETFD,FD_CLOEXEC) || fcntl(fd,F_SETFL,O_NONBLOCK) ||
+        bind(fd,reinterpret_cast<sockaddr*>(&addr),addr.sun_len) || lstat(path_.c_str(),&original_) ||
+        !S_ISSOCK(original_.st_mode) || original_.st_uid!=geteuid()) return false;
+    owns_ = true;
+    return !chmod(path_.c_str(),0600) && !listen(fd,4);
+  }
+  int offer(const arbol_attempt::PackagedLayout& layout, NSString* digest, int expectedPid, double deadline) {
+    if (!arbol_attempt::pattern(digest,@"^[0-9a-f]{64}$")) return -1;
+    Descriptor peer(accept(listener_.get(),nullptr,nullptr));
+    if (peer.get()<0) return errno==EAGAIN || errno==EWOULDBLOCK || errno==EINTR ? 0 : -1;
+    NSDictionary* process = signedProvisionalPeer(peer.get(),layout.bootstrap,@ARBOL_PRODUCTION_BUNDLE_ID);
+    const int actual = [process[@"pid"] intValue];
+    if (!process || actual<=1 || (expectedPid>1 && actual!=expectedPid) || [process[@"group"] intValue]!=actual) return 0;
+    int noSignal = 1;
+    if (fcntl(peer.get(),F_SETFL,O_NONBLOCK) || setsockopt(peer.get(),SOL_SOCKET,SO_NOSIGPIPE,&noSignal,sizeof(noSignal)) ||
+        !arbol_attempt::currentProcess(process) || arbol_boundary::clockMs()>=deadline ||
+        send(peer.get(),digest.UTF8String,64,0)!=64) return -1;
+    return actual;
+  }
+};
+
+inline NSString* awaitProvisionalClaim(const std::string& requestPath, const arbol_attempt::PackagedLayout& layout,
+                                       double deadline) {
+  const auto endpoint = provisionalEndpoint(requestPath);
+  sockaddr_un addr{};
+  struct stat named{};
+  if (!address(endpoint,addr) || !arbol_boundary::canonical(endpoint) || lstat(endpoint.c_str(),&named) ||
+      !S_ISSOCK(named.st_mode) || named.st_uid!=geteuid() || (named.st_mode&07777)!=0600) return nil;
+  Descriptor peer(socket(AF_UNIX,SOCK_STREAM,0));
+  const int fd = peer.get();
+  if (fd<0 || fcntl(fd,F_SETFD,FD_CLOEXEC) || fcntl(fd,F_SETFL,O_NONBLOCK) ||
+      connect(fd,reinterpret_cast<sockaddr*>(&addr),addr.sun_len)) return nil;
+  NSDictionary* process = signedProvisionalPeer(fd,layout.launcher,@"host-launch");
+  if (!process) return nil;
+  char bytes[64]; size_t used=0;
+  while (used<sizeof(bytes) && arbol_boundary::clockMs()<deadline) {
+    pollfd ready{fd,POLLIN,0};
+    const int available = poll(&ready,1,25);
+    if (available==0 || (available<0 && errno==EINTR)) continue;
+    if (available<0 || !(ready.revents&POLLIN)) return nil;
+    const ssize_t count = read(fd,bytes+used,sizeof(bytes)-used);
+    if (count<=0) return nil;
+    used+=size_t(count);
+  }
+  if (used!=sizeof(bytes) || arbol_boundary::clockMs()>=deadline || !arbol_attempt::currentProcess(process)) return nil;
+  NSString* digest = [[NSString alloc] initWithBytes:bytes length:sizeof(bytes) encoding:NSASCIIStringEncoding];
+  return arbol_attempt::pattern(digest,@"^[0-9a-f]{64}$") ? digest : nil;
+}
+
 inline bool packet(NSDictionary* value) {
   return arbol_attempt::keys(value, @[@"format", @"bundle", @"root", @"backing", @"snapshot"]) &&
     [value[@"format"] isEqual:@1] && arbol_attempt::path(value[@"bundle"]) &&

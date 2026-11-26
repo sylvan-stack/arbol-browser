@@ -322,31 +322,41 @@ int main(int argc, const char* argv[]) {
         return verifyInstalledPackage(layout, bundle, argv[2], verifierArgc == 4 ? argv[3] : nullptr, reportSnapshot);
       }
       const bool profileOpen = argc == 4 && !strcmp(argv[1], "--arbol-profile-open");
-      if ((!profileOpen && (argc != 3 || strcmp(argv[1], "--arbol-host-request") || argv[2][0] != '/')) ||
+      const bool provisional = argc == 3 && !strcmp(argv[1], "--arbol-host-preflight");
+      if ((!profileOpen && (argc != 3 || (!provisional && strcmp(argv[1], "--arbol-host-request")) || argv[2][0] != '/')) ||
           getppid() != 1 || setpgid(0, 0) || getpgrp() != getpid()) return 4;
       NSOperatingSystemVersion os = NSProcessInfo.processInfo.operatingSystemVersion;
       if (os.majorVersion != 27 || os.minorVersion != 0 || os.patchVersion != 1 || sizeof(void*) != 8) return 4;
       NSString* bundle = NSBundle.mainBundle.bundlePath;
       arbol_attempt::PackagedLayout layout;
       if (!arbol_attempt::packagedLayout(bundle.fileSystemRepresentation,layout)) return 4;
+      if (provisional && !layout.installed) return 4;
       arbol_boundary::Lock build;
       if (!arbol_attempt::openBuild(bundle.fileSystemRepresentation,build)) return 4;
       if (profileOpen) return openInstalledProfile(layout, bundle, argv[2], argv[3]);
+      arbol_boundary::Identity original; std::string originalPath;
+      if(arbol_boundary::observe(getpid(),original)!=1 || original.group!=(uint32_t)getpid() || getsid(0)<=0 ||
+          !arbol_boundary::executable(original,originalPath) || originalPath!=layout.bootstrap) return 4;
+      arbol_startup_proof::RetainedAppPackage earlyPackage;
+      const bool preparedPackage = provisional && earlyPackage.capture(layout,expiry);
+      NSString* gateDigest = provisional ? arbol_startup_proof::awaitProvisionalClaim(argv[2],layout,expiry) : nil;
+      if (provisional && !gateDigest) return 4;
       // Read only authenticated private control metadata here, release the
       // short lock during signature work, then compare the exact version again.
       std::string initialRaw; NSDictionary* initial=nil; arbol_attempt::PackagedLayout initialLayout;
       { arbol_attempt::Claim early;
         if(!early.acquire(argv[2],std::min(expiry,arbol_boundary::clockMs()+2000)) || !early.read(initialRaw,initial) ||
+           (provisional && ![arbol_attempt::digest(initialRaw) isEqual:gateDigest]) ||
            !arbol_attempt::launchRequest(early,argv[2],initial) ||
            !arbol_attempt::claimedLayout(initial,initialLayout) || initialLayout.bundle!=layout.bundle || initialLayout.guard!=build.path || ![initial[@"phase"] isEqual:@"pending"]) return 4;
         expiry=std::min(expiry,[initial[@"expires"] doubleValue]); if(!inTime()) return 4;
       }
-      arbol_boundary::Identity original; std::string originalPath;
-      if(arbol_boundary::observe(getpid(),original)!=1 || original.group!=(uint32_t)getpid() || getsid(0)<=0 ||
-          !arbol_boundary::executable(original,originalPath) || originalPath!=layout.bootstrap) return 4;
       RetainedStartupPackage relayed;
-      const bool alreadyVerified = relayed.authenticate(layout, initial);
-      if (alreadyVerified) os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT, "arbol-browser outer startup used launcher package proof");
+      const bool useEarlyPackage = preparedPackage && earlyPackage.matches(layout,initial[@"candidateDigest"]) && earlyPackage.current();
+      const bool alreadyVerified = useEarlyPackage || relayed.authenticate(layout, initial);
+      const auto verifiedPackageCurrent = [&]() { return useEarlyPackage ? earlyPackage.current() : relayed.current(); };
+      if (useEarlyPackage) os_log(OS_LOG_DEFAULT,"arbol-browser outer startup verified its package during reservation");
+      else if (alreadyVerified) os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT, "arbol-browser outer startup used launcher package proof");
       if (!alreadyVerified && !signature(bundle, true, false, layout.installed)) return 4;
       NSString* expectedTeam = layout.installed ? @ARBOL_PRODUCTION_PUBLISHER_TEAM : team;
       NSString* expectedBundle = layout.installed ? @ARBOL_PRODUCTION_BUNDLE_ID : bundleID;
@@ -358,7 +368,7 @@ int main(int argc, const char* argv[]) {
       NSDictionary* features = @{@"sitePerProcess": @YES, @"disabledFeatures": @[@"MacAccessibilityTextOperation"], @"extraChromiumArguments": @[]};
       if (![manifest[@"runtime"] isEqual:runtime] || ![manifest[@"featureConfiguration"] isEqual:features] ||
           ![manifest[@"publisherTeam"] isEqual:expectedTeam] || ![manifest[@"bundleIdentifier"] isEqual:expectedBundle] ||
-          (alreadyVerified ? !relayed.current() : !payload(bundle, manifest) || !signature(bundle, true, false, layout.installed))) return 4;
+          (alreadyVerified ? !verifiedPackageCurrent() : !payload(bundle, manifest) || !signature(bundle, true, false, layout.installed))) return 4;
       NSString* root = [NSString stringWithUTF8String:layout.payload.c_str()];
       NSDictionary* hostPolicy=json([bundle stringByAppendingPathComponent:@"Contents/Resources/host-policy.json"]);
       NSDictionary* metadata=json([root stringByAppendingPathComponent:@"metadata.json"]);
@@ -412,7 +422,7 @@ int main(int argc, const char* argv[]) {
       std::string inherited="ARBOL_BROWSER_BUILD_CAPSULE="+std::to_string(capsule);
       char* environment[] = {home.data(), user.data(), custody.data(), inherited.data(), (char*)"PATH=/usr/bin:/bin", (char*)"TMPDIR=/private/tmp", nullptr};
       char* args[] = {(char*)engine.fileSystemRepresentation, (char*)"--site-per-process", (char*)"--disable-features=MacAccessibilityTextOperation", (char*)entry.fileSystemRepresentation, (char*)"--arbol-host-request", (char*)argv[2], nullptr};
-      if(!inTime() || !arbol_boundary::lockIdentity(build) || (alreadyVerified && !relayed.current())) return 4;
+      if(!inTime() || !arbol_boundary::lockIdentity(build) || (alreadyVerified && !verifiedPackageCurrent())) return 4;
       noUse.beforeExec();
       execve(engine.fileSystemRepresentation, args, environment);
       int failure=errno; noUse.returnedExecFailure(failure); return 4;

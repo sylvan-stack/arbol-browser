@@ -3,6 +3,7 @@
 #import <AppKit/AppKit.h>
 #import <os/log.h>
 #include "attempt.hpp"
+#include "startup-proof.hpp"
 #include <sys/stat.h>
 #include <unistd.h>
 #include <cstdio>
@@ -173,25 +174,43 @@ int main(int argc, const char* argv[]) {
     NSString* application = [NSString stringWithUTF8String:argv[1]];
     NSString* request = [NSString stringWithUTF8String:argv[2]];
     if (!application.isAbsolutePath || !request.isAbsolutePath) return 4;
-    NSWorkspace* workspace = nil;
-    if (prepared) {
-      // Only LaunchServices initialization overlaps reservation. No request,
-      // profile lock, or native Claim is touched before the private gate.
-      @try { workspace = [NSWorkspace sharedWorkspace]; } @catch (NSException*) { return 4; }
+    arbol_attempt::PackagedLayout packaged;
+    if (!arbol_attempt::packagedLayout(application.fileSystemRepresentation,packaged)) return 4;
+    const double preparationDeadline=arbol_boundary::clockMs()+60000;
+    arbol_startup_proof::RetainedAppPackage package;
+    const bool provisional = prepared && packaged.installed &&
+      package.capture(packaged,std::min(preparationDeadline,arbol_boundary::clockMs()+250)) && package.witnessed();
+    arbol_boundary::Lock packageGuard;
+    if (provisional && !arbol_attempt::openBuild(packaged.bundle,packageGuard)) return 4;
+    arbol_startup_proof::Descriptor originalGuard(packageGuard.fd);
+    arbol_startup_proof::ProvisionalClaimOffer offer;
+    if (provisional && !offer.listenFor(argv[2])) return 4;
+    const auto waitForReservation = [&](const std::shared_ptr<Reply>& reply) {
       struct stat gate{};
-      pollfd readable{STDIN_FILENO, POLLIN, 0};
-      char approved=0;
-      if (!workspace || fstat(STDIN_FILENO,&gate) || (!S_ISFIFO(gate.st_mode) && !S_ISSOCK(gate.st_mode)) ||
-          poll(&readable,1,60000)!=1 || !(readable.revents&POLLIN) || read(STDIN_FILENO,&approved,1)!=1 || approved!='1') return 4;
-    }
+      if (fstat(STDIN_FILENO,&gate) || (!S_ISFIFO(gate.st_mode) && !S_ISSOCK(gate.st_mode))) return false;
+      while (arbol_boundary::clockMs()<preparationDeadline) {
+        if (reply) { std::lock_guard<std::mutex> held(reply->mutex); if (reply->error) return false; }
+        pollfd readable{STDIN_FILENO,POLLIN,0};
+        const int available=poll(&readable,1,0);
+        if (available>0) {
+          char approved=0;
+          return (readable.revents&POLLIN) && read(STDIN_FILENO,&approved,1)==1 && approved=='1';
+        }
+        if (available<0 && errno!=EINTR) return false;
+        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+        usleep(1000);
+      }
+      return false;
+    };
     double deadline=arbol_boundary::clockMs()+28000;
-    NSDictionary* pending = nil; std::string requestRaw; Baseline baseline;
-    { arbol_attempt::Claim claim; std::string raw; NSDictionary* attempt=nil; arbol_attempt::PackagedLayout layout;
-      if(!claim.acquire(argv[2],std::min(deadline,arbol_boundary::clockMs()+2000)) || !claim.read(raw,attempt) ||
+    NSDictionary* pending = nil; std::string pendingRaw, requestRaw; Baseline baseline;
+    const auto loadPending = [&]() {
+      arbol_attempt::Claim claim; NSDictionary* attempt=nil; arbol_attempt::PackagedLayout layout;
+      if(!claim.acquire(argv[2],std::min(deadline,arbol_boundary::clockMs()+2000)) || !claim.read(pendingRaw,attempt) ||
          !arbol_attempt::launchRequest(claim,argv[2],attempt) || ![attempt[@"phase"] isEqual:@"pending"] ||
          !arbol_attempt::currentProcess(attempt[@"starter"]) ||
          !arbol_attempt::claimedLayout(attempt,layout) || layout.bundle!=application.fileSystemRepresentation ||
-         !arbol_boundary::canonical(application.fileSystemRepresentation)) return 4;
+         !arbol_boundary::canonical(application.fileSystemRepresentation)) return false;
       std::string checkedRequest;
       const std::string name = request.lastPathComponent.UTF8String;
       baseline.requestFd = openat(claim.at.directory,name.c_str(),O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
@@ -201,23 +220,29 @@ int main(int argc, const char* argv[]) {
           !readRequest(claim,baseline,name,deadline,requestRaw) ||
           !arbol_attempt::launchRequest(claim,argv[2],attempt) ||
           !readRequest(claim,baseline,name,deadline,checkedRequest) ||
-          checkedRequest != requestRaw || !stable(claim,baseline,name)) return 4;
+          checkedRequest != requestRaw || !stable(claim,baseline,name)) return false;
       pending = [attempt copy];
       deadline=std::min(deadline,[attempt[@"expires"] doubleValue]);
+      return arbol_boundary::clockMs()<deadline;
+    };
+    if (!provisional) {
+      if (prepared && !waitForReservation({})) return 4;
+      deadline=arbol_boundary::clockMs()+28000;
+      if (!loadPending()) return 4;
     }
-    if(arbol_boundary::clockMs()>=deadline) return 4;
     NSWorkspaceOpenConfiguration* configuration = [NSWorkspaceOpenConfiguration configuration];
     configuration.createsNewApplicationInstance = YES;
     configuration.activates = NO;
     configuration.addsToRecentItems = NO;
-    configuration.arguments = @[ @"--arbol-host-request", request ];
+    configuration.arguments = @[ provisional ? @"--arbol-host-preflight" : @"--arbol-host-request", request ];
     // A closed environment is supplied; bootstrap also replaces the complete
     // inherited environment before exec. No caller flags or Node/DYLD options.
     configuration.environment = @{};
     const std::string requestPath = argv[2];
     const auto reply = std::make_shared<Reply>();
+    if (provisional && (!package.current() || !arbol_boundary::lockIdentity(packageGuard))) return 4;
     try { @try {
-      [(workspace ?: [NSWorkspace sharedWorkspace]) openApplicationAtURL:[NSURL fileURLWithPath:application]
+      [[NSWorkspace sharedWorkspace] openApplicationAtURL:[NSURL fileURLWithPath:application]
       configuration:configuration completionHandler:^(NSRunningApplication* app, NSError* error) {
         { std::lock_guard<std::mutex> held(reply->mutex);
           if (reply->callback || reply->outcome != Outcome::pending) return;
@@ -254,6 +279,25 @@ int main(int argc, const char* argv[]) {
       }];
     } @catch (NSException*) { std::lock_guard<std::mutex> held(reply->mutex); reply->error = true; }
     } catch (...) { std::lock_guard<std::mutex> held(reply->mutex); reply->error = true; }
+    int provisionalPid=0;
+    if (provisional) {
+      if (!waitForReservation(reply)) return 4;
+      deadline=std::min(preparationDeadline,arbol_boundary::clockMs()+28000);
+      if (!loadPending()) return 4;
+      if (!package.matches(packaged,pending[@"candidateDigest"]) || !package.current() ||
+          !arbol_boundary::lockIdentity(packageGuard)) return 4;
+      NSString* digest=arbol_attempt::digest(pendingRaw);
+      while (arbol_boundary::clockMs()<deadline) {
+        int callbackPid=0;
+        { std::lock_guard<std::mutex> held(reply->mutex); if (reply->error) return 4; callbackPid=reply->callbackPid; }
+        provisionalPid=offer.offer(packaged,digest,callbackPid,deadline);
+        if (provisionalPid<0) return 4;
+        if (provisionalPid>0) break;
+        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+        usleep(1000);
+      }
+      if (provisionalPid<=1) return 4;
+    }
     unsigned branch = 0, phase = 0;
     while (arbol_boundary::clockMs() < deadline) {
       { std::lock_guard<std::mutex> held(reply->mutex);
@@ -267,7 +311,8 @@ int main(int argc, const char* argv[]) {
         } @catch (NSException*) {} } catch (...) {}
         std::lock_guard<std::mutex> held(reply->mutex);
         if (reply->error || result == Observation::refused ||
-            (result == Observation::proved && reply->callbackPid > 0 && reply->callbackPid != pid)) {
+            (result == Observation::proved && ((reply->callbackPid > 0 && reply->callbackPid != pid) ||
+              (provisionalPid > 0 && provisionalPid != pid)))) {
           reply->outcome = Outcome::refused; break;
         }
         if (result == Observation::proved) {
