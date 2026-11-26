@@ -1,6 +1,7 @@
 #pragma once
 
 #include "attempt.hpp"
+#include <os/log.h>
 
 namespace arbol_startup_proof {
 inline constexpr int writerDescriptor = 12;
@@ -151,11 +152,27 @@ inline void publishToApp(NSDictionary* verified, NSString* imageDigest, double d
   if (arbol_boundary::clockMs() >= deadline || !packet(verified) ||
       !arbol_attempt::pattern(imageDigest, @"^[0-9a-f]{64}$")) return;
   Descriptor connection;
-  if (!connectAppCache(connection)) return;
+  if (!connectAppCache(connection)) {
+    os_log_info(OS_LOG_DEFAULT, "arbol-browser App package proof publisher could not authenticate the App");
+    return;
+  }
   NSMutableDictionary* proof = [verified mutableCopy];
   proof[@"imageSha256"] = imageDigest;
   const std::string frame = "P" + arbol_attempt::bytes(proof);
-  if (frame.size() <= packetLimit) (void)send(connection.get(), frame.data(), frame.size(), 0);
+  const int fd = connection.get();
+  if (frame.size() > packetLimit || send(fd, frame.data(), frame.size(), 0) != ssize_t(frame.size()) ||
+      shutdown(fd, SHUT_WR)) return;
+
+  // Keep our kernel identity available to the App through its validation.
+  const int wait = int(std::clamp(deadline - arbol_boundary::clockMs(), 0.0, 100.0));
+  pollfd ready{fd, POLLIN, 0};
+  char acknowledgement = 0;
+  if (poll(&ready, 1, wait) > 0 && (ready.revents & POLLIN) &&
+      recv(fd, &acknowledgement, sizeof(acknowledgement), 0) == 1 && acknowledgement == 1) {
+    os_log_info(OS_LOG_DEFAULT, "arbol-browser App package proof publication acknowledged");
+  } else {
+    os_log_info(OS_LOG_DEFAULT, "arbol-browser App package proof publication was not acknowledged");
+  }
 }
 
 // The native parent and the Node command share an anonymous write pipe.
