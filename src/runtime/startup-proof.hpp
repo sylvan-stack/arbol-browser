@@ -110,34 +110,41 @@ inline bool connectAppCache(Descriptor& connection) {
   return arbol_boundary::liveApplicationCode(attributes) && arbol_boundary::current(process) == 1;
 }
 
-inline bool cached(const std::string& bundle, int root, int image, double cutoff,
-                   NSString* expectedImage = nil, NSString* expectedSnapshot = nil) {
+inline NSDictionary* cached(const std::string& bundle, int root, int image, double cutoff,
+                            NSString* expectedImage = nil, NSString* expectedSnapshot = nil) {
   Descriptor connection;
   const double deadline = std::min(cutoff, arbol_boundary::clockMs() + 150);
-  if (!connectAppCache(connection)) return false;
+  if (!connectAppCache(connection)) return nil;
   const int fd = connection.get();
   const char query = 'Q';
-  if (send(fd, &query, 1, 0) != 1 || shutdown(fd, SHUT_WR)) return false;
+  if (send(fd, &query, 1, 0) != 1 || shutdown(fd, SHUT_WR)) return nil;
   std::string data;
   while (arbol_boundary::clockMs() < deadline && data.size() <= packetLimit) {
     pollfd ready{fd, POLLIN, 0};
-    if (poll(&ready, 1, 25) < 1 || !(ready.revents & (POLLIN | POLLHUP))) return false;
+    if (poll(&ready, 1, 25) < 1 || !(ready.revents & (POLLIN | POLLHUP))) return nil;
     char buffer[packetLimit];
     const ssize_t count = read(fd, buffer, sizeof(buffer));
-    if (count < 0) return false;
+    if (count < 0) return nil;
     if (count == 0) {
       NSDictionary* cachedProof = arbol_attempt::json(data);
       NSString* digest = cachedProof[@"imageSha256"];
       if (!arbol_attempt::pattern(digest, @"^[0-9a-f]{64}$") ||
           (expectedImage && ![expectedImage isEqual:digest]) ||
-          (expectedSnapshot && ![expectedSnapshot isEqual:cachedProof[@"snapshot"]])) return false;
+          (expectedSnapshot && ![expectedSnapshot isEqual:cachedProof[@"snapshot"]])) return nil;
       NSMutableDictionary* physicalProof = [cachedProof mutableCopy];
       [physicalProof removeObjectForKey:@"imageSha256"];
-      return descriptors(physicalProof, bundle, root, image) && arbol_boundary::clockMs() < deadline;
+      return descriptors(physicalProof, bundle, root, image) && arbol_boundary::clockMs() < deadline ? physicalProof : nil;
     }
     data.append(buffer, size_t(count));
   }
-  return false;
+  return nil;
+}
+
+inline bool currentCache(NSDictionary* proof, const std::string& bundle, int root, int image,
+                         const arbol_attempt::MaintenancePayload& mount) {
+  struct statfs filesystem{};
+  return descriptors(proof, bundle, root, image) && !fstatfs(root, &filesystem) &&
+    mount.sameFilesystem(filesystem) && mount.current() && descriptors(proof, bundle, root, image);
 }
 
 inline void publishToApp(NSDictionary* verified, NSString* imageDigest, double deadline) {

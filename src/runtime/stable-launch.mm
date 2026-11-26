@@ -332,9 +332,12 @@ int launch(int argc, const char* argv[], double deadline) {
   if (backing.get() < 0 || fstat(backing.get(), &imageStat) || !fileIdentity(backing.get(), imagePath, imageStat)) return 4;
   FD cacheRoot(ordinaryOpen ? open(bundle.c_str(), O_DIRECTORY | O_RDONLY | O_NOFOLLOW | O_CLOEXEC) : -1);
   arbol_attempt::MaintenancePayload cachedMount;
-  const bool cachedPackage = cacheRoot.get() >= 0 &&
-    arbol_startup_proof::cached(bundle, cacheRoot.get(), backing.get(), deadline, receipt[@"imageSha256"]) &&
-    cachedMount.capture(layout, false);
+  NSDictionary* appProof = cacheRoot.get() >= 0
+    ? arbol_startup_proof::cached(bundle, cacheRoot.get(), backing.get(), deadline, receipt[@"imageSha256"]) : nil;
+  const auto proofCurrent = [&]() {
+    return arbol_startup_proof::currentCache(appProof, bundle, cacheRoot.get(), backing.get(), cachedMount);
+  };
+  const bool cachedPackage = appProof && cachedMount.capture(layout, false) && proofCurrent();
   if (!cachedPackage && ![imageDigest(backing.get(), imagePath, imageStat, deadline) isEqual:receipt[@"imageSha256"]]) return 4;
   if (cachedPackage) os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT, "arbol-browser stable launcher used App package proof");
 
@@ -351,7 +354,7 @@ int launch(int argc, const char* argv[], double deadline) {
     if (!entries || entries.count || !diskImageTool(@[@"attach", image, @"-readonly", @"-nokernel",
         @"-mountpoint", point, @"-noautoopen", @"-nobrowse", @"-plist"], deadline)) return 4;
   }
-  if ((cachedPackage ? !cachedMount.current() : !mountedImage(mount, image, deadline)) ||
+  if ((cachedPackage ? !proofCurrent() : !mountedImage(mount, image, deadline)) ||
       !fileIdentity(backing.get(), imagePath, imageStat) || !arbol_boundary::canonical(bundle) ||
       (!cachedPackage && !arbol_attempt::signedIdentity(bundle, @ARBOL_PRODUCTION_BUNDLE_ID, true)) ||
       !arbol_boundary::lockIdentity(lock) || !fileIdentity(mountGuard.get(), mountGuardPath, mountGuardStat) ||
@@ -404,7 +407,7 @@ int launch(int argc, const char* argv[], double deadline) {
   for (int index = first; index < argc; ++index) args.push_back((char*)argv[index]);
   args.push_back(nullptr);
   pid_t child = 0;
-  const int result = clockMs() < deadline ?
+  const int result = clockMs() < deadline && (!cachedPackage || proofCurrent()) ?
     posix_spawn(&child, layout.engine.c_str(), &actions, nullptr, args.data(), environment) : ETIMEDOUT;
   posix_spawn_file_actions_destroy(&actions);
   copies.closeCopies();
