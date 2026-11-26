@@ -16,7 +16,6 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <libproc.h>
-#include <mach-o/loader.h>
 #include <map>
 #include <bsm/libbsm.h>
 #include <fcntl.h>
@@ -4730,59 +4729,8 @@ static napi_value inspectInstalledMountTopology(napi_env env, napi_callback_info
   } @catch (NSException*) { return fail(env); } } catch (...) { return fail(env); } }
 }
 
-// This independently signed library can read the same mounted package witness
-// as the external verifier. It grants no profile or process authority.
-static napi_value readInstalledStartupSnapshot(napi_env env,napi_callback_info info) {
-  size_t count = 5;
-  napi_value args[5];
-  std::string bundle;
-  int root = -1, image = -1, library = -1, budget = 0;
-  if (napi_get_cb_info(env,info,&count,args,nullptr,nullptr)!=napi_ok || count!=5 ||
-      !string(env,args[0],bundle) || !integer(env,args[1],&root) || root<3 ||
-      !integer(env,args[2],&image) || image<3 || !integer(env,args[3],&library) || library<3 ||
-      !integer(env,args[4],&budget) || budget<1 || budget>5000) return fail(env);
-  @autoreleasepool { try { @try {
-    const double deadline = arbol_boundary::clockMs() + budget;
-    arbol_attempt::PackagedLayout layout;
-    arbol_boundary::Identity self;
-    std::string executable;
-    struct stat backing{}, original{};
-    Dl_info loaded{};
-    if (!arbol_attempt::packagedLayout(bundle,layout) || !layout.installed ||
-        !arbol_boundary::canonical(bundle) || arbol_boundary::observe(getpid(),self)!=1 ||
-        !arbol_boundary::executable(self,executable) || executable!=layout.engine ||
-        fstat(image,&backing) || (fcntl(image,F_GETFL)&O_ACCMODE)!=O_RDONLY ||
-        fstat(library,&original) || !S_ISREG(original.st_mode) ||
-        !dladdr(reinterpret_cast<void*>(&readInstalledStartupSnapshot),&loaded) || !loaded.dli_fname) return fail(env);
-    const std::string path = layout.payload + "/native/platform.node";
-    if (path != loaded.dli_fname || !loaded.dli_fbase) return fail(env);
-    struct mach_header_64 header{};
-    if (pread(library,&header,sizeof(header),0)!=sizeof(header) || header.magic!=MH_MAGIC_64 ||
-        !header.sizeofcmds || header.sizeofcmds>65536 || memcmp(&header,loaded.dli_fbase,sizeof(header))) return fail(env);
-    std::vector<char> loadedCommands(sizeof(header)+header.sizeofcmds);
-    if (pread(library,loadedCommands.data(),loadedCommands.size(),0)!=ssize_t(loadedCommands.size()) ||
-        memcmp(loadedCommands.data(),loaded.dli_fbase,loadedCommands.size())) return fail(env);
-    const auto libraryCurrent = [&]() {
-      struct stat held{}, named{};
-      char source[PATH_MAX]{};
-      return !fstat(library,&held) && !lstat(path.c_str(),&named) && !fcntl(library,F_GETPATH,source) &&
-        path==source && arbol_boundary::canonical(path) && arbol_attempt::sameFile(original,held) &&
-        arbol_attempt::sameFile(original,named);
-    };
-    arbol_startup_proof::RetainedAppPackage package;
-    if (!libraryCurrent() || !package.capture(layout,deadline) || !package.witnessed() ||
-        !package.matchesOriginal(root,backing) || !package.current() || !libraryCurrent() ||
-        arbol_boundary::current(self)!=1 || arbol_boundary::clockMs()>=deadline) return fail(env);
-    NSString* digest = package.witnessedSnapshot();
-    if (!arbol_attempt::pattern(digest,@"^[0-9a-f]{64}$")) return fail(env);
-    os_log(OS_LOG_DEFAULT,"arbol-browser read the installed startup snapshot in process");
-    return text(env,digest.UTF8String);
-  } @catch(NSException*) { return fail(env); } } catch(...) { return fail(env); } }
-}
-
 static napi_value init(napi_env env, napi_value exports) {
   napi_property_descriptor properties[] = {
-    {"readInstalledStartupSnapshot",nullptr,readInstalledStartupSnapshot,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"noteHostStartup",nullptr,noteHostStartup,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"publishHostReady",nullptr,publishHostReady,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"terminateAdoptedHost",nullptr,terminateAdoptedHost,nullptr,nullptr,nullptr,napi_default,nullptr},
