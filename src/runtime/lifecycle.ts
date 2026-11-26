@@ -254,7 +254,7 @@ export async function closeProfile(profile: ProfileSnapshot, selection: BuildSel
 export interface ProcessIntegration {
   assertAdmissionAvailable(deadline?: number): Promise<void>;
   start(profile: ProfileSnapshot, endpoint: Endpoint, deadline: number, contentionDeadline: number,
-    label?: string, signal?: AbortSignal): Promise<{
+    label?: string, signal?: AbortSignal, showEmptyWhenReady?: boolean): Promise<{
     client: RuntimeClient; record: RuntimeRecord; alreadyRunning: boolean;
   }>;
 }
@@ -280,7 +280,8 @@ export function createProcessService(options: { selection: BuildSelection; platf
       if (input.approve && (input.url === undefined || input.profileInstance === undefined ||
           input.creationRequest === undefined)) throw profileUnavailable();
       const attached = await acquireWithin(deadline,
-        () => integration.start(profile, 'management', deadline, contentionDeadline), result => result.client.close());
+        () => integration.start(profile, 'management', deadline, contentionDeadline, undefined, undefined,
+          input.approve !== undefined), result => result.client.close());
       try {
         if (input.profileInstance !== undefined && attached.record.profileInstance !== input.profileInstance) throw profileUnavailable();
         noteOpenCommand(options.observation, 'open-reply');

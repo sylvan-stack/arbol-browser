@@ -205,7 +205,7 @@ function installApplicationMenu(): () => void {
 async function assembleAfterReady(prepared: HostPreparation, sessions: ProfileSessions,
   boundary: import('./bootstrap.js').NativeFailureBoundary, request: HostRequest,
   state: ActualHostAssembly, deadline: number, platform: import('./platform.js').PlatformPort,
-  assertMenuInstalled: () => void): Promise<void> {
+  assertMenuInstalled: () => void, showEmptyWhenReady: boolean): Promise<void> {
   assertOwnedHost(prepared); assertTime(deadline);
   const bootstrapURL = new URL('./bootstrap.js', import.meta.url).href;
   const lifecycleURL = new URL('./lifecycle.js', import.meta.url).href;
@@ -281,6 +281,10 @@ async function assembleAfterReady(prepared: HostPreparation, sessions: ProfileSe
     noteHostStartup(prepared.custody, 'host-lifecycle-ready-before');
     await runtime.ready();
     noteHostStartup(prepared.custody, 'host-lifecycle-ready-after'); current();
+    if (showEmptyWhenReady && shell.tabs.all().length === 0) {
+      runtime.assertAdmission();
+      shell.registration.offerPresentation();
+    }
   } catch {
     if (state.runtime?.phase === 'closing') return; // actual bounded native shutdown already owns abandonment
     state.closed = true; return boundary.fatal.fail('native_boundary_unavailable');
@@ -306,7 +310,8 @@ export async function runHostEntry(): Promise<void> {
     const selections = await import(selectionURL) as typeof import('./selection.js');
     const layout = selections.packagedLayout(basename(buildRoot), payload), argv = [...process.argv];
     const selection: BuildSelection = Object.freeze({ build: layout.build, directory: layout.buildRoot, guard: layout.guard, explicit: true });
-    if (argv.length !== 6 || argv[0] !== layout.engine || process.execPath !== layout.engine ||
+    const showEmptyWhenReady = argv.length === 7 && argv[6] === '--arbol-show-empty-when-ready';
+    if ((argv.length !== 6 && !showEmptyWhenReady) || argv[0] !== layout.engine || process.execPath !== layout.engine ||
         argv[1] !== '--site-per-process' || argv[2] !== '--disable-features=MacAccessibilityTextOperation' ||
         argv[3] !== layout.hostEntry || argv[4] !== '--arbol-host-request' || !argv[5]?.startsWith('/')) throw unavailable('browser');
     const args = Object.freeze([argv[4], argv[5]] as const);
@@ -362,7 +367,7 @@ export async function runHostEntry(): Promise<void> {
         noteHostStartup(prepared.custody, 'host-session-bind-after');
         assertTime(deadline); prepared.custody.assertRetained();
         if (state.closed) return prepared.custody.terminate();
-        await assembleAfterReady(prepared, sessions, installed, request, state, deadline, native.platform, assertMenuInstalled);
+        await assembleAfterReady(prepared, sessions, installed, request, state, deadline, native.platform, assertMenuInstalled, showEmptyWhenReady);
       } catch { state.closed = true; return installed.fatal.fail('native_boundary_unavailable'); }
     }, () => installed.fatal.fail('native_boundary_unavailable'));
   } catch (error) {

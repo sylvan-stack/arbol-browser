@@ -39,7 +39,7 @@ export interface LaunchAttemptPort {
 interface PreparedLaunch { submit(): Promise<number>; cancel(): void }
 
 function runLaunchHelper(selection: BuildSelection, requestPath: string, deadline: number,
-  signal?: AbortSignal, waitForReservation = false): PreparedLaunch {
+  signal?: AbortSignal, waitForReservation = false, showEmptyWhenReady = false): PreparedLaunch {
   assertTime(deadline);
   if (signal?.aborted) throw unavailable('browser');
   const layout = selectedLayout(selection, resolve(fileURLToPath(new URL('../../', import.meta.url))));
@@ -66,7 +66,7 @@ function runLaunchHelper(selection: BuildSelection, requestPath: string, deadlin
     async submit() {
       assertTime(deadline);
       if (signal?.aborted || (waitForReservation && (!gate || gate.destroyed))) throw unavailable('browser');
-      gate?.end(waitForReservation ? '1' : undefined);
+      gate?.end(waitForReservation ? (showEmptyWhenReady ? '2' : '1') : undefined);
       return result;
     },
     cancel() { gate?.destroy(); },
@@ -92,7 +92,8 @@ export function unresolvedStartups(): readonly RetainedStartup[] { return [...re
 export function createStarter(options: { selection: BuildSelection; platform: PlatformPort; authority: StartAuthority;
   acquireBuild(): Promise<BuildGuard>; launch?: LaunchPort; attempts?: LaunchAttemptPort; observation?: OpenCommandObservation }) {
   return async (profile: ProfileSnapshot, endpoint: Endpoint, deadline: number, contentionDeadline = Math.min(deadline, now() + 10000),
-    label = 'Browser client', signal?: AbortSignal): Promise<{ client: RuntimeClient; record: RuntimeRecord; alreadyRunning: boolean }> => {
+    label = 'Browser client', signal?: AbortSignal, showEmptyWhenReady = false):
+    Promise<{ client: RuntimeClient; record: RuntimeRecord; alreadyRunning: boolean }> => {
     const current = (limit = deadline) => {
       if (signal?.aborted) throw unavailable('browser');
       assertTime(limit);
@@ -165,7 +166,8 @@ export function createStarter(options: { selection: BuildSelection; platform: Pl
       // Production temporarily takes Owner only inside verified reservation;
       // it releases that exact description before LaunchServices, never waits
       // for a host while retaining the temporary Owner.
-      if (options.attempts && !options.launch) preparation = runLaunchHelper(options.selection, path, admissionDeadline, signal, true);
+      if (options.attempts && !options.launch) preparation = runLaunchHelper(options.selection, path, admissionDeadline, signal, true,
+        endpoint === 'management' && showEmptyWhenReady);
       attempted = true;
       noteOpenCommand(options.observation, 'open-reservation');
       await options.attempts?.reserve(profile, request, admissionDeadline, guard, signal);

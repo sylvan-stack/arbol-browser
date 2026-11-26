@@ -378,7 +378,7 @@ export function createProductionProcessIntegration(host: VerifiedHost, selection
       await assertHostStartupContinuity(host, cutoff, cutoff);
     },
     async start(profile: ProfileSnapshot, endpoint: import('./transport.js').Endpoint, deadline: number,
-      contentionDeadline: number, label?: string, signal?: AbortSignal) {
+      contentionDeadline: number, label?: string, signal?: AbortSignal, showEmptyWhenReady = false) {
       noteOpenCommand(observation, 'open-current-signed-start');
       if (signal?.aborted) throw unavailable('browser');
       assertTime(deadline);
@@ -416,7 +416,7 @@ export function createProductionProcessIntegration(host: VerifiedHost, selection
           },
         },
       });
-      return starter(profile, endpoint, deadline, contentionDeadline, label, signal);
+      return starter(profile, endpoint, deadline, contentionDeadline, label, signal, showEmptyWhenReady);
     },
   });
 }

@@ -185,7 +185,7 @@ int main(int argc, const char* argv[]) {
       package.capture(packaged,std::min(preparationDeadline,arbol_boundary::clockMs()+250)) && package.witnessed() &&
       offer.listenFor(argv[2]) && arbol_attempt::openBuild(packaged.bundle,packageGuard);
     arbol_startup_proof::Descriptor originalGuard(packageGuard.fd);
-    const auto waitForReservation = [&](const std::shared_ptr<Reply>& reply) {
+    const auto waitForReservation = [&](const std::shared_ptr<Reply>& reply) -> char {
       struct stat gate{};
       if (fstat(STDIN_FILENO,&gate) || (!S_ISFIFO(gate.st_mode) && !S_ISSOCK(gate.st_mode))) return false;
       while (arbol_boundary::clockMs()<preparationDeadline) {
@@ -194,7 +194,8 @@ int main(int argc, const char* argv[]) {
         const int available=poll(&readable,1,0);
         if (available>0) {
           char approved=0;
-          return (readable.revents&POLLIN) && read(STDIN_FILENO,&approved,1)==1 && approved=='1';
+          if ((readable.revents&POLLIN) && read(STDIN_FILENO,&approved,1)==1 && (approved=='1'||approved=='2')) return approved;
+          return 0;
         }
         if (available<0 && errno!=EINTR) return false;
         [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
@@ -281,7 +282,8 @@ int main(int argc, const char* argv[]) {
     } catch (...) { std::lock_guard<std::mutex> held(reply->mutex); reply->error = true; }
     NSDictionary* offered = nil;
     if (provisional) {
-      if (!waitForReservation(reply)) return 4;
+      const char approval=waitForReservation(reply);
+      if (!approval) return 4;
       deadline=std::min(preparationDeadline,arbol_boundary::clockMs()+28000);
       if (!loadPending()) return 4;
       if (!package.matches(packaged,pending[@"candidateDigest"]) || !package.current() ||
@@ -295,7 +297,7 @@ int main(int argc, const char* argv[]) {
       };
       while (arbol_boundary::clockMs()<deadline) {
         { std::lock_guard<std::mutex> held(reply->mutex); if (reply->error) return 4; }
-        const int result=offer.offer(packaged,digest,deadline,approve,offered);
+        const int result=offer.offer(packaged,digest,approval=='2',deadline,approve,offered);
         if (result<0) return 4;
         if (result>0) break;
         [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
