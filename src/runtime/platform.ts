@@ -328,6 +328,7 @@ export interface PlatformPort {
   /** One-use fixed-exec native adoption. No numeric FD or role is accepted. */
   adoptHostBuild(requestPath: string, guard: string, bundle: string): HeldLock;
   adoptInstalledLaunch(bundle: string): { lock: HeldLock; deadline: number };
+  inspectInstalledMountTopology?(bundle: string, root: number): string;
   adoptMaintenanceCustody(input: IsolatedMaintenanceInput | InstalledMaintenanceInput): MaintenanceCustody;
   /** Read-only query on an adopted custody. Only the real writer can stop. */
   maintenanceInterruptionMatches?(custody: MaintenanceCustody, point: MaintenanceInterruptionPoint): boolean;
@@ -414,6 +415,7 @@ interface NativeSupport {
   latchWatchdogFatal(handle: object): void;
   adoptHostBuild(requestPath: string, guard: string, bundle: string): object;
   adoptInstalledLaunch?(bundle: string): { lock: object; remaining: number };
+  inspectInstalledMountTopology?(bundle: string, root: number): string;
   adoptMaintenanceCustody?(bundle: string, policy: string | null, runtime: string | null): {
     handle: object; oldBuild: object | null; newBuild: object; facts: string; remaining: number;
   };
@@ -588,6 +590,13 @@ export function loadPlatform(): PlatformPort {
         throw unavailable('browser');
       const lease = wrapLock(call(() => native.adoptHostBuild(requestPath, guard, bundle)), true);
       lease.assertIdentity(); return lease;
+    },
+    inspectInstalledMountTopology(bundle: string, root: number): string {
+      if (!native.inspectInstalledMountTopology || !isAbsolute(bundle) || !Number.isSafeInteger(root) ||
+          root < 3 || root > 0x7fffffff) throw unavailable('browser');
+      const stamp = call(() => native.inspectInstalledMountTopology!(bundle, root));
+      if (typeof stamp !== 'string' || !/^-?\d{1,10}:-?\d{1,10}$/.test(stamp)) throw unavailable('browser');
+      return stamp;
     },
     adoptInstalledLaunch(bundle: string): { lock: HeldLock; deadline: number } {
       if (process.type === 'browser' || typeof native.adoptInstalledLaunch !== 'function' ||

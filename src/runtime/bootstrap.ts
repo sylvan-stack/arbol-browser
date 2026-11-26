@@ -63,6 +63,7 @@ export async function prepareNativeBoundary(bundle: string, deadline = performan
   const platformModule = await import(platformUrl) as typeof import('./platform.js');
   manifest.assertStartupCandidateTrust(trust, deadline);
   const platform = platformModule.loadPlatform();
+  if (installedImage !== undefined) manifest.bindInstalledStartupTopology(trust, installedImage, platform, deadline);
   const watchdogUrl = new URL('../native/watchdog.js', import.meta.url).href;
   const watchdogModule = await import(watchdogUrl) as typeof import('../native/watchdog.js');
   const services: NativeServices = Object.freeze({ manifest, platform: platformModule, watchdog: watchdogModule });

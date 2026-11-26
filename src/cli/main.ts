@@ -67,11 +67,16 @@ async function installedLaunch(cutoff: number): Promise<InstalledLaunch | undefi
   const layout = packagedLayout(build, payload);
   if (process.type === 'browser' || process.execPath !== layout.engine) throw unavailable('browser');
   const selection = consumePackagedSelection(build, payload);
-  const { verifyPackagedOpenHost } = await import('../runtime/authorities.js');
+  const { installedImagePath, verifyPackagedOpenHost } = await import('../runtime/authorities.js');
   const host = await verifyPackagedOpenHost(selection, payload, cutoff);
   const { loadPlatform } = await import('../runtime/platform.js');
   const platform = loadPlatform();
   const { lock, deadline } = platform.adoptInstalledLaunch(layout.bundle);
+  const image = installedImagePath(layout);
+  if (!image) throw unavailable('browser');
+  const manifestAddress = new URL('../native/manifest.js', import.meta.url).href;
+  const manifest = await import(manifestAddress) as typeof import('../native/manifest.js');
+  manifest.bindInstalledStartupTopology(host.signed, image, platform, Math.min(cutoff, deadline));
   return { selection, host, platform, lock, deadline: Math.min(cutoff, deadline) };
 }
 async function productionPorts(selection: BuildSelection, observation?: ColdObservation, openCutoff?: number,

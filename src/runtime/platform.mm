@@ -4658,6 +4658,49 @@ static napi_value cancelExitInspection(napi_env env,napi_callback_info info) {
   job->cancelled.store(true,std::memory_order_release); napi_value out; napi_get_undefined(env,&out); return out;
 }
 
+static napi_value inspectInstalledMountTopology(napi_env env, napi_callback_info info) {
+  size_t count = 2;
+  napi_value args[2];
+  std::string bundle;
+  int32_t fd = -1;
+  if (napi_get_cb_info(env, info, &count, args, nullptr, nullptr) != napi_ok || count != 2 ||
+      !string(env, args[0], bundle) || napi_get_value_int32(env, args[1], &fd) != napi_ok || fd < 3) return fail(env);
+  @autoreleasepool { try { @try {
+    arbol_attempt::PackagedLayout layout;
+    struct stat held{}, named{}, device{};
+    struct statfs filesystem{}, current{};
+    char original[PATH_MAX]{};
+    if (!arbol_attempt::packagedLayout(bundle, layout) || !layout.installed || !arbol_boundary::canonical(bundle) ||
+        fstat(fd, &held) || !S_ISDIR(held.st_mode) || lstat(bundle.c_str(), &named) ||
+        held.st_dev != named.st_dev || held.st_ino != named.st_ino ||
+        fcntl(fd, F_GETPATH, original) || bundle != original ||
+        fstatfs(fd, &filesystem) || layout.buildRoot + "/app" != filesystem.f_mntonname ||
+        (filesystem.f_flags & (MNT_RDONLY | MNT_LOCAL)) != (MNT_RDONLY | MNT_LOCAL) ||
+        strcmp(filesystem.f_fstypename, "apfs") || lstat(filesystem.f_mntfromname, &device) ||
+        !S_ISBLK(device.st_mode) || device.st_rdev != held.st_dev) return fail(env);
+    const int available = getfsstat(nullptr, 0, MNT_NOWAIT);
+    if (available < 1 || available >= 4096) return fail(env);
+    std::vector<struct statfs> mounts(size_t(available) + 1);
+    const int received = getfsstat(mounts.data(), int(mounts.size() * sizeof(struct statfs)), MNT_NOWAIT);
+    if (received < 1 || size_t(received) >= mounts.size()) return fail(env);
+    size_t matching = 0;
+    for (int index = 0; index < received; ++index) {
+      const struct statfs& mount = mounts[size_t(index)];
+      if (arbol_attempt::within(mount.f_mntonname, filesystem.f_mntonname)) return fail(env);
+      if (!strcmp(mount.f_mntonname, filesystem.f_mntonname)) {
+        if (memcmp(&mount.f_fsid, &filesystem.f_fsid, sizeof(fsid_t))) return fail(env);
+        ++matching;
+      }
+    }
+    if (matching != 1 || statfs(bundle.c_str(), &current) ||
+        memcmp(&current.f_fsid, &filesystem.f_fsid, sizeof(fsid_t)) ||
+        (current.f_flags & (MNT_RDONLY | MNT_LOCAL)) != (MNT_RDONLY | MNT_LOCAL) ||
+        strcmp(current.f_mntfromname, filesystem.f_mntfromname) ||
+        strcmp(current.f_mntonname, filesystem.f_mntonname)) return fail(env);
+    return text(env, std::to_string(filesystem.f_fsid.val[0]) + ":" + std::to_string(filesystem.f_fsid.val[1]));
+  } @catch (NSException*) { return fail(env); } } catch (...) { return fail(env); } }
+}
+
 static napi_value init(napi_env env, napi_value exports) {
   napi_property_descriptor properties[] = {
     {"noteHostStartup",nullptr,noteHostStartup,nullptr,nullptr,nullptr,napi_default,nullptr},
@@ -4693,6 +4736,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"latchWatchdogFatal",nullptr,latchWatchdogFatal,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"adoptHostBuild",nullptr,adoptHostBuild,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"adoptInstalledLaunch",nullptr,adoptInstalledLaunch,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"inspectInstalledMountTopology",nullptr,inspectInstalledMountTopology,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"adoptMaintenanceCustody",nullptr,adoptMaintenanceCustody,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"assertMaintenanceCustody",nullptr,assertMaintenanceCustody,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"maintenanceInterruptionMatches",nullptr,maintenanceInterruptionMatches,nullptr,nullptr,nullptr,napi_default,nullptr},

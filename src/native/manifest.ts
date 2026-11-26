@@ -2,10 +2,11 @@
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
-import { join, dirname, resolve, sep, relative } from 'node:path';
+import { basename, join, dirname, resolve, sep, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Contract } from '../contracts/generated.js';
 import { validator } from '../contracts/schema.js';
+import { assertPlatform, type PlatformPort } from '../runtime/platform.js';
 
 // Trust covers physical signed bytes, including ASAR archives, on every check.
 // Browser verification uses the mandatory unpatched Electron builtin. The Node
@@ -186,7 +187,9 @@ interface FrozenSnapshot {
 }
 const signedSnapshots = new WeakMap<SignedBundle, FrozenSnapshot>();
 export interface SignedSnapshotComparison { readonly deadline: number }
-const comparisons = new WeakMap<SignedSnapshotComparison, { signed: SignedBundle; snapshot: FrozenSnapshot; used: boolean; expiry: ReturnType<typeof setTimeout> }>();
+const comparisons = new WeakMap<SignedSnapshotComparison, {
+  signed: SignedBundle; snapshot: FrozenSnapshot; nativeStartup: boolean; used: boolean; expiry: ReturnType<typeof setTimeout>;
+}>();
 function physicalStamp(stat: import('node:fs').BigIntStats): string {
   return stable([stat.dev, stat.ino, stat.mode, stat.uid, stat.gid, stat.nlink, stat.size, stat.mtimeNs, stat.ctimeNs, stat.birthtimeNs].map(String));
 }
@@ -276,6 +279,7 @@ function run(argv) {
 `;
 interface StorageDescription { readonly fd: number; readonly path: string; readonly stamp: string; readonly directory: boolean }
 interface StorageContext { readonly descriptions: readonly [StorageDescription, StorageDescription]; readonly mapping: string }
+const installedStartupTopologies = new WeakMap<StorageContext, () => void>();
 const storageFinalizer = new FinalizationRegistry<readonly StorageDescription[]>(descriptions => {
   for (const description of descriptions) {
     try { closeSync(description.fd); }
@@ -306,6 +310,15 @@ function storageAssert(context: StorageContext | undefined, deadline: number): v
     }
     budget(deadline);
   } catch (error) { return refuseVerification('storage-context', error); }
+}
+function assertNativeStartupTopology(context: StorageContext | undefined, deadline: number): boolean {
+  if (!context) return false;
+  const check = installedStartupTopologies.get(context);
+  if (!check) return false;
+  storageAssert(context, deadline);
+  check();
+  storageAssert(context, deadline);
+  return true;
 }
 function retainedDescription(path: string, directory: boolean): StorageDescription {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK | (directory ? constants.O_DIRECTORY : 0));
@@ -545,7 +558,21 @@ function run(argv) {
 }
 `;
 
-function verifyInstalledStartupStorage(root: string, image: string, deadline: number): StorageContext {
+// These earlier production releases use the same authenticated verifier
+// contract. Identify its exact signed code by the original open descriptor.
+const retainedStartupVerifiers: Readonly<Record<string, string>> = Object.freeze({
+  '28': 'abf912a74384efe8fd2784796085a4d5cc570e2c',
+  '29': '59afb189275a2aae342df4ae262658246d373390',
+});
+function hasRetainedStartupVerifier(root: string, deadline: number): boolean {
+  const expected = retainedStartupVerifiers[basename(dirname(dirname(root)))];
+  if (!expected) return false;
+  const file = retainedDescription(join(root, 'Contents/MacOS/arbol-browser-native'), false);
+  try { return startupCodeDirectoryHash(file, deadline) === expected; }
+  finally { closeSync(file.fd); }
+}
+
+function verifyInstalledStartupStorage(root: string, image: string, deadline: number, retainedVerifier?: string): StorageContext {
   const descriptions: StorageDescription[] = [];
   try {
     // Pin the same original names and descriptions before running any checks.
@@ -560,6 +587,7 @@ function verifyInstalledStartupStorage(root: string, image: string, deadline: nu
     const executable = retainedDescription(bootstrap, false);
     try {
       const cdhash = startupCodeDirectoryHash(executable, deadline);
+      if (retainedVerifier !== undefined && cdhash !== retainedVerifier) return refuse();
       const requirement = productionPublisher.requirement +
         ` and identifier "${productionPublisher.bundleIdentifier}" and cdhash H"${cdhash}"`;
       storageAssert(context, deadline);
@@ -825,13 +853,16 @@ export async function compareSignedSnapshot(signed: SignedBundle, deadline: numb
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     budget(deadline); storageAssert(snapshot.storage, deadline);
-    await Promise.race([compareCompleteSnapshot(signed, snapshot, deadline, retainStartupBytes), new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(() => {
-        const error = new Error('native_snapshot_timeout');
-        noteVerificationFailure(error, 'verification-cutoff');
-        reject(error);
-      }, Math.max(1, deadline - performance.now()));
-    })]);
+    const nativeStartup = retainStartupBytes && assertNativeStartupTopology(snapshot.storage, deadline);
+    if (!nativeStartup) {
+      await Promise.race([compareCompleteSnapshot(signed, snapshot, deadline, retainStartupBytes), new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          const error = new Error('native_snapshot_timeout');
+          noteVerificationFailure(error, 'verification-cutoff');
+          reject(error);
+        }, Math.max(1, deadline - performance.now()));
+      })]);
+    }
     budget(deadline); if (snapshot.poisoned) refuse();
     storageAssert(snapshot.storage, deadline);
     const receipt: SignedSnapshotComparison = Object.freeze({ deadline });
@@ -839,7 +870,7 @@ export async function compareSignedSnapshot(signed: SignedBundle, deadline: numb
       const actual = comparisons.get(receipt);
       if (actual && !actual.used) { snapshot.poisoned = true; if (signed === trustedCandidate) poisonedTrust = true; }
     }, Math.max(1, deadline - performance.now())); expiry.unref();
-    comparisons.set(receipt, { signed, snapshot, used: false, expiry }); return receipt;
+    comparisons.set(receipt, { signed, snapshot, nativeStartup, used: false, expiry }); return receipt;
   } catch (error) {
     snapshot.poisoned = true; if (signed === trustedCandidate) poisonedTrust = true; return refuseVerification('repeated-snapshot', error);
   } finally { if (timer) clearTimeout(timer); }
@@ -852,6 +883,7 @@ export function consumeSignedSnapshot(receipt: SignedSnapshotComparison, signed:
     if (!actual || actual.used || actual.signed !== signed || actual.snapshot !== snapshot || !snapshot || snapshot.poisoned ||
         receipt.deadline !== deadline || (signed === trustedCandidate && poisonedTrust)) refuse();
     actual.used = true; clearTimeout(actual.expiry); budget(deadline); storageAssert(snapshot.storage, deadline);
+    if (actual.nativeStartup && !assertNativeStartupTopology(snapshot.storage, deadline)) refuse();
   } catch (error) {
     if (actual) actual.snapshot.poisoned = true;
     if (snapshot) snapshot.poisoned = true;
@@ -869,6 +901,7 @@ export function assertRetainedReadOnlyStorage(signed: SignedBundle, deadline: nu
   if (!snapshot.storage) return false;
   try {
     storageAssert(snapshot.storage, deadline);
+    assertNativeStartupTopology(snapshot.storage, deadline);
     return true;
   } catch (error) {
     snapshot.poisoned = true;
@@ -883,6 +916,20 @@ export function assertInstalledImage(signed: SignedBundle, image: string, deadli
     refuseVerification('storage-context');
 }
 
+export function bindInstalledStartupTopology(signed: SignedBundle, image: string, platform: PlatformPort, deadline: number): void {
+  assertPlatform(platform);
+  assertInstalledImage(signed, image, deadline);
+  const storage = signedSnapshots.get(signed)?.storage;
+  const inspect = platform.inspectInstalledMountTopology;
+  if (!storage || !inspect || installedStartupTopologies.has(storage)) return refuseVerification('storage-context');
+  const root = storage.descriptions[0];
+  const original = inspect.call(platform, root.path, root.fd);
+  storageAssert(storage, deadline);
+  installedStartupTopologies.set(storage, () => {
+    if (inspect.call(platform, root.path, root.fd) !== original) refuseVerification('storage-context');
+  });
+}
+
 let attemptedTrust = false, poisonedTrust = false;
 let trustedCandidate: CandidateTrust | undefined;
 /** Complete physical signed bundle, including the outer seal and directories.
@@ -892,7 +939,8 @@ interface MountedBundleRead {
   readonly files: Map<string, ReturnType<typeof physicalFile>>;
 }
 function completeSnapshot(root: string, deadline = Infinity, physical?: Record<string, PhysicalEntry>,
-  observed: SnapshotFailure = {}, mounted?: MountedBundleRead, confirmOnly = false): string {
+  observed: SnapshotFailure = {}, mounted?: MountedBundleRead, confirmOnly = false,
+  verifiedPayload?: Readonly<Record<string, string>>): string {
   const entries: Record<string, string> = Object.create(null); let count = 0;
   function walk(directory: string): void {
     budget(deadline);
@@ -918,7 +966,10 @@ function completeSnapshot(root: string, deadline = Infinity, physical?: Record<s
         if (physical) physical[key] = Object.freeze({ stamp: beforeStamp, kind: 'symlink', link, target });
       } else if (before.isDirectory()) { entries[key] = `directory:${before.mode & 0o7777}`; walk(path); }
       else if (before.isFile()) {
-        const bytes = confirmOnly ? mounted?.files.get(key) : physicalFile(path, before, deadline, observed);
+        const verifiedDigest = verifiedPayload && Object.hasOwn(verifiedPayload, key) ? verifiedPayload[key] : undefined;
+        const bytes = confirmOnly ? mounted?.files.get(key) : verifiedDigest
+          ? { digest: verifiedDigest, magic: '' }
+          : physicalFile(path, before, deadline, observed);
         if (!bytes) return refuseSnapshot('snapshot-entry-identity', observed);
         if (!confirmOnly) mounted?.files.set(key, bytes);
         entries[key] = `file:${before.mode & 0o7777}:${bytes.digest}`;
@@ -952,10 +1003,12 @@ export function verifySignedBundle(bundle: string, deadline = Infinity, scope: P
     const root = resolve(bundle);
     const expectedPublisher = scope === 'production' ? productionPublisher : publisher;
     const payloadRoot = resolve(fileURLToPath(new URL('../../', import.meta.url)));
-    const installedStartup = scope === 'production' && installedStartupImage !== undefined &&
-      root === dirname(dirname(dirname(payloadRoot))) && process.platform === 'darwin';
+    const exactCurrent = root === dirname(dirname(dirname(payloadRoot)));
+    const installedStartup = scope === 'production' && installedStartupImage !== undefined && process.platform === 'darwin' &&
+      (exactCurrent || hasRetainedStartupVerifier(root, deadline));
     storage = installedStartup
-      ? verifyInstalledStartupStorage(root, installedStartupImage, deadline)
+      ? verifyInstalledStartupStorage(root, installedStartupImage, deadline,
+        exactCurrent ? undefined : retainedStartupVerifiers[basename(dirname(dirname(root)))])
       : discoverStorage(root, deadline);
     const mounted: MountedBundleRead | undefined = scope === 'production' && storage
       ? { device: fstatSync(storage.descriptions[0].fd, { bigint: true }).dev, files: new Map() }
@@ -1013,7 +1066,16 @@ export function verifySignedBundle(bundle: string, deadline = Infinity, scope: P
       return value;
     };
     phase = 'initial-snapshot';
-    const before = completeSnapshot(root, deadline, physical, observed, mounted);
+    let verifiedPayload: Compatibility['files'] | undefined;
+    if (installedStartup) {
+      // The authenticated native verifier checked the exact manifest leaf
+      // digests on the original mounted volume. Read the rest of the bundle
+      // here and record the same full physical inventory as every other host.
+      const compiled = boundedJson(join(root, 'Contents/Resources/native-compatibility.json'), deadline);
+      if (!validator('native.BuildCompatibility')(compiled)) return refuse();
+      verifiedPayload = compiled.files;
+    }
+    const before = completeSnapshot(root, deadline, physical, observed, mounted, false, verifiedPayload);
     if (mounted) storageAssert(storage, deadline);
     const initial = check(), encoded = stable(initial);
     phase = 'final-snapshot';
@@ -1038,15 +1100,17 @@ export function verifySignedBundle(bundle: string, deadline = Infinity, scope: P
         let repeatedPhase: SignedVerificationPhase = 'repeated-snapshot';
         try {
           budget(limit); storageAssert(storage, limit);
-          const currentPhysical: Record<string, PhysicalEntry> = Object.create(null);
           if (snapshot.poisoned) refuse();
           if (snapshotFilesystem(() => realpathSync(root), observed) !== root) refuseSnapshot('snapshot-root-identity', observed);
-          const retained = retainStartupBytes ? snapshot.mounted : undefined;
-          if (completeSnapshot(root, limit, currentPhysical, observed, retained, retained !== undefined) !== before)
-            refuseSnapshot('snapshot-encoded-mismatch', observed);
-          repeatedPhase = 'repeated-physical';
-          if (stable(currentPhysical) !== stable(snapshot.physical))
-            refuseSnapshot(stampFailurePhase(currentPhysical['']?.stamp !== snapshot.physical['']?.stamp ? 'snapshot-root-identity' : 'snapshot-entry-identity', snapshot.physical['']?.stamp, currentPhysical['']?.stamp), observed);
+          if (!retainStartupBytes || !assertNativeStartupTopology(storage, limit)) {
+            const currentPhysical: Record<string, PhysicalEntry> = Object.create(null);
+            const retained = retainStartupBytes ? snapshot.mounted : undefined;
+            if (completeSnapshot(root, limit, currentPhysical, observed, retained, retained !== undefined) !== before)
+              refuseSnapshot('snapshot-encoded-mismatch', observed);
+            repeatedPhase = 'repeated-physical';
+            if (stable(currentPhysical) !== stable(snapshot.physical))
+              refuseSnapshot(stampFailurePhase(currentPhysical['']?.stamp !== snapshot.physical['']?.stamp ? 'snapshot-root-identity' : 'snapshot-entry-identity', snapshot.physical['']?.stamp, currentPhysical['']?.stamp), observed);
+          }
           repeatedPhase = 'repeated-manifest';
           if (stable(boundedJson(join(root, 'Contents/Resources/native-compatibility.json'), limit)) !== encoded) refuse();
           repeatedPhase = 'repeated-cutoff';
