@@ -38,6 +38,7 @@
 #include <deque>
 #include <dlfcn.h>
 #include <mach-o/loader.h>
+extern "C" int csops_audittoken(pid_t, unsigned int, void*, size_t, audit_token_t*);
 namespace arbol_boundary {
 struct Unique { uint8_t uuid[16]; uint64_t start, parent; int32_t version, originalParentVersion; uint64_t reserve[2]; };
 static_assert(sizeof(Unique) == 56);
@@ -205,6 +206,54 @@ inline bool signature(const std::string& path, bool jit, bool application=false)
   }
   if (info) CFRelease(info); if (req) CFRelease(req); if (code) CFRelease(code); if (url) CFRelease(url); if (s) CFRelease(s); return valid;
 }
+inline bool sameExecutableFile(const struct stat& original, const struct stat& value) {
+  return S_ISREG(value.st_mode) && value.st_dev == original.st_dev && value.st_ino == original.st_ino &&
+    value.st_gen == original.st_gen && value.st_mode == original.st_mode && value.st_flags == original.st_flags &&
+    value.st_uid == original.st_uid && value.st_gid == original.st_gid && value.st_nlink == 1 && original.st_nlink == 1 &&
+    value.st_size == original.st_size && value.st_mtimespec.tv_sec == original.st_mtimespec.tv_sec &&
+    value.st_mtimespec.tv_nsec == original.st_mtimespec.tv_nsec && value.st_ctimespec.tv_sec == original.st_ctimespec.tv_sec &&
+    value.st_ctimespec.tv_nsec == original.st_ctimespec.tv_nsec;
+}
+// Writable App storage requires a retained file and the live kernel signing
+// status of the originally authenticated exec, independently for each monitor.
+class AppSupervisorImage final {
+  int fd_ = -1;
+  struct stat file_{};
+  std::string path_;
+
+  bool fileCurrent() const {
+    struct stat held{}, named{};
+    return !fstat(fd_, &held) && !lstat(path_.c_str(), &named) &&
+      sameExecutableFile(file_, held) && sameExecutableFile(file_, named);
+  }
+public:
+  const Identity process;
+  AppSupervisorImage(const Identity& identity, const std::string& path) : path_(path), process(identity) {}
+  AppSupervisorImage(const AppSupervisorImage&) = delete;
+  AppSupervisorImage& operator=(const AppSupervisorImage&) = delete;
+  ~AppSupervisorImage() { if (fd_ >= 0) close(fd_); }
+
+  bool currentImage(const std::string& path) const {
+    if(path != path_ || current(process) != 1 || !fileCurrent()) return false;
+    audit_token_t token{};
+    token.val[5] = (uint32_t)process.pid;
+    token.val[7] = (uint32_t)process.version;
+    uint32_t status = 0;
+    constexpr unsigned signingStatus = 0; // Darwin CS_OPS_STATUS
+    return !csops_audittoken(process.pid, signingStatus, &status, sizeof(status), &token) &&
+      (status & kSecCodeStatusValid) && (status & kSecCodeSignatureRuntime) &&
+      current(process) == 1 && fileCurrent();
+  }
+  bool authenticate() {
+    if(fd_ >= 0 || current(process) != 1) return false;
+    fd_ = open(path_.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if(fd_ < 0 || fstat(fd_, &file_) || !fileCurrent()) return false;
+    @autoreleasepool {
+      auto* attributes=@{(__bridge NSString*)kSecGuestAttributePid:@(process.pid)};
+      return liveApplicationCode(attributes) && signature(path_,false,true) && currentImage(path_);
+    }
+  }
+};
 // Constructed for the signed main's bound watchdogs only. Writable storage
 // keeps live publisher verification. A lost retained proof cannot be renewed.
 class ReadOnlyMonitorImage final {
@@ -215,12 +264,7 @@ class ReadOnlyMonitorImage final {
   struct statfs mount_{};
 
   bool sameFile(const struct stat& value) const {
-    return S_ISREG(value.st_mode) && value.st_dev == file_.st_dev && value.st_ino == file_.st_ino &&
-      value.st_gen == file_.st_gen && value.st_mode == file_.st_mode && value.st_flags == file_.st_flags &&
-      value.st_uid == file_.st_uid && value.st_gid == file_.st_gid && value.st_nlink == 1 && file_.st_nlink == 1 &&
-      value.st_size == file_.st_size && value.st_mtimespec.tv_sec == file_.st_mtimespec.tv_sec &&
-      value.st_mtimespec.tv_nsec == file_.st_mtimespec.tv_nsec && value.st_ctimespec.tv_sec == file_.st_ctimespec.tv_sec &&
-      value.st_ctimespec.tv_nsec == file_.st_ctimespec.tv_nsec;
+    return sameExecutableFile(file_, value);
   }
   bool sameMount(const struct statfs& value) const {
     constexpr auto requiredFlags = MNT_RDONLY | MNT_LOCAL;
@@ -370,6 +414,7 @@ struct Context {
   double lastFullCensus=0; bool fullCensusValid=false,originalGroupRetired=false,groupPending=false;
   std::map<int,std::shared_ptr<KernelAnswer>> groupGaps;
   FamilyCapture* family=nullptr; // actual native capability owns its lifetime
+  mutable std::shared_ptr<const AppSupervisorImage> appMonitorImages[2];
   void uncertainFamily(unsigned callerLine=__builtin_LINE()) {
     familyUncertain=true;
     if(family) family->refuse(callerLine,FatalSource::boundaryHeader);
@@ -417,12 +462,18 @@ struct Context {
   std::string helper() const { return app.pid?supervisorExecutable():bundle + "/Contents/Resources/browser/native/watchdog"; }
   bool helperSignature(const Identity& process, const std::string& path) const {
     if(!app.pid) return signature(path,false);
-    // Query the loaded image and bracket the PID lookup with the captured
-    // kernel start ID and exec version. The installed App path is writable.
-    @autoreleasepool {
-      auto* attributes=@{(__bridge NSString*)kSecGuestAttributePid:@(process.pid)};
-      return current(process)==1&&liveApplicationCode(attributes)&&signature(path,false,true)&&current(process)==1;
+    for(const auto& image:appMonitorImages) {
+      if(image && image->process.pid == process.pid)
+        return same(image->process,process) && image->currentImage(path);
     }
+    for(auto& image:appMonitorImages) {
+      if(image) continue;
+      auto original=std::make_shared<AppSupervisorImage>(process,path);
+      if(!original->authenticate()) return false;
+      image=std::move(original);
+      return true;
+    }
+    return false;
   }
   unsigned engineRole(const std::string& path) const {
     unsigned role=0;
