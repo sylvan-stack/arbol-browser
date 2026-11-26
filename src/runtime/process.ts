@@ -9,7 +9,8 @@ import { unavailable } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
 import { assertProfile, type ProfileSnapshot } from '../profiles/records.js';
 import { assertPlatform, type HeldLock, type PlatformPort, type ProcessProvenance } from './platform.js';
-import { noteOpenCommand, type OpenCommandObservation, assertHostCloseContinuity, assertHostStartupContinuity, assertVerifiedHostMetadata, type VerifiedHost } from './authorities.js';
+import { noteOpenCommand, type OpenCommandObservation, assertHostCloseContinuity, assertHostStartupContinuity,
+  assertHostStartupSnapshot, assertVerifiedHostMetadata, type VerifiedHost } from './authorities.js';
 import { assertTime, now, runtimeLocation, type RuntimeLocation, type RuntimeRecord } from './instance.js';
 import { createStarter, type LaunchAttemptPort, type LaunchWithdrawal } from './start.js';
 import type { ProcessIntegration } from './lifecycle.js';
@@ -173,7 +174,7 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
   exits: ProductionExitAuthority = createProductionExitAuthority(platform, {
     build: host.identity.layout.build, directory: host.identity.layout.buildRoot,
     guard: host.identity.layout.guard, explicit: true,
-  }), closeVerification = false): LaunchAttemptPort {
+  }), closeVerification = false, reuseOpenSnapshot = false): LaunchAttemptPort {
   assertPlatform(platform); assertProductionExitAuthority(exits);
   const pending = new Map<string, LaunchAttempt>();
   return Object.freeze({
@@ -298,7 +299,7 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
                 originalHost.identity.productDigest !== admitted.productDigest || originalHost.policy.stateRoot !== profile.paths.state)
               throw unavailable('browser');
             if (sameHost && closeVerification) await assertHostCloseContinuity(originalHost, deadline);
-            else if (sameHost && (own || joiningStartup)) {
+            else if (sameHost && (own || joiningStartup || reuseOpenSnapshot)) {
               // The host completed its independent full snapshot before the
               // exact Claim could reach ready. Retain the CLI's verified
               // package for this startup and its exact Build lock.
@@ -307,7 +308,8 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
                 if (actual.device !== expected.device || actual.inode !== expected.inode || actual.uid !== expected.uid)
                   throw unavailable('browser');
               });
-              await assertHostStartupContinuity(originalHost, deadline, deadline);
+              if (own || joiningStartup) await assertHostStartupContinuity(originalHost, deadline, deadline);
+              else await assertHostStartupSnapshot(originalHost, deadline);
             }
             else await originalHost.assertTrusted(deadline);
             await lease.assert(); assertTime(deadline);
@@ -384,7 +386,7 @@ export function createProductionProcessIntegration(host: VerifiedHost, selection
       await assertHostStartupContinuity(host, deadline, deadline);
       if (signal?.aborted) throw unavailable('browser');
       if (profile.paths.state !== host.policy.stateRoot) throw unavailable('profile');
-      const attempts = createLaunchTransactions(host, platform, exits);
+      const attempts = createLaunchTransactions(host, platform, exits, false, openCutoff !== undefined);
       const starter = createStarter({ selection, platform, attempts, ...(observation ? { observation } : {}),
         acquireBuild: () => acquireBuildLease(selection, platform),
         authority: {

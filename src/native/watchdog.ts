@@ -1,7 +1,7 @@
 /** Private protocol-1 client. No stop/disarm export or finally-based release. */
 import { Socket } from 'node:net';
 import { isMainThread } from 'node:worker_threads';
-import { assertCandidateTrust, productionPublisher, refuse, type CandidateTrust } from './manifest.js';
+import { assertCandidateTrust, assertStartupCandidateTrust, productionPublisher, refuse, type CandidateTrust } from './manifest.js';
 import { assertWatchdogCustody, type WatchdogCustody, type HostLossStage } from '../runtime/platform.js';
 export type ProfileFatalCause = Extract<HostLossStage, `native_${string}`>;
 export interface NativeWatchdog {
@@ -16,9 +16,13 @@ const actualWatchdogs = new WeakSet<object>();
 export function assertNativeWatchdog(value: NativeWatchdog): void {
   if (!actualWatchdogs.has(value)) refuse();
 }
-export async function startNativeWatchdog(trust: CandidateTrust, custody: WatchdogCustody): Promise<NativeWatchdog> {
+export async function startNativeWatchdog(trust: CandidateTrust, custody: WatchdogCustody,
+  startupDeadline?: number): Promise<NativeWatchdog> {
   if (attempted || !isMainThread || process.type !== 'browser') refuse();
-  attempted = true; assertCandidateTrust(trust); assertWatchdogCustody(custody);
+  attempted = true;
+  if (startupDeadline === undefined) assertCandidateTrust(trust);
+  else assertStartupCandidateTrust(trust, startupDeadline);
+  assertWatchdogCustody(custody);
   const launch = custody.now();
   if (trust.manifest.bundleIdentifier !== productionPublisher.bundleIdentifier &&
       !trust.manifest.files['Contents/Resources/browser/native/watchdog']) refuse();

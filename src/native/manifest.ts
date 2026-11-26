@@ -806,6 +806,10 @@ export function assertCandidateTrust(value: CandidateTrust): void {
   if (poisonedTrust || value !== trustedCandidate) refuse();
   value.assertIdentity();
 }
+export function assertStartupCandidateTrust(value: CandidateTrust, deadline: number): void {
+  if (poisonedTrust || value !== trustedCandidate) refuse();
+  value.assertIdentity(deadline, true);
+}
 export function verifySignedBundle(bundle: string, deadline = Infinity, scope: PublisherScope = 'isolated'): SignedBundle {
   const observed: SnapshotFailure = {};
   let phase: SignedVerificationPhase = 'bundle-selection';

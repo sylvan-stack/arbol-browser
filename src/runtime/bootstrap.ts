@@ -31,7 +31,7 @@ import type { NativeWatchdog } from '../native/watchdog.js';
 export interface NativeBoundaryPreparation {
   readonly trust: CandidateTrust;
   readonly platform: PlatformPort;
-  arm(owner: HeldLock, build: HeldLock): Promise<NativeWatchdog>;
+  arm(owner: HeldLock, build: HeldLock, deadline: number): Promise<NativeWatchdog>;
 }
 interface NativeServices {
   readonly manifest: typeof import('../native/manifest.js');
@@ -61,18 +61,19 @@ export async function prepareNativeBoundary(bundle: string, deadline = performan
       Number(process.versions.napi) < 8 || performance.now() >= deadline) throw unavailable('browser');
   const platformUrl = new URL('../runtime/platform.js', import.meta.url).href;
   const platformModule = await import(platformUrl) as typeof import('./platform.js');
-  trust.assertIdentity(deadline);
+  manifest.assertStartupCandidateTrust(trust, deadline);
   const platform = platformModule.loadPlatform();
   const watchdogUrl = new URL('../native/watchdog.js', import.meta.url).href;
   const watchdogModule = await import(watchdogUrl) as typeof import('../native/watchdog.js');
   const services: NativeServices = Object.freeze({ manifest, platform: platformModule, watchdog: watchdogModule });
   let armAttempted = false;
   const prepared: NativeBoundaryPreparation = Object.freeze({ trust, platform,
-    async arm(owner: HeldLock, build: HeldLock): Promise<NativeWatchdog> {
+    async arm(owner: HeldLock, build: HeldLock, startupDeadline: number): Promise<NativeWatchdog> {
       if (armAttempted) throw unavailable('browser'); armAttempted = true;
-      services.manifest.assertCandidateTrust(trust);
+      const cutoff = Math.min(deadline, startupDeadline);
+      services.manifest.assertStartupCandidateTrust(trust, cutoff);
       const custody = platform.prepareWatchdogCustody(owner, build, trust.bundle, trust.snapshotDigest);
-      const watchdog = await services.watchdog.startNativeWatchdog(trust, custody);
+      const watchdog = await services.watchdog.startNativeWatchdog(trust, custody, cutoff);
       handovers.set(watchdog, { prepared, owner, build }); return watchdog;
     } });
   preparationServices.set(prepared, services); preparations.add(prepared); return prepared;

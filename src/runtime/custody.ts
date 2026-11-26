@@ -81,14 +81,15 @@ async function prepareSnapshot(custody: HostCustody, trust: import('../native/ma
     const manifest = await import(moduleURL) as typeof import('../native/manifest.js');
     assertHostCustody(custody); assertTime(deadline);
     const runtime = custody.instance.record;
+    const sameStartingHost = runtime.phase === 'starting' && trust === custody.host.signed;
     let consume: () => void;
-    if (startupConstruction && runtime.phase === 'starting' && trust === custody.host.signed &&
+    if (startupConstruction && sameStartingHost &&
         manifest.assertRetainedReadOnlyStorage(trust, deadline)) {
       consume = () => {
         if (!manifest.assertRetainedReadOnlyStorage(trust, deadline)) throw unavailable('browser');
       };
     } else {
-      const proof = await manifest.compareSignedSnapshot(trust, deadline);
+      const proof = await manifest.compareSignedSnapshot(trust, deadline, sameStartingHost);
       consume = () => manifest.consumeSignedSnapshot(proof, trust, deadline);
     }
     // No further await after minting: the caller immediately enters its exact
@@ -163,7 +164,7 @@ export async function prepareHostCustody(host: VerifiedHost, instance: InstanceO
             prepared.trust.snapshotDigest !== host.signed.snapshotDigest) return native.terminate();
         assertTime(limit); await instance.owner.assert(); assertTime(limit);
         const watchdog = await withOwnerLockForCustody(instance.owner, platform, owner =>
-          withBuildLockForCustody(build, platform, heldBuild => prepared.arm(owner, heldBuild)));
+          withBuildLockForCustody(build, platform, heldBuild => prepared.arm(owner, heldBuild, limit)));
         if (watchdog.custody !== native) return native.terminate();
         native.assert(); native.assertHost(); watchdog.assertArmed(prepared.trust); assertTime(limit);
         receipts.get(receipt)!.watchdog = watchdog; bindArmedHost(host, receipt); return watchdog;
