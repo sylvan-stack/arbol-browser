@@ -4424,7 +4424,8 @@ static bool inspectExit(ExitInspection& job) {
   bool unused=closed&&[[closed[@"terminal"][@"path"] lastPathComponent] isEqual:@"unused.json"];
   std::map<std::pair<std::string,std::string>,std::unique_ptr<arbol_startup_proof::RetainedAppPackage>> verifiedPackages;
   auto verifiedSignature=[&](const PackagedLayout& layout, NSDictionary* attempt) {
-    if (!migration && (prior || reserve || hostMode) && layout.installed) {
+    // After watchdog enrollment, the process family admits no Apple tools.
+    if (!migration && (prior || reserve) && layout.installed) {
       NSString* digest=attempt[@"candidateDigest"];
       if (!pattern(digest,@"^[0-9a-f]{64}$")) return false;
       auto key=std::make_pair(layout.bundle,std::string(digest.UTF8String));
@@ -4523,8 +4524,9 @@ static bool inspectExit(ExitInspection& job) {
     // then install pending atomically. Interrupted publication fails closed:
     // a missing/mismatched newest claim cannot fall back to an older witness.
     if(closed&&(!head||![head isEqual:closed])&&!writeExitHistory(history.fd,"previous-claim.json",closed,job)) return false;
-    if(!writeExitHistory(history.fd,"current-attempt.json",next,job)||!job.within()||
+    if(!writeExitHistory(history.fd,"current-attempt.json",next,job)||
        !std::all_of(verifiedPackages.begin(),verifiedPackages.end(),[](const auto& item) { return !item.second||item.second->current(); })||
+       !job.within()||
        !replace(claim.at,currentRaw,absent,bytes(next))) return false;
   } else if(retire) {
     if(!current||![current isEqual:closed]||historyMissing||!verify()||
