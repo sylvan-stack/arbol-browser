@@ -646,7 +646,7 @@ async function runInstalledVerifier(bootstrap: string, args: string[], requireme
       });
       let signerTimer: ReturnType<typeof setTimeout> | undefined;
       const expired = new Promise<undefined>(resolve => {
-        signerTimer = setTimeout(resolve, Math.max(1, signerDeadline - performance.now()));
+        signerTimer = setTimeout(() => resolve(undefined), Math.max(1, signerDeadline - performance.now()));
       });
       // This stays a private read-only observation until the signed verifier
       // independently attests to the same mounted package and digest.
