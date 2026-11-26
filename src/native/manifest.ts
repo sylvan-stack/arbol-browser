@@ -589,8 +589,9 @@ const retainedStartupVerifiers: Readonly<Record<string, string>> = Object.freeze
   '36': 'a90f94bfb9ed5acf7fa9199b3f7b1242b72b52c5',
   '37': '482637f33d3cf8f42c8e6561f1263b6b81d2cb84',
   '38': 'd5f8056a4c3a2078ab20ce69a9b93e019a6f93aa',
+  '39': '6827f088c075f2db0383d4ca24c2f2273aede310',
 });
-const retainedDirectVerifiers = new Set(['31', '32', '33', '34', '35', '36', '37', '38']);
+const retainedDirectVerifiers = new Set(['31', '32', '33', '34', '35', '36', '37', '38', '39']);
 function hasRetainedStartupVerifier(root: string, deadline: number): boolean {
   const expected = retainedStartupVerifiers[basename(dirname(dirname(root)))];
   if (!expected) return false;
@@ -603,7 +604,8 @@ interface InstalledVerification { readonly verified: boolean; readonly snapshotD
 const verifierRefusal: InstalledVerification = Object.freeze({ verified: false });
 
 async function runInstalledVerifier(bootstrap: string, args: string[], requirement: string,
-  bundle: StorageDescription, backing: StorageDescription, deadline: number): Promise<InstalledVerification> {
+  bundle: StorageDescription, backing: StorageDescription, deadline: number,
+  captureInventory?: () => void): Promise<InstalledVerification> {
   const started = performance.now();
   const remaining = budget(deadline);
   const environment = { PATH: '/usr/bin:/bin' };
@@ -632,12 +634,26 @@ async function runInstalledVerifier(bootstrap: string, args: string[], requireme
     if (!gate || !child.pid || (reportsSnapshot && !report)) return verifierRefusal;
     // The gated child receives approval only after stock Security verifies
     // this live exec against the original descriptor's exact CodeDirectory.
-    const signature = spawnSync('/usr/bin/codesign', ['--verify', '--strict', '-R', '=' + requirement, String(child.pid)], {
-      timeout: budget(deadline), killSignal: 'SIGKILL', env: environment, stdio: 'ignore',
-    });
+    const signatureArguments = ['--verify', '--strict', '-R', '=' + requirement, String(child.pid)];
+    const signatureOptions = { timeout: budget(deadline), killSignal: 'SIGKILL' as const, env: environment, stdio: 'ignore' as const };
+    let signed: boolean;
+    if (captureInventory) {
+      const signature = spawn('/usr/bin/codesign', signatureArguments, signatureOptions);
+      const completed = new Promise<boolean>(resolve => {
+        signature.once('error', () => resolve(false));
+        signature.once('close', code => resolve(code === 0));
+      });
+      // This stays a private read-only observation until the signed verifier
+      // independently attests to the same mounted package and digest.
+      try { captureInventory(); }
+      finally { signed = await completed; }
+    } else {
+      const signature = spawnSync('/usr/bin/codesign', signatureArguments, signatureOptions);
+      signed = !signature.error && signature.status === 0;
+    }
     budget(deadline);
     const wait = Math.floor(started + remaining - performance.now());
-    if (wait < 1 || signature.error || signature.status !== 0 || child.exitCode !== null) return verifierRefusal;
+    if (wait < 1 || !signed || child.exitCode !== null) return verifierRefusal;
     const expired = new Promise<InstalledVerification>(resolve => {
       timer = setTimeout(() => { gate.destroy(); report?.destroy(); resolve(verifierRefusal); }, wait);
     });
@@ -700,13 +716,20 @@ async function verifyInstalledStartupStorage(root: string, image: string, deadli
         ? runInstalledVerifier(bootstrap, [helper, ...(hostRequest ? [hostRequest] : [])], requirement, bundle, backing, deadline)
         : { verified: verifyPrevious(helper) };
       let verified = preliminary;
-      const cached = direct ? await verify('0') : verifierRefusal;
+      let inventory: InstalledInventory | undefined;
+      const cached = direct ? await runInstalledVerifier(bootstrap, ['0', ...(hostRequest ? [hostRequest] : [])],
+        requirement, bundle, backing, deadline, retainedVerifier === undefined ? () => {
+          inventory = captureInstalledInventory(root, preliminary, deadline);
+        } : undefined) : verifierRefusal;
       if (!cached.verified) {
         const mapping = storageMapping(root, deadline);
         if (!mapping.image || mapping.image['image-path'] !== image || storageMapping(image, deadline).image ||
             !(await verify(String(mapping.image['hdid-pid']))).verified) return refuse();
         verified = context(mapping.key);
-      } else if (cached.snapshotDigest) verified = Object.freeze({ ...preliminary, snapshotDigest: cached.snapshotDigest });
+      } else if (cached.snapshotDigest) {
+        verified = Object.freeze({ ...preliminary, snapshotDigest: cached.snapshotDigest });
+        if (inventory) installedInventories.set(verified, inventory);
+      }
       if (physicalStamp(fstatSync(executable.fd, { bigint: true })) !== executable.stamp ||
           physicalStamp(lstatSync(bootstrap, { bigint: true })) !== executable.stamp) return refuse();
       storageAssert(verified, deadline);
@@ -1059,6 +1082,25 @@ interface MountedBundleRead {
   readonly device: bigint;
   readonly files: Map<string, ReturnType<typeof physicalFile>>;
 }
+interface InstalledInventory {
+  readonly mounted: MountedBundleRead;
+  readonly physical: Record<string, PhysicalEntry>;
+  readonly snapshot: string;
+}
+const installedInventories = new WeakMap<StorageContext, InstalledInventory>();
+
+function captureInstalledInventory(root: string, storage: StorageContext, deadline: number,
+  observed: SnapshotFailure = {}): InstalledInventory {
+  storageAssert(storage, deadline);
+  const mounted = { device: fstatSync(storage.descriptions[0].fd, { bigint: true }).dev, files: new Map() };
+  const compiled = boundedJson(join(root, 'Contents/Resources/native-compatibility.json'), deadline, mounted.device);
+  if (!validator('native.BuildCompatibility')(compiled)) return refuse();
+  const physical: Record<string, PhysicalEntry> = Object.create(null);
+  const snapshot = completeSnapshot(root, deadline, physical, observed, mounted, false, compiled.files);
+  storageAssert(storage, deadline);
+  return { mounted, physical, snapshot };
+}
+
 function completeSnapshot(root: string, deadline = Infinity, physical?: Record<string, PhysicalEntry>,
   observed: SnapshotFailure = {}, mounted?: MountedBundleRead, confirmOnly = false,
   verifiedPayload?: Readonly<Record<string, string>>): string {
@@ -1146,10 +1188,16 @@ function assembleSignedBundle(bundle: string, deadline: number, scope: Publisher
     const expectedPublisher = scope === 'production' ? productionPublisher : publisher;
     const installedStartup = startupStorage !== undefined;
     storage ??= discoverStorage(root, deadline);
-    const mounted: MountedBundleRead | undefined = scope === 'production' && storage
+    phase = 'initial-snapshot';
+    // Installed verification may have captured the original descriptors'
+    // inventory in parallel. Only a witnessed digest admits that observation.
+    const installedInventory = startupStorage && (installedInventories.get(startupStorage) ??
+      captureInstalledInventory(root, startupStorage, deadline, observed));
+    const mounted: MountedBundleRead | undefined = installedInventory?.mounted ?? (scope === 'production' && storage
       ? { device: fstatSync(storage.descriptions[0].fd, { bigint: true }).dev, files: new Map() }
-      : undefined;
-    const physical: Record<string, PhysicalEntry> = Object.create(null), afterPhysical: Record<string, PhysicalEntry> = Object.create(null);
+      : undefined);
+    const physical: Record<string, PhysicalEntry> = installedInventory?.physical ?? Object.create(null);
+    const afterPhysical: Record<string, PhysicalEntry> = Object.create(null);
     const check = (): Compatibility => {
       if (!installedStartup) signature(root, true, false, deadline, expectedPublisher);
       phase = 'publisher';
@@ -1202,18 +1250,7 @@ function assembleSignedBundle(bundle: string, deadline: number, scope: Publisher
       if (stable(inventory) !== stable(value.files)) refuseSnapshot('snapshot-encoded-mismatch', observed);
       return value;
     };
-    phase = 'initial-snapshot';
-    let verifiedPayload: Compatibility['files'] | undefined;
-    if (installedStartup) {
-      // The authenticated native verifier checked the exact manifest leaf
-      // digests on the original mounted volume. Read the rest of the bundle
-      // here and record the same full physical inventory as every other host.
-      if (!mounted) return refuse();
-      const compiled = boundedJson(join(root, 'Contents/Resources/native-compatibility.json'), deadline, mounted.device);
-      if (!validator('native.BuildCompatibility')(compiled)) return refuse();
-      verifiedPayload = compiled.files;
-    }
-    const before = completeSnapshot(root, deadline, physical, observed, mounted, false, verifiedPayload);
+    const before = installedInventory?.snapshot ?? completeSnapshot(root, deadline, physical, observed, mounted);
     const snapshotDigest = createHash('sha256').update(before).digest('hex');
     if (mounted) storageAssert(storage, deadline);
     const initial = check(), encoded = stable(initial);
