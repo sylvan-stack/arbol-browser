@@ -424,10 +424,10 @@ int main(int argc, const char* argv[]) {
       // let preloaded process support capture the running engine's actual version.
       std::string custody="ARBOL_BROWSER_BOOTSTRAP=1:"+std::to_string(original.pid)+":"+std::to_string(original.start)+":"+std::to_string(original.group)+":"+std::to_string(getsid(0))+":"+std::to_string(original.uid);
       std::string inherited="ARBOL_BROWSER_BUILD_CAPSULE="+std::to_string(capsule);
-      char* environment[] = {home.data(), user.data(), custody.data(), inherited.data(), (char*)"PATH=/usr/bin:/bin", (char*)"TMPDIR=/private/tmp", nullptr};
+      char* environment[] = {home.data(), user.data(), custody.data(), inherited.data(), (char*)"PATH=/usr/bin:/bin", (char*)"TMPDIR=/private/tmp",
+        showEmptyWhenReady?(char*)"ARBOL_BROWSER_SHOW_EMPTY_WHEN_READY=1":nullptr, nullptr};
       char* args[] = {(char*)engine.fileSystemRepresentation, (char*)"--site-per-process", (char*)"--disable-features=MacAccessibilityTextOperation",
-        (char*)entry.fileSystemRepresentation, (char*)"--arbol-host-request", (char*)argv[2],
-        showEmptyWhenReady?(char*)"--arbol-show-empty-when-ready":nullptr, nullptr};
+        (char*)entry.fileSystemRepresentation, (char*)"--arbol-host-request", (char*)argv[2], nullptr};
       if(!inTime() || !arbol_boundary::lockIdentity(build) || (alreadyVerified && !verifiedPackageCurrent())) return 4;
       noUse.beforeExec();
       execve(engine.fileSystemRepresentation, args, environment);

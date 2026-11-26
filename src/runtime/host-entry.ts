@@ -310,8 +310,9 @@ export async function runHostEntry(): Promise<void> {
     const selections = await import(selectionURL) as typeof import('./selection.js');
     const layout = selections.packagedLayout(basename(buildRoot), payload), argv = [...process.argv];
     const selection: BuildSelection = Object.freeze({ build: layout.build, directory: layout.buildRoot, guard: layout.guard, explicit: true });
-    const showEmptyWhenReady = argv.length === 7 && argv[6] === '--arbol-show-empty-when-ready';
-    if ((argv.length !== 6 && !showEmptyWhenReady) || argv[0] !== layout.engine || process.execPath !== layout.engine ||
+    const showEmptyWhenReady = process.env.ARBOL_BROWSER_SHOW_EMPTY_WHEN_READY === '1';
+    delete process.env.ARBOL_BROWSER_SHOW_EMPTY_WHEN_READY;
+    if (argv.length !== 6 || argv[0] !== layout.engine || process.execPath !== layout.engine ||
         argv[1] !== '--site-per-process' || argv[2] !== '--disable-features=MacAccessibilityTextOperation' ||
         argv[3] !== layout.hostEntry || argv[4] !== '--arbol-host-request' || !argv[5]?.startsWith('/')) throw unavailable('browser');
     const args = Object.freeze([argv[4], argv[5]] as const);
