@@ -339,14 +339,16 @@ int main(int argc, const char* argv[]) {
           !arbol_boundary::executable(original,originalPath) || originalPath!=layout.bootstrap) return 4;
       arbol_startup_proof::RetainedAppPackage earlyPackage;
       const bool preparedPackage = provisional && earlyPackage.capture(layout,expiry);
-      NSString* gateDigest = provisional ? arbol_startup_proof::awaitProvisionalClaim(argv[2],layout,expiry) : nil;
+      NSDictionary* gateHelper = nil;
+      NSString* gateDigest = provisional ? arbol_startup_proof::awaitProvisionalClaim(argv[2],layout,expiry,gateHelper) : nil;
       if (provisional && !gateDigest) return 4;
       // Read only authenticated private control metadata here, release the
       // short lock during signature work, then compare the exact version again.
       std::string initialRaw; NSDictionary* initial=nil; arbol_attempt::PackagedLayout initialLayout;
       { arbol_attempt::Claim early;
         if(!early.acquire(argv[2],std::min(expiry,arbol_boundary::clockMs()+2000)) || !early.read(initialRaw,initial) ||
-           (provisional && ![arbol_attempt::digest(initialRaw) isEqual:gateDigest]) ||
+           (provisional && (![arbol_attempt::digest(initialRaw) isEqual:gateDigest] ||
+                            !arbol_startup_proof::helperForStarter(gateHelper,initial[@"starter"]))) ||
            !arbol_attempt::launchRequest(early,argv[2],initial) ||
            !arbol_attempt::claimedLayout(initial,initialLayout) || initialLayout.bundle!=layout.bundle || initialLayout.guard!=build.path || ![initial[@"phase"] isEqual:@"pending"]) return 4;
         expiry=std::min(expiry,[initial[@"expires"] doubleValue]); if(!inTime()) return 4;
@@ -387,6 +389,7 @@ int main(int argc, const char* argv[]) {
       // cancelled or already claimed LaunchServices delivery.
       arbol_attempt::Claim claim; std::string prior; NSDictionary* attempt=nil;
       if (!claim.acquire(argv[2],std::min(expiry,arbol_boundary::clockMs()+2000)) || !claim.read(prior,attempt) || prior!=initialRaw ||
+          (provisional && !arbol_startup_proof::helperForStarter(gateHelper,attempt[@"starter"])) ||
           !arbol_attempt::launchRequest(claim,argv[2],attempt) ||
           ![attempt[@"buildRoot"] isEqual:buildRoot] || ![attempt[@"build"] isEqual:hostPolicy[@"build"]] ||
           ![attempt[@"buildGuard"] isEqual:[NSString stringWithUTF8String:build.path.c_str()]] ||

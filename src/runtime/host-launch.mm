@@ -107,7 +107,7 @@ Observation sample(NSString* application, NSDictionary* original,
 // it only until this observation/reply ends, never across a polling wait.
 Observation inspect(arbol_attempt::Claim& claim, NSString* application, const std::string& requestPath,
     NSDictionary* pending, const std::string& requestRaw, const Baseline& baseline,
-    double deadline, int& pid, unsigned& branch, unsigned& phase) {
+    NSDictionary* offered, double deadline, int& pid, unsigned& branch, unsigned& phase) {
   std::string raw; NSDictionary* current = nil;
   const std::string name = requestPath.substr(requestPath.rfind('/')+1);
   if (!claim.acquire(requestPath,std::min(deadline,arbol_boundary::clockMs()+2000)) ||
@@ -128,6 +128,7 @@ Observation inspect(arbol_attempt::Claim& claim, NSString* application, const st
   if (![@[@"claimed",@"ready"] containsObject:current[@"phase"]]) return Observation::refused;
   NSDictionary* original = current[@"bootstrap"];
   if (!arbol_attempt::process(original) || [original[@"group"] intValue] != [original[@"pid"] intValue] ||
+      (offered && ![original isEqual:offered]) ||
       ![original[@"executable"] isEqual:[NSString stringWithUTF8String:layout.bootstrap.c_str()]] ||
       !arbol_boundary::canonical([original[@"executable"] fileSystemRepresentation])) return Observation::refused;
   phase = 3;
@@ -178,13 +179,12 @@ int main(int argc, const char* argv[]) {
     if (!arbol_attempt::packagedLayout(application.fileSystemRepresentation,packaged)) return 4;
     const double preparationDeadline=arbol_boundary::clockMs()+60000;
     arbol_startup_proof::RetainedAppPackage package;
-    const bool provisional = prepared && packaged.installed &&
-      package.capture(packaged,std::min(preparationDeadline,arbol_boundary::clockMs()+250)) && package.witnessed();
     arbol_boundary::Lock packageGuard;
-    if (provisional && !arbol_attempt::openBuild(packaged.bundle,packageGuard)) return 4;
-    arbol_startup_proof::Descriptor originalGuard(packageGuard.fd);
     arbol_startup_proof::ProvisionalClaimOffer offer;
-    if (provisional && !offer.listenFor(argv[2])) return 4;
+    const bool provisional = prepared && packaged.installed &&
+      package.capture(packaged,std::min(preparationDeadline,arbol_boundary::clockMs()+250)) && package.witnessed() &&
+      offer.listenFor(argv[2]) && arbol_attempt::openBuild(packaged.bundle,packageGuard);
+    arbol_startup_proof::Descriptor originalGuard(packageGuard.fd);
     const auto waitForReservation = [&](const std::shared_ptr<Reply>& reply) {
       struct stat gate{};
       if (fstat(STDIN_FILENO,&gate) || (!S_ISFIFO(gate.st_mode) && !S_ISSOCK(gate.st_mode))) return false;
@@ -279,7 +279,7 @@ int main(int argc, const char* argv[]) {
       }];
     } @catch (NSException*) { std::lock_guard<std::mutex> held(reply->mutex); reply->error = true; }
     } catch (...) { std::lock_guard<std::mutex> held(reply->mutex); reply->error = true; }
-    int provisionalPid=0;
+    NSDictionary* offered = nil;
     if (provisional) {
       if (!waitForReservation(reply)) return 4;
       deadline=std::min(preparationDeadline,arbol_boundary::clockMs()+28000);
@@ -287,16 +287,21 @@ int main(int argc, const char* argv[]) {
       if (!package.matches(packaged,pending[@"candidateDigest"]) || !package.current() ||
           !arbol_boundary::lockIdentity(packageGuard)) return 4;
       NSString* digest=arbol_attempt::digest(pendingRaw);
+      const auto approve = [&](int pid,const auto& deliver) {
+        std::lock_guard<std::mutex> held(reply->mutex);
+        if (reply->error) return -1;
+        if (reply->callbackPid>0 && reply->callbackPid!=pid) return 0;
+        return deliver() ? 1 : -1;
+      };
       while (arbol_boundary::clockMs()<deadline) {
-        int callbackPid=0;
-        { std::lock_guard<std::mutex> held(reply->mutex); if (reply->error) return 4; callbackPid=reply->callbackPid; }
-        provisionalPid=offer.offer(packaged,digest,callbackPid,deadline);
-        if (provisionalPid<0) return 4;
-        if (provisionalPid>0) break;
+        { std::lock_guard<std::mutex> held(reply->mutex); if (reply->error) return 4; }
+        const int result=offer.offer(packaged,digest,deadline,approve,offered);
+        if (result<0) return 4;
+        if (result>0) break;
         [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
         usleep(1000);
       }
-      if (provisionalPid<=1) return 4;
+      if (!offered) return 4;
     }
     unsigned branch = 0, phase = 0;
     while (arbol_boundary::clockMs() < deadline) {
@@ -307,12 +312,11 @@ int main(int argc, const char* argv[]) {
         arbol_attempt::Claim claim; int pid = 0;
         Observation result = Observation::refused;
         try { @try {
-          result = inspect(claim,application,requestPath,pending,requestRaw,baseline,deadline,pid,branch,phase);
+          result = inspect(claim,application,requestPath,pending,requestRaw,baseline,offered,deadline,pid,branch,phase);
         } @catch (NSException*) {} } catch (...) {}
         std::lock_guard<std::mutex> held(reply->mutex);
         if (reply->error || result == Observation::refused ||
-            (result == Observation::proved && ((reply->callbackPid > 0 && reply->callbackPid != pid) ||
-              (provisionalPid > 0 && provisionalPid != pid)))) {
+            (result == Observation::proved && reply->callbackPid > 0 && reply->callbackPid != pid)) {
           reply->outcome = Outcome::refused; break;
         }
         if (result == Observation::proved) {

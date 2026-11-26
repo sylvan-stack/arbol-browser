@@ -123,23 +123,29 @@ public:
     owns_ = true;
     return !chmod(path_.c_str(),0600) && !listen(fd,4);
   }
-  int offer(const arbol_attempt::PackagedLayout& layout, NSString* digest, int expectedPid, double deadline) {
+  template<typename Approve>
+  int offer(const arbol_attempt::PackagedLayout& layout, NSString* digest, double deadline,
+            Approve approve, NSDictionary* __strong& offered) {
     if (!arbol_attempt::pattern(digest,@"^[0-9a-f]{64}$")) return -1;
     Descriptor peer(accept(listener_.get(),nullptr,nullptr));
     if (peer.get()<0) return errno==EAGAIN || errno==EWOULDBLOCK || errno==EINTR ? 0 : -1;
     NSDictionary* process = signedProvisionalPeer(peer.get(),layout.bootstrap,@"com.sylvan-stack.arbol-browser");
     const int actual = [process[@"pid"] intValue];
-    if (!process || actual<=1 || (expectedPid>1 && actual!=expectedPid) || [process[@"group"] intValue]!=actual) return 0;
+    if (!process || actual<=1 || [process[@"group"] intValue]!=actual) return 0;
     int noSignal = 1;
     if (fcntl(peer.get(),F_SETFL,O_NONBLOCK) || setsockopt(peer.get(),SOL_SOCKET,SO_NOSIGPIPE,&noSignal,sizeof(noSignal)) ||
-        !arbol_attempt::currentProcess(process) || arbol_boundary::clockMs()>=deadline ||
-        send(peer.get(),digest.UTF8String,64,0)!=64) return -1;
-    return actual;
+        !arbol_attempt::currentProcess(process)) return -1;
+    const auto deliver = [&]() {
+      return arbol_boundary::clockMs()<deadline && send(peer.get(),digest.UTF8String,64,0)==64;
+    };
+    const int result = approve(actual,deliver);
+    if (result>0) offered=process;
+    return result;
   }
 };
 
 inline NSString* awaitProvisionalClaim(const std::string& requestPath, const arbol_attempt::PackagedLayout& layout,
-                                       double deadline) {
+                                       double deadline, NSDictionary* __strong& helper) {
   const auto endpoint = provisionalEndpoint(requestPath);
   sockaddr_un addr{};
   struct stat named{};
@@ -163,7 +169,15 @@ inline NSString* awaitProvisionalClaim(const std::string& requestPath, const arb
   }
   if (used!=sizeof(bytes) || arbol_boundary::clockMs()>=deadline || !arbol_attempt::currentProcess(process)) return nil;
   NSString* digest = [[NSString alloc] initWithBytes:bytes length:sizeof(bytes) encoding:NSASCIIStringEncoding];
-  return arbol_attempt::pattern(digest,@"^[0-9a-f]{64}$") ? digest : nil;
+  if (!arbol_attempt::pattern(digest,@"^[0-9a-f]{64}$")) return nil;
+  helper=process;
+  return digest;
+}
+
+inline bool helperForStarter(NSDictionary* helper, NSDictionary* starter) {
+  return arbol_attempt::currentProcess(helper) && arbol_attempt::currentProcess(starter) &&
+    [helper[@"parentStartId"] isEqual:starter[@"startId"]] &&
+    [helper[@"parentPidVersion"] isEqual:starter[@"pidVersion"]];
 }
 
 inline bool packet(NSDictionary* value) {
