@@ -103,7 +103,7 @@ if (!['agent-session.js', 'agent-tools.js'].every(file => graphs['cli/main.js'].
 // Compile each genuine external provider graph without evaluation. Compare
 // every actual package input and manifest/side-asset projection under the lock.
 const runtimeProjection = await installedRuntimeProjection(), vendorInputs = {};
-for (const entry of ['ajv/dist/2020.js', 'ajv-formats']) {
+for (const entry of ['ajv/dist/2020.js', 'ajv/dist/standalone/index.js', 'ajv-formats']) {
   const result = await build({ stdin: { contents: `import * as provider from ${JSON.stringify(entry)}; export { provider };`, resolveDir: root },
     write: false, bundle: true, format: 'esm', platform: 'node', metafile: true, logLevel: 'silent' });
   for (const input of Object.keys(result.metafile.inputs)) if (input !== '<stdin>') {
