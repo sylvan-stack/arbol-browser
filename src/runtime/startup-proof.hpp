@@ -148,6 +148,42 @@ inline bool currentCache(NSDictionary* proof, const std::string& bundle, int roo
     mount.sameFilesystem(filesystem) && mount.current() && descriptors(proof, bundle, root, image);
 }
 
+inline std::string installedImagePath(const arbol_attempt::PackagedLayout& layout) {
+  NSString* home = arbol_attempt::physicalAccountHome();
+  if (!home) return {};
+  NSString* support = [home stringByAppendingPathComponent:@ARBOL_INSTALLATION_STABLE_USES].stringByDeletingLastPathComponent;
+  return [[support stringByAppendingPathComponent:@"images"]
+    stringByAppendingPathComponent:[NSString stringWithFormat:@"%s.dmg", layout.build.c_str()]].fileSystemRepresentation;
+}
+
+class RetainedAppPackage {
+  Descriptor root_;
+  arbol_attempt::MaintenanceFile image_;
+  arbol_attempt::MaintenanceBacking backing_;
+  arbol_attempt::MaintenancePayload mount_;
+  NSDictionary* proof_ = nil;
+  std::string bundle_;
+public:
+  bool capture(const arbol_attempt::PackagedLayout& layout, double deadline, NSString* snapshot = nil) {
+    if (!layout.installed || root_.get() >= 0 ||
+        !image_.openPath(installedImagePath(layout), 0600, 1024LL * 1024 * 1024)) return false;
+    bundle_ = layout.bundle;
+    root_.reset(open(bundle_.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    if (root_.get() < 0) return false;
+    proof_ = cached(bundle_, root_.get(), image_.fd, deadline, nil, snapshot);
+    if (!proof_ || !mount_.capture(layout, false) ||
+        !arbol_attempt::maintenanceMount(mount_.mount, image_, deadline, backing_)) return false;
+    return current();
+  }
+  bool current() const {
+    return proof_ && currentCache(proof_, bundle_, root_.get(), image_.fd, mount_) &&
+      backing_.current(image_) && currentCache(proof_, bundle_, root_.get(), image_.fd, mount_);
+  }
+  bool matchesOriginal(int root, const struct stat& image) const {
+    return arbol_attempt::sameFile(image, image_.identity) && descriptors(proof_, bundle_, root, image_.fd);
+  }
+};
+
 inline void publishToApp(NSDictionary* verified, NSString* imageDigest, double deadline) {
   if (arbol_boundary::clockMs() >= deadline || !packet(verified) ||
       !arbol_attempt::pattern(imageDigest, @"^[0-9a-f]{64}$")) return;

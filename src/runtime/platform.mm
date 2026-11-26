@@ -5,6 +5,7 @@
 #include <os/log.h>
 #include "../../watchdog/boundary.hpp"
 #include "attempt.hpp"
+#include "startup-proof.hpp"
 #include "../../watchdog/exit.hpp"
 #include <spawn.h>
 #include <set>
@@ -776,11 +777,16 @@ static napi_value adoptHostBuild(napi_env env,napi_callback_info info) {
     NSDictionary* self=arbol_attempt::processRecord(getpid()); NSDictionary* outer=attempt[@"bootstrap"];
     if(!self || ![outer[@"executable"] isEqual:[NSString stringWithUTF8String:layout.bootstrap.c_str()]] ||
        ![self[@"executable"] isEqual:[NSString stringWithUTF8String:layout.engine.c_str()]] ||
-       [outer[@"pidVersion"] isEqual:self[@"pidVersion"]] || !arbol_boundary::signature(bundle,false) ||
-       !arbol_boundary::signature([self[@"executable"] UTF8String],true)) return fail(env);
+       [outer[@"pidVersion"] isEqual:self[@"pidVersion"]]) return fail(env);
     for(NSString* key in @[@"pid",@"uid",@"startId",@"group",@"session",@"parentStartId",@"parentPidVersion"])
       if(![outer[key] isEqual:self[key]]) return fail(env);
-    if([self[@"group"] intValue]!=getpid()||getppid()!=1||!arbol_boundary::retainNativeImage()) return fail(env);
+    if([self[@"group"] intValue]!=getpid()||getppid()!=1) return fail(env);
+    arbol_startup_proof::RetainedAppPackage package;
+    const bool originalPackage = !cancelled && package.capture(layout, [attempt[@"expires"] doubleValue], attempt[@"candidateDigest"]);
+    if (!originalPackage && (!arbol_boundary::signature(bundle,false) || !arbol_boundary::signature(layout.engine,true)))
+      return fail(env);
+    if ((originalPackage && !package.current()) || !arbol_attempt::currentProcess(self,true) ||
+        !arbol_boundary::retainNativeImage()) return fail(env);
     adoptedNoUse=new arbol_exit::NoUseOriginal;
     adoptedNoUse->capture(requestPath,bundle,original,originalClaim,@"post-exec");
     auto terminalOnly=[&]() -> void {
@@ -4416,6 +4422,21 @@ static bool inspectExit(ExitInspection& job) {
   };
   NSDictionary* data=nil,*capability=nil,*receipt=nil,*frontier=nil,*unusedReceipt=nil;
   bool unused=closed&&[[closed[@"terminal"][@"path"] lastPathComponent] isEqual:@"unused.json"];
+  std::map<std::pair<std::string,std::string>,std::unique_ptr<arbol_startup_proof::RetainedAppPackage>> verifiedPackages;
+  auto verifiedSignature=[&](const PackagedLayout& layout, NSDictionary* attempt) {
+    if (!migration && (prior || reserve || hostMode) && layout.installed) {
+      NSString* digest=attempt[@"candidateDigest"];
+      if (!pattern(digest,@"^[0-9a-f]{64}$")) return false;
+      auto key=std::make_pair(layout.bundle,std::string(digest.UTF8String));
+      auto [entry, inserted]=verifiedPackages.try_emplace(key);
+      if (inserted) {
+        auto proof=std::make_unique<arbol_startup_proof::RetainedAppPackage>();
+        if (proof->capture(layout,job.deadline,digest)) entry->second=std::move(proof);
+      }
+      if (entry->second) return entry->second->current();
+    }
+    return arbol_boundary::signature(layout.bundle,false);
+  };
   auto verify=[&] {
     if(wholeReceipt) {
       if((closed?![closed isEqual:expected]:expected!=(id)NSNull.null)||!applyReceipt(nil,true)) return false;
@@ -4435,7 +4456,7 @@ static bool inspectExit(ExitInspection& job) {
       if(!claimedLayout(closed,layout)||expected==(id)NSNull.null||![closed isEqual:expected]||!sameProfile(closed)||
          job.build.path!=std::string([closed[@"buildGuard"] UTF8String])||
          ![input[@"bundle"] isEqual:[NSString stringWithUTF8String:layout.bundle.c_str()]]||
-         !arbol_boundary::signature([input[@"bundle"] UTF8String],false)) return false;
+         !verifiedSignature(layout,closed)) return false;
       if(unused) {
         if(!verifyUnusedReceipt(closed,unusedReceipt,job)) return false;
         data=unusedReceipt[@"priorDataClaim"]==NSNull.null?nil:unusedReceipt[@"priorDataClaim"];
@@ -4454,7 +4475,7 @@ static bool inspectExit(ExitInspection& job) {
             return verifyClosedReceipt(data,capability,receipt,frontier,job,job.build,bundle)&&
               (prior||receiptMarker(capability,receipt[@"marker"],job));
           })) return false;
-        } else if(guard.fd<0||guard.path!=std::string([data[@"buildGuard"] UTF8String])||!arbol_boundary::signature(bundle.UTF8String,false)||
+        } else if(guard.fd<0||guard.path!=std::string([data[@"buildGuard"] UTF8String])||!verifiedSignature(dataLayout,data)||
             !verifyClosedReceipt(data,capability,receipt,frontier,job,guard,bundle)||
             (!prior&&!receiptMarker(capability,receipt[@"marker"],job))) return false;
       }
@@ -4496,13 +4517,14 @@ static bool inspectExit(ExitInspection& job) {
     // only then can the actual live starter replace the unchanged exact record.
     if(!verify()||!physical()||!sameProfile(next)||!claimedLayout(next,nextLayout)||!transition(nil,next,Role::starter)||
        job.nextBuild.path!=std::string([next[@"buildGuard"] UTF8String])||
-       !arbol_boundary::signature(nextLayout.bundle,false)||
+       !verifiedSignature(nextLayout,next)||
        (current&&[current[@"request"] isEqual:next[@"request"]])||historyMissing) return false;
     // Persist predecessor first, newest immutable reservation second, and only
     // then install pending atomically. Interrupted publication fails closed:
     // a missing/mismatched newest claim cannot fall back to an older witness.
     if(closed&&(!head||![head isEqual:closed])&&!writeExitHistory(history.fd,"previous-claim.json",closed,job)) return false;
     if(!writeExitHistory(history.fd,"current-attempt.json",next,job)||!job.within()||
+       !std::all_of(verifiedPackages.begin(),verifiedPackages.end(),[](const auto& item) { return !item.second||item.second->current(); })||
        !replace(claim.at,currentRaw,absent,bytes(next))) return false;
   } else if(retire) {
     if(!current||![current isEqual:closed]||historyMissing||!verify()||

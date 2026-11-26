@@ -172,13 +172,6 @@ class RetainedStartupPackage {
   NSDictionary* appProof_ = nil;
   std::string bundle_;
 public:
-  static std::string imagePath(const arbol_attempt::PackagedLayout& layout) {
-    NSString* home = arbol_attempt::physicalAccountHome();
-    if (!home) return {};
-    NSString* support = [home stringByAppendingPathComponent:@ARBOL_INSTALLATION_STABLE_USES].stringByDeletingLastPathComponent;
-    return [[support stringByAppendingPathComponent:@"images"]
-      stringByAppendingPathComponent:[NSString stringWithFormat:@"%s.dmg", layout.build.c_str()]].fileSystemRepresentation;
-  }
   bool current() const {
     return root_.get() >= 0 && image_.current() &&
       (appProof_ ? arbol_startup_proof::currentCache(appProof_, bundle_, root_.get(), image_.fd, mount_) : mount_.current());
@@ -187,7 +180,7 @@ public:
     if (!layout.installed || !arbol_attempt::record(attempt) || !inTime()) return false;
     arbol_attempt::PackagedLayout claimed;
     if (!arbol_attempt::claimedLayout(attempt, claimed) || claimed.bundle != layout.bundle ||
-        claimed.guard != layout.guard || !image_.openPath(imagePath(layout), 0600, 1024LL * 1024 * 1024)) return false;
+        claimed.guard != layout.guard || !image_.openPath(arbol_startup_proof::installedImagePath(layout), 0600, 1024LL * 1024 * 1024)) return false;
     bundle_ = layout.bundle;
     root_.reset(open(layout.bundle.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
     if (root_.get() < 0 || !mount_.capture(layout, false)) return false;
@@ -209,13 +202,14 @@ static int verifyInstalledPackage(const arbol_attempt::PackagedLayout& layout, N
   if (!inTime() || poll(&gate, 1, int(std::min(5000.0, expiry - arbol_boundary::clockMs()))) != 1 ||
       !(gate.revents & POLLIN) || read(STDIN_FILENO, &approval, 1) != 1 || approval != '1' || !inTime()) return 4;
   NSString* helperText = [NSString stringWithUTF8String:helper];
-  if (!layout.installed || !arbol_attempt::pattern(helperText, @"^[1-9][0-9]{0,9}$") ||
-      helperText.longLongValue <= 1 || helperText.longLongValue > INT_MAX) return 4;
+  const bool cachedOnly = [helperText isEqual:@"0"];
+  if (!layout.installed || (!cachedOnly && (!arbol_attempt::pattern(helperText, @"^[1-9][0-9]{0,9}$") ||
+      helperText.longLongValue <= 1 || helperText.longLongValue > INT_MAX))) return 4;
   arbol_boundary::Identity self;
   std::string executable;
   if (arbol_boundary::observe(getpid(), self) != 1 || !arbol_boundary::executable(self, executable) ||
       executable != layout.bootstrap) return 4;
-  const std::string imagePath = RetainedStartupPackage::imagePath(layout);
+  const std::string imagePath = arbol_startup_proof::installedImagePath(layout);
   arbol_attempt::MaintenanceFile image;
   arbol_attempt::MaintenanceBacking backing;
   arbol_attempt::MaintenancePayload immutable;
@@ -231,8 +225,15 @@ static int verifyInstalledPackage(const arbol_attempt::PackagedLayout& layout, N
       !memcmp(&callerBundle.st_ctimespec, &namedBundle.st_ctimespec, sizeof(timespec));
   };
   if (fstat(STDOUT_FILENO, &callerBundle) || !S_ISDIR(callerBundle.st_mode) || !sameBundle() ||
-      fstat(STDERR_FILENO, &callerImage) || (fcntl(STDERR_FILENO, F_GETFL) & O_ACCMODE) != O_RDONLY ||
-      !image.openPath(imagePath, 0600, 1024LL * 1024 * 1024) ||
+      fstat(STDERR_FILENO, &callerImage) || (fcntl(STDERR_FILENO, F_GETFL) & O_ACCMODE) != O_RDONLY) return 4;
+  if (cachedOnly) {
+    arbol_startup_proof::RetainedAppPackage cached;
+    if (!cached.capture(layout, expiry) || !cached.matchesOriginal(STDOUT_FILENO, callerImage) ||
+        !cached.current() || !sameBundle() || !inTime()) return 4;
+    os_log(OS_LOG_DEFAULT, "arbol-browser native verifier reused installed App package proof");
+    return 0;
+  }
+  if (!image.openPath(imagePath, 0600, 1024LL * 1024 * 1024) ||
       !arbol_attempt::sameFile(callerImage, image.identity) ||
       !backing.capture(helperText.intValue, image)) return 4;
   if (requestPath) {

@@ -573,6 +573,7 @@ const retainedStartupVerifiers: Readonly<Record<string, string>> = Object.freeze
   '2a': '5c33202dc2553264b50a31dbc36c2aa2d96b9738',
   '2b': '2a0e22546be4a4ba6fc09752f6e4923bf713ee8c',
   '2c': 'f07c5c8ce0153ef94286ba3ac7a652e01485f920',
+  '2d': '9fdb9ea348448ddbb73101fc64955600977cf5d7',
 });
 function hasRetainedStartupVerifier(root: string, deadline: number): boolean {
   const expected = retainedStartupVerifiers[basename(dirname(dirname(root)))];
@@ -591,9 +592,7 @@ function verifyInstalledStartupStorage(root: string, image: string, deadline: nu
     descriptions.push(bundle);
     const backing = retainedDescription(image, false);
     descriptions.push(backing);
-    const mapping = storageMapping(root, deadline);
-    if (!mapping.image || mapping.image['image-path'] !== image || storageMapping(image, deadline).image) return refuse();
-    const context = Object.freeze({ descriptions: Object.freeze([bundle, backing] as const), mapping: mapping.key });
+    const held = Object.freeze([bundle, backing] as const);
     const bootstrap = join(root, 'Contents/MacOS/arbol-browser-native');
     const executable = retainedDescription(bootstrap, false);
     try {
@@ -601,25 +600,36 @@ function verifyInstalledStartupStorage(root: string, image: string, deadline: nu
       if (retainedVerifier !== undefined && cdhash !== retainedVerifier) return refuse();
       const requirement = productionPublisher.requirement +
         ` and identifier "${productionPublisher.bundleIdentifier}" and cdhash H"${cdhash}"`;
-      storageAssert(context, deadline);
+      const context = (mapping: string): StorageContext => Object.freeze({ descriptions: held, mapping });
+      const preliminary = context('installed-startup');
+      storageAssert(preliminary, deadline);
       if (fstatSync(executable.fd, { bigint: true }).dev !==
           fstatSync(bundle.fd, { bigint: true }).dev ||
           physicalStamp(lstatSync(bootstrap, { bigint: true })) !== executable.stamp ||
           realpathSync(bootstrap) !== bootstrap) return refuse();
       // Process identity, read-only backing, full code signatures and every
       // signed payload entry are checked inside the signed bootstrap.
-      const result = spawnSync('/usr/bin/osascript', ['-l', 'JavaScript', '-e', installedVerifierBroker,
-        bootstrap, String(mapping.image['hdid-pid']), requirement, ...(hostRequest ? [hostRequest] : [])], {
-        timeout: budget(deadline), killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'ignore', bundle.fd, backing.fd],
-        encoding: 'utf8', maxBuffer: nativeLimit,
-        env: { PATH: '/usr/bin:/bin' },
-      });
-      budget(deadline);
-      if (result.error || result.status !== 0 || result.stdout !== 'verified\n') return refuse();
+      const verify = (helper: string): boolean => {
+        const result = spawnSync('/usr/bin/osascript', ['-l', 'JavaScript', '-e', installedVerifierBroker,
+          bootstrap, helper, requirement, ...(hostRequest ? [hostRequest] : [])], {
+          timeout: budget(deadline), killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'ignore', bundle.fd, backing.fd],
+          encoding: 'utf8', maxBuffer: nativeLimit,
+          env: { PATH: '/usr/bin:/bin' },
+        });
+        budget(deadline);
+        return !result.error && result.status === 0 && result.stdout === 'verified\n';
+      };
+      let verified = preliminary;
+      if (retainedVerifier !== undefined || !verify('0')) {
+        const mapping = storageMapping(root, deadline);
+        if (!mapping.image || mapping.image['image-path'] !== image || storageMapping(image, deadline).image ||
+            !verify(String(mapping.image['hdid-pid']))) return refuse();
+        verified = context(mapping.key);
+      }
       if (physicalStamp(fstatSync(executable.fd, { bigint: true })) !== executable.stamp ||
           physicalStamp(lstatSync(bootstrap, { bigint: true })) !== executable.stamp) return refuse();
-      storageAssert(context, deadline);
-      return context;
+      storageAssert(verified, deadline);
+      return verified;
     } finally { closeSync(executable.fd); }
   } catch (error) {
     for (const description of descriptions) {
