@@ -54,6 +54,25 @@ inline int observe(int pid, Identity& id, Info* detail = nullptr) {
   if (n != sizeof(info) || pid < 1 || info.bsd.pbi_pid != (uint32_t)pid || !info.unique.start || info.unique.version <= 0) return -1;
   id = {pid, info.unique.start, info.unique.version, info.bsd.pbi_uid, info.bsd.pbi_pgid}; if (detail) *detail = info; return 1;
 }
+// Darwin allows these narrower queries without the combined read's same-user
+// check. They can exclude an unrelated process, never enroll an original or
+// establish its terminal exit. Bracket the group read with the same birth.
+inline int observeCensusIdentity(int pid, Unique& birth, proc_bsdshortinfo& detail) {
+  constexpr int uniqueIdentifierFlavor = 17; // Darwin PROC_PIDUNIQIDENTIFIERINFO.
+  errno = 0;
+  int first = proc_pidinfo(pid, uniqueIdentifierFlavor, 0, &birth, sizeof(birth));
+  if (!first && errno == ESRCH) return 0;
+  if (first != sizeof(birth) || !birth.start || birth.version <= 0) return -1;
+  int groupBytes = proc_pidinfo(pid, PROC_PIDT_SHORTBSDINFO, 0, &detail, sizeof(detail));
+  Unique current{};
+  errno = 0;
+  int last = proc_pidinfo(pid, uniqueIdentifierFlavor, 0, &current, sizeof(current));
+  if (!last && errno == ESRCH) return 0;
+  if (groupBytes != sizeof(detail) || detail.pbsi_pid != (uint32_t)pid || last != sizeof(current) ||
+      birth.start != current.start || birth.version != current.version || birth.parent != current.parent ||
+      birth.originalParentVersion != current.originalParentVersion || memcmp(birth.uuid,current.uuid,sizeof(birth.uuid))) return -1;
+  return 1;
+}
 inline int current(const Identity& original) { if (!original.pid) return 0; Identity now; int n = observe(original.pid, now); return n <= 0 ? n : same(original, now) ? 1 : now.start != original.start ? 0 : -1; }
 using OriginalKey=std::pair<int,uint64_t>;
 inline OriginalKey key(const Identity& id) { return {id.pid,id.start}; }
@@ -674,9 +693,17 @@ struct Context {
       if(pid<=0) return;
       const double sampledAt=readback?clockMs():0;
       Identity id; Info info{}; int state=observe(pid,id,&info);
-      // Retry a partial whole-user sample before classifying this PID.
-      // Treat the same failure on the second sample as an incomplete census.
+      // Keep the whole-user scan in order. An incomplete full read still
+      // requires a positive kernel answer before the scan can continue.
       if(state<0&&!groupMember) state=observe(pid,id,&info);
+      if(state<0&&!groupMember) {
+        Unique birth{}; proc_bsdshortinfo detail{};
+        const int limited=observeCensusIdentity(pid,birth,detail);
+        if(!limited) state=0;
+        else if(limited==1&&detail.pbsi_pgid!=main.group&&pid!=main.pid&&pid!=primary.pid&&pid!=custody.pid&&
+                !parents.count({birth.parent,birth.originalParentVersion})&&
+                std::none_of(seen.begin(),seen.end(),[&](const auto& entry) { return entry.second.pid==pid; })) return;
+      }
       if(!state) {
         if(groupMember) {
           Identity known{};
