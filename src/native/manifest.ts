@@ -587,7 +587,9 @@ const retainedStartupVerifiers: Readonly<Record<string, string>> = Object.freeze
   '34': 'eee7a9de9611b2609a974172a730456c126f8c7b',
   '35': 'b9f5f3eb04d1cfe4fa59b6409870d23e036bb65f',
   '36': 'a90f94bfb9ed5acf7fa9199b3f7b1242b72b52c5',
+  '37': '482637f33d3cf8f42c8e6561f1263b6b81d2cb84',
 });
+const retainedDirectVerifiers = new Set(['31', '32', '33', '34', '35', '36', '37']);
 function hasRetainedStartupVerifier(root: string, deadline: number): boolean {
   const expected = retainedStartupVerifiers[basename(dirname(dirname(root)))];
   if (!expected) return false;
@@ -692,11 +694,12 @@ async function verifyInstalledStartupStorage(root: string, image: string, deadli
         budget(deadline);
         return !result.error && result.status === 0 && result.stdout === 'verified\n';
       };
-      const verify = async (helper: string): Promise<InstalledVerification> => retainedVerifier === undefined
+      const direct = retainedVerifier === undefined || retainedDirectVerifiers.has(basename(dirname(dirname(root))));
+      const verify = async (helper: string): Promise<InstalledVerification> => direct
         ? runInstalledVerifier(bootstrap, [helper, ...(hostRequest ? [hostRequest] : [])], requirement, bundle, backing, deadline)
         : { verified: verifyPrevious(helper) };
       let verified = preliminary;
-      const cached = retainedVerifier === undefined ? await verify('0') : verifierRefusal;
+      const cached = direct ? await verify('0') : verifierRefusal;
       if (!cached.verified) {
         const mapping = storageMapping(root, deadline);
         if (!mapping.image || mapping.image['image-path'] !== image || storageMapping(image, deadline).image ||
