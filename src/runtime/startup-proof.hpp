@@ -85,6 +85,72 @@ inline bool descriptors(NSDictionary* value, const std::string& bundle, int root
     !fstat(image, &backing) && arbol_attempt::privateFile(backing) && [stamp(backing) isEqual:value[@"backing"]];
 }
 
+inline bool connectAppCache(Descriptor& connection) {
+  const auto home = arbol_boundary::appHome();
+  if (home.empty()) return false;
+  const auto endpoint = home + "/.arbol/app/browser-package-proof-v1.sock";
+  sockaddr_un addr{};
+  struct stat node{};
+  if (!address(endpoint, addr) || !arbol_boundary::canonical(endpoint) ||
+      lstat(endpoint.c_str(), &node) || !S_ISSOCK(node.st_mode) || node.st_uid != geteuid() ||
+      (node.st_mode & 07777) != 0600) return false;
+  connection.reset(socket(AF_UNIX, SOCK_STREAM, 0));
+  const int fd = connection.get();
+  audit_token_t token{};
+  int suppressSignal = 1;
+  if (fd < 0 || fcntl(fd, F_SETFD, FD_CLOEXEC) || fcntl(fd, F_SETFL, O_NONBLOCK) ||
+      setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &suppressSignal, sizeof(suppressSignal)) ||
+      connect(fd, reinterpret_cast<sockaddr*>(&addr), addr.sun_len) || !peerToken(fd, token)) return false;
+  arbol_boundary::Identity process;
+  std::string executable;
+  if (arbol_boundary::observe(audit_token_to_pid(token), process) != 1 ||
+      process.version != audit_token_to_pidversion(token) ||
+      !arbol_boundary::executable(process, executable) || executable != arbol_boundary::supervisorExecutable()) return false;
+  NSDictionary* attributes = @{(__bridge NSString*)kSecGuestAttributeAudit:[NSData dataWithBytes:&token length:sizeof(token)]};
+  return arbol_boundary::liveApplicationCode(attributes) && arbol_boundary::current(process) == 1;
+}
+
+inline bool cached(const std::string& bundle, int root, int image, double cutoff,
+                   NSString* expectedImage = nil, NSString* expectedSnapshot = nil) {
+  Descriptor connection;
+  const double deadline = std::min(cutoff, arbol_boundary::clockMs() + 150);
+  if (!connectAppCache(connection)) return false;
+  const int fd = connection.get();
+  const char query = 'Q';
+  if (send(fd, &query, 1, 0) != 1 || shutdown(fd, SHUT_WR)) return false;
+  std::string data;
+  while (arbol_boundary::clockMs() < deadline && data.size() <= packetLimit) {
+    pollfd ready{fd, POLLIN, 0};
+    if (poll(&ready, 1, 25) < 1 || !(ready.revents & (POLLIN | POLLHUP))) return false;
+    char buffer[packetLimit];
+    const ssize_t count = read(fd, buffer, sizeof(buffer));
+    if (count < 0) return false;
+    if (count == 0) {
+      NSDictionary* cachedProof = arbol_attempt::json(data);
+      NSString* digest = cachedProof[@"imageSha256"];
+      if (!arbol_attempt::pattern(digest, @"^[0-9a-f]{64}$") ||
+          (expectedImage && ![expectedImage isEqual:digest]) ||
+          (expectedSnapshot && ![expectedSnapshot isEqual:cachedProof[@"snapshot"]])) return false;
+      NSMutableDictionary* physicalProof = [cachedProof mutableCopy];
+      [physicalProof removeObjectForKey:@"imageSha256"];
+      return descriptors(physicalProof, bundle, root, image) && arbol_boundary::clockMs() < deadline;
+    }
+    data.append(buffer, size_t(count));
+  }
+  return false;
+}
+
+inline void publishToApp(NSDictionary* verified, NSString* imageDigest, double deadline) {
+  if (arbol_boundary::clockMs() >= deadline || !packet(verified) ||
+      !arbol_attempt::pattern(imageDigest, @"^[0-9a-f]{64}$")) return;
+  Descriptor connection;
+  if (!connectAppCache(connection)) return;
+  NSMutableDictionary* proof = [verified mutableCopy];
+  proof[@"imageSha256"] = imageDigest;
+  const std::string frame = "P" + arbol_attempt::bytes(proof);
+  if (frame.size() <= packetLimit) (void)send(connection.get(), frame.data(), frame.size(), 0);
+}
+
 // The native parent and the Node command share an anonymous write pipe.
 // Only the verified command can nominate the exact original package.
 class Relay {
@@ -119,7 +185,8 @@ public:
     starter_ = starter;
     return true;
   }
-  void advance(const std::string& bundle, int root, int backing, double deadline) {
+  void advance(const std::string& bundle, int root, int backing, NSString* imageDigest, double deadline,
+               bool completedInfo = false) {
     if (arbol_boundary::clockMs() >= deadline) return;
     if (input_.get() >= 0) {
       char bytes[packetLimit];
@@ -129,7 +196,10 @@ public:
         if (raw_.size() > packetLimit) input_.reset();
       } else if (!count) {
         NSDictionary* candidate = arbol_attempt::json(raw_);
-        if (arbol_attempt::currentProcess(starter_) && descriptors(candidate, bundle, root, backing)) verified_ = candidate;
+        if ((completedInfo || arbol_attempt::currentProcess(starter_)) && descriptors(candidate, bundle, root, backing)) {
+          verified_ = candidate;
+          publishToApp(verified_, imageDigest, deadline);
+        }
         input_.reset();
       }
     }

@@ -1,6 +1,7 @@
 // Installed Browser entry. It uses only the account's installed image and guard.
 #include "attempt.hpp"
 #include "startup-proof.hpp"
+#include <os/log.h>
 #include <poll.h>
 
 namespace {
@@ -308,6 +309,10 @@ int launch(int argc, const char* argv[], double deadline) {
   }
   if (arbol_attempt::profileFormat == 2 && rehearsal) return 4;
   if (rehearsal && !admitRehearsal(receipt, argc - first, argv + first)) return 4;
+  const bool ordinaryOpen = arbol_attempt::profileFormat == 2 && first < argc && !strcmp(argv[first], "open") &&
+    std::any_of(argv + first + 1, argv + argc, [](const char* value) { return !strcmp(value, "--await-approval"); });
+  const bool infoProof = arbol_attempt::profileFormat == 2 && argc - first == 1 && !strcmp(argv[first], "info");
+  const bool prepareProof = ordinaryOpen || infoProof;
   NSString* root = [[home stringByAppendingPathComponent:@ARBOL_INSTALLATION_STABLE_BUILDS] stringByAppendingPathComponent:build];
   const std::string mount = [root stringByAppendingPathComponent:@"app"].fileSystemRepresentation;
   const std::string bundle = mount + "/ArbolBrowser.app";
@@ -324,8 +329,14 @@ int launch(int argc, const char* argv[], double deadline) {
   const std::string imagePath = image.fileSystemRepresentation;
   FD backing(openInstalledFile(imagePath));
   struct stat imageStat{};
-  if (backing.get() < 0 || fstat(backing.get(), &imageStat) ||
-      ![imageDigest(backing.get(), imagePath, imageStat, deadline) isEqual:receipt[@"imageSha256"]]) return 4;
+  if (backing.get() < 0 || fstat(backing.get(), &imageStat) || !fileIdentity(backing.get(), imagePath, imageStat)) return 4;
+  FD cacheRoot(ordinaryOpen ? open(bundle.c_str(), O_DIRECTORY | O_RDONLY | O_NOFOLLOW | O_CLOEXEC) : -1);
+  arbol_attempt::MaintenancePayload cachedMount;
+  const bool cachedPackage = cacheRoot.get() >= 0 &&
+    arbol_startup_proof::cached(bundle, cacheRoot.get(), backing.get(), deadline, receipt[@"imageSha256"]) &&
+    cachedMount.capture(layout, false);
+  if (!cachedPackage && ![imageDigest(backing.get(), imagePath, imageStat, deadline) isEqual:receipt[@"imageSha256"]]) return 4;
+  if (cachedPackage) os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT, "arbol-browser stable launcher used App package proof");
 
   const std::string mountGuardPath = layout.guard + ".mount";
   FD mountGuard(openInstalledFile(mountGuardPath));
@@ -340,8 +351,9 @@ int launch(int argc, const char* argv[], double deadline) {
     if (!entries || entries.count || !diskImageTool(@[@"attach", image, @"-readonly", @"-nokernel",
         @"-mountpoint", point, @"-noautoopen", @"-nobrowse", @"-plist"], deadline)) return 4;
   }
-  if (!mountedImage(mount, image, deadline) || !fileIdentity(backing.get(), imagePath, imageStat) ||
-      !arbol_boundary::canonical(bundle) || !arbol_attempt::signedIdentity(bundle, @ARBOL_PRODUCTION_BUNDLE_ID, true) ||
+  if ((cachedPackage ? !cachedMount.current() : !mountedImage(mount, image, deadline)) ||
+      !fileIdentity(backing.get(), imagePath, imageStat) || !arbol_boundary::canonical(bundle) ||
+      (!cachedPackage && !arbol_attempt::signedIdentity(bundle, @ARBOL_PRODUCTION_BUNDLE_ID, true)) ||
       !arbol_boundary::lockIdentity(lock) || !fileIdentity(mountGuard.get(), mountGuardPath, mountGuardStat) ||
       readSelection(selectionPath) != selected || clockMs() >= deadline || flock(mountGuard.get(), LOCK_UN)) return 4;
 
@@ -366,16 +378,14 @@ int launch(int argc, const char* argv[], double deadline) {
   posix_spawn_file_actions_t actions;
   if (capsule.get() < 0 || posix_spawn_file_actions_init(&actions)) return 4;
   arbol_boundary::SpawnCopies copies;
-  const bool prepareRelay = arbol_attempt::profileFormat == 2 && first < argc && !strcmp(argv[first], "open") &&
-    std::any_of(argv + first + 1, argv + argc, [](const char* value) { return !strcmp(value, "--await-approval"); });
   int channel[2] = {-1, -1};
-  if (prepareRelay && pipe(channel)) {
+  if (prepareProof && pipe(channel)) {
     channel[0] = -1;
     channel[1] = -1;
   }
   arbol_startup_proof::Relay relay(channel[0]);
   FD writer(channel[1]);
-  FD retainedRoot(prepareRelay ? open(bundle.c_str(), O_DIRECTORY | O_RDONLY | O_NOFOLLOW | O_CLOEXEC) : -1);
+  FD retainedRoot(prepareProof ? open(bundle.c_str(), O_DIRECTORY | O_RDONLY | O_NOFOLLOW | O_CLOEXEC) : -1);
   const bool offerProof = writer.get() >= 0 && retainedRoot.get() >= 0;
   if (!copies.map(actions, guard.get(), arbol_attempt::cliBuildDescriptor) ||
       !copies.map(actions, capsule.get(), arbol_attempt::cliCapsuleDescriptor) ||
@@ -411,11 +421,17 @@ int launch(int argc, const char* argv[], double deadline) {
     do {
       waited = waitpid(child, &status, WNOHANG);
       if (waited == child || (waited < 0 && errno != EINTR)) break;
-      relay.advance(bundle, retainedRoot.get(), backing.get(), deadline);
+      relay.advance(bundle, retainedRoot.get(), backing.get(), receipt[@"imageSha256"], deadline);
       usleep(1000);
     } while (clockMs() < deadline);
     if (!waited || (waited < 0 && errno == EINTR)) {
       do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+    }
+    if (infoProof && waited == child && WIFEXITED(status) && !WEXITSTATUS(status)) {
+      // A short Info command can publish and exit between polls. Reap the
+      // exact spawned child first, then drain its private pipe through EOF.
+      relay.advance(bundle, retainedRoot.get(), backing.get(), receipt[@"imageSha256"], deadline, true);
+      relay.advance(bundle, retainedRoot.get(), backing.get(), receipt[@"imageSha256"], deadline, true);
     }
   } else {
     do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);

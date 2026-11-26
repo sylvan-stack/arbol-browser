@@ -186,9 +186,10 @@ public:
     if (!arbol_attempt::claimedLayout(attempt, claimed) || claimed.bundle != layout.bundle ||
         claimed.guard != layout.guard || !image_.openPath(imagePath(layout), 0600, 1024LL * 1024 * 1024)) return false;
     root_.reset(open(layout.bundle.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
-    return root_.get() >= 0 && mount_.capture(layout, false) &&
-      arbol_startup_proof::fromStarter(attempt, layout.bundle, root_.get(), image_.fd,
-        std::min(expiry, arbol_boundary::clockMs() + 60)) && current();
+    if (root_.get() < 0 || !mount_.capture(layout, false)) return false;
+    return (arbol_startup_proof::fromStarter(attempt, layout.bundle, root_.get(), image_.fd,
+        std::min(expiry, arbol_boundary::clockMs() + 60)) ||
+      arbol_startup_proof::cached(layout.bundle, root_.get(), image_.fd, expiry, nil, attempt[@"candidateDigest"])) && current();
   }
 };
 
@@ -243,6 +244,11 @@ static int verifyInstalledPackage(const arbol_attempt::PackagedLayout& layout, N
       os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT, "arbol-browser startup used launcher package proof");
       return 0;
     }
+  }
+  if (arbol_startup_proof::cached(layout.bundle, STDOUT_FILENO, image.fd, expiry) &&
+      immutable.capture(layout, false) && backing.current(image) && sameBundle() && inTime()) {
+    os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT, "arbol-browser verifier used App package proof");
+    return 0;
   }
   if (!immutable.capture(layout, false) || !signature(bundle, true, false, true)) return 4;
   NSDictionary* manifest = json([bundle stringByAppendingPathComponent:@"Contents/Resources/native-compatibility.json"]);
