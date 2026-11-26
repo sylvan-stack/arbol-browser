@@ -1,6 +1,7 @@
 #pragma once
 // Closed target/encoding/provider table from the retained signed prototype,
 // abi-inspection.json; production qualification is separate. No runtime discovery.
+#include <mach-o/dyld.h>
 #import <Cocoa/Cocoa.h>
 #import <objc/runtime.h>
 #include <node_api.h>
@@ -135,7 +136,16 @@ inline const Target targets[] = {
   {"WebContentsViewCocoa", "draggingUpdated:", "Q24@0:8@16", "Electron Framework"},
   {"WebContentsViewCocoa", "performDragOperation:", "B24@0:8@16", "Electron Framework"},
 };
-struct Hook { Class cls; SEL selector; IMP before; IMP guard; std::string encoding; std::string provider; bool applied; };
+struct Hook {
+  Class cls;
+  SEL selector;
+  IMP before;
+  IMP guard;
+  std::string encoding;
+  std::string provider;
+  bool applied;
+  const mach_header* providerImage = nullptr;
+};
 extern std::vector<Hook> hooks;
 // ABR-6 binds these internal seams to weak-view/tombstone policy. They are not
 // JavaScript exports and may be installed only during the one planning phase.

@@ -32,10 +32,11 @@ export const profileMigrationPredecessor = Object.freeze({
   launcherSha256: '1cb4b88f12fe7f8c157c272cf284f0effa798fa74ad1338e9826851304501bcf',
 });
 const readableDataEpochs = Object.freeze([1]);
-// Signed format-2 Builds f and 12 use the same pinned Electron/Chromium data epoch.
+// Signed format-2 Builds f, 12 and 17 use the same pinned Electron/Chromium data epoch.
 const productionFormat2Predecessors = [
   '2f5768753521620b7fe65f0726fc4898df44abb781d1e1adc0bf86cbb4f5f70d',
   '8a6879d72a0f89306ac4f54f6919ca20e149b45019771b93083c4615dd78eb64',
+  '9df13c6dc36502305fdd6d605e259efeeefde89b150f63ae17109a60ba47afe2',
 ];
 function predecessorReaderKeys(scope) {
   const keys = ['production', 'isolated'].includes(scope)

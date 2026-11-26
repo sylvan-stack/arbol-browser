@@ -3,6 +3,7 @@
 #include <limits.h>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <stdexcept>
 namespace arbol_native {
 std::atomic<Phase> phase{Phase::New};
@@ -53,32 +54,45 @@ NSString* providerOf(IMP implementation) {
   if (!dladdr((void*)implementation, &image) || !image.dli_fname) return @"<unknown>";
   return resolveProvider(image);
 }
+// Darwin's header lookup resolves the current mapping without symbol lookup.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+static const mach_header* loadedImage(const void* address) {
+  return _dyld_get_image_header_containing_address(address);
+}
+#pragma clang diagnostic pop
+static void pinHookProviders() {
+  static std::map<const mach_header*, void*> pinned;
+  for (auto& hook : hooks) {
+    const auto* implementation = reinterpret_cast<const void*>(hook.before);
+    Dl_info image{};
+    if (!dladdr(implementation, &image) || !image.dli_fname ||
+        ![resolveProvider(image) isEqualToString:@(hook.provider.c_str())])
+      throw std::runtime_error("native_provider_changed");
+    const auto* header = loadedImage(implementation);
+    if (!header || header != image.dli_fbase) throw std::runtime_error("native_provider_header_changed");
+    if (!pinned.count(header)) {
+      // Keep one loader reference per verified mapping for the process lifetime.
+      void* handle = dlopen(image.dli_fname, RTLD_NOLOAD | RTLD_NOW | RTLD_LOCAL);
+      if (!handle) throw std::runtime_error("native_provider_pin_failed");
+      if (_dyld_get_dlopen_image_header(handle) != header) {
+        dlclose(handle);
+        throw std::runtime_error("native_provider_pin_changed");
+      }
+      pinned.emplace(header, handle);
+    }
+    if (loadedImage(implementation) != header)
+      throw std::runtime_error("native_provider_header_changed");
+    hook.providerImage = header;
+  }
+}
 bool installedHooksIntact() {
-  struct ProviderImage {
-    const void* base = nullptr;
-    std::string loaderPath;
-  };
-  // The positive path proof belongs to this one synchronous integrity pass.
-  ProviderImage appKit, electron;
   for (const auto& hook : hooks) {
     Method method = class_getInstanceMethod(hook.cls, hook.selector);
     if (!hook.applied || !method || method_getImplementation(method) != hook.guard ||
-        strcmp(method_getTypeEncoding(method), hook.encoding.c_str())) return false;
-
-    ProviderImage* verified = nullptr;
-    if (hook.provider == "AppKit") verified = &appKit;
-    else if (hook.provider == "Electron Framework") verified = &electron;
-    if (!verified) {
-      if (![providerOf(hook.before) isEqualToString:@(hook.provider.c_str())]) return false;
-      continue;
-    }
-
-    Dl_info image{};
-    if (!dladdr((void*)hook.before, &image) || !image.dli_fname) return false;
-    if (verified->base && verified->base == image.dli_fbase && verified->loaderPath == image.dli_fname) continue;
-    if (![resolveProvider(image) isEqualToString:@(hook.provider.c_str())]) return false;
-    verified->base = image.dli_fbase;
-    verified->loaderPath = image.dli_fname;
+        strcmp(method_getTypeEncoding(method), hook.encoding.c_str()) || !hook.providerImage ||
+        loadedImage(reinterpret_cast<const void*>(hook.before)) != hook.providerImage)
+      return false;
   }
   return true;
 }
@@ -141,7 +155,15 @@ static void planOwnershipGuards() {
   size_t required = 0;
   for (const auto& target : targets) if (strcmp(target.encoding, "<absent>")) {
     ++required; bool planned = false;
-    for (const auto& hook : hooks) if (hook.cls == objc_getClass(target.cls) && hook.selector == sel_registerName(target.selector)) planned = true;
+    const Class cls = objc_getClass(target.cls);
+    const SEL selector = sel_registerName(target.selector);
+    for (const auto& hook : hooks) {
+      if (hook.cls == cls && hook.selector == selector) {
+        if (hook.provider != target.provider) throw std::runtime_error("native_route_provider_mismatch");
+        planned = true;
+        break;
+      }
+    }
     if (!planned) throw std::runtime_error("native_route_not_planned");
   }
   if (hooks.size() != required) throw std::runtime_error("native_route_coverage_mismatch");
@@ -163,6 +185,7 @@ static napi_value install(napi_env env, napi_callback_info info) {
       if (error || ![expected isKindOfClass:[NSDictionary class]] || ![expected isEqual:pinnedInventory()] || ![expected isEqual:liveInventory()]) throw std::runtime_error("native_inventory_mismatch");
       planOwnershipGuards();
       if (hooks.empty()) throw std::runtime_error("native_empty_plan");
+      pinHookProviders();
       // Complete preflight before the first mutation, then recheck each commit.
       for (const auto& hook : hooks) if (!originalIntact(hook)) throw std::runtime_error("native_plan_changed");
       for (auto& hook : hooks) {
