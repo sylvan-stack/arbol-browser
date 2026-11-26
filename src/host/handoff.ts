@@ -318,6 +318,7 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
   let phase: 'prepared' | 'live' | 'closed' = 'prepared';
   let registry: TabRegistry | undefined, runtime: HostLifecycle | undefined, everBound = false;
   let presented = false;
+  const emptyPresentations = new WeakMap<ConnectionContext, number>();
   const windows = new Map<WindowHost, ShellRegistration>();
   const contexts = new Map<string, ConnectionContext>(), attempted = new WeakSet<ConnectionContext>();
   const disconnected = new WeakSet<ConnectionContext>(), cleanups = new Map<string, Promise<void>>();
@@ -712,7 +713,12 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
           const showEmpty = request.params.showEmpty === true;
           const empty = tabs().all().length === 0;
           const destination = !showEmpty && (url !== undefined || empty) ? userURL(url ?? 'about:blank') : undefined;
-          if (destination !== undefined && host.hasForegroundWork()) throw new ForegroundWorkRequired('window');
+          const preparedUntil = emptyPresentations.get(context);
+          emptyPresentations.delete(context);
+          const mustPreserveWork = () => host.hasForegroundWork() && !(preparedUntil !== undefined &&
+            performance.now() < preparedUntil && !host.window.isDestroyed() && host.window.isEnabled() &&
+            tabs().all().length === 0);
+          if (destination !== undefined && mustPreserveWork()) throw new ForegroundWorkRequired('window');
           live();
           const registration = windows.get(host);
           if (!registration) throw unavailable('browser');
@@ -726,10 +732,11 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
             } : undefined);
             live(); assertShellRegistration(registration, host);
             presented = true;
+            if (showEmpty && tabs().all().length === 0) emptyPresentations.set(context, performance.now() + 60_000);
           }
           if (destination !== undefined) {
             if (signal.aborted || performance.now() >= deadline) throw refused('control_refused');
-            if (host.hasForegroundWork()) throw new ForegroundWorkRequired('window');
+            if (mustPreserveWork()) throw new ForegroundWorkRequired('window');
             await tabs().openUser(host, destination);
             live(); assertShellRegistration(registration, host);
           }
