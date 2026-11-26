@@ -51,7 +51,8 @@ async function labels(state: string): Promise<Map<string, { instance: string; la
   return result;
 }
 
-export function createProfileNavigation(custody: HostCustody, platform: PlatformPort): ProfileNavigation | undefined {
+export function createProfileNavigation(custody: HostCustody, platform: PlatformPort,
+  yieldPresentation: () => () => void): ProfileNavigation | undefined {
   assertHostCustody(custody);
   if (custody.host.identity.layout.scope !== 'installed') return undefined;
   const selected = custody.instance.owner.profile;
@@ -101,12 +102,19 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
         try {
           await attempts.admitted(profile, runtime, deadline);
           check();
-          const reply = await client.call({ wire: 1, id: token('req'), method: 'open', params: {} }, Math.min(deadline, now() + 15000));
-          if (!openResult(reply) || reply.profile !== id || reply.process !== runtime.pid || reply.instance !== runtime.instance)
-            throw unavailable('browser');
-          check();
-          if (isFocused()) platform.activateProfileWindow?.(recordProcess(runtime));
-          return;
+          const activate = isFocused();
+          const restore = yieldPresentation();
+          try {
+            const reply = await client.call({ wire: 1, id: token('req'), method: 'open', params: {} }, Math.min(deadline, now() + 15000));
+            if (!openResult(reply) || reply.profile !== id || reply.process !== runtime.pid || reply.instance !== runtime.instance)
+              throw unavailable('browser');
+            check();
+            if (activate) platform.activateProfileWindow?.(recordProcess(runtime));
+            return;
+          } catch (error) {
+            try { restore(); } catch { /* Preserve the original presentation refusal. */ }
+            throw error;
+          }
         } finally { client.close(); }
       }
       if (!requested) {

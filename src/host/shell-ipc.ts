@@ -5,6 +5,7 @@ import { invalidInput, publicFailure, unavailable } from '../contracts/errors.js
 import type { HostCustody } from '../runtime/custody.js';
 import type { PlatformPort } from '../runtime/platform.js';
 import { createProfileNavigation, type ProfileNavigation } from './profile-navigation.js';
+import { bindProfilePresentation } from './presentation.js';
 import { assertWindowHost, shellURL, type WindowHost } from './windows.js';
 import { assertTabRegistry, refused, userURL, type TabRegistry, type TabTarget } from './tabs.js';
 
@@ -26,7 +27,8 @@ export interface ShellRegistration {
   /** The only supported loader; handlers and the initial projection already exist. */
   load(): Promise<void>;
   assertLoaded(): void;
-  show(): void;
+  offerPresentation(): void;
+  show(deadline: number, signal: AbortSignal): Promise<void>;
   publish(): void;
   dispose(): void;
 }
@@ -123,7 +125,13 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
     if (!eventShape(value)) throw unavailable('browser');
     return value;
   };
-  const profiles = profileSource && createProfileNavigation(profileSource.custody, profileSource.platform);
+  const presentation = profileSource?.custody.host.identity.layout.scope === 'installed'
+    ? bindProfilePresentation(host.window, profileSource.custody.host.policy.stateRoot, profileSource.platform, ownerSwitch =>
+      !host.window.isDestroyed() && host.window.isEnabled() && (ownerSwitch || !host.window.isFocused()) &&
+      tabs.all().filter(target => target.page.window === host).every(target => tabs.state(target).handoff === 'idle'))
+    : undefined;
+  const profiles = profileSource && presentation && createProfileNavigation(profileSource.custody, profileSource.platform, presentation.yieldForSwitch);
+  const assertPresentable = () => { registration.assertLoaded(); authority.assertOperational(); };
   const current: Registration = { host, authority, snapshot, ...(profiles ? { profiles } : {}),
     async dispatch(request): Promise<Result> {
       host.assertHealthy(); authority.assertReady();
@@ -182,9 +190,15 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
       assertShellRegistration(registration, host);
       if (!prepared || disposed || host.shell.webContents.getURL() !== shellURL) throw unavailable('browser');
     },
-    show() {
-      registration.assertLoaded(); authority.assertOperational();
+    offerPresentation() {
+      assertPresentable();
+      if (presentation) { presentation.offer(); return; }
       if (!host.window.isVisible()) host.window.showInactive();
+    },
+    async show(deadline, signal) {
+      assertPresentable();
+      if (presentation) await presentation.show(deadline, signal, assertPresentable);
+      else if (!host.window.isVisible()) host.window.showInactive();
     },
     publish() {
       if (!host.presentationStable()) return; // a real placement co-commit will notify the consistent state
@@ -194,16 +208,16 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
     },
     dispose() {
       if (disposed) return; disposed = true;
-      unsubscribe(); presentation(); senders.delete(host.shell.webContents); registrations.delete(registration);
+      unsubscribe(); unsubscribePresentation(); senders.delete(host.shell.webContents); registrations.delete(registration);
     },
   });
   installTransport(); senders.set(host.shell.webContents, current); registrations.set(registration, current);
   let unsubscribe: () => void = () => {};
-  let presentation: () => void = () => {};
+  let unsubscribePresentation: () => void = () => {};
   try {
     snapshot();
     unsubscribe = authority.subscribe(() => registration.publish());
-    presentation = host.onPresentation(() => {}, () => { if (!disposed) registration.publish(); });
+    unsubscribePresentation = host.onPresentation(() => {}, () => { if (!disposed) registration.publish(); });
     host.shell.webContents.once('destroyed', () => registration.dispose());
     return registration;
   } catch (error) { registration.dispose(); throw error; }

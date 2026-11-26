@@ -679,7 +679,7 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
       opens.set(context, new Map()); requests.set(context, new Map()); staged.set(context, new Map()); delivery.enroll(context);
       if (context.attachment && contexts.get(context.attachment.id) !== context) throw unavailable('browser');
       if (context.attachment && !presented) {
-        for (const [host, registration] of windows) { live(); assertShellRegistration(registration, host); registration.show(); }
+        for (const [host, registration] of windows) { live(); assertShellRegistration(registration, host); registration.offerPresentation(); }
         presented = true;
       }
     },
@@ -715,7 +715,8 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
           live();
           const registration = windows.get(host);
           if (!registration) throw unavailable('browser');
-          assertShellRegistration(registration, host); registration.show();
+          assertShellRegistration(registration, host); await registration.show(deadline, signal);
+          live(); assertShellRegistration(registration, host);
           presented = true;
           const info = operations.info();
           value = { profile: info.profile, instance: info.instance, process: process.pid, alreadyRunning: true };
