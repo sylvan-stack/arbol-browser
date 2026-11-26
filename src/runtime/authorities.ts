@@ -381,8 +381,8 @@ async function verifySelectedHost(selection: BuildSelection, payload: string, de
       // The canonical bootstrap alone owns this Native candidate brand. Reuse
       // that exact original frozen object, with no second signer or snapshot.
       signed = manifests.reuseNativeCandidateForHost(layout.bundle, bootstrapSigned, deadline);
-    } else signed = manifests.verifySignedBundle(layout.bundle, deadline, image ? 'production' : 'isolated',
-      ordinaryOpen ? image : undefined);
+    } else if (ordinaryOpen && image) signed = await manifests.verifyInstalledStartupBundle(layout.bundle, image, deadline);
+    else signed = manifests.verifySignedBundle(layout.bundle, deadline, image ? 'production' : 'isolated');
     if (image) manifests.assertInstalledImage(signed, image, deadline);
   } catch (error) {
     try {

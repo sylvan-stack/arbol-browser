@@ -1,6 +1,6 @@
 /** The publisher anchor is source policy, never derived from a running package. */
 import { createHash } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
 import { basename, join, dirname, resolve, sep, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -575,6 +575,7 @@ const retainedStartupVerifiers: Readonly<Record<string, string>> = Object.freeze
   '2c': 'f07c5c8ce0153ef94286ba3ac7a652e01485f920',
   '2d': '9fdb9ea348448ddbb73101fc64955600977cf5d7',
   '2e': '40b6b518a143ada94c05a0ec3a8cb9fb061bc416',
+  '2f': 'efc1dab478035a09a3b7568fbfdbd1bfb67dfb1f',
 });
 function hasRetainedStartupVerifier(root: string, deadline: number): boolean {
   const expected = retainedStartupVerifiers[basename(dirname(dirname(root)))];
@@ -584,8 +585,45 @@ function hasRetainedStartupVerifier(root: string, deadline: number): boolean {
   finally { closeSync(file.fd); }
 }
 
-function verifyInstalledStartupStorage(root: string, image: string, deadline: number, retainedVerifier?: string,
-  hostRequest?: string): StorageContext {
+async function runInstalledVerifier(bootstrap: string, args: string[], requirement: string,
+  bundle: StorageDescription, backing: StorageDescription, deadline: number): Promise<boolean> {
+  const remaining = budget(deadline);
+  const environment = { PATH: '/usr/bin:/bin' };
+  const child = spawn(bootstrap, ['--arbol-verify-installed-package', ...args], {
+    env: environment, stdio: ['pipe', bundle.fd, backing.fd],
+  });
+  const result = new Promise<boolean>(resolve => {
+    child.once('error', () => resolve(false));
+    child.once('exit', code => resolve(code === 0));
+  });
+  const gate = child.stdin;
+  const stop = () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  };
+  gate?.on('error', stop);
+  const timer = setTimeout(stop, remaining);
+  try {
+    if (!gate || !child.pid) return false;
+    // The gated child receives approval only after stock Security verifies
+    // this live exec against the original descriptor's exact CodeDirectory.
+    const signature = spawnSync('/usr/bin/codesign', ['--verify', '--strict', '-R', '=' + requirement, String(child.pid)], {
+      timeout: budget(deadline), killSignal: 'SIGKILL', env: environment, stdio: 'ignore',
+    });
+    budget(deadline);
+    if (signature.error || signature.status !== 0 || child.exitCode !== null) return false;
+    gate.end('1');
+    const verified = await result;
+    budget(deadline);
+    return verified;
+  } finally {
+    clearTimeout(timer);
+    gate?.destroy();
+    stop();
+  }
+}
+
+async function verifyInstalledStartupStorage(root: string, image: string, deadline: number, retainedVerifier?: string,
+  hostRequest?: string): Promise<StorageContext> {
   const descriptions: StorageDescription[] = [];
   try {
     // Pin the same original names and descriptions before running any checks.
@@ -610,7 +648,7 @@ function verifyInstalledStartupStorage(root: string, image: string, deadline: nu
           realpathSync(bootstrap) !== bootstrap) return refuse();
       // Process identity, read-only backing, full code signatures and every
       // signed payload entry are checked inside the signed bootstrap.
-      const verify = (helper: string): boolean => {
+      const verifyPrevious = (helper: string): boolean => {
         const result = spawnSync('/usr/bin/osascript', ['-l', 'JavaScript', '-e', installedVerifierBroker,
           bootstrap, helper, requirement, ...(hostRequest ? [hostRequest] : [])], {
           timeout: budget(deadline), killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'ignore', bundle.fd, backing.fd],
@@ -620,11 +658,14 @@ function verifyInstalledStartupStorage(root: string, image: string, deadline: nu
         budget(deadline);
         return !result.error && result.status === 0 && result.stdout === 'verified\n';
       };
+      const verify = (helper: string): boolean | Promise<boolean> => retainedVerifier === undefined
+        ? runInstalledVerifier(bootstrap, [helper, ...(hostRequest ? [hostRequest] : [])], requirement, bundle, backing, deadline)
+        : verifyPrevious(helper);
       let verified = preliminary;
-      if (retainedVerifier !== undefined || !verify('0')) {
+      if (retainedVerifier !== undefined || !await verify('0')) {
         const mapping = storageMapping(root, deadline);
         if (!mapping.image || mapping.image['image-path'] !== image || storageMapping(image, deadline).image ||
-            !verify(String(mapping.image['hdid-pid']))) return refuse();
+            !await verify(String(mapping.image['hdid-pid']))) return refuse();
         verified = context(mapping.key);
       }
       if (physicalStamp(fstatSync(executable.fd, { bigint: true })) !== executable.stamp ||
@@ -1033,25 +1074,39 @@ export function assertStartupCandidateTrust(value: CandidateTrust, deadline: num
   if (poisonedTrust || value !== trustedCandidate) refuse();
   value.assertIdentity(deadline, true);
 }
-export function verifySignedBundle(bundle: string, deadline = Infinity, scope: PublisherScope = 'isolated',
-  installedStartupImage?: string, hostRequest?: string): SignedBundle {
+export function verifySignedBundle(bundle: string, deadline = Infinity, scope: PublisherScope = 'isolated'): SignedBundle {
+  return assembleSignedBundle(bundle, deadline, scope);
+}
+
+export async function verifyInstalledStartupBundle(bundle: string, image: string, deadline: number,
+  hostRequest?: string): Promise<SignedBundle> {
+  const root = resolve(bundle);
+  try {
+    budget(deadline);
+    if (!bundle.endsWith('.app') || realpathSync(bundle) !== root) return refuse();
+  } catch (error) { return refuseVerification('bundle-selection', error); }
+  const payloadRoot = resolve(fileURLToPath(new URL('../../', import.meta.url)));
+  const exactCurrent = root === dirname(dirname(dirname(payloadRoot)));
+  if (process.platform !== 'darwin' || (!exactCurrent && !hasRetainedStartupVerifier(root, deadline)))
+    return verifySignedBundle(root, deadline, 'production');
+  const storage = await verifyInstalledStartupStorage(root, image, deadline,
+    exactCurrent ? undefined : retainedStartupVerifiers[basename(dirname(dirname(root)))],
+    exactCurrent ? hostRequest : undefined);
+  return assembleSignedBundle(root, deadline, 'production', storage);
+}
+
+function assembleSignedBundle(bundle: string, deadline: number, scope: PublisherScope,
+  startupStorage?: StorageContext): SignedBundle {
   const observed: SnapshotFailure = {};
   let phase: SignedVerificationPhase = 'bundle-selection';
-  let storage: StorageContext | undefined, retained = false;
+  let storage = startupStorage, retained = false;
   try {
     budget(deadline);
     if (!bundle.endsWith('.app') || realpathSync(bundle) !== resolve(bundle)) refuse();
     const root = resolve(bundle);
     const expectedPublisher = scope === 'production' ? productionPublisher : publisher;
-    const payloadRoot = resolve(fileURLToPath(new URL('../../', import.meta.url)));
-    const exactCurrent = root === dirname(dirname(dirname(payloadRoot)));
-    const installedStartup = scope === 'production' && installedStartupImage !== undefined && process.platform === 'darwin' &&
-      (exactCurrent || hasRetainedStartupVerifier(root, deadline));
-    storage = installedStartup
-      ? verifyInstalledStartupStorage(root, installedStartupImage, deadline,
-        exactCurrent ? undefined : retainedStartupVerifiers[basename(dirname(dirname(root)))],
-        exactCurrent ? hostRequest : undefined)
-      : discoverStorage(root, deadline);
+    const installedStartup = startupStorage !== undefined;
+    storage ??= discoverStorage(root, deadline);
     const mounted: MountedBundleRead | undefined = scope === 'production' && storage
       ? { device: fstatSync(storage.descriptions[0].fd, { bigint: true }).dev, files: new Map() }
       : undefined;
@@ -1167,8 +1222,7 @@ export function verifySignedBundle(bundle: string, deadline = Infinity, scope: P
   } catch (error) { noteSnapshotFailure(observed, error, phase); throw error; }
   finally { if (!retained && storage) for (const d of storage.descriptions) { try { closeSync(d.fd); } catch { /* Preserve construction refusal. */ } } }
 }
-export function verifyNativeCandidate(bundle: string, deadline = Infinity, scope: PublisherScope = 'isolated',
-  installedStartupImage?: string, hostRequest?: string): CandidateTrust {
+function existingNativeCandidate(bundle: string, deadline: number, scope: PublisherScope): CandidateTrust | undefined {
   if (poisonedTrust) refuse();
   if (trustedCandidate) {
     const expectedPublisher = scope === 'production' ? productionPublisher : publisher;
@@ -1178,7 +1232,21 @@ export function verifyNativeCandidate(bundle: string, deadline = Infinity, scope
     trustedCandidate.assertIdentity(deadline); return trustedCandidate;
   }
   if (attemptedTrust) refuse(); attemptedTrust = true;
-  try { trustedCandidate = verifySignedBundle(bundle, deadline, scope, installedStartupImage, hostRequest); return trustedCandidate; }
+  return undefined;
+}
+
+export function verifyNativeCandidate(bundle: string, deadline = Infinity, scope: PublisherScope = 'isolated'): CandidateTrust {
+  const existing = existingNativeCandidate(bundle, deadline, scope);
+  if (existing) return existing;
+  try { trustedCandidate = verifySignedBundle(bundle, deadline, scope); return trustedCandidate; }
+  catch (error) { poisonedTrust = true; return refuseVerification('bundle-selection', error); }
+}
+
+export async function verifyInstalledNativeCandidate(bundle: string, image: string, deadline: number,
+  hostRequest?: string): Promise<CandidateTrust> {
+  const existing = existingNativeCandidate(bundle, deadline, 'production');
+  if (existing) return existing;
+  try { trustedCandidate = await verifyInstalledStartupBundle(bundle, image, deadline, hostRequest); return trustedCandidate; }
   catch (error) { poisonedTrust = true; return refuseVerification('bundle-selection', error); }
 }
 
