@@ -255,7 +255,8 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
         await assertHostStartupContinuity(verified, deadline, deadline);
       };
       if (host) await verifyListingBuild(host);
-      if (startingHost && process.type === 'browser' && actualMode === 'prior') {
+      const startProofMayApply = process.type === 'browser' ? actualMode === 'prior' : actualMode === 'reserve';
+      if (startingHost && startProofMayApply) {
         assertVerifiedHostMetadata(startingHost, deadline);
         const currentLayout = startingHost.identity.layout;
         if (currentLayout.build === oldSelection.build && currentLayout.buildRoot === oldSelection.directory &&

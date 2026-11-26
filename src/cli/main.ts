@@ -117,7 +117,8 @@ async function productionPorts(selection: BuildSelection, observation?: ColdObse
   noteCold(observation, 'native-platform');
   const platform = installed?.platform ?? loadPlatform();
   noteCold(observation, 'production-adapters');
-  const exits = createProductionExitAuthority(platform, selection, undefined, listingHost);
+  const startingHost = installed && openCutoff !== undefined ? host : undefined;
+  const exits = createProductionExitAuthority(platform, selection, startingHost, listingHost);
   const openObservation = observation ? authorities.createOpenCommandObservation() : undefined;
   if (observation && openObservation) observation.open = openObservation;
   const integration = createProductionProcessIntegration(host, selection, platform, exits, openObservation, openCutoff);
