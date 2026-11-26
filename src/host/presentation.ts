@@ -67,9 +67,14 @@ export function bindProfilePresentation(window: BaseWindow, state: string, platf
     }
     finally { request.release(); }
   }
-  async function show(deadline: number, signal: AbortSignal, check: () => void, raiseWindow = false): Promise<void> {
+  async function show(deadline: number, signal: AbortSignal, check: () => void, raiseWindow = false,
+    mayShowEmpty?: () => boolean): Promise<void> {
     check();
-    if (signal.aborted || performance.now() >= deadline) throw busy();
+    if (signal.aborted || performance.now() >= deadline) {
+      if (mayShowEmpty) return;
+      throw busy();
+    }
+    if (mayShowEmpty && !mayShowEmpty()) return;
     if (held && window.isVisible() && !window.isMinimized()) {
       held.assertIdentity();
       if (raiseWindow) window.moveTop();
@@ -81,6 +86,7 @@ export function bindProfilePresentation(window: BaseWindow, state: string, platf
     try {
       while (performance.now() < cutoff && !signal.aborted) {
         check();
+        if (mayShowEmpty && !mayShowEmpty()) return;
         request ??= platform.tryLock(requests);
         if (request) {
           presenting = true;
@@ -93,10 +99,10 @@ export function bindProfilePresentation(window: BaseWindow, state: string, platf
         }
         await delay(25, undefined, { signal });
       }
-      throw busy();
+      if (!mayShowEmpty) throw busy();
     } finally {
       if (request) {
-        try { if (!shown && held) hide(); }
+        try { if (!shown && held && (!mayShowEmpty || !window.isVisible())) hide(); }
         finally { presenting = false; request.release(); }
       }
     }
@@ -104,15 +110,14 @@ export function bindProfilePresentation(window: BaseWindow, state: string, platf
   return {
     offer,
     show,
-    async offerForeground(deadline: number, check: () => void): Promise<void> {
+    async offerForeground(deadline: number, check: () => void, mayShowEmpty: () => boolean): Promise<void> {
       check();
-      if (offer()) return;
+      if (!mayShowEmpty() || offer()) return;
       // Only a pending App-owned window warrants actively requesting the
       // lease here. Routine early offers preserve an existing focused host.
       const idle = platform.trySharedLock(appStartup);
       if (idle) { idle.release(); return; }
-      try { await show(deadline, new AbortController().signal, check, true); }
-      catch { check(); } // The normal approved Open can still present later.
+      await show(deadline, new AbortController().signal, check, true, mayShowEmpty);
     },
     yieldForSwitch(): () => void {
       if (!canYield(true)) throw busy();
