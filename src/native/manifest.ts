@@ -1,6 +1,7 @@
 /** The publisher anchor is source policy, never derived from a running package. */
 import { createHash } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { performance } from 'node:perf_hooks';
 import { basename, join, dirname, resolve, sep, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -486,9 +487,9 @@ function revalidateStorage(root: string, context: StorageContext | undefined, de
 // The signed release bootstrap is a thin arm64 Mach-O with a SHA-256
 // CodeDirectory. Derive its live-code requirement from the original open
 // description, so a different executable cannot supply the expected hash.
-function startupCodeDirectoryHash(executable: StorageDescription, deadline: number): string {
+function startupCodeDirectoryHash(executable: StorageDescription, deadline: number, maximum = nativeLimit): string {
   const original = fstatSync(executable.fd, { bigint: true });
-  if (physicalStamp(original) !== executable.stamp || original.size < 32n || original.size > BigInt(nativeLimit)) return refuse();
+  if (physicalStamp(original) !== executable.stamp || original.size < 32n || original.size > BigInt(maximum)) return refuse();
   const bytes = Buffer.alloc(Number(original.size));
   for (let at = 0; at < bytes.length;) {
     budget(deadline);
@@ -582,6 +583,7 @@ const retainedStartupVerifiers: Readonly<Record<string, string>> = Object.freeze
   '2f': 'efc1dab478035a09a3b7568fbfdbd1bfb67dfb1f',
   '30': '76b0146cea972552dd4849ec397ba70d8073d97f',
   '31': 'c0bd4507b630a86923bde6175efc9d8bcf8d3417',
+  '32': '9935adb2bcb3bf2a2d12ba2dc55304545b8105a0',
 });
 function hasRetainedStartupVerifier(root: string, deadline: number): boolean {
   const expected = retainedStartupVerifiers[basename(dirname(dirname(root)))];
@@ -589,6 +591,36 @@ function hasRetainedStartupVerifier(root: string, deadline: number): boolean {
   const file = retainedDescription(join(root, 'Contents/MacOS/arbol-browser-native'), false);
   try { return startupCodeDirectoryHash(file, deadline) === expected; }
   finally { closeSync(file.fd); }
+}
+
+function readInstalledSnapshotWithSignedSupport(root: string, bundle: StorageDescription,
+  backing: StorageDescription, deadline: number): string | undefined {
+  let library: StorageDescription | undefined;
+  try {
+    const path = join(root, 'Contents/Resources/browser/native/platform.node');
+    library = retainedDescription(path, false);
+    const original = library;
+    const rootDevice = fstatSync(bundle.fd, { bigint: true }).dev;
+    const current = (): boolean => {
+      const held = fstatSync(original.fd, { bigint: true });
+      return held.dev === rootDevice && physicalStamp(held) === original.stamp &&
+        physicalStamp(lstatSync(path, { bigint: true })) === original.stamp && realpathSync(path) === path;
+    };
+    if (!current()) return undefined;
+    const cdhash = startupCodeDirectoryHash(original, deadline, 4 * nativeLimit);
+    const requirement = productionPublisher.requirement + ` and identifier "platform" and cdhash H"${cdhash}"`;
+    const signature = spawnSync('/usr/bin/codesign', ['--verify', '--strict', '--all-architectures', '-R', '=' + requirement, path], {
+      timeout: budget(deadline), killSignal: 'SIGKILL', env: { PATH: '/usr/bin:/bin' }, stdio: 'ignore',
+    });
+    if (signature.error || signature.status !== 0 || !current()) return undefined;
+    const support = createRequire(import.meta.url)(path) as { readInstalledStartupSnapshot?: (...args: [string, number, number, number, number]) => unknown };
+    if (typeof support.readInstalledStartupSnapshot !== 'function') return undefined;
+    const digest = support.readInstalledStartupSnapshot(root, bundle.fd, backing.fd, original.fd, Math.min(250, budget(deadline)));
+    budget(deadline);
+    if (typeof digest !== 'string' || !/^[0-9a-f]{64}$/.test(digest) || !current()) return undefined;
+    return digest;
+  } catch { return undefined; }
+  finally { if (library) closeSync(library.fd); }
 }
 
 interface InstalledVerification { readonly verified: boolean; readonly snapshotDigest?: string }
@@ -675,6 +707,14 @@ async function verifyInstalledStartupStorage(root: string, image: string, deadli
           fstatSync(bundle.fd, { bigint: true }).dev ||
           physicalStamp(lstatSync(bootstrap, { bigint: true })) !== executable.stamp ||
           realpathSync(bootstrap) !== bootstrap) return refuse();
+      if (retainedVerifier === undefined) {
+        const snapshotDigest = readInstalledSnapshotWithSignedSupport(root, bundle, backing, deadline);
+        if (snapshotDigest) {
+          const verified = Object.freeze({ ...preliminary, snapshotDigest });
+          storageAssert(verified, deadline);
+          return verified;
+        }
+      }
       // Process identity, read-only backing, full code signatures and every
       // signed payload entry are checked inside the signed bootstrap.
       const verifyPrevious = (helper: string): boolean => {
