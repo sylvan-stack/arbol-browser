@@ -391,7 +391,10 @@ struct Deadline {
     // the loop tail when a complete census may make this call nonreturning.
     if(deadline.hardLoss) poison(cap,arbol_exit::protocolLoss|arbol_exit::forced,deadline.firstHardLossLine,deadline.firstHardLossSource);
     else if(deadline.fatal&&cap) cap->shared()->declareFatal();
-    if(c.engineGone(false,&childExecReadback)&&(!cap||watch.observed()||deadline.hardLoss)) {
+    // While the protected host is live, the regular census below owns
+    // liveness checks and records the exact refusal. A premature retirement
+    // scan can leave an incomplete full census cached for that live check.
+    if((!cap||watch.observed()||deadline.hardLoss)&&c.engineGone(false,&childExecReadback)) {
       // The census itself may have been delayed. Its first complete result
       // cannot be backdated from a late poll into the frozen live window.
       if(cap&&terminal&&clockMs()>=terminalExpires) { deadline.lost(clockMs()); poison(cap,arbol_exit::identityLoss); }
