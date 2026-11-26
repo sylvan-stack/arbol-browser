@@ -108,11 +108,17 @@ export function assertVerifiedMaintenanceHost(value: VerifiedMaintenanceHost): v
 const verifiedHosts = new WeakSet<object>();
 const armedHosts = new WeakMap<VerifiedHost, import('./custody.js').HostCustody>();
 const startupTrustChecks = new WeakMap<VerifiedHost, (deadline: number, originalStartupCutoff: number) => Promise<void>>();
+const startupSnapshotChecks = new WeakMap<VerifiedHost, (deadline: number) => Promise<void>>();
 const closeTrustChecks = new WeakMap<VerifiedHost, (deadline: number) => Promise<void>>();
 export async function assertHostStartupContinuity(host: VerifiedHost, deadline: number, originalStartupCutoff: number): Promise<void> {
   const check = startupTrustChecks.get(host);
   if (!check) throw unavailable('browser');
   await check(deadline, originalStartupCutoff);
+}
+export async function assertHostStartupSnapshot(host: VerifiedHost, deadline: number): Promise<void> {
+  const check = startupSnapshotChecks.get(host);
+  if (!check) throw unavailable('browser');
+  await check(deadline);
 }
 export async function assertHostCloseContinuity(host: VerifiedHost, deadline: number): Promise<void> {
   const check = closeTrustChecks.get(host);
@@ -443,7 +449,8 @@ async function verifySelectedHost(selection: BuildSelection, payload: string, de
   const result: VerifiedHost = Object.freeze({ identity, policy, signed, policyDigest: rawPolicy.digest, guardIdentity,
     assertTrusted: (limit: number, originalStartupCutoff?: number) => verifyTrusted(limit, originalStartupCutoff),
   });
-  async function verifyTrusted(limit: number, originalStartupCutoff?: number, retainedFor?: 'startup' | 'close'): Promise<void> {
+  async function verifyTrusted(limit: number, originalStartupCutoff?: number, retainedFor?: 'startup' | 'close',
+    retainStartupBytes = false): Promise<void> {
     if (!(maintenance ? maintenanceHosts.has(result) : verifiedHosts.has(result))) throw unavailable('browser');
     const custody = armedHosts.get(result);
     const closing = retainedFor === 'close' ? custody?.instance.record : undefined;
@@ -485,14 +492,14 @@ async function verifySelectedHost(selection: BuildSelection, payload: string, de
       } else if (custody) {
         assertHostCustody(custody);
         if (observeReady) noteHostStartup(custody, 'ready-trust-snapshot-before');
-        const proof = await manifests.compareSignedSnapshot(signed, limit);
+        const proof = await manifests.compareSignedSnapshot(signed, limit, retainStartupBytes);
         if (observeReady) noteHostStartup(custody, 'ready-trust-snapshot-after');
         assertHostCustody(custody);
         if (observeReady) noteHostStartup(custody, 'ready-trust-consume-before');
         manifests.consumeSignedSnapshot(proof, signed, limit);
         if (observeReady) noteHostStartup(custody, 'ready-trust-consume-after');
         assertHostCustody(custody);
-      } else signed.assertIdentity(limit);
+      } else signed.assertIdentity(limit, retainStartupBytes);
       if (closing && custody?.instance.record !== closing) throw unavailable('browser');
       if (maintenance) { assertMaintenanceCustody(maintenance.custody); maintenance.root.assert(); }
       assertBudget(limit);
@@ -511,6 +518,7 @@ async function verifySelectedHost(selection: BuildSelection, payload: string, de
   }
   if (!maintenance) {
     startupTrustChecks.set(result, (limit, cutoff) => verifyTrusted(limit, cutoff, 'startup'));
+    startupSnapshotChecks.set(result, limit => verifyTrusted(limit, undefined, undefined, true));
     closeTrustChecks.set(result, limit => verifyTrusted(limit, undefined, 'close'));
   }
   noteHostVerification(observation, 'initial-verified-host');

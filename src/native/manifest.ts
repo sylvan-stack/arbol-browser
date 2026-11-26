@@ -146,17 +146,16 @@ function signature(path: string, outer: boolean, jit: boolean, deadline: number,
     budget(deadline);
     if (result.error || result.status !== 0) refuse();
     phase = outer ? 'outer-signature-details' : 'nested-signature-details';
-    const details = spawnSync('/usr/bin/codesign', ['-dvvv', path], { timeout: budget(deadline), maxBuffer: nativeLimit, encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
+    const details = spawnSync('/usr/bin/codesign', ['-dvvv', '--entitlements', ':-', path],
+      { timeout: budget(deadline), maxBuffer: nativeLimit, encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
     budget(deadline);
     if (details.error || details.status !== 0 || !details.stderr.includes(`TeamIdentifier=${expectedPublisher.team}`) ||
         !details.stderr.includes('runtime)') || !details.stderr.includes('Timestamp=')) refuse();
     phase = outer ? 'outer-signature-entitlements' : 'nested-signature-entitlements';
-    const ent = spawnSync('/usr/bin/codesign', ['-d', '--entitlements', ':-', path], { timeout: budget(deadline), maxBuffer: nativeLimit, encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
-    budget(deadline);
-    if (ent.error || ent.status !== 0 || /com\.apple\.security\.(?:cs\.(?:disable-library-validation|allow-unsigned-executable-memory|allow-dyld-environment-variables)|get-task-allow)/.test(ent.stdout + ent.stderr)) refuse();
-    const keys = [...ent.stdout.matchAll(/<key>([^<]+)<\/key>/g)].map(match => match[1]);
+    if (/com\.apple\.security\.(?:cs\.(?:disable-library-validation|allow-unsigned-executable-memory|allow-dyld-environment-variables)|get-task-allow)/.test(details.stdout + details.stderr)) refuse();
+    const keys = [...details.stdout.matchAll(/<key>([^<]+)<\/key>/g)].map(match => match[1]);
     if (keys.length > 1 || keys.some(key => key !== 'com.apple.security.cs.allow-jit' || !jit) ||
-        (keys.length && !/<key>com\.apple\.security\.cs\.allow-jit<\/key>\s*<true\s*\/>/.test(ent.stdout))) refuse();
+        (keys.length && !/<key>com\.apple\.security\.cs\.allow-jit<\/key>\s*<true\s*\/>/.test(details.stdout))) refuse();
   } catch (error) { noteVerificationFailure(error, phase); throw error; }
 }
 export interface CandidateTrust {
@@ -164,7 +163,7 @@ export interface CandidateTrust {
   readonly manifest: Readonly<Compatibility>;
   readonly snapshotDigest: string;
   /** Cryptographic identity only. It cannot assert previous exit or production qualification. */
-  assertIdentity(deadline?: number): void;
+  assertIdentity(deadline?: number, retainStartupBytes?: boolean): void;
 }
 /** Independently verified signed bytes, without the installed Native brand.
  * Node clients may verify two different retained Builds. Only the host's one
@@ -179,6 +178,7 @@ interface PhysicalEntry {
 }
 interface FrozenSnapshot {
   readonly storage: StorageContext | undefined;
+  readonly mounted: MountedBundleRead | undefined;
   readonly encoded: string;
   readonly physical: Readonly<Record<string, PhysicalEntry>>;
   poisoned: boolean;
@@ -600,7 +600,8 @@ function asyncRead(fd: number, buffer: Buffer, length: number, position: number,
 }
 /** Recompare every original byte and physical entry. Nothing here signs,
  * loads an addon, spawns a verifier or learns a replacement snapshot. */
-async function compareCompleteSnapshot(signed: SignedBundle, snapshot: FrozenSnapshot, deadline: number): Promise<void> {
+async function compareCompleteSnapshot(signed: SignedBundle, snapshot: FrozenSnapshot, deadline: number,
+  retainStartupBytes: boolean): Promise<void> {
   const observed: SnapshotFailure = {};
   const root = signed.bundle, entries: Record<string, string> = Object.create(null), keys = Object.keys(snapshot.physical).sort();
   if (keys.length > 4097) refuseSnapshot('snapshot-directory-membership', observed);
@@ -647,6 +648,12 @@ async function compareCompleteSnapshot(signed: SignedBundle, snapshot: FrozenSna
       active(); return stat;
     } catch (error) { noteSnapshotFailure(observed, error); poison(); throw error; }
   };
+  // The caller holds the original read-only image and backing file. Stamps
+  // include the device, and every captured path and directory is still checked.
+  if (retainStartupBytes && snapshot.mounted) {
+    await phase(async key => { await check(key, true); });
+    return;
+  }
   await phase(async key => {
     const expected = snapshot.physical[key]!, path = key ? join(root, key) : root;
     const named = await check(key, true);
@@ -680,13 +687,14 @@ async function compareCompleteSnapshot(signed: SignedBundle, snapshot: FrozenSna
   await phase(async key => { await check(key, true); });
   active();
 }
-export async function compareSignedSnapshot(signed: SignedBundle, deadline: number): Promise<SignedSnapshotComparison> {
+export async function compareSignedSnapshot(signed: SignedBundle, deadline: number,
+  retainStartupBytes = false): Promise<SignedSnapshotComparison> {
   const snapshot = signedSnapshots.get(signed);
   if (!snapshot || snapshot.poisoned || (signed === trustedCandidate && poisonedTrust)) refuseVerification('repeated-snapshot');
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     budget(deadline); storageAssert(snapshot.storage, deadline);
-    await Promise.race([compareCompleteSnapshot(signed, snapshot, deadline), new Promise<never>((_resolve, reject) => {
+    await Promise.race([compareCompleteSnapshot(signed, snapshot, deadline, retainStartupBytes), new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => {
         const error = new Error('native_snapshot_timeout');
         noteVerificationFailure(error, 'verification-cutoff');
@@ -880,10 +888,10 @@ export function verifySignedBundle(bundle: string, deadline = Infinity, scope: P
     // Snapshot validation cannot be bypassed by mutation through a caller-held object.
     function frozen<T>(value: T): T { if (value && typeof value === 'object') { for (const entry of Object.values(value)) frozen(entry); Object.freeze(value); } return value; }
     const manifest = frozen(initial);
-    const snapshot: FrozenSnapshot = { storage, encoded: before, physical: Object.freeze(physical), poisoned: false };
+    const snapshot: FrozenSnapshot = { storage, mounted, encoded: before, physical: Object.freeze(physical), poisoned: false };
     const result: SignedBundle = Object.freeze({ bundle: root, manifest,
       snapshotDigest: createHash('sha256').update(before).digest('hex'),
-      assertIdentity(limit = Infinity) {
+      assertIdentity(limit = Infinity, retainStartupBytes = false) {
         const observed: SnapshotFailure = {};
         let repeatedPhase: SignedVerificationPhase = 'repeated-snapshot';
         try {
@@ -891,7 +899,9 @@ export function verifySignedBundle(bundle: string, deadline = Infinity, scope: P
           const currentPhysical: Record<string, PhysicalEntry> = Object.create(null);
           if (snapshot.poisoned) refuse();
           if (snapshotFilesystem(() => realpathSync(root), observed) !== root) refuseSnapshot('snapshot-root-identity', observed);
-          if (completeSnapshot(root, limit, currentPhysical, observed) !== before) refuseSnapshot('snapshot-encoded-mismatch', observed);
+          const retained = retainStartupBytes ? snapshot.mounted : undefined;
+          if (completeSnapshot(root, limit, currentPhysical, observed, retained, retained !== undefined) !== before)
+            refuseSnapshot('snapshot-encoded-mismatch', observed);
           repeatedPhase = 'repeated-physical';
           if (stable(currentPhysical) !== stable(snapshot.physical))
             refuseSnapshot(stampFailurePhase(currentPhysical['']?.stamp !== snapshot.physical['']?.stamp ? 'snapshot-root-identity' : 'snapshot-entry-identity', snapshot.physical['']?.stamp, currentPhysical['']?.stamp), observed);

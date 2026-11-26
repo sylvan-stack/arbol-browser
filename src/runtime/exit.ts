@@ -15,7 +15,7 @@ import { assertProfile, readJson, type ProfileSnapshot } from '../profiles/recor
 import { directory, identity, privateFile, sameIdentity, statOrAbsent } from '../profiles/paths.js';
 import { ownerLock, withOwnerLockForCustody, type OwnerLease } from '../profiles/locking.js';
 import { acquireBuildLease, withBuildLockForCustody, type BuildLease } from './build-lease.js';
-import { assertHostCloseContinuity, assertHostStartupContinuity, assertTrustedHost, assertVerifiedHostMetadata, physicalJson, verifyPackagedHost, type VerifiedHost } from './authorities.js';
+import { assertHostCloseContinuity, assertHostStartupContinuity, assertHostStartupSnapshot, assertVerifiedHostMetadata, physicalJson, verifyPackagedHost, verifyPackagedOpenHost, type VerifiedHost } from './authorities.js';
 import { assertPlatform, assertExitInspectionReceipt, type PlatformPort, type ExitInspectionReceipt, type PriorMarkerExpectation } from './platform.js';
 import { withLaunchAttempt, type LaunchAttempt } from './process.js';
 import { now, assertTime, runtimeLocation, type RuntimeRecord } from './instance.js';
@@ -276,12 +276,16 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
       }
       if (!host) {
         if (attempt.phase === 'closed') await mountRetainedImage(layout, build, platform, deadline);
-        host = await verifyPackagedHost(oldSelection, layout.payload, deadline);
+        const startup = layout.scope === 'installed' && (actualMode === 'reserve' || actualMode === 'prior');
+        host = startup
+          ? await verifyPackagedOpenHost(oldSelection, layout.payload, deadline)
+          : await verifyPackagedHost(oldSelection, layout.payload, deadline);
         if (!matchesAttempt(host)) throw unavailable('profile');
         if (listingBuilds && actualMode === 'full' && layout.scope === 'installed') {
           await verifyListingBuild(host);
           if (listingBuilds.size < 16) listingBuilds.set(oldSelection.directory, host);
-        } else await host.assertTrusted(deadline);
+        } else if (startup) await assertHostStartupSnapshot(host, deadline);
+        else await host.assertTrusted(deadline);
       }
       await build.assert();
       if (actualMode === 'prior') {
@@ -371,7 +375,7 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
     },
     async reserve(profile: ProfileSnapshot, owner: OwnerLease, host: VerifiedHost, build: BuildLease,
       pending: LaunchAttempt, deadline: number) {
-      await assertTrustedHost(host, deadline); await build.assert();
+      await assertHostStartupSnapshot(host, deadline); await build.assert();
       if (build.selection.directory !== host.identity.layout.buildRoot || pending.buildRoot !== build.selection.directory ||
           pending.candidateDigest !== host.signed.snapshotDigest || pending.sourceDigest !== host.identity.sourceDigest ||
           pending.productDigest !== host.identity.productDigest) throw unavailable('profile');

@@ -1,4 +1,4 @@
-import { noteOpenCommand, type OpenCommandObservation, type VerifiedHost } from './authorities.js';
+import { assertHostStartupSnapshot, noteOpenCommand, type OpenCommandObservation, type VerifiedHost } from './authorities.js';
 import { setTimeout } from 'node:timers/promises';
 import type { Contract } from '../contracts/generated.js';
 import { unavailable, BrowserFailure } from '../contracts/errors.js';
@@ -546,7 +546,7 @@ export function createHostLifecycle(prepared: HostPreparation, sessions: Profile
         if (productionDeadline === undefined) return prepared.custody.terminate();
         assertTime(productionDeadline);
         noteHostStartup(prepared.custody, 'lifecycle-final-trust-before');
-        await prepared.custody.host.assertTrusted(productionDeadline);
+        await assertHostStartupSnapshot(prepared.custody.host, productionDeadline);
         noteHostStartup(prepared.custody, 'lifecycle-final-trust-after');
         const generation = prepared.instance.record;
         const guard = () => {
