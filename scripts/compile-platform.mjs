@@ -130,7 +130,7 @@ export async function captureCompilerInputs(sourceNames, headers = officialHeade
     ...(installationPaths ? { installationPaths, profileFormat } : {}),
     ...(productionPublisher ? { productionPublisher } : {}),
     compiler: hash(await readFile(compilerPath)), linker: hash(await readFile(linkerPath)), linkerInputs,
-    frameworks: { 'platform.node': ['Foundation', 'Security', 'AppKit'], 'host-launch': ['AppKit'],
+    frameworks: { 'platform.node': ['Foundation', 'Security', 'AppKit'], 'host-launch': ['AppKit', 'Security'],
       'host-bootstrap': ['Foundation', 'Security'], 'stable-launch': ['Foundation', 'Security'] },
     sdkSettings: hash(settings), files };
 }
@@ -159,11 +159,10 @@ export async function compilePlatform(headers = officialHeaders) {
     '-bundle', '-undefined', 'dynamic_lookup', '-I', headers, ...input.installationPaths.flags, names[0],
     '-lbsm', '-framework', 'Foundation', '-framework', 'Security', '-framework', 'AppKit',
     '-o', join(root, 'dist/native/platform.node')]);
-  for (const [source, name, frameworks] of [[names[1], 'host-launch', ['AppKit']], [names[2], 'host-bootstrap', ['Foundation', 'Security']],
-    [names[3], 'stable-launch', ['Foundation', 'Security']]]) {
+  for (const [source, name] of [[names[1], 'host-launch'], [names[2], 'host-bootstrap'], [names[3], 'stable-launch']]) {
     const flags = [...input.installationPaths.flags, ...(source !== names[1] ? input.productionPublisher.flags : [])];
     staticCommand('/usr/bin/xcrun', [...common, ...flags, source,
-      ...(source === names[1] ? [] : ['-lbsm']), ...frameworks.flatMap(value => ['-framework', value]),
+      '-lbsm', ...input.frameworks[name].flatMap(value => ['-framework', value]),
       '-o', join(root, 'dist/native', name)]);
   }
   const outputs = {};
