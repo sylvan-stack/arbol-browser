@@ -493,13 +493,15 @@ async function recoverInstall(context, provider, existingOnly = false) {
   if (!pending) return;
   const decoded = parseStrictJson(pending.bytes, 4096);
   if (decoded.format === 3) throw new Error('Journal3 requires forward signed maintenance; legacy rollback cannot consume it');
-  const { format, before, after, aliasBefore } = decoded;
+  const { format, before, after, aliasBefore, retainPrevious } = decoded;
   const checked = item => item && item.selection?.format === 1 && buildNumber(item.selection.build) &&
     digest(item.selection.imageSha256) && digest(item.launcherSha256);
   if (pending.identity.mode !== 0o600 || pending.identity.uid !== userInfo().uid ||
       ![1, 2].includes(format) || (format === 2 && typeof aliasBefore !== 'boolean') ||
       (before !== null && !checked(before)) || !checked(after) ||
-      before?.selection.build === after.selection.build) throw new Error('Browser installation journal is unsafe');
+      before?.selection.build === after.selection.build ||
+      (retainPrevious !== undefined && (retainPrevious !== true || format !== 2 || !before || existingOnly)))
+    throw new Error('Browser installation journal is unsafe');
   const selectionPath = join(support, 'selected.json');
   const selected = await optionalSelection(selectionPath);
   if (![before?.selection ?? null, after.selection].some(value => canonical(value) === canonical(selected))) {
@@ -508,7 +510,18 @@ async function recoverInstall(context, provider, existingOnly = false) {
   const current = await optionalFile(executable, launcherLimit);
   const target = canonical(selected) === canonical(after.selection) ? after : before;
   const unchanged = target && current?.sha256 === target.launcherSha256;
-  await withLock(provider, join(uses, selected?.build ?? after.selection.build), async () => {
+  const sharesPrevious = retainPrevious === true && target === before;
+  const buildGuard = join(uses, selected?.build ?? after.selection.build);
+  await withLock(provider, buildGuard, async handle => {
+    if (sharesPrevious) {
+      const original = await guardRecord(provider, buildGuard, handle, 1);
+      const assertBuild = async build => {
+        if (build !== selected.build || !equal(await guardRecord(provider, buildGuard, handle, 1), original))
+          throw new Error('Original compatible-upgrade guard changed');
+      };
+      if (await installedProfileFormat(context, selected, { assertBuild, publication: { provider } }) !== 2)
+        throw new Error('Compatible upgrade recovery requires a signed format-2 predecessor');
+    }
     if (format === 2) {
       const entry = await installedAlias(alias, executable);
       if ((target === after || aliasBefore) && !entry) throw new Error('Browser PATH entry changed during installation');
@@ -535,7 +548,7 @@ async function recoverInstall(context, provider, existingOnly = false) {
     await unlink(journal);
     try { await unlink(backup); } catch (error) { if (error.code !== 'ENOENT') throw error; }
     await syncPath(support);
-  }, false, existingOnly ? 'tryExistingQualificationObserverLock' : 'tryLock');
+  }, false, sharesPrevious ? 'trySharedLock' : existingOnly ? 'tryExistingQualificationObserverLock' : 'tryLock');
 }
 
 /** Read the predecessor format from its exact signed installed image, never
@@ -777,26 +790,27 @@ async function mountIsolatedCandidate(context, release, provider, initialization
     if (initialization) requireEqual(await guardRecord(provider, join(context.uses, `${release.build}.mount`), handle), initialization.guards.mount);
   }, false, initialization ? 'tryExistingInitializationLock' : 'tryLock');
 }
-async function guardRecord(provider, path, handle) {
+async function guardRecord(provider, path, handle, heldMode = 2) {
   const expected = await checkedGuard(path, false), actual = provider.assertLock(handle);
   if (actual.device !== String(expected.dev) || actual.inode !== String(expected.ino) || actual.uid !== Number(expected.uid))
     throw new Error('Original installation guard changed');
-  return { path, identity: { ...actual, mode: 0o600 }, heldMode: 2 };
+  return { path, identity: { ...actual, mode: 0o600 }, heldMode };
 }
 /** Every handle is closed before returning. The result of work must contain
  * observations only, never these native EX descriptions or publication cap. */
-async function withInstallationGuards(context, provider, previous, build, work, createNew = false, existingOnly = false) {
+async function withInstallationGuards(context, provider, previous, build, work, createNew = false, existingOnly = false,
+  retainPrevious = false) {
   await assertContext(context);
   const acquire = existingOnly ? 'tryExistingQualificationObserverLock' : 'tryLock';
   return withLock(provider, join(context.support, 'selection.lock'), async selection => {
     const candidate = async old => withLock(provider, join(context.uses, build), async next => {
       const guards = { selection: await guardRecord(provider, join(context.support, 'selection.lock'), selection),
-        oldBuild: old ? await guardRecord(provider, join(context.uses, previous.build), old) : null,
+        oldBuild: old ? await guardRecord(provider, join(context.uses, previous.build), old, retainPrevious ? 1 : 2) : null,
         newBuild: await guardRecord(provider, join(context.uses, build), next) };
       const assert = async () => {
         await assertContext(context);
         const current = { selection: await guardRecord(provider, guards.selection.path, selection),
-          oldBuild: old ? await guardRecord(provider, guards.oldBuild.path, old) : null,
+          oldBuild: old ? await guardRecord(provider, guards.oldBuild.path, old, guards.oldBuild.heldMode) : null,
           newBuild: await guardRecord(provider, guards.newBuild.path, next) };
         if (canonical(current) !== canonical(guards)) throw new Error('Installation custody changed');
       };
@@ -810,7 +824,8 @@ async function withInstallationGuards(context, provider, previous, build, work, 
       return work({ guards, assert, assertBuild, publication: { provider, selection } });
     }, createNew, createNew ? 'tryLock' : acquire);
     return previous && previous.build !== build
-      ? withLock(provider, join(context.uses, previous.build), candidate, false, acquire) : candidate(null);
+      ? withLock(provider, join(context.uses, previous.build), candidate, false, retainPrevious ? 'trySharedLock' : acquire)
+      : candidate(null);
   }, !existingOnly, acquire);
 }
 function fileReference(file) { return file ? { identity: file.identity, sha256: file.sha256 } : null; }
@@ -1459,6 +1474,7 @@ async function ordinaryInstall(context, release, options, route, custody, retry 
     else await publishBackup(false);
   }
   const transaction = { format: 2, aliasBefore: Boolean(await installedAlias(context.alias, context.executable)),
+    ...(custody.guards.oldBuild?.heldMode === 1 ? { retainPrevious: true } : {}),
     before: { selection: route.previous, launcherSha256: old.launcherSha256 },
     after: { selection: { format: 1, build: release.build, imageSha256: release.imageSha256 }, launcherSha256: release.launcher.sha256 } };
   const bytes = encode(transaction);
@@ -1498,6 +1514,8 @@ async function recoverCompatibleInstallation(context, provider, release, qualifi
 
 async function installVerifiedRelease(context, release, options, qualification = null) {
   await assertContext(context);
+  const retainPrevious = options.retainPrevious === true;
+  if (retainPrevious && (qualification || isolatedAuthorities.has(context))) throw new Error('Compatible update requires the installed Browser');
   return withLockProvider(release.platform, async provider => {
     const existingOnly = Boolean(qualification?.mode);
     const retry = qualification?.mode === 'retry';
@@ -1534,6 +1552,8 @@ async function installVerifiedRelease(context, release, options, qualification =
             throw new Error('Original qualification journal changed while taking custody');
         }
         if (route.kind === 'legacy') throw new Error('Installation changed while taking original guards');
+        if (retainPrevious && route.kind !== 'ordinary' && route.kind !== 'same')
+          throw new Error('Compatible update requires an installed signed format-2 predecessor and no pending migration');
         if (qualification) requireQualificationInstallRoute(route, release, qualification);
         if (completedRetry) return verifyCompletedQualificationRetry(context, release, qualification.predecessor, custody);
         let retryBackup = null;
@@ -1560,7 +1580,7 @@ async function installVerifiedRelease(context, release, options, qualification =
         prepared = await prepareMigrationRelease(context, release, options, route, custody, retry, installerBudget);
         return null;
       }, !initialJournal && previous?.build !== release.build && (!existingOnly ||
-        (qualification.mode === 'interrupt' && qualification.role === 'A')), existingOnly);
+        (qualification.mode === 'interrupt' && qualification.role === 'A')), existingOnly, retainPrevious);
       if (completed) return completed;
       // All installer-held descriptions have closed. Native acquires its own
       // original EX set, and journal3 closes admission throughout the handoff.
@@ -3106,11 +3126,12 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     await qualificationInitializeEntry();
   } else {
   const [action, imageFlag, image, signedFlag, signedReceiptPath, ...extra] = process.argv.slice(2);
-  if (!['verify', 'install'].includes(action) || imageFlag !== '--image' || signedFlag !== '--signed-receipt' ||
+  if (!['verify', 'install', 'install-compatible'].includes(action) || imageFlag !== '--image' || signedFlag !== '--signed-receipt' ||
       !image || !signedReceiptPath || extra.length) {
-    throw new Error('Usage: install-release.mjs <verify|install> --image <signed.dmg> --signed-receipt <signed-release.json>');
+    throw new Error('Usage: install-release.mjs <verify|install|install-compatible> --image <signed.dmg> --signed-receipt <signed-release.json>');
   }
-  const options = { image: resolve(image), signedReceiptPath: resolve(signedReceiptPath) };
+  const options = { image: resolve(image), signedReceiptPath: resolve(signedReceiptPath),
+    retainPrevious: action === 'install-compatible' };
   const result = await (action === 'verify' ? verifySignedRelease(options) : installRelease(options));
   delete result.launcher;
   delete result.platform;
