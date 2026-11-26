@@ -68,10 +68,14 @@ export function bindProfilePresentation(window: BaseWindow, state: string, platf
   }
   return {
     offer,
-    async show(deadline: number, signal: AbortSignal, check: () => void): Promise<void> {
+    async show(deadline: number, signal: AbortSignal, check: () => void, raiseWindow = false): Promise<void> {
       check();
-      if (signal.aborted) throw busy();
-      if (held && window.isVisible() && !window.isMinimized()) { held.assertIdentity(); return; }
+      if (signal.aborted || performance.now() >= deadline) throw busy();
+      if (held && window.isVisible() && !window.isMinimized()) {
+        held.assertIdentity();
+        if (raiseWindow) window.moveTop();
+        return;
+      }
       const cutoff = Math.min(deadline, performance.now() + 1800);
       let request: HeldLock | null = null;
       let shown = false;
@@ -83,7 +87,10 @@ export function bindProfilePresentation(window: BaseWindow, state: string, platf
             presenting = true;
             request.assertIdentity();
             shown = showUnderRequest(true);
-            if (shown) return;
+            if (shown) {
+              if (raiseWindow) window.moveTop();
+              return;
+            }
           }
           await delay(25, undefined, { signal });
         }

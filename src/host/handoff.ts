@@ -708,14 +708,15 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
           // fabricated provider acknowledgement or agent-accessible close.
           if (request.method === 'close') throw unavailable('browser');
           const host = windowForOpen();
-          if (request.params.url !== undefined || tabs().all().length === 0) {
+          const url = request.params.url;
+          if (url !== undefined || tabs().all().length === 0) {
             if (host.hasForegroundWork()) throw new ForegroundWorkRequired('window');
-            await tabs().openUser(host, userURL(request.params.url ?? 'about:blank'));
+            await tabs().openUser(host, userURL(url ?? 'about:blank'));
           }
           live();
           const registration = windows.get(host);
           if (!registration) throw unavailable('browser');
-          assertShellRegistration(registration, host); await registration.show(deadline, signal);
+          assertShellRegistration(registration, host); await registration.show(deadline, signal, url !== undefined);
           live(); assertShellRegistration(registration, host);
           presented = true;
           const info = operations.info();

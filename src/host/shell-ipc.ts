@@ -28,7 +28,7 @@ export interface ShellRegistration {
   load(): Promise<void>;
   assertLoaded(): void;
   offerPresentation(): void;
-  show(deadline: number, signal: AbortSignal): Promise<void>;
+  show(deadline: number, signal: AbortSignal, raiseWindow?: boolean): Promise<void>;
   publish(): void;
   dispose(): void;
 }
@@ -195,9 +195,9 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
       if (presentation) { presentation.offer(); return; }
       if (!host.window.isVisible()) host.window.showInactive();
     },
-    async show(deadline: number, signal: AbortSignal) {
+    async show(deadline: number, signal: AbortSignal, raiseWindow = false) {
       assertPresentable();
-      if (presentation) await presentation.show(deadline, signal, assertPresentable);
+      if (presentation) await presentation.show(deadline, signal, assertPresentable, raiseWindow);
       else if (!host.window.isVisible()) host.window.showInactive();
     },
     publish() {
