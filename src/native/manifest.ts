@@ -587,6 +587,7 @@ function hasRetainedStartupVerifier(root: string, deadline: number): boolean {
 
 async function runInstalledVerifier(bootstrap: string, args: string[], requirement: string,
   bundle: StorageDescription, backing: StorageDescription, deadline: number): Promise<boolean> {
+  const started = performance.now();
   const remaining = budget(deadline);
   const environment = { PATH: '/usr/bin:/bin' };
   const child = spawn(bootstrap, ['--arbol-verify-installed-package', ...args], {
@@ -597,11 +598,7 @@ async function runInstalledVerifier(bootstrap: string, args: string[], requireme
     child.once('exit', code => resolve(code === 0));
   });
   const gate = child.stdin;
-  const stop = () => {
-    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-  };
-  gate?.on('error', stop);
-  const timer = setTimeout(stop, remaining);
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     if (!gate || !child.pid) return false;
     // The gated child receives approval only after stock Security verifies
@@ -610,15 +607,25 @@ async function runInstalledVerifier(bootstrap: string, args: string[], requireme
       timeout: budget(deadline), killSignal: 'SIGKILL', env: environment, stdio: 'ignore',
     });
     budget(deadline);
-    if (signature.error || signature.status !== 0 || child.exitCode !== null) return false;
-    gate.end('1');
-    const verified = await result;
+    const wait = Math.floor(started + remaining - performance.now());
+    if (wait < 1 || signature.error || signature.status !== 0 || child.exitCode !== null) return false;
+    const expired = new Promise<false>(resolve => {
+      timer = setTimeout(() => { gate.destroy(); resolve(false); }, wait);
+    });
+    const delivered = new Promise<boolean>(resolve => {
+      gate.once('error', () => resolve(false));
+      gate.end('1', () => resolve(gate.writableFinished && !gate.errored));
+    });
+    const verification = Promise.all([delivered, result]).then(([approved, verified]) => approved && verified);
+    const verified = await Promise.race([expired, verification]);
     budget(deadline);
-    return verified;
+    return verified && performance.now() < started + remaining;
   } finally {
     clearTimeout(timer);
     gate?.destroy();
-    stop();
+    // The native verifier has its own fixed cutoff. Closing the original
+    // gate and releasing the wait never signals a process by a recycled PID.
+    child.unref();
   }
 }
 
