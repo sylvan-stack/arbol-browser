@@ -5,7 +5,7 @@ import { directory, assertDirectory, privateFile, sameIdentity, identity, profil
 import type { PlatformPort, HeldLock } from './platform.js';
 import { buildLocation, selectedLayout, type BuildSelection } from './selection.js';
 import type { BuildGuard } from './start.js';
-import { assertHostCloseContinuity, assertHostStartupContinuity, assertTrustedHost, type VerifiedHost } from './authorities.js';
+import { assertHostCloseContinuity, assertHostStartupContinuity, assertHostStartupSnapshot, type VerifiedHost } from './authorities.js';
 import { assertPlatform, assertMaintenanceCustody, type MaintenanceCustody, type MaintenanceGuard } from './platform.js';
 import { withOwnerLockForCustody, type OwnerLease } from '../profiles/locking.js';
 
@@ -120,7 +120,7 @@ export async function adoptHostBuildLease(host: VerifiedHost, platform: Platform
       const current = held.assertIdentity(), expected = host.guardIdentity;
       if (current.device !== expected.device || current.inode !== expected.inode || current.uid !== expected.uid) throw profileUnavailable();
     };
-    assertOriginal(); await assertTrustedHost(host, deadline); assertOriginal();
+    assertOriginal(); await assertHostStartupSnapshot(host, deadline); assertOriginal();
     const lease: BuildLease = Object.freeze({ selection,
       async assert() {
         const current = held.assertIdentity(), expected = host.guardIdentity;

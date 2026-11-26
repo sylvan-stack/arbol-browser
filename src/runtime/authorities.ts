@@ -462,7 +462,13 @@ async function verifySelectedHost(selection: BuildSelection, payload: string, de
       // and instance. Only startup uses the already captured Claim cutoff.
       if (originalStartupCutoff !== undefined) {
         if (custody && custody.host !== result) throw unavailable('browser');
-        if (!custody || custody.instance.record.phase === 'starting') limit = originalStartupCutoff;
+        if (!custody || custody.instance.record.phase === 'starting') {
+          limit = originalStartupCutoff;
+          // The adopted native host already verified the bytes on this exact
+          // installed image. Keep the complete name, link and stamp comparison
+          // at every startup check on its original lease.
+          if (bootstrapSigned !== undefined && image !== undefined) retainStartupBytes = true;
+        }
       }
       assertBudget(limit); if (custody) assertHostCustody(custody);
       try {
