@@ -64,9 +64,6 @@
         },
         "running": {
           "type": "boolean"
-        },
-        "unavailable": {
-          "const": true
         }
       },
       "required": [
@@ -77,8 +74,6 @@
         "createdAt",
         "running"
       ],
-      "if": { "required": ["unavailable"] },
-      "then": { "properties": { "running": { "const": false } } },
       "additionalProperties": false
     },
     "ProfileList": {

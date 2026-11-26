@@ -98,7 +98,9 @@ export function createProfileService(options: {
               if (owner || !(error instanceof BrowserFailure) || error.detail.code !== 'profile_unavailable' ||
                   !await hasRetainedProfileLock(profile, os)) throw error;
               await registry.assert(); await assertProfile(profile);
-              profiles.push({ ...profile.record, running: false, unavailable: true as const });
+              // Retained custody still blocks admission. This row only reports that
+              // the recorded Browser host is absent.
+              profiles.push({ ...profile.record, running: false });
               continue;
             }
             // A verified running host cannot coexist with our exclusive owner lock.

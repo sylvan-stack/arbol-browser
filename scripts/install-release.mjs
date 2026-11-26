@@ -500,7 +500,8 @@ async function recoverInstall(context, provider, existingOnly = false) {
       ![1, 2].includes(format) || (format === 2 && typeof aliasBefore !== 'boolean') ||
       (before !== null && !checked(before)) || !checked(after) ||
       before?.selection.build === after.selection.build ||
-      (retainPrevious !== undefined && (retainPrevious !== true || format !== 2 || !before || existingOnly)))
+      (retainPrevious !== undefined && (retainPrevious !== true || format !== 2 || !before || existingOnly ||
+        isolatedAuthorities.has(context))))
     throw new Error('Browser installation journal is unsafe');
   const selectionPath = join(support, 'selected.json');
   const selected = await optionalSelection(selectionPath);
