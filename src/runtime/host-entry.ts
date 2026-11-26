@@ -39,7 +39,7 @@ export async function consumeHostRequest(args: readonly string[], packagedBuild:
   await location.assert();
   return Object.freeze({ request: input.request, profile, selection });
 }
-export interface HostPreviousExit {
+export interface HostPreviousExit extends PreviousExit {
   /** Read only the independent outside-profile terminal/activation journal at
    * this stage. Actual engine.json validation follows Native enrollment. */
   priorExpectation(profile: ProfileSnapshot, previous: RuntimeRecord | undefined,
