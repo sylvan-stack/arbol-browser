@@ -27,7 +27,7 @@ export interface ShellRegistration {
   /** The only supported loader; handlers and the initial projection already exist. */
   load(): Promise<void>;
   assertLoaded(): void;
-  offerPresentation(): void;
+  offerPresentation(deadline: number): Promise<void>;
   show(deadline: number, signal: AbortSignal, raiseWindow?: boolean, guard?: () => void): Promise<void>;
   publish(): void;
   dispose(): void;
@@ -190,9 +190,9 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
       assertShellRegistration(registration, host);
       if (!prepared || disposed || host.shell.webContents.getURL() !== shellURL) throw unavailable('browser');
     },
-    offerPresentation() {
+    async offerPresentation(deadline) {
       assertPresentable();
-      if (presentation) { presentation.offer(); return; }
+      if (presentation) { await presentation.offerForeground(deadline, assertPresentable); return; }
       if (!host.window.isVisible()) host.window.showInactive();
     },
     async show(deadline: number, signal: AbortSignal, raiseWindow = false, guard?: () => void) {

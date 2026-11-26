@@ -9,6 +9,7 @@ export function bindProfilePresentation(window: BaseWindow, state: string, platf
   canYield: (ownerSwitch: boolean) => boolean) {
   const requests = join(state, 'window-presentation-request.lock');
   const visible = join(state, 'window-presentation-visible.lock');
+  const appStartup = join(state, 'window-presentation-app.lock');
   const busy = () => refused('control_refused', 'Finish the current Browser interaction before switching profiles.');
   let held: HeldLock | null = null;
   let watch: NodeJS.Timeout | undefined;
@@ -66,41 +67,52 @@ export function bindProfilePresentation(window: BaseWindow, state: string, platf
     }
     finally { request.release(); }
   }
+  async function show(deadline: number, signal: AbortSignal, check: () => void, raiseWindow = false): Promise<void> {
+    check();
+    if (signal.aborted || performance.now() >= deadline) throw busy();
+    if (held && window.isVisible() && !window.isMinimized()) {
+      held.assertIdentity();
+      if (raiseWindow) window.moveTop();
+      return;
+    }
+    const cutoff = Math.min(deadline, performance.now() + 1800);
+    let request: HeldLock | null = null;
+    let shown = false;
+    try {
+      while (performance.now() < cutoff && !signal.aborted) {
+        check();
+        request ??= platform.tryLock(requests);
+        if (request) {
+          presenting = true;
+          request.assertIdentity();
+          shown = showUnderRequest(true);
+          if (shown) {
+            if (raiseWindow) window.moveTop();
+            return;
+          }
+        }
+        await delay(25, undefined, { signal });
+      }
+      throw busy();
+    } finally {
+      if (request) {
+        try { if (!shown && held) hide(); }
+        finally { presenting = false; request.release(); }
+      }
+    }
+  }
   return {
     offer,
-    async show(deadline: number, signal: AbortSignal, check: () => void, raiseWindow = false): Promise<void> {
+    show,
+    async offerForeground(deadline: number, check: () => void): Promise<void> {
       check();
-      if (signal.aborted || performance.now() >= deadline) throw busy();
-      if (held && window.isVisible() && !window.isMinimized()) {
-        held.assertIdentity();
-        if (raiseWindow) window.moveTop();
-        return;
-      }
-      const cutoff = Math.min(deadline, performance.now() + 1800);
-      let request: HeldLock | null = null;
-      let shown = false;
-      try {
-        while (performance.now() < cutoff && !signal.aborted) {
-          check();
-          request ??= platform.tryLock(requests);
-          if (request) {
-            presenting = true;
-            request.assertIdentity();
-            shown = showUnderRequest(true);
-            if (shown) {
-              if (raiseWindow) window.moveTop();
-              return;
-            }
-          }
-          await delay(25, undefined, { signal });
-        }
-        throw busy();
-      } finally {
-        if (request) {
-          try { if (!shown && held) hide(); }
-          finally { presenting = false; request.release(); }
-        }
-      }
+      if (offer()) return;
+      // Only a pending App-owned window warrants actively requesting the
+      // lease here. Routine early offers preserve an existing focused host.
+      const idle = platform.trySharedLock(appStartup);
+      if (idle) { idle.release(); return; }
+      try { await show(deadline, new AbortController().signal, check, true); }
+      catch { check(); } // The normal approved Open can still present later.
     },
     yieldForSwitch(): () => void {
       if (!canYield(true)) throw busy();
