@@ -3180,7 +3180,8 @@ struct OrdinaryMigrationAuthority {
       !fstat(bundle.fd,&held)&&!lstat(layout.bundle.c_str(),&named)&&!fcntl(bundle.fd,F_GETPATH,path)&&layout.bundle==path&&
       stableSnapshotNode(identity,held)&&stableSnapshotNode(held,named)&&!fstatfs(bundle.fd,&fs)&&
       (fs.f_flags&MNT_RDONLY)&&(fs.f_flags&MNT_LOCAL)&&fs.f_fsid.val[0]==filesystem.f_fsid.val[0]&&fs.f_fsid.val[1]==filesystem.f_fsid.val[1]&&
-      policy.current()&&(!startupPackage||startupPackage->current())&&
+      policy.current()&&(!startupPackage||(policy.identity.st_dev==held.st_dev&&
+        startupPackage->matchesRoot(bundle.fd)&&startupPackage->current()))&&
       (!available||(layout.installed?runtime.current():isolated.current()));
   }
   bool open(const std::string& ownBundle,NSString* profile,const arbol_boundary::Lock& ownGuard,double deadline,
@@ -3188,11 +3189,9 @@ struct OrdinaryMigrationAuthority {
     using namespace arbol_attempt;
     if(profileFormat!=2||!packagedLayout(ownBundle,layout)||layout.guard!=ownGuard.path||ownGuard.heldMode!=LOCK_SH||
        !arbol_boundary::lockIdentity(ownGuard)||!arbol_boundary::canonical(ownBundle)) return false;
-    if(layout.installed&&candidate&&candidate->witnessed()&&candidate->matches(layout,snapshot)) {
-      if(!candidate->current()) return false;
-      startupPackage=candidate;
-      os_log(OS_LOG_DEFAULT,"arbol-browser receipt authority reused its verified installed package");
-    } else if(!signedIdentity(ownBundle,layout.installed?@"com.sylvan-stack.arbol-browser":@"com.sylvan-stack.arbol-browser.native-candidate",true)) return false;
+    const bool useStartupPackage=layout.installed&&candidate&&candidate->witnessed()&&candidate->matches(layout,snapshot);
+    if(useStartupPackage ? !candidate->current() :
+       !signedIdentity(ownBundle,layout.installed?@"com.sylvan-stack.arbol-browser":@"com.sylvan-stack.arbol-browser.native-candidate",true)) return false;
     if(!layout.installed) {
       struct stat sealed{}; errno=0;
       if(lstat((ownBundle+"/Contents/Resources/maintenance-fixture.json").c_str(),&sealed)) return errno==ENOENT;
@@ -3201,6 +3200,11 @@ struct OrdinaryMigrationAuthority {
     if(bundle.fd<0||fstat(bundle.fd,&identity)||!S_ISDIR(identity.st_mode)||fstatfs(bundle.fd,&filesystem)||
        !(filesystem.f_flags&MNT_RDONLY)||!(filesystem.f_flags&MNT_LOCAL)||
        !policy.openPath(ownBundle+"/Contents/Resources/host-policy.json",0600,limit,true)) return false;
+    if(useStartupPackage) {
+      if(policy.identity.st_dev!=identity.st_dev||!candidate->matchesRoot(bundle.fd)) return false;
+      startupPackage=candidate;
+      os_log(OS_LOG_DEFAULT,"arbol-browser receipt authority reused its verified installed package");
+    }
     state=policyStateRoot(json(policy.content),layout);
     if(!state||![profile.stringByDeletingLastPathComponent isEqual:[state stringByAppendingPathComponent:@"profiles"]]) return false;
     if(layout.installed) {
@@ -4446,10 +4450,13 @@ static bool inspectExit(ExitInspection& job) {
   NSDictionary* data=nil,*capability=nil,*receipt=nil,*frontier=nil,*unusedReceipt=nil;
   bool unused=closed&&[[closed[@"terminal"][@"path"] lastPathComponent] isEqual:@"unused.json"];
   std::map<std::pair<std::string,std::string>,std::unique_ptr<arbol_startup_proof::RetainedAppPackage>> verifiedPackages;
+  bool reusedReservationPackage=false;
   auto verifiedSignature=[&](const PackagedLayout& layout, NSDictionary* attempt) {
     NSString* digest=attempt[@"candidateDigest"];
-    if(reserve&&activePackage&&activePackage->witnessed()&&activePackage->matches(layout,digest))
+    if(reserve&&activePackage&&activePackage->witnessed()&&activePackage->matches(layout,digest)) {
+      reusedReservationPackage=true;
       return activePackage->current();
+    }
     if (!migration && (prior || hostMode) && adoptedPackage && adoptedPackage->matches(layout,digest))
       return adoptedPackage->current();
     // After watchdog enrollment, the process family admits no Apple tools.
@@ -4552,6 +4559,7 @@ static bool inspectExit(ExitInspection& job) {
     // a missing/mismatched newest claim cannot fall back to an older witness.
     if(closed&&(!head||![head isEqual:closed])&&!writeExitHistory(history.fd,"previous-claim.json",closed,job)) return false;
     if(!writeExitHistory(history.fd,"current-attempt.json",next,job)||
+       (reusedReservationPackage&&!activePackage->current())||
        !std::all_of(verifiedPackages.begin(),verifiedPackages.end(),[](const auto& item) { return !item.second||item.second->current(); })||
        !job.within()||
        !replace(claim.at,currentRaw,absent,bytes(next))) return false;

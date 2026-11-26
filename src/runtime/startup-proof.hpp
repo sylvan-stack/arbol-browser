@@ -337,6 +337,12 @@ public:
     return matchesBacking(image) && descriptors(proof_, bundle_, root, image_.fd);
   }
   bool matchesBacking(const struct stat& image) const { return arbol_attempt::sameFile(image, image_.identity); }
+  bool matchesRoot(int fd) const {
+    struct stat held{};
+    struct statfs filesystem{};
+    return proof_ && !fstat(fd,&held) && S_ISDIR(held.st_mode) && [stamp(held) isEqual:proof_[@"root"]] &&
+      !fstatfs(fd,&filesystem) && mount_.sameFilesystem(filesystem);
+  }
   bool matches(const arbol_attempt::PackagedLayout& layout, NSString* snapshot) const {
     return proof_ && bundle_ == layout.bundle && [proof_[@"snapshot"] isEqual:snapshot];
   }
