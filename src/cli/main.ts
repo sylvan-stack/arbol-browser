@@ -4,8 +4,6 @@ import { resolve, dirname, basename } from 'node:path';
 import { stateDirectory } from '../profiles/paths.js';
 import { fileURLToPath } from 'node:url';
 import { parse } from './parse.js';
-import { runAgentSession } from './agent-session.js';
-import { describeAgentTools } from './agent-tools.js';
 import { publicFailure, unavailable, type ExitCode } from '../contracts/errors.js';
 import { validator, managementResults } from '../contracts/schema.js';
 import type { Contract } from '../contracts/generated.js';
@@ -54,6 +52,7 @@ interface InstalledLaunch {
   lock: HeldLock;
   deadline: number;
 }
+type ProductionPorts = Pick<CommandPorts, 'process'> & Partial<Pick<CommandPorts, 'profiles'>>;
 function releaseInstalledLaunch(launch: InstalledLaunch | undefined): void {
   try { launch?.lock.release(); }
   catch { /* The installed launcher retains its original guard until this process exits. */ }
@@ -81,12 +80,12 @@ async function installedLaunch(cutoff: number): Promise<InstalledLaunch | undefi
   return { selection, host, platform, lock, deadline: Math.min(cutoff, deadline) };
 }
 async function productionPorts(selection: BuildSelection, observation?: ColdObservation, openCutoff?: number,
-  installed?: InstalledLaunch, listInstalledProfiles = false): Promise<CommandPorts> {
+  installed?: InstalledLaunch, profileOperation?: 'list' | 'change'): Promise<ProductionPorts> {
   if (openCutoff !== undefined && performance.now() >= openCutoff) throw unavailable('browser');
   noteCold(observation, 'runtime-imports');
-  const [{ createProfileService }, { loadPlatform }, { createProcessService, createProfileRuntime },
+  const [{ loadPlatform }, { createProcessService, createProfileRuntime },
     authorities, { createProductionExitAuthority }, { createProductionProcessIntegration }] = await Promise.all([
-    import('../profiles/manage.js'), import('../runtime/platform.js'), import('../runtime/lifecycle.js'),
+    import('../runtime/platform.js'), import('../runtime/lifecycle.js'),
     import('../runtime/authorities.js'), import('../runtime/exit.js'), import('../runtime/process.js'),
   ]);
   const payload = resolve(fileURLToPath(new URL('../../', import.meta.url)));
@@ -117,7 +116,7 @@ async function productionPorts(selection: BuildSelection, observation?: ColdObse
       process.versions.modules !== pinnedRuntime.modules || process.versions.napi !== pinnedRuntime.napi ||
       process.platform !== pinnedRuntime.platform || process.arch !== pinnedRuntime.arch) throw unavailable('browser');
   noteCold(observation, 'repeated-host-trust');
-  const listingHost = listInstalledProfiles ? installed?.host : undefined;
+  const listingHost = profileOperation === 'list' ? installed?.host : undefined;
   if (openCutoff !== undefined || listingHost) await authorities.assertHostStartupContinuity(host, deadline, openCutoff ?? deadline);
   else await host.assertTrusted(deadline);
   noteCold(observation, 'native-platform');
@@ -129,8 +128,13 @@ async function productionPorts(selection: BuildSelection, observation?: ColdObse
   if (observation && openObservation) observation.open = openObservation;
   const integration = createProductionProcessIntegration(host, selection, platform, exits, openObservation, openCutoff);
   const state = host.policy.stateRoot;
+  let profiles: CommandPorts['profiles'] | undefined;
+  if (profileOperation) {
+    const { createProfileService } = await import('../profiles/manage.js');
+    profiles = createProfileService({ state, platform: () => platform, runtime: createProfileRuntime(platform, selection, exits, listingHost) });
+  }
   return Object.freeze({
-    profiles: createProfileService({ state, platform: () => platform, runtime: createProfileRuntime(platform, selection, exits, listingHost) }),
+    ...(profiles ? { profiles } : {}),
     process: createProcessService({ state, selection, platform: () => platform, integration, exits, closeHost: host,
       ...(openObservation ? { observation: openObservation } : {}),
       ...(openCutoff === undefined ? {} : { openCutoff }) }),
@@ -194,10 +198,12 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
     const command = parse(args);
     const claim = command.kind === 'seqoya-usage' ? await readSeqoyaClaim(io.stdin) : undefined;
     if (command.kind === 'agent-describe') {
+      const { describeAgentTools } = await import('./agent-tools.js');
       io.stdout.write(`${JSON.stringify(describeAgentTools())}\n`);
       return 0;
     }
     if (command.kind === 'agent') {
+      const { runAgentSession } = await import('./agent-session.js');
       const { stdin, stdout, stderr } = io;
       return await runAgentSession({ profile: command.profile, label: command.label, stdin, stdout, stderr,
         cutoff: commandCutoff, async attach(input) {
@@ -227,13 +233,15 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
       ? installed?.deadline ?? commandCutoff : undefined;
     if (ports === defaultPorts && (command.kind === 'open' || command.kind === 'profiles-create'))
       observation = { stage: 'package-metadata' };
-    let activePorts = ports;
+    let activePorts: ProductionPorts = ports;
     if (ports === defaultPorts && command.kind !== 'info') {
       if (openCutoff !== undefined && performance.now() >= openCutoff) throw unavailable('browser');
       const metadata = installed?.host.identity.component ?? await componentInfo();
       noteCold(observation, 'selected-build');
       const selection = installed?.selection ?? consumePackagedSelection(metadata.build, resolve(fileURLToPath(new URL('../../', import.meta.url))));
-      activePorts = await productionPorts(selection, observation, openCutoff, installed, command.kind === 'profiles-list');
+      const profileOperation = command.kind === 'profiles-list' ? 'list' :
+        command.kind === 'profiles-create' || command.kind === 'profiles-remove' ? 'change' : undefined;
+      activePorts = await productionPorts(selection, observation, openCutoff, installed, profileOperation);
     }
     let result: unknown;
     let check: (value: unknown) => boolean;
@@ -250,13 +258,20 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
         if (!installed || !claim || !activePorts.process.captureSeqoya) throw unavailable('browser');
         result = await activePorts.process.captureSeqoya({ ...command, claim, deadline: openCutoff ?? commandCutoff });
         check = isSeqoyaResult; break;
-      case 'profiles-list': result = await activePorts.profiles.list(command.profile); check = validator(managementResults.list); break;
+      case 'profiles-list':
       case 'profiles-create':
-        result = await activePorts.profiles.create(command.profile, command.creationRequest);
-        check = validator(managementResults.create); break;
-      case 'profiles-remove':
-        result = await activePorts.profiles.remove(command.profile);
-        check = validator(managementResults.remove); break;
+      case 'profiles-remove': {
+        const profiles = activePorts.profiles;
+        if (!profiles) throw unavailable('profile');
+        if (command.kind === 'profiles-list') {
+          result = await profiles.list(command.profile); check = validator(managementResults.list);
+        } else if (command.kind === 'profiles-create') {
+          result = await profiles.create(command.profile, command.creationRequest); check = validator(managementResults.create);
+        } else {
+          result = await profiles.remove(command.profile); check = validator(managementResults.remove);
+        }
+        break;
+      }
     }
     if (observation) delete observation.open;
     noteCold(observation, 'result-schema');

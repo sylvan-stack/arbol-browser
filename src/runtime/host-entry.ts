@@ -324,8 +324,12 @@ export async function runHostEntry(): Promise<void> {
     capture = captureHostBuild(native.platform, selection, bundle, args[1]);
     const authoritiesURL = new URL('./authorities.js', import.meta.url).href;
     const authorities = await import(authoritiesURL) as typeof import('./authorities.js');
-    const request = await consumeHostRequest(args, selection.build, buildRoot);
-    const host = await authorities.verifyPackagedHost(request.selection, payload, localBudget, native.trust);
+    const [request, host] = await Promise.all([
+      consumeHostRequest(args, selection.build, buildRoot),
+      authorities.verifyPackagedHost(selection, payload, localBudget, native.trust),
+    ]);
+    if (request.selection.build !== selection.build || request.selection.directory !== selection.directory ||
+        request.selection.guard !== selection.guard) return terminateCapturedHostBuild(capture);
     const processURL = new URL('./process.js', import.meta.url).href;
     const attempts = await import(processURL) as typeof import('./process.js');
     const attempt = await attempts.withLaunchAttempt(request.profile, native.platform, localBudget, transaction => transaction.current);
