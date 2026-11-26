@@ -4,7 +4,7 @@ import { isSeqoyaProvider, seqoyaProfilePattern, type SeqoyaProvider } from '../
 
 export type Command =
   | { kind: 'info' }
-  | { kind: 'open'; profile: string; url?: string; profileInstance?: string; creationRequest?: string }
+  | { kind: 'open'; profile: string; url?: string; profileInstance?: string; creationRequest?: string; awaitApproval?: true }
   | { kind: 'close'; profile: string }
   | { kind: 'seqoya-usage'; profile: string; profileInstance: string; provider: SeqoyaProvider }
   | { kind: 'agent'; profile: string; label: string }
@@ -37,10 +37,10 @@ export function parse(args: readonly string[]): Command {
   for (let i = 0; i < args.length; i++) {
     const word = args[i]!;
     if (!word.startsWith('-')) { words.push(word); continue; }
-    if (!['--profile', '--profile-instance', '--url', '--creation-request', '--delete-data', '--contract', '--label', '--describe', '--provider'].includes(word))
+    if (!['--profile', '--profile-instance', '--url', '--creation-request', '--delete-data', '--contract', '--label', '--describe', '--provider', '--await-approval'].includes(word))
       throw invalidInput();
     let value: string | true = true;
-    if (word !== '--delete-data' && word !== '--describe') {
+    if (word !== '--delete-data' && word !== '--describe' && word !== '--await-approval') {
       const next = args[++i];
       if (!next || next.startsWith('-')) throw invalidInput();
       value = next;
@@ -65,7 +65,7 @@ export function parse(args: readonly string[]): Command {
     return { kind: 'seqoya-usage', profile, profileInstance: instance, provider };
   }
   if ((command === 'open' || command === 'close') && words.length === 1) {
-    allowed('--profile', ...(command === 'open' ? ['--url', '--profile-instance', '--creation-request'] : []));
+    allowed('--profile', ...(command === 'open' ? ['--url', '--profile-instance', '--creation-request', '--await-approval'] : []));
     const profile = selectedProfile(options.get('--profile') ?? 'default');
     if (command === 'open') {
       const url = options.get('--url');
@@ -76,7 +76,11 @@ export function parse(args: readonly string[]): Command {
         throw invalidInput();
       if (request !== undefined && (typeof instance !== 'string' || typeof request !== 'string' ||
           !creationRequest.test(request))) throw invalidInput();
-      return { kind: 'open', profile, ...(typeof url === 'string' ? { url: checkedUrl(url) } : {}),
+      const awaitApproval = options.has('--await-approval');
+      if (awaitApproval && (typeof url !== 'string' || !url.startsWith('https://') || typeof request !== 'string' ||
+          !seqoyaProfilePattern.test(profile))) throw invalidInput();
+      return { kind: 'open', profile, ...(awaitApproval ? { awaitApproval: true } : {}),
+        ...(typeof url === 'string' ? { url: checkedUrl(url) } : {}),
         ...(typeof instance === 'string' ? { profileInstance: instance } : {}),
         ...(typeof request === 'string' ? { creationRequest: request } : {}) };
     }

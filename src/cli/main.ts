@@ -163,6 +163,20 @@ async function readSeqoyaClaim(input: Stdio['stdin']): Promise<string> {
   } finally { clearTimeout(timer); }
 }
 
+async function awaitOpenApproval(input: Stdio['stdin'], deadline: number): Promise<void> {
+  if (performance.now() >= deadline) throw unavailable('browser');
+  const timer = setTimeout(() => input.destroy(), Math.max(1, deadline - performance.now()));
+  try {
+    let approved = false;
+    for await (const chunk of input) {
+      const bytes = Buffer.from(chunk);
+      if (approved || bytes.length !== 1 || bytes[0] !== 49) throw unavailable('browser');
+      approved = true;
+    }
+    if (!approved || performance.now() >= deadline) throw unavailable('browser');
+  } finally { clearTimeout(timer); }
+}
+
 export async function runCli(args: readonly string[], ports: CommandPorts = defaultPorts,
   io: Stdio = process): Promise<ExitCode> {
   const commandCutoff = performance.now() + 60000;
@@ -219,7 +233,11 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
     noteCold(observation, 'command-dispatch');
     switch (command.kind) {
       case 'info': result = installed?.host.identity.component ?? await componentInfo(); check = validator(managementResults.info); break;
-      case 'open': result = await activePorts.process.open(command); check = validator('wire.OpenResult'); break;
+      case 'open':
+        if (command.awaitApproval && !installed) throw unavailable('browser');
+        result = await activePorts.process.open({ ...command, ...(command.awaitApproval
+          ? { approve: (deadline: number) => awaitOpenApproval(io.stdin, deadline) } : {}) });
+        check = validator('wire.OpenResult'); break;
       case 'close': result = await activePorts.process.close(command.profile); check = validator('wire.CloseResult'); break;
       case 'seqoya-usage':
         if (!installed || !claim || !activePorts.process.captureSeqoya) throw unavailable('browser');

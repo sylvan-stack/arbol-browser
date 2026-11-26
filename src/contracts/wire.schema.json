@@ -376,8 +376,12 @@
               "properties": {
                 "url": {
                   "$ref": "urn:arbol-browser:contract:1#/$defs/Url"
+                },
+                "showEmpty": {
+                  "const": true
                 }
               },
+              "not": { "required": ["url", "showEmpty"] },
               "required": [],
               "additionalProperties": false
             }

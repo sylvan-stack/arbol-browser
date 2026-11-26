@@ -709,14 +709,24 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
           if (request.method === 'close') throw unavailable('browser');
           const host = windowForOpen();
           const url = request.params.url;
-          const destination = url !== undefined || tabs().all().length === 0 ? userURL(url ?? 'about:blank') : undefined;
+          const showEmpty = request.params.showEmpty === true;
+          const empty = tabs().all().length === 0;
+          const destination = !showEmpty && (url !== undefined || empty) ? userURL(url ?? 'about:blank') : undefined;
           if (destination !== undefined && host.hasForegroundWork()) throw new ForegroundWorkRequired('window');
           live();
           const registration = windows.get(host);
           if (!registration) throw unavailable('browser');
-          assertShellRegistration(registration, host); await registration.show(deadline, signal, url !== undefined);
-          live(); assertShellRegistration(registration, host);
-          presented = true;
+          assertShellRegistration(registration, host);
+          // Before approval, reveal only chrome or raise an already visible window.
+          // A hidden profile with tabs stays hidden until the normal verified open.
+          const mayShowEarly = () => tabs().all().length === 0 || (host.window.isVisible() && !host.window.isMinimized());
+          if (!showEmpty || mayShowEarly()) {
+            await registration.show(deadline, signal, showEmpty || url !== undefined, showEmpty ? () => {
+              if (!mayShowEarly()) throw refused('control_refused');
+            } : undefined);
+            live(); assertShellRegistration(registration, host);
+            presented = true;
+          }
           if (destination !== undefined) {
             if (signal.aborted || performance.now() >= deadline) throw refused('control_refused');
             if (host.hasForegroundWork()) throw new ForegroundWorkRequired('window');

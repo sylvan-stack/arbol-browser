@@ -277,16 +277,27 @@ export function createProcessService(options: { selection: BuildSelection; platf
           (input.creationRequest !== undefined && (input.profileInstance === undefined ||
             profile.record.creationRequest !== input.creationRequest))) throw profileUnavailable();
       noteOpenCommand(options.observation, 'open-current-signed-start');
+      if (input.approve && (input.url === undefined || input.profileInstance === undefined ||
+          input.creationRequest === undefined)) throw profileUnavailable();
       const attached = await acquireWithin(deadline,
         () => integration.start(profile, 'management', deadline, contentionDeadline), result => result.client.close());
       try {
         if (input.profileInstance !== undefined && attached.record.profileInstance !== input.profileInstance) throw profileUnavailable();
         noteOpenCommand(options.observation, 'open-reply');
-        const result = await attached.client.call({ wire: 1, id: token('req'), method: 'open',
-          params: input.url === undefined ? {} : { url: input.url } }, Math.min(deadline, now() + 15000)) as Contract<'wire.OpenResult'>;
+        const requestOpen = async (params: Extract<Request, { method: 'open' }>['params']) => {
+          const result = await attached.client.call({ wire: 1, id: token('req'), method: 'open', params },
+            Math.min(deadline, now() + 15000)) as Contract<'wire.OpenResult'>;
+          if (result.instance !== attached.record.instance || result.process !== attached.record.pid ||
+              result.profile !== profile.record.id) throw unavailable('browser');
+          return result;
+        };
+        if (input.approve) {
+          await requestOpen({ showEmpty: true });
+          await input.approve(deadline);
+          assertTime(deadline);
+        }
+        const result = await requestOpen(input.url === undefined ? {} : { url: input.url });
         noteOpenCommand(options.observation, 'open-reply-validation');
-        if (result.instance !== attached.record.instance || result.process !== attached.record.pid || result.profile !== profile.record.id)
-          throw unavailable('browser');
         assertTime(deadline); return { ...result, alreadyRunning: attached.alreadyRunning };
       } finally { attached.client.close(); }
     },
