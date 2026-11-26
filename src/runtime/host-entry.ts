@@ -1,4 +1,4 @@
-import { app, Menu } from 'electron';
+import { app, Menu, nativeImage } from 'electron';
 import { resolve, join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
@@ -343,6 +343,9 @@ export async function runHostEntry(): Promise<void> {
       try {
         assertTime(deadline); prepared.custody.assertRetained();
         if (!app.isReady() || state.closed) return prepared.custody.terminate();
+        const icon = nativeImage.createFromPath(join(bundle, 'Contents/Resources/ArbolBrowser.png'));
+        if (icon.isEmpty()) throw unavailable('browser');
+        app.dock?.setIcon(icon);
         noteHostStartup(prepared.custody, 'host-session-bind-before');
         const sessions = await bindHostSessions(prepared, deadline);
         noteHostStartup(prepared.custody, 'host-session-bind-after');

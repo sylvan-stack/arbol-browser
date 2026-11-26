@@ -32,12 +32,13 @@ export const profileMigrationPredecessor = Object.freeze({
   launcherSha256: '1cb4b88f12fe7f8c157c272cf284f0effa798fa74ad1338e9826851304501bcf',
 });
 const readableDataEpochs = Object.freeze([1]);
-// Signed format-2 Builds f, 12, 17 and 18 use the same pinned Electron/Chromium data epoch.
+// Signed format-2 Builds f, 12, 17, 18 and 19 use the same pinned Electron/Chromium data epoch.
 const productionFormat2Predecessors = [
   '2f5768753521620b7fe65f0726fc4898df44abb781d1e1adc0bf86cbb4f5f70d',
   '8a6879d72a0f89306ac4f54f6919ca20e149b45019771b93083c4615dd78eb64',
   '9df13c6dc36502305fdd6d605e259efeeefde89b150f63ae17109a60ba47afe2',
   'e7145e2e37e81bdebe0565d01d2383ff6198f8131d135ca845c1490359f88cd6',
+  'c5f1de722ba84e74973c8d7415fc012d7e292acf7748f4b21fa3b341d50958a6',
 ];
 function predecessorReaderKeys(scope) {
   const keys = ['production', 'isolated'].includes(scope)
@@ -469,7 +470,7 @@ async function productionDependencies(payload, scratch) {
   return archives;
 }
 export function outerPlist(policy) {
-  return `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>${policy.bundleIdentifier}</string><key>CFBundleName</key><string>Arbol Browser</string><key>CFBundleExecutable</key><string>arbol-browser-native</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleVersion</key><string>1</string><key>LSMinimumSystemVersion</key><string>27.0.1</string><key>LSMultipleInstancesProhibited</key><false/></dict></plist>\n`;
+  return `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>${policy.bundleIdentifier}</string><key>CFBundleName</key><string>Arbol Browser</string><key>CFBundleIconFile</key><string>ArbolBrowser.icns</string><key>CFBundleExecutable</key><string>arbol-browser-native</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleVersion</key><string>1</string><key>LSMinimumSystemVersion</key><string>27.0.1</string><key>LSMultipleInstancesProhibited</key><false/></dict></plist>\n`;
 }
 export async function refreshMaintenanceFixture(bundle, staged) {
   if (!staged.maintenanceFixture) return null;
@@ -550,6 +551,10 @@ export async function prepareUnsignedHost({ out, buildRoot, stateRoot, runtimeAr
   await mkdir(join(payload, 'bin')); await writeExclusive(join(payload, 'bin/arbol-browser'), hostLauncher('..'), 0o755);
   await mkdir(join(bundle, 'Contents/MacOS')); await cp(join(root, 'dist/native/host-bootstrap'), join(bundle, 'Contents/MacOS/arbol-browser-native'), copy);
   await writeExclusive(join(bundle, 'Contents/Info.plist'), outerPlist(publisher));
+  const icon = join(bundle, 'Contents/Resources/ArbolBrowser.icns');
+  const dockIcon = join(bundle, 'Contents/Resources/ArbolBrowser.png');
+  await cp(join(root, 'src/runtime/ArbolBrowser.icns'), icon, copy);
+  command('/usr/bin/sips', ['-z', '256', '256', '-s', 'format', 'png', icon, '--out', dockIcon]);
   await writeExclusive(join(bundle, 'Contents/Resources/publisher-requirement.json'), JSON.stringify(publisher, null, 2) + '\n');
   const staged = { format: 1, kind: 'unsigned-current-host', purpose, buildRoot, stateRoot, maintenanceFixture,
     component: { name: 'arbol-browser', version: pkg.version, build: basename(buildRoot), contract: pkg.arbolBrowser.contract, profileFormat: pkg.arbolBrowser.profileFormat },
