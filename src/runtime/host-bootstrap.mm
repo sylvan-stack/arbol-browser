@@ -255,11 +255,12 @@ static int verifyInstalledPackage(const arbol_attempt::PackagedLayout& layout, N
   }
   arbol_startup_proof::AppImageWitness witness;
   NSDictionary* appProof = arbol_startup_proof::cached(layout.bundle, STDOUT_FILENO, image.fd, expiry, nil, nil, &witness);
+  arbol_attempt::MaintenancePayload cachedMount;
   if (appProof && (!witness.present() || [witness.helper isEqual:arbol_startup_proof::helperIdentity(backing)]) &&
-      immutable.capture(layout, false) &&
-      (!witness.present() || [witness.volume isEqual:arbol_startup_proof::volumeIdentity(immutable)]) &&
+      cachedMount.capture(layout, false) &&
+      (!witness.present() || [witness.volume isEqual:arbol_startup_proof::volumeIdentity(cachedMount)]) &&
       backing.current(image) && sameBundle() &&
-      arbol_startup_proof::currentCache(appProof, layout.bundle, STDOUT_FILENO, image.fd, immutable) && inTime()) {
+      arbol_startup_proof::currentCache(appProof, layout.bundle, STDOUT_FILENO, image.fd, cachedMount) && inTime()) {
     os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT, "arbol-browser verifier used App package proof");
     return 0;
   }
