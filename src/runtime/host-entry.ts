@@ -39,7 +39,7 @@ export async function consumeHostRequest(args: readonly string[], packagedBuild:
   await location.assert();
   return Object.freeze({ request: input.request, profile, selection });
 }
-export interface HostPreviousExit extends PreviousExit {
+export interface HostPreviousExit {
   /** Read only the independent outside-profile terminal/activation journal at
    * this stage. Actual engine.json validation follows Native enrollment. */
   priorExpectation(profile: ProfileSnapshot, previous: RuntimeRecord | undefined,
@@ -86,15 +86,26 @@ export async function prepareOwnedHost(actualApp: ProfileApp, request: HostReque
   };
   const assertContinuity = () => assertAdmission(false);
   let instance: InstanceOwner | null = null, custody: HostCustody | undefined;
+  let prior: PriorMarkerExpectation | undefined;
+  const previousShutdown: PreviousExit = {
+    async assertExited(profile, previous, owner) {
+      if (!owner || prior) throw unavailable('browser');
+      // Capture the native prior-marker expectation during the same original
+      // Owner lease that proves the last process has exited. Acquisition
+      // rechecks the runtime before publishing; enrollment still validates
+      // the actual marker and its bound shutdown evidence.
+      prior = await previousExit.priorExpectation(profile, previous, owner, buildGuard,
+        Math.min(deadline, performance.now() + 10000));
+    },
+  };
   try {
-    instance = await acquireInstance(request.profile, platform, request.selection.build, previousExit, deadline,
+    instance = await acquireInstance(request.profile, platform, request.selection.build, previousShutdown, deadline,
       { assertAdmission, assertContinuity, failed: owner => abortUnadmittedHost(owner, buildGuard, platform) });
     // The losing original still owns the genuine inherited Build, and must
     // publish terminal-only no-use before exact self exit. No invented Owner.
     if (!instance) return abortUnadmittedHost(undefined, buildGuard, platform);
     await assertContinuity(); await instance.owner.assert();
-    const prior = await previousExit.priorExpectation(request.profile, instance.previous, instance.owner, buildGuard, deadline);
-    await assertContinuity();
+    if (!prior) throw unavailable('browser');
     custody = await prepareHostCustody(host, instance, buildGuard, platform, request.request, prior, deadline);
     const watchdog = await custody.arm(native, deadline);
     custody.assertRetained(); assertTime(deadline);
