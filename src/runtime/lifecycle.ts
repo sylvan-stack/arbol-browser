@@ -69,7 +69,7 @@ async function assertNoSockets(profile: ProfileSnapshot): Promise<void> {
   if (location && (await statOrAbsent(location.agent) || await statOrAbsent(location.management))) throw profileUnavailable();
 }
 export function createProfileRuntime(platform: PlatformPort, selection: BuildSelection,
-  exits: PreviousExit = neverOpenedExit): ProfileRuntimePort {
+  exits: PreviousExit = neverOpenedExit, listingHost?: VerifiedHost): ProfileRuntimePort {
   const production = isProductionExitAuthority(exits);
   const assertLeases = async (profile: ProfileSnapshot, owner: OwnerLease | undefined, registry: RegistryLease | undefined) => {
     if (!owner || !registry || owner.profile !== profile || registry.state !== profile.paths.state || registry.platform !== platform)
@@ -112,7 +112,7 @@ export function createProfileRuntime(platform: PlatformPort, selection: BuildSel
       const location = await runtimeLocation(profile), record = location ? await readRuntime(location) : undefined;
       if (!location || !record || !originalAlive(record, platform)) throw profileUnavailable();
       const deadline = now() + 5000;
-      if (isProductionExitAuthority(exits)) await assertProductionCloseReady(profile, record, selection, platform, exits, deadline);
+      if (isProductionExitAuthority(exits)) await assertProductionCloseReady(profile, record, selection, platform, exits, deadline, listingHost);
       const client = await connectRuntime(location, record, 'management', { ...selection, explicit: false }, platform, deadline, 'Profile inspection');
       try {
         await registry?.assert(); await assertProfile(profile);

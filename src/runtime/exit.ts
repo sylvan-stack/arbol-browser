@@ -120,10 +120,15 @@ export async function mountRetainedImage(layout: PackagedLayout, build: Pick<Bui
 
 /** Build selection is the current CLI location only. A previous instance's
  * signed package and original stable Build guard are always proved separately. */
-export function createProductionExitAuthority(platform: PlatformPort, selection: BuildSelection, startingHost?: VerifiedHost): ProductionExitAuthority {
+export function createProductionExitAuthority(platform: PlatformPort, selection: BuildSelection, startingHost?: VerifiedHost,
+  listingHost?: VerifiedHost): ProductionExitAuthority {
   assertPlatform(platform);
   type OldProof = { host: VerifiedHost; build: BuildLease };
   const priorProofs = new WeakMap<OwnerLease, Map<string, OldProof>>();
+  // The command creates this authority once. Retain immutable package proofs,
+  // while every row still takes its own original Build and Profile locks.
+  const listingBuilds = listingHost?.identity.layout.scope === 'installed'
+    ? new Map([[listingHost.identity.layout.buildRoot, listingHost]]) : undefined;
   const inspect = async (profile: ProfileSnapshot, previous: RuntimeRecord | undefined, owner: OwnerLease,
     mode: 'prior' | 'host' | 'full' | 'retire' | 'reserve' | 'withdraw', deadline: number, currentBuild?: BuildLease,
     pending?: LaunchAttempt, closeHost?: VerifiedHost): Promise<ExitInspectionReceipt> => {
@@ -226,7 +231,21 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
       const matchesAttempt = (host: VerifiedHost) => host.policy.stateRoot === profile.paths.state &&
         host.signed.snapshotDigest === attempt.candidateDigest && host.identity.sourceDigest === attempt.sourceDigest &&
         host.identity.productDigest === attempt.productDigest;
-      let host: VerifiedHost | undefined;
+      let host = actualMode === 'full' ? listingBuilds?.get(oldSelection.directory) : undefined;
+      const verifyListingBuild = async (verified: VerifiedHost) => {
+        assertVerifiedHostMetadata(verified, deadline);
+        if (!matchesAttempt(verified) || verified.identity.layout.build !== oldSelection.build ||
+            verified.identity.layout.buildRoot !== oldSelection.directory || verified.identity.layout.bundle !== layout.bundle ||
+            verified.identity.layout.payload !== layout.payload || verified.identity.layout.guard !== oldSelection.guard)
+          throw unavailable('profile');
+        await withBuildLockForCustody(build, platform, held => {
+          const actual = held.assertIdentity(), expected = verified.guardIdentity;
+          if (actual.device !== expected.device || actual.inode !== expected.inode || actual.uid !== expected.uid)
+            throw unavailable('profile');
+        });
+        await assertHostStartupContinuity(verified, deadline, deadline);
+      };
+      if (host) await verifyListingBuild(host);
       if (startingHost && process.type === 'browser' && actualMode === 'prior') {
         assertVerifiedHostMetadata(startingHost, deadline);
         const currentLayout = startingHost.identity.layout;
@@ -249,7 +268,10 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
         if (attempt.phase === 'closed') await mountRetainedImage(layout, build, platform, deadline);
         host = await verifyPackagedHost(oldSelection, layout.payload, deadline);
         if (!matchesAttempt(host)) throw unavailable('profile');
-        await host.assertTrusted(deadline);
+        if (listingBuilds && actualMode === 'full' && layout.scope === 'installed') {
+          await verifyListingBuild(host);
+          if (listingBuilds.size < 16) listingBuilds.set(oldSelection.directory, host);
+        } else await host.assertTrusted(deadline);
       }
       await build.assert();
       if (actualMode === 'prior') {

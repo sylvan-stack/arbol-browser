@@ -75,7 +75,7 @@ async function installedLaunch(cutoff: number): Promise<InstalledLaunch | undefi
   return { selection, host, platform, lock, deadline: Math.min(cutoff, deadline) };
 }
 async function productionPorts(selection: BuildSelection, observation?: ColdObservation, openCutoff?: number,
-  installed?: InstalledLaunch): Promise<CommandPorts> {
+  installed?: InstalledLaunch, listInstalledProfiles = false): Promise<CommandPorts> {
   if (openCutoff !== undefined && performance.now() >= openCutoff) throw unavailable('browser');
   noteCold(observation, 'runtime-imports');
   const [{ createProfileService }, { loadPlatform }, { createProcessService, createProfileRuntime },
@@ -111,18 +111,19 @@ async function productionPorts(selection: BuildSelection, observation?: ColdObse
       process.versions.modules !== pinnedRuntime.modules || process.versions.napi !== pinnedRuntime.napi ||
       process.platform !== pinnedRuntime.platform || process.arch !== pinnedRuntime.arch) throw unavailable('browser');
   noteCold(observation, 'repeated-host-trust');
-  if (openCutoff === undefined) await host.assertTrusted(deadline);
-  else await authorities.assertHostStartupContinuity(host, deadline, openCutoff);
+  const listingHost = listInstalledProfiles ? installed?.host : undefined;
+  if (openCutoff !== undefined || listingHost) await authorities.assertHostStartupContinuity(host, deadline, openCutoff ?? deadline);
+  else await host.assertTrusted(deadline);
   noteCold(observation, 'native-platform');
   const platform = installed?.platform ?? loadPlatform();
   noteCold(observation, 'production-adapters');
-  const exits = createProductionExitAuthority(platform, selection);
+  const exits = createProductionExitAuthority(platform, selection, undefined, listingHost);
   const openObservation = observation ? authorities.createOpenCommandObservation() : undefined;
   if (observation && openObservation) observation.open = openObservation;
   const integration = createProductionProcessIntegration(host, selection, platform, exits, openObservation, openCutoff);
   const state = host.policy.stateRoot;
   return Object.freeze({
-    profiles: createProfileService({ state, platform: () => platform, runtime: createProfileRuntime(platform, selection, exits) }),
+    profiles: createProfileService({ state, platform: () => platform, runtime: createProfileRuntime(platform, selection, exits, listingHost) }),
     process: createProcessService({ state, selection, platform: () => platform, integration, exits, closeHost: host,
       ...(openObservation ? { observation: openObservation } : {}),
       ...(openCutoff === undefined ? {} : { openCutoff }) }),
@@ -211,7 +212,7 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
       const metadata = installed?.host.identity.component ?? await componentInfo();
       noteCold(observation, 'selected-build');
       const selection = installed?.selection ?? consumePackagedSelection(metadata.build, resolve(fileURLToPath(new URL('../../', import.meta.url))));
-      activePorts = await productionPorts(selection, observation, openCutoff, installed);
+      activePorts = await productionPorts(selection, observation, openCutoff, installed, command.kind === 'profiles-list');
     }
     let result: unknown;
     let check: (value: unknown) => boolean;
