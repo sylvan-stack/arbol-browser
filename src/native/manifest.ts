@@ -72,13 +72,16 @@ function snapshotFilesystem<T>(operation: () => T, observed?: SnapshotFailure): 
 function rejectSnapshotFilesystem(error: unknown, observed?: SnapshotFailure): unknown {
   noteSnapshotFailure(observed, error, 'snapshot-filesystem'); return error;
 }
-export function boundedJson(path: string, deadline = Infinity): unknown {
+export function boundedJson(path: string, deadline = Infinity, expectedDevice?: bigint): unknown {
   budget(deadline);
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const stat = fstatSync(fd), named = lstatSync(path);
+    const mounted = expectedDevice === undefined ? undefined : fstatSync(fd, { bigint: true });
     if (!stat.isFile() || !named.isFile() || stat.dev !== named.dev || stat.ino !== named.ino ||
         stat.nlink !== 1 || named.nlink !== 1 || stat.size < 1 || stat.size > nativeLimit) return refuse();
+    if (mounted && (mounted.dev !== expectedDevice ||
+        physicalStamp(lstatSync(path, { bigint: true })) !== physicalStamp(mounted))) return refuse();
     const buffer = Buffer.alloc(stat.size + 1); let length = 0;
     while (length < buffer.length) {
       budget(deadline); const n = readSync(fd, buffer, length, buffer.length - length, null);
@@ -90,6 +93,8 @@ export function boundedJson(path: string, deadline = Infinity): unknown {
         after.mtimeMs !== stat.mtimeMs || after.ctimeMs !== stat.ctimeMs || !lastName.isFile() ||
         lastName.dev !== after.dev || lastName.ino !== after.ino || lastName.nlink !== 1 ||
         lastName.size !== after.size || lastName.mtimeMs !== after.mtimeMs || lastName.ctimeMs !== after.ctimeMs) return refuse();
+    if (mounted && (physicalStamp(fstatSync(fd, { bigint: true })) !== physicalStamp(mounted) ||
+        physicalStamp(lstatSync(path, { bigint: true })) !== physicalStamp(mounted))) return refuse();
     return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw));
   } finally { closeSync(fd); }
 }
@@ -1017,9 +1022,10 @@ export function verifySignedBundle(bundle: string, deadline = Infinity, scope: P
     const check = (): Compatibility => {
       if (!installedStartup) signature(root, true, false, deadline, expectedPublisher);
       phase = 'publisher';
-      if (stable(boundedJson(join(root, 'Contents/Resources/publisher-requirement.json'), deadline)) !== stable(expectedPublisher)) refuse();
+      const verifiedDevice = installedStartup ? mounted?.device : undefined;
+      if (stable(boundedJson(join(root, 'Contents/Resources/publisher-requirement.json'), deadline, verifiedDevice)) !== stable(expectedPublisher)) refuse();
       phase = 'compatibility';
-      const value = boundedJson(join(root, 'Contents/Resources/native-compatibility.json'), deadline);
+      const value = boundedJson(join(root, 'Contents/Resources/native-compatibility.json'), deadline, verifiedDevice);
       if (!validator('native.BuildCompatibility')(value)) return refuse();
       if (value.publisherTeam !== expectedPublisher.team || value.bundleIdentifier !== expectedPublisher.bundleIdentifier ||
           stable(value.runtime) !== stable(pinnedRuntime) || value.nativeABI.compiledNapi !== 8 ||
@@ -1071,7 +1077,8 @@ export function verifySignedBundle(bundle: string, deadline = Infinity, scope: P
       // The authenticated native verifier checked the exact manifest leaf
       // digests on the original mounted volume. Read the rest of the bundle
       // here and record the same full physical inventory as every other host.
-      const compiled = boundedJson(join(root, 'Contents/Resources/native-compatibility.json'), deadline);
+      if (!mounted) return refuse();
+      const compiled = boundedJson(join(root, 'Contents/Resources/native-compatibility.json'), deadline, mounted.device);
       if (!validator('native.BuildCompatibility')(compiled)) return refuse();
       verifiedPayload = compiled.files;
     }
