@@ -12,6 +12,7 @@ export function bindProfilePresentation(window: BaseWindow, state: string, platf
   const busy = () => refused('control_refused', 'Finish the current Browser interaction before switching profiles.');
   let held: HeldLock | null = null;
   let watch: NodeJS.Timeout | undefined;
+  let presenting = false;
   const release = () => {
     clearInterval(watch); watch = undefined;
     held?.release(); held = null;
@@ -29,13 +30,15 @@ export function bindProfilePresentation(window: BaseWindow, state: string, platf
   window.on('hide', () => { if (!window.isVisible()) release(); });
   window.once('closed', release);
 
-  const showUnderRequest = () => {
+  const showUnderRequest = (restore: boolean) => {
     if (window.isDestroyed()) throw busy();
+    if (!restore && window.isMinimized()) return false;
     if (!held) {
       held = platform.tryLock(visible);
       if (!held) return false;
       watch = setInterval(() => {
         try { held?.assertIdentity(); } catch { hide(); return; }
+        if (presenting) return;
         try {
           const request = platform.trySharedLock(requests);
           if (request) request.release();
@@ -46,16 +49,21 @@ export function bindProfilePresentation(window: BaseWindow, state: string, platf
     }
     try {
       held.assertIdentity();
-      if (!window.isVisible()) window.showInactive();
-      if (!window.isVisible()) throw busy();
-      return true;
+      if (window.isMinimized()) window.restore();
+      else if (!window.isVisible()) window.showInactive();
+      return window.isVisible() && !window.isMinimized();
     } catch (error) { hide(); throw error; }
   };
   function offer(): boolean {
-    if (held) return showUnderRequest();
-    const request = platform.tryLock(requests);
+    if (held) return window.isVisible() && !window.isMinimized();
+    const request = platform.trySharedLock(requests);
     if (!request) return false;
-    try { request.assertIdentity(); return showUnderRequest(); }
+    try {
+      request.assertIdentity();
+      if (showUnderRequest(false)) return true;
+      if (held) hide();
+      return false;
+    }
     finally { request.release(); }
   }
   return {
@@ -63,21 +71,29 @@ export function bindProfilePresentation(window: BaseWindow, state: string, platf
     async show(deadline: number, signal: AbortSignal, check: () => void): Promise<void> {
       check();
       if (signal.aborted) throw busy();
-      if (held && showUnderRequest()) return;
+      if (held && window.isVisible() && !window.isMinimized()) { held.assertIdentity(); return; }
       const cutoff = Math.min(deadline, performance.now() + 1800);
       let request: HeldLock | null = null;
+      let shown = false;
       try {
         while (performance.now() < cutoff && !signal.aborted) {
           check();
           request ??= platform.tryLock(requests);
           if (request) {
+            presenting = true;
             request.assertIdentity();
-            if (showUnderRequest()) return;
+            shown = showUnderRequest(true);
+            if (shown) return;
           }
           await delay(25, undefined, { signal });
         }
         throw busy();
-      } finally { request?.release(); }
+      } finally {
+        if (request) {
+          try { if (!shown && held) hide(); }
+          finally { presenting = false; request.release(); }
+        }
+      }
     },
     yieldForSwitch(): () => void {
       if (!canYield(true)) throw busy();

@@ -195,7 +195,7 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
       if (presentation) { presentation.offer(); return; }
       if (!host.window.isVisible()) host.window.showInactive();
     },
-    async show(deadline, signal) {
+    async show(deadline: number, signal: AbortSignal) {
       assertPresentable();
       if (presentation) await presentation.show(deadline, signal, assertPresentable);
       else if (!host.window.isVisible()) host.window.showInactive();
