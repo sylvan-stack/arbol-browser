@@ -6,6 +6,7 @@ import { readFile, writeFile, mkdir, copyFile, rm, readdir } from 'node:fs/promi
 import { createHash } from 'node:crypto';
 import { join, relative, resolve, sep } from 'node:path';
 import { Ajv2020 } from 'ajv/dist/2020.js';
+import standaloneCode from 'ajv/dist/standalone/index.js';
 import addFormats from 'ajv-formats';
 import { root, inventory, inventoryDigest, sourceInventory, productInventory } from './package-base.mjs';
 import { compileNative, validateNativeCompilation } from './compile-native.mjs';
@@ -30,17 +31,37 @@ const sourceIdentity = { repositoryDigest: hash(git(['rev-parse', '--show-toplev
 await mkdir(join(root, 'build'), { recursive: true });
 for (const name of ['lib', 'cli', 'host', 'native']) await rm(join(root, 'dist', name), { recursive: true, force: true });
 const generator = join(root, 'build/contracts-generator.mjs');
-await build({ entryPoints: [join(root, 'src/contracts/schema.ts')], outfile: generator,
+await build({ entryPoints: [join(root, 'src/contracts/schema-data.ts')], outfile: generator,
   bundle: true, platform: 'node', format: 'esm', packages: 'external' });
 // This evaluates only the schema compiler, not the product/renderer/native host.
 const contracts = await import(generator);
 if (await readFile(join(root, 'src/contracts/generated.ts'), 'utf8') !== contracts.generatedTypes())
   throw new Error('Generated types are stale; regenerate under a contract Intention');
-const count = contracts.compileContracts(), ajv = new Ajv2020({ strict: true, strictRequired: false, strictTypes: false });
+const contractCompiler = new Ajv2020({ strict: true, strictRequired: false, strictTypes: false,
+  allErrors: false, validateFormats: true, coerceTypes: false, useDefaults: false, removeAdditional: false,
+  code: { source: true } });
+contractCompiler.addKeyword('x-tools');
+addFormats(contractCompiler);
+const references = {};
+for (const schema of Object.values(contracts.bundles)) {
+  contractCompiler.addSchema(schema);
+  for (const definition of Object.keys(schema.$defs)) {
+    const reference = `${schema.$id}#/$defs/${definition}`;
+    references[reference] = reference;
+  }
+}
+for (const { inputSchema, resultSchema } of contracts.agentDescriptionSchemas()) {
+  contractCompiler.compile(inputSchema);
+  contractCompiler.compile(resultSchema);
+}
+const validators = standaloneCode(contractCompiler, references);
+const count = Object.keys(references).length;
+const ajv = new Ajv2020({ strict: true, strictRequired: false, strictTypes: false });
 addFormats(ajv);
 for (const tool of contracts.agentToolSchemas) { ajv.compile(tool.inputSchema); ajv.compile(tool.outputSchema); }
 console.log(`Compiled ${count} named contract roots and ${contracts.agentToolSchemas.length * 2} public schema roots`);
 run(['node_modules/typescript/bin/tsc', '-p', 'tsconfig.json']);
+await writeFile(join(root, 'dist/lib/contracts/validators.cjs'), validators);
 const shell = join(root, 'dist/lib/shell'); await mkdir(shell, { recursive: true });
 for (const name of ['index.html', 'style.css']) await copyFile(join(root, 'src/shell', name), join(shell, name));
 await build({ entryPoints: [join(root, 'src/shell/control.ts')], outfile: join(shell, 'control.js'),
