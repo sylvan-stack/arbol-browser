@@ -111,8 +111,36 @@ inline bool connectAppCache(Descriptor& connection) {
   return arbol_boundary::liveApplicationCode(attributes) && arbol_boundary::current(process) == 1;
 }
 
+inline NSArray* volumeIdentity(const arbol_attempt::MaintenancePayload& mount) {
+  return @[decimal(mount.filesystem.f_fsid.val[0]), decimal(mount.filesystem.f_fsid.val[1])];
+}
+inline NSArray* helperIdentity(const arbol_attempt::MaintenanceBacking& backing) {
+  return @[decimal(backing.helper.pid), [NSString stringWithUTF8String:std::to_string(backing.helper.start).c_str()],
+    decimal(backing.helper.version)];
+}
+
+struct AppImageWitness {
+  NSArray* volume = nil;
+  NSArray* helper = nil;
+  bool present() const { return volume && helper; }
+  bool bind(NSDictionary* record) {
+    id observedVolume = record[@"volume"], observedHelper = record[@"helper"];
+    if (![observedVolume isKindOfClass:NSArray.class] || [observedVolume count] != 2 ||
+        ![observedHelper isKindOfClass:NSArray.class] || [observedHelper count] != 3) return false;
+    for (id field in observedVolume) if (!arbol_attempt::pattern(field, @"^-?[0-9]{1,10}$")) return false;
+    if (!arbol_attempt::pattern(observedHelper[0], @"^[1-9][0-9]{0,9}$") ||
+        [observedHelper[0] longLongValue] < 2 || [observedHelper[0] longLongValue] > INT_MAX ||
+        !arbol_attempt::pattern(observedHelper[1], @"^[1-9][0-9]{0,19}$") ||
+        !arbol_attempt::pattern(observedHelper[2], @"^-?[0-9]{1,10}$")) return false;
+    volume = observedVolume;
+    helper = observedHelper;
+    return true;
+  }
+};
+
 inline NSDictionary* cached(const std::string& bundle, int root, int image, double cutoff,
-                            NSString* expectedImage = nil, NSString* expectedSnapshot = nil) {
+                            NSString* expectedImage = nil, NSString* expectedSnapshot = nil,
+                            AppImageWitness* witness = nullptr) {
   Descriptor connection;
   const double deadline = std::min(cutoff, arbol_boundary::clockMs() + 150);
   if (!connectAppCache(connection)) return nil;
@@ -134,6 +162,13 @@ inline NSDictionary* cached(const std::string& bundle, int root, int image, doub
           (expectedSnapshot && ![expectedSnapshot isEqual:cachedProof[@"snapshot"]])) return nil;
       NSMutableDictionary* physicalProof = [cachedProof mutableCopy];
       [physicalProof removeObjectForKey:@"imageSha256"];
+      if ([physicalProof[@"format"] isEqual:@2]) {
+        AppImageWitness witnessed;
+        if (!witnessed.bind(physicalProof)) return nil;
+        [physicalProof removeObjectsForKeys:@[@"volume", @"helper"]];
+        physicalProof[@"format"] = @1;
+        if (witness) *witness = witnessed;
+      }
       return descriptors(physicalProof, bundle, root, image) && arbol_boundary::clockMs() < deadline ? physicalProof : nil;
     }
     data.append(buffer, size_t(count));
@@ -163,37 +198,69 @@ class RetainedAppPackage {
   arbol_attempt::MaintenancePayload mount_;
   NSDictionary* proof_ = nil;
   std::string bundle_;
+  bool witnessed_ = false;
 public:
-  bool capture(const arbol_attempt::PackagedLayout& layout, double deadline, NSString* snapshot = nil) {
+  bool capture(const arbol_attempt::PackagedLayout& layout, double deadline, NSString* snapshot = nil,
+               NSString* archive = nil) {
     if (!layout.installed || root_.get() >= 0 ||
         !image_.openPath(installedImagePath(layout), 0600, 1024LL * 1024 * 1024)) return false;
     bundle_ = layout.bundle;
     root_.reset(open(bundle_.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
     if (root_.get() < 0) return false;
-    proof_ = cached(bundle_, root_.get(), image_.fd, deadline, nil, snapshot);
-    if (!proof_ || !mount_.capture(layout, false) ||
-        !arbol_attempt::maintenanceMount(mount_.mount, image_, deadline, backing_)) return false;
-    return current();
+    AppImageWitness witness;
+    proof_ = cached(bundle_, root_.get(), image_.fd, deadline, archive, snapshot, &witness);
+    if (!proof_ || !mount_.capture(layout, false, !witness.present())) return false;
+    if (witness.present()) {
+      // The signed launcher recorded this exact read-only filesystem and
+      // already checked every tree entry while the same helper held its image.
+      if (![witness.volume isEqual:volumeIdentity(mount_)] ||
+          !backing_.capture([witness.helper[0] intValue], image_) ||
+          ![witness.helper isEqual:helperIdentity(backing_)]) return false;
+      witnessed_ = true;
+    } else if (!arbol_attempt::maintenanceMount(mount_.mount, image_, deadline, backing_)) return false;
+    return current() && arbol_boundary::clockMs() < deadline;
   }
   bool current() const {
     return proof_ && currentCache(proof_, bundle_, root_.get(), image_.fd, mount_) &&
       backing_.current(image_) && currentCache(proof_, bundle_, root_.get(), image_.fd, mount_);
   }
   bool matchesOriginal(int root, const struct stat& image) const {
-    return arbol_attempt::sameFile(image, image_.identity) && descriptors(proof_, bundle_, root, image_.fd);
+    return matchesBacking(image) && descriptors(proof_, bundle_, root, image_.fd);
   }
+  bool matchesBacking(const struct stat& image) const { return arbol_attempt::sameFile(image, image_.identity); }
+  bool matches(const arbol_attempt::PackagedLayout& layout, NSString* snapshot) const {
+    return proof_ && bundle_ == layout.bundle && [proof_[@"snapshot"] isEqual:snapshot];
+  }
+  bool witnessed() const { return witnessed_; }
 };
 
-inline void publishToApp(NSDictionary* verified, NSString* imageDigest, double deadline) {
+inline void publishToApp(NSDictionary* verified, const std::string& bundle, int root, int image,
+                         NSString* imageDigest, double deadline) {
   if (arbol_boundary::clockMs() >= deadline || !packet(verified) ||
       !arbol_attempt::pattern(imageDigest, @"^[0-9a-f]{64}$")) return;
+  NSMutableDictionary* proof = [verified mutableCopy];
+  proof[@"imageSha256"] = imageDigest;
+  arbol_attempt::PackagedLayout layout;
+  arbol_attempt::MaintenanceFile file;
+  arbol_attempt::MaintenancePayload mount;
+  arbol_attempt::MaintenanceBacking helper;
+  struct stat original{};
+  if (arbol_attempt::packagedLayout(bundle, layout) && layout.installed && !fstat(image, &original) &&
+      file.openPath(installedImagePath(layout), 0600, 1024LL * 1024 * 1024) &&
+      arbol_attempt::sameFile(original, file.identity) && mount.capture(layout, false) &&
+      arbol_attempt::maintenanceMount(mount.mount, file, deadline, helper) &&
+      currentCache(verified, bundle, root, image, mount) && helper.current(file)) {
+    proof[@"format"] = @2;
+    proof[@"volume"] = volumeIdentity(mount);
+    proof[@"helper"] = helperIdentity(helper);
+  }
+  if (arbol_boundary::clockMs() >= deadline || !descriptors(verified, bundle, root, image)) return;
+
   Descriptor connection;
   if (!connectAppCache(connection)) {
     os_log_info(OS_LOG_DEFAULT, "arbol-browser App package proof publisher could not authenticate the App");
     return;
   }
-  NSMutableDictionary* proof = [verified mutableCopy];
-  proof[@"imageSha256"] = imageDigest;
   const std::string frame = "P" + arbol_attempt::bytes(proof);
   const int fd = connection.get();
   if (frame.size() > packetLimit || send(fd, frame.data(), frame.size(), 0) != ssize_t(frame.size()) ||
@@ -221,8 +288,9 @@ class Relay {
   NSDictionary* verified_ = nil;
   std::string raw_;
   bool ownsSocket_ = false;
+  bool alreadyWitnessed_;
 public:
-  explicit Relay(int reader) : input_(reader) {}
+  Relay(int reader, bool alreadyWitnessed) : input_(reader), alreadyWitnessed_(alreadyWitnessed) {}
   Relay(const Relay&) = delete;
   ~Relay() {
     struct stat current{};
@@ -258,7 +326,7 @@ public:
         NSDictionary* candidate = arbol_attempt::json(raw_);
         if ((completedInfo || arbol_attempt::currentProcess(starter_)) && descriptors(candidate, bundle, root, backing)) {
           verified_ = candidate;
-          publishToApp(verified_, imageDigest, deadline);
+          if (!alreadyWitnessed_) publishToApp(verified_, bundle, root, backing, imageDigest, deadline);
         }
         input_.reset();
       }

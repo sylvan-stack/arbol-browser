@@ -169,25 +169,27 @@ class RetainedStartupPackage {
   arbol_startup_proof::Descriptor root_;
   arbol_attempt::MaintenanceFile image_;
   arbol_attempt::MaintenancePayload mount_;
-  NSDictionary* appProof_ = nil;
-  std::string bundle_;
+  arbol_startup_proof::RetainedAppPackage appPackage_;
+  bool usingAppPackage_ = false;
 public:
   bool current() const {
-    return root_.get() >= 0 && image_.current() &&
-      (appProof_ ? arbol_startup_proof::currentCache(appProof_, bundle_, root_.get(), image_.fd, mount_) : mount_.current());
+    return usingAppPackage_ ? appPackage_.current() : root_.get() >= 0 && image_.current() && mount_.current();
   }
   bool authenticate(const arbol_attempt::PackagedLayout& layout, NSDictionary* attempt) {
     if (!layout.installed || !arbol_attempt::record(attempt) || !inTime()) return false;
     arbol_attempt::PackagedLayout claimed;
     if (!arbol_attempt::claimedLayout(attempt, claimed) || claimed.bundle != layout.bundle ||
         claimed.guard != layout.guard || !image_.openPath(arbol_startup_proof::installedImagePath(layout), 0600, 1024LL * 1024 * 1024)) return false;
-    bundle_ = layout.bundle;
     root_.reset(open(layout.bundle.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
-    if (root_.get() < 0 || !mount_.capture(layout, false)) return false;
-    if (arbol_startup_proof::fromStarter(attempt, layout.bundle, root_.get(), image_.fd,
-        std::min(expiry, arbol_boundary::clockMs() + 60))) return current();
-    appProof_ = arbol_startup_proof::cached(layout.bundle, root_.get(), image_.fd, expiry, nil, attempt[@"candidateDigest"]);
-    return appProof_ && current();
+    if (root_.get() < 0) return false;
+    if (appPackage_.capture(layout, expiry, attempt[@"candidateDigest"]) &&
+        appPackage_.matchesOriginal(root_.get(), image_.identity)) {
+      usingAppPackage_ = true;
+      return current();
+    }
+    if (!mount_.capture(layout, false)) return false;
+    return arbol_startup_proof::fromStarter(attempt, layout.bundle, root_.get(), image_.fd,
+      std::min(expiry, arbol_boundary::clockMs() + 60)) && current();
   }
 };
 
@@ -251,8 +253,12 @@ static int verifyInstalledPackage(const arbol_attempt::PackagedLayout& layout, N
       return 0;
     }
   }
-  NSDictionary* appProof = arbol_startup_proof::cached(layout.bundle, STDOUT_FILENO, image.fd, expiry);
-  if (appProof && immutable.capture(layout, false) && backing.current(image) && sameBundle() &&
+  arbol_startup_proof::AppImageWitness witness;
+  NSDictionary* appProof = arbol_startup_proof::cached(layout.bundle, STDOUT_FILENO, image.fd, expiry, nil, nil, &witness);
+  if (appProof && (!witness.present() || [witness.helper isEqual:arbol_startup_proof::helperIdentity(backing)]) &&
+      immutable.capture(layout, false) &&
+      (!witness.present() || [witness.volume isEqual:arbol_startup_proof::volumeIdentity(immutable)]) &&
+      backing.current(image) && sameBundle() &&
       arbol_startup_proof::currentCache(appProof, layout.bundle, STDOUT_FILENO, image.fd, immutable) && inTime()) {
     os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT, "arbol-browser verifier used App package proof");
     return 0;

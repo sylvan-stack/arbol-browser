@@ -574,6 +574,7 @@ const retainedStartupVerifiers: Readonly<Record<string, string>> = Object.freeze
   '2b': '2a0e22546be4a4ba6fc09752f6e4923bf713ee8c',
   '2c': 'f07c5c8ce0153ef94286ba3ac7a652e01485f920',
   '2d': '9fdb9ea348448ddbb73101fc64955600977cf5d7',
+  '2e': '40b6b518a143ada94c05a0ec3a8cb9fb061bc416',
 });
 function hasRetainedStartupVerifier(root: string, deadline: number): boolean {
   const expected = retainedStartupVerifiers[basename(dirname(dirname(root)))];

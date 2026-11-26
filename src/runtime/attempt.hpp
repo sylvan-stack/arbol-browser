@@ -765,26 +765,12 @@ struct MaintenancePayload {
     }
     return true;
   }
-  bool capture(const PackagedLayout& layout, bool isolated) {
+  bool capture(const PackagedLayout& layout, bool isolated, bool inspectTree = true) {
     if (root >= 0) return false;
     mount = layout.buildRoot + "/app";
     root = open(mount.c_str(),O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
     if (root < 0 || fstat(root,&identity) || fstatfs(root,&filesystem) || !current()) return false;
-    // Check every signed tree entry for another filesystem or an escaping
-    // symlink. The signature alone does not impose either path restriction.
-    __block bool enumerationFailed = false;
-    NSDirectoryEnumerator* entries = [[NSFileManager defaultManager] enumeratorAtURL:
-      [NSURL fileURLWithPath:[NSString stringWithUTF8String:layout.bundle.c_str()]] includingPropertiesForKeys:nil
-      options:0 errorHandler:^BOOL(NSURL*,NSError*) { enumerationFailed = true; return NO; }];
-    if (!entries) return false;
-    size_t count = 0;
-    for (NSURL* entry in entries) {
-      if (++count > 65536) return false;
-      std::string path = entry.path.fileSystemRepresentation; struct stat st{}; struct statfs fs{}; char resolved[PATH_MAX]{};
-      if (lstat(path.c_str(),&st) || !realpath(path.c_str(),resolved) || !within(resolved,mount) ||
-          statfs(path.c_str(),&fs) || !sameFilesystem(fs) || (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode))) return false;
-    }
-    if (enumerationFailed) return false;
+    if (inspectTree && !wholeTree(layout.bundle)) return false;
     std::vector<std::string> paths{layout.engine,layout.payload + "/lib/cli/maintenance.js",layout.payload + "/native/platform.node",
       layout.bundle + "/Contents/Resources/host-policy.json",layout.bundle + "/Contents/Resources/native-compatibility.json"};
     if (isolated) paths.push_back(layout.bundle + "/Contents/Resources/maintenance-fixture.json");
@@ -795,6 +781,24 @@ struct MaintenancePayload {
       files.push_back(std::move(file));
     }
     return current();
+  }
+private:
+  // Check every signed tree entry for another filesystem or an escaping
+  // symlink. The signature alone does not impose either path restriction.
+  bool wholeTree(const std::string& bundle) const {
+    __block bool enumerationFailed = false;
+    NSDirectoryEnumerator* entries = [[NSFileManager defaultManager] enumeratorAtURL:
+      [NSURL fileURLWithPath:[NSString stringWithUTF8String:bundle.c_str()]] includingPropertiesForKeys:nil
+      options:0 errorHandler:^BOOL(NSURL*,NSError*) { enumerationFailed = true; return NO; }];
+    if (!entries) return false;
+    size_t count = 0;
+    for (NSURL* entry in entries) {
+      if (++count > 65536) return false;
+      std::string path = entry.path.fileSystemRepresentation; struct stat st{}; struct statfs fs{}; char resolved[PATH_MAX]{};
+      if (lstat(path.c_str(),&st) || !realpath(path.c_str(),resolved) || !within(resolved,mount) ||
+          statfs(path.c_str(),&fs) || !sameFilesystem(fs) || (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode))) return false;
+    }
+    return !enumerationFailed;
   }
 };
 

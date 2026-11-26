@@ -727,6 +727,7 @@ static bool adoptionAttempted=false;
 // terminal loop on ordinary Node teardown after actual transfer/session use.
 static arbol_exit::NoUseOriginal* adoptedNoUse=nullptr;
 static HeldLock* adoptedBuild=nullptr;
+static std::unique_ptr<arbol_startup_proof::RetainedAppPackage> adoptedPackage;
 static napi_value adoptHostBuild(napi_env env,napi_callback_info info) {
   napi_value args[3]; size_t n=3; std::string requestPath,guard,bundle;
   if(adoptionAttempted) return fail(env); adoptionAttempted=true;
@@ -781,11 +782,11 @@ static napi_value adoptHostBuild(napi_env env,napi_callback_info info) {
     for(NSString* key in @[@"pid",@"uid",@"startId",@"group",@"session",@"parentStartId",@"parentPidVersion"])
       if(![outer[key] isEqual:self[key]]) return fail(env);
     if([self[@"group"] intValue]!=getpid()||getppid()!=1) return fail(env);
-    arbol_startup_proof::RetainedAppPackage package;
-    const bool originalPackage = !cancelled && package.capture(layout, [attempt[@"expires"] doubleValue], attempt[@"candidateDigest"]);
+    auto package = std::make_unique<arbol_startup_proof::RetainedAppPackage>();
+    const bool originalPackage = !cancelled && package->capture(layout, [attempt[@"expires"] doubleValue], attempt[@"candidateDigest"]);
     if (!originalPackage && (!arbol_boundary::signature(bundle,false) || !arbol_boundary::signature(layout.engine,true)))
       return fail(env);
-    if ((originalPackage && !package.current()) || !arbol_attempt::currentProcess(self,true) ||
+    if ((originalPackage && !package->current()) || !arbol_attempt::currentProcess(self,true) ||
         !arbol_boundary::retainNativeImage()) return fail(env);
     adoptedNoUse=new arbol_exit::NoUseOriginal;
     adoptedNoUse->capture(requestPath,bundle,original,originalClaim,@"post-exec");
@@ -806,6 +807,7 @@ static napi_value adoptHostBuild(napi_env env,napi_callback_info info) {
     auto* lock=new HeldLock{fd,guard,guardStat.st_dev,guardStat.st_ino,LOCK_SH,true};
     adoptedBuild=lock; liveLocks.insert(lock); napi_value out;
     if(napi_create_external(env,lock,finalize,nullptr,&out)!=napi_ok) { terminalOnly(); return fail(env); }
+    if (originalPackage) adoptedPackage=std::move(package);
     return out;
   } @catch(NSException*) {
     if(adoptedNoUse) adoptedNoUse->terminate(); return fail(env);
@@ -4424,9 +4426,11 @@ static bool inspectExit(ExitInspection& job) {
   bool unused=closed&&[[closed[@"terminal"][@"path"] lastPathComponent] isEqual:@"unused.json"];
   std::map<std::pair<std::string,std::string>,std::unique_ptr<arbol_startup_proof::RetainedAppPackage>> verifiedPackages;
   auto verifiedSignature=[&](const PackagedLayout& layout, NSDictionary* attempt) {
+    NSString* digest=attempt[@"candidateDigest"];
+    if (!migration && (prior || hostMode) && adoptedPackage && adoptedPackage->matches(layout,digest))
+      return adoptedPackage->current();
     // After watchdog enrollment, the process family admits no Apple tools.
     if (!migration && (prior || reserve) && layout.installed) {
-      NSString* digest=attempt[@"candidateDigest"];
       if (!pattern(digest,@"^[0-9a-f]{64}$")) return false;
       auto key=std::make_pair(layout.bundle,std::string(digest.UTF8String));
       auto [entry, inserted]=verifiedPackages.try_emplace(key);

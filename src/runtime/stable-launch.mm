@@ -330,14 +330,9 @@ int launch(int argc, const char* argv[], double deadline) {
   FD backing(openInstalledFile(imagePath));
   struct stat imageStat{};
   if (backing.get() < 0 || fstat(backing.get(), &imageStat) || !fileIdentity(backing.get(), imagePath, imageStat)) return 4;
-  FD cacheRoot(ordinaryOpen ? open(bundle.c_str(), O_DIRECTORY | O_RDONLY | O_NOFOLLOW | O_CLOEXEC) : -1);
-  arbol_attempt::MaintenancePayload cachedMount;
-  NSDictionary* appProof = cacheRoot.get() >= 0
-    ? arbol_startup_proof::cached(bundle, cacheRoot.get(), backing.get(), deadline, receipt[@"imageSha256"]) : nil;
-  const auto proofCurrent = [&]() {
-    return arbol_startup_proof::currentCache(appProof, bundle, cacheRoot.get(), backing.get(), cachedMount);
-  };
-  const bool cachedPackage = appProof && cachedMount.capture(layout, false) && proofCurrent();
+  arbol_startup_proof::RetainedAppPackage cached;
+  const auto proofCurrent = [&]() { return cached.matchesBacking(imageStat) && cached.current(); };
+  const bool cachedPackage = prepareProof && cached.capture(layout, deadline, nil, receipt[@"imageSha256"]) && proofCurrent();
   if (!cachedPackage && ![imageDigest(backing.get(), imagePath, imageStat, deadline) isEqual:receipt[@"imageSha256"]]) return 4;
   if (cachedPackage) os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT, "arbol-browser stable launcher used App package proof");
 
@@ -386,7 +381,7 @@ int launch(int argc, const char* argv[], double deadline) {
     channel[0] = -1;
     channel[1] = -1;
   }
-  arbol_startup_proof::Relay relay(channel[0]);
+  arbol_startup_proof::Relay relay(channel[0], cachedPackage && cached.witnessed());
   FD writer(channel[1]);
   FD retainedRoot(prepareProof ? open(bundle.c_str(), O_DIRECTORY | O_RDONLY | O_NOFOLLOW | O_CLOEXEC) : -1);
   const bool offerProof = writer.get() >= 0 && retainedRoot.get() >= 0;
