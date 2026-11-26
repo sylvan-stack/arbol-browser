@@ -64,6 +64,7 @@ const productionFormat2Predecessors = [
   '0164d0260dd69cb79dd21b8bc21d0cd7b26e8a75086795d63355da21e950cd98',
   '96f86530df9db898bc6a58028541a252ad0082329a2f00d3a1c61da3f3465096',
   '5151557a78e4e4f3684fe8ae5b4c4ddc05cf08cd875da12433b1f8d36f16809b',
+  '4e86664d8fec9b162f1be27dc3b99efcd04eaf8980f8ad62faead601c734bffa',
 ];
 function predecessorReaderKeys(scope) {
   const keys = ['production', 'isolated'].includes(scope)
