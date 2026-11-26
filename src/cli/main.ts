@@ -225,7 +225,7 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
         if (!installed || !claim || !activePorts.process.captureSeqoya) throw unavailable('browser');
         result = await activePorts.process.captureSeqoya({ ...command, claim, deadline: openCutoff ?? commandCutoff });
         check = isSeqoyaResult; break;
-      case 'profiles-list': result = await activePorts.profiles.list(); check = validator(managementResults.list); break;
+      case 'profiles-list': result = await activePorts.profiles.list(command.profile); check = validator(managementResults.list); break;
       case 'profiles-create':
         result = await activePorts.profiles.create(command.profile, command.creationRequest);
         check = validator(managementResults.create); break;

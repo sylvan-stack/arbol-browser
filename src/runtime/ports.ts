@@ -20,7 +20,7 @@ export interface ProcessPort {
   attachAgent(input: AgentAttachment): Promise<RuntimeClient>;
 }
 export interface ProfilePort {
-  list(): Promise<Contract<'profile2.ProfileList'>>;
+  list(profile?: string): Promise<Contract<'profile2.ProfileList'>>;
   create(profile: string, creationRequest?: string): Promise<Contract<'profile2.ProfileCreated'>>;
   remove(profile: string): Promise<Contract<'profile2.ProfileRemoved'>>;
 }

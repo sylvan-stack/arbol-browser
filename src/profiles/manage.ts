@@ -69,6 +69,14 @@ async function existingRegistry(state: string, platform: PlatformPort, deadline:
   privateFile(stat);
   return registryLock(state, platform, false, deadline);
 }
+async function selectedRecords(registry: RegistryLease, id: string | undefined): Promise<readonly ProfileSnapshot[]> {
+  if (id === undefined) return managedProfiles(registry);
+  const paths = profilePaths(id, registry.state);
+  await registry.assert();
+  const records = await statOrAbsent(paths.root) ? [await readProfile(paths)] : [];
+  await registry.assert();
+  return records;
+}
 const retainedRemovals = new Set<{ owner: OwnerLease; registry: RegistryLease }>();
 export function createProfileService(options: {
   state?: string; platform?: () => PlatformPort; runtime?: ProfileRuntimePort;
@@ -83,11 +91,11 @@ export function createProfileService(options: {
   };
   return Object.freeze({
     create: (id: string, request?: string) => protect(() => createProfile(id, request, platform(), state)),
-    list: () => protect(async () => {
+    list: (id?: string) => protect(async () => {
       if (!await registryExists(state)) return { profiles: [] };
       const os = platform(), registry = await existingRegistry(state, os, lockDeadline());
       try {
-        const records = await managedProfiles(registry), profiles = [];
+        const records = await selectedRecords(registry, id), profiles = [];
         for (const profile of records) {
           const owner = await ownerLock(profile, os, false);
           try {

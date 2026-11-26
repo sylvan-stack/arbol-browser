@@ -9,7 +9,7 @@ export type Command =
   | { kind: 'seqoya-usage'; profile: string; profileInstance: string; provider: SeqoyaProvider }
   | { kind: 'agent'; profile: string; label: string }
   | { kind: 'agent-describe' }
-  | { kind: 'profiles-list' }
+  | { kind: 'profiles-list'; profile?: string }
   | { kind: 'profiles-create'; profile: string; creationRequest?: string }
   | { kind: 'profiles-remove'; profile: string; deleteData: true };
 const profileId = validator('browser.ProfileId');
@@ -91,7 +91,10 @@ export function parse(args: readonly string[]): Command {
     return { kind: 'agent', profile, label };
   }
   if (command === 'profiles') {
-    if (subcommand === 'list' && words.length === 2) { allowed(); return { kind: 'profiles-list' }; }
+    if (subcommand === 'list' && (words.length === 2 || words.length === 3)) {
+      allowed();
+      return id === undefined ? { kind: 'profiles-list' } : { kind: 'profiles-list', profile: selectedProfile(id) };
+    }
     if (words.length !== 3) throw invalidInput();
     const profile = selectedProfile(id);
     if (profile === 'default') throw invalidInput();
