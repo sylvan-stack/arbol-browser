@@ -283,7 +283,7 @@ async function assembleAfterReady(prepared: HostPreparation, sessions: ProfileSe
     noteHostStartup(prepared.custody, 'host-lifecycle-ready-after'); current();
     if (showEmptyWhenReady && shell.tabs.all().length === 0) {
       runtime.assertAdmission();
-      await shell.registration.offerPresentation(deadline);
+      await shell.registration.offerForegroundPresentation(deadline);
     }
   } catch {
     if (state.runtime?.phase === 'closing') return; // actual bounded native shutdown already owns abandonment
