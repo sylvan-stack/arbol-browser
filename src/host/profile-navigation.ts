@@ -4,6 +4,7 @@ import { invalidInput, unavailable } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
 import { createProfile, managedProfiles } from '../profiles/create.js';
 import { registryLock } from '../profiles/locking.js';
+import { hasRetainedProfileLock } from '../profiles/manage.js';
 import { profileId, profilePaths, profileUnavailable, statOrAbsent } from '../profiles/paths.js';
 import { readJson, readProfile } from '../profiles/records.js';
 import { assertHostCustody, type HostCustody } from '../runtime/custody.js';
@@ -19,6 +20,7 @@ export interface ProfileNavigationEntry {
   readonly id: string;
   readonly instance: string;
   readonly label?: string;
+  readonly unavailable?: true;
 }
 export interface ProfileNavigationState {
   readonly current: string;
@@ -65,14 +67,20 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
     try {
       const records = await managedProfiles(registry);
       const names = await labels(state);
-      await registry.assert();
-      check();
       if (!records.some(({ record }) => record.id === selected.record.id && record.instance === selected.record.instance))
         throw profileUnavailable();
-      return { current: selected.record.id, profiles: records.map(({ record }) => {
+      const profiles: ProfileNavigationEntry[] = [];
+      for (const profile of records) {
+        const { record } = profile;
         const name = names.get(record.id);
-        return { id: record.id, instance: record.instance, ...(name?.instance === record.instance ? { label: name.label } : {}) };
-      }) };
+        const blocked = record.id !== selected.record.id && await hasRetainedProfileLock(profile, platform);
+        profiles.push({ id: record.id, instance: record.instance,
+          ...(name?.instance === record.instance ? { label: name.label } : {}),
+          ...(blocked ? { unavailable: true } : {}) });
+      }
+      await registry.assert();
+      check();
+      return { current: selected.record.id, profiles };
     } finally { registry.release(); }
   }
 
@@ -131,7 +139,8 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
         const { instance } = request;
         if (typeof instance !== 'string' || !instancePattern.test(instance)) throw invalidInput();
         const snapshot = await list(check);
-        if (!snapshot.profiles.some(profile => profile.id === id && profile.instance === instance)) throw profileUnavailable();
+        if (!snapshot.profiles.some(profile => profile.id === id && profile.instance === instance && !profile.unavailable))
+          throw profileUnavailable();
         if ((await readProfile(selected.paths)).record.instance !== selected.record.instance) throw profileUnavailable();
         check();
         if (id !== selected.record.id) await open(id, instance, check, isFocused);

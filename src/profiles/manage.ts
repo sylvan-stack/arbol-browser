@@ -5,6 +5,7 @@ import { BrowserFailure } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
 import type { ProfilePort } from '../runtime/ports.js';
 import { loadPlatform, type PlatformPort } from '../runtime/platform.js';
+import { originalAlive, readRuntime, runtimeLocation } from '../runtime/instance.js';
 import { createProfile, managedProfiles } from './create.js';
 import { registryLock, ownerLock, lockDeadline, type OwnerLease, type RegistryLease } from './locking.js';
 import { readProfile, assertProfile, readJson, type ProfileSnapshot } from './records.js';
@@ -20,6 +21,18 @@ export interface ProfileRuntimePort {
   /** Production coordinates exact runtime archive and the actual profile detach
    * under the same genuine Claim/Owner/Registry. Uncertainty retains guards. */
   detach?(profile: ProfileSnapshot, owner: OwnerLease, registry: RegistryLease, retired: string): Promise<'detached' | 'uncertain'>;
+}
+/** Read-only presentation state. Startup and retirement still need their own
+ * proof and must never treat this observation as evidence of a safe exit. */
+export async function hasRetainedProfileLock(profile: ProfileSnapshot, platform: PlatformPort): Promise<boolean> {
+  const owner = await ownerLock(profile, platform, false);
+  if (owner) {
+    owner.release();
+    return false;
+  }
+  const location = await runtimeLocation(profile);
+  const record = location && await readRuntime(location);
+  return Boolean(record && !originalAlive(record, platform));
 }
 async function noRuntimeFootprint(profile: ProfileSnapshot): Promise<void> {
   // Listing does not read engine.json, cookies, storage or page content.
@@ -78,7 +91,16 @@ export function createProfileService(options: {
         for (const profile of records) {
           const owner = await ownerLock(profile, os, false);
           try {
-            const running = await runtime.running(profile, owner !== null, owner ?? undefined, registry);
+            let running: boolean;
+            try {
+              running = await runtime.running(profile, owner !== null, owner ?? undefined, registry);
+            } catch (error) {
+              if (owner || !(error instanceof BrowserFailure) || error.detail.code !== 'profile_unavailable' ||
+                  !await hasRetainedProfileLock(profile, os)) throw error;
+              await registry.assert(); await assertProfile(profile);
+              profiles.push({ ...profile.record, running: false, unavailable: true as const });
+              continue;
+            }
             // A verified running host cannot coexist with our exclusive owner lock.
             if (owner && running) throw profileUnavailable();
             if (!owner && !running) throw profileUnavailable();

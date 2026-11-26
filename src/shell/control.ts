@@ -45,10 +45,12 @@ async function profileAction(request: ProfileNavigationRequest): Promise<void> {
     profilePicker.replaceChildren(...result.profiles.map(entry => {
       const option = document.createElement('option');
       option.value = entry.id;
-      option.textContent = (entry.label ?? profileLabel(entry.id)) + (entry.id === result.current ? ' (current)' : '');
+      option.disabled = entry.unavailable === true;
+      const status = entry.unavailable ? ' (unavailable)' : entry.id === result.current ? ' (current)' : '';
+      option.textContent = (entry.label ?? profileLabel(entry.id)) + status;
       return option;
     }));
-    profilePicker.value = result.profiles.some(entry => entry.id === previous) ? previous : result.current;
+    profilePicker.value = result.profiles.some(entry => entry.id === previous && !entry.unavailable) ? previous : result.current;
     if (request.method === 'create') profileName.value = '';
     profileStatus.textContent = request.method === 'open' ? 'Profile window opened.' : request.method === 'create' ? 'Profile created.' : '';
   } catch { profileStatus.textContent = 'Could not load or change the Browser profiles.'; }
@@ -143,7 +145,7 @@ button('profiles').onclick = () => {
 profilePicker.onchange = renderProfiles;
 button('profile-open').onclick = () => {
   const profile = profiles?.profiles.find(entry => entry.id === profilePicker.value);
-  if (profile) void profileAction({ method: 'open', profile: profile.id, instance: profile.instance });
+  if (profile && !profile.unavailable) void profileAction({ method: 'open', profile: profile.id, instance: profile.instance });
 };
 element<HTMLFormElement>('profile-create').onsubmit = event => {
   event.preventDefault();

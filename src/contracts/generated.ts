@@ -94,7 +94,7 @@ export interface ContractTypes {
   "native.BuildCompatibility": { "abi": 1; "runtime": ContractTypes["native.Runtime"]; "nativeABI": ContractTypes["native.Inventory"]; "publisherTeam": string; "bundleIdentifier": string; "featureConfiguration": { "sitePerProcess": true; "disabledFeatures": Array<string>; "extraChromiumArguments": Array<unknown>; }; "files": { [key: string]: string; }; "dataEpoch": number; "compatibleReaderKeys": Array<string>; "qualification": string; "writerKey": string; "readableDataEpochs": Array<number>; };
   "native.BindingKey": { "id": number; "nonce": string; "webContentsId": number; "revision": number; };
   "profile2.ProfileRecord": { "format": 2; "id": ContractTypes["browser.ProfileId"]; "instance": string; "creationRequest": string; "createdAt": string; };
-  "profile2.ProfileListItem": { "format": 2; "id": ContractTypes["browser.ProfileId"]; "instance": string; "creationRequest": string; "createdAt": string; "running": boolean; };
+  "profile2.ProfileListItem": { "format": 2; "id": ContractTypes["browser.ProfileId"]; "instance": string; "creationRequest": string; "createdAt": string; "running": boolean; "unavailable"?: true; };
   "profile2.ProfileList": { "profiles": Array<ContractTypes["profile2.ProfileListItem"]>; };
   "profile2.ProfileCreated": { "profile": ContractTypes["profile2.ProfileRecord"]; "created": boolean; };
   "profile2.ProfileRemoved": { "profile": ContractTypes["browser.ProfileId"]; "dataRemoved": true; };
