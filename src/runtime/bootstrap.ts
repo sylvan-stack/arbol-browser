@@ -52,7 +52,7 @@ export async function prepareNativeBoundary(bundle: string, deadline = performan
   boundaryAttempted = true;
   const manifestUrl = new URL('../native/manifest.js', import.meta.url).href;
   const manifest = await import(manifestUrl) as typeof import('../native/manifest.js');
-  const trust = manifest.verifyNativeCandidate(bundle, deadline, installedImage === undefined ? 'isolated' : 'production');
+  const trust = manifest.verifyNativeCandidate(bundle, deadline, installedImage === undefined ? 'isolated' : 'production', installedImage);
   if (installedImage !== undefined) manifest.assertInstalledImage(trust, installedImage, deadline);
   const actualRuntime = { electron: process.versions.electron, chromium: process.versions.chrome, node: process.versions.node,
     napi: process.versions.napi, modules: process.versions.modules, platform: process.platform, arch: process.arch,

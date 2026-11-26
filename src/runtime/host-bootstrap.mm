@@ -154,7 +154,8 @@ static bool payload(NSString* bundle, NSDictionary* manifest) {
     actual[[@"Contents/Resources/browser/" stringByAppendingString:relative]] = hash;
     if (actual.count > 4096) return false;
     if (!link) {
-      if (magic == MH_MAGIC_64 || magic == MH_CIGAM_64 || magic == FAT_MAGIC || magic == FAT_CIGAM) {
+      if (magic == MH_MAGIC || magic == MH_CIGAM || magic == MH_MAGIC_64 || magic == MH_CIGAM_64 ||
+          magic == FAT_MAGIC || magic == FAT_CIGAM || magic == FAT_MAGIC_64 || magic == FAT_CIGAM_64) {
         bool jit = [relative hasPrefix:@"runtime/Electron.app/"] && [relative containsString:@"/Contents/MacOS/"];
         if (!signature(path, false, jit, layout.installed)) return false;
       }
@@ -162,6 +163,48 @@ static bool payload(NSString* bundle, NSDictionary* manifest) {
   }
   return [actual isEqual:files];
 }
+
+// This invocation only verifies the installed package. It never reads a
+// profile, takes ownership or admits a Browser process.
+static int verifyInstalledPackage(const arbol_attempt::PackagedLayout& layout, NSString* bundle, const char* helper) {
+  NSString* helperText = [NSString stringWithUTF8String:helper];
+  if (!layout.installed || !arbol_attempt::pattern(helperText, @"^[1-9][0-9]{0,9}$") ||
+      helperText.longLongValue <= 1 || helperText.longLongValue > INT_MAX) return 4;
+  arbol_boundary::Identity self;
+  std::string executable;
+  if (arbol_boundary::observe(getpid(), self) != 1 || !arbol_boundary::executable(self, executable) ||
+      executable != layout.bootstrap) return 4;
+  NSString* home = arbol_attempt::physicalAccountHome();
+  if (!home) return 4;
+  NSString* support = [home stringByAppendingPathComponent:@ARBOL_INSTALLATION_STABLE_USES].stringByDeletingLastPathComponent;
+  const std::string imagePath = [[support stringByAppendingPathComponent:@"images"]
+    stringByAppendingPathComponent:[NSString stringWithFormat:@"%s.dmg", layout.build.c_str()]].fileSystemRepresentation;
+  arbol_attempt::MaintenanceFile image;
+  arbol_attempt::MaintenanceBacking backing;
+  arbol_attempt::MaintenancePayload immutable;
+  // The verifier must see the same directory and backing file that the caller
+  // retained before consulting the system's mounted-image inventory.
+  struct stat callerBundle{}, namedBundle{}, callerImage{};
+  const auto sameBundle = [&]() {
+    return !lstat(layout.bundle.c_str(), &namedBundle) &&
+      callerBundle.st_dev == namedBundle.st_dev && callerBundle.st_ino == namedBundle.st_ino &&
+      callerBundle.st_mode == namedBundle.st_mode && callerBundle.st_uid == namedBundle.st_uid &&
+      callerBundle.st_nlink == namedBundle.st_nlink && callerBundle.st_size == namedBundle.st_size &&
+      !memcmp(&callerBundle.st_mtimespec, &namedBundle.st_mtimespec, sizeof(timespec)) &&
+      !memcmp(&callerBundle.st_ctimespec, &namedBundle.st_ctimespec, sizeof(timespec));
+  };
+  if (fstat(3, &callerBundle) || !S_ISDIR(callerBundle.st_mode) || !sameBundle() || fstat(4, &callerImage) ||
+      (fcntl(4, F_GETFL) & O_ACCMODE) != O_RDONLY ||
+      !image.openPath(imagePath, 0600, 1024LL * 1024 * 1024) ||
+      !arbol_attempt::sameFile(callerImage, image.identity) ||
+      !backing.capture(helperText.intValue, image) || !immutable.capture(layout, false) ||
+      !signature(bundle, true, false, true)) return 4;
+  NSDictionary* manifest = json([bundle stringByAppendingPathComponent:@"Contents/Resources/native-compatibility.json"]);
+  if (!payload(bundle, manifest) || !immutable.current() || !backing.current(image) ||
+      !sameBundle() || !inTime()) return 4;
+  return 0;
+}
+
 // LaunchServices supplies a new independent process. The fixed signed shim
 // still owns selection, profile-instance checks and ordinary open admission.
 static int openInstalledProfile(const arbol_attempt::PackagedLayout& layout, NSString* bundle, const char* profile, const char* instance) {
@@ -193,6 +236,12 @@ int main(int argc, const char* argv[]) {
     arbol_exit::NoUseOriginal noUse;
     try { @try {
       expiry=arbol_boundary::clockMs()+60000;
+      if (argc == 3 && !strcmp(argv[1], "--arbol-verify-installed-package")) {
+        NSString* bundle = NSBundle.mainBundle.bundlePath;
+        arbol_attempt::PackagedLayout layout;
+        if (!arbol_attempt::packagedLayout(bundle.fileSystemRepresentation, layout)) return 4;
+        return verifyInstalledPackage(layout, bundle, argv[2]);
+      }
       const bool profileOpen = argc == 4 && !strcmp(argv[1], "--arbol-profile-open");
       if ((!profileOpen && (argc != 3 || strcmp(argv[1], "--arbol-host-request") || argv[2][0] != '/')) ||
           getppid() != 1 || setpgid(0, 0) || getpgrp() != getpid()) return 4;

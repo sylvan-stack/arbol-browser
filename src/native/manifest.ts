@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
 import { join, dirname, resolve, sep, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { Contract } from '../contracts/generated.js';
 import { validator } from '../contracts/schema.js';
 
@@ -460,6 +461,49 @@ function revalidateStorage(root: string, context: StorageContext | undefined, de
   } catch (error) { return refuseVerification('storage-context', error); }
 }
 
+function verifyInstalledStartupStorage(root: string, image: string, deadline: number): StorageContext {
+  const descriptions: StorageDescription[] = [];
+  try {
+    // Pin the same original names and descriptions before running any checks.
+    const bundle = retainedDescription(root, true);
+    descriptions.push(bundle);
+    const backing = retainedDescription(image, false);
+    descriptions.push(backing);
+    const mapping = storageMapping(root, deadline);
+    if (!mapping.image || mapping.image['image-path'] !== image || storageMapping(image, deadline).image) return refuse();
+    const context = Object.freeze({ descriptions: Object.freeze([bundle, backing] as const), mapping: mapping.key });
+    const bootstrap = join(root, 'Contents/MacOS/arbol-browser-native');
+    const executable = retainedDescription(bootstrap, false);
+    try {
+      const requirement = productionPublisher.requirement + ` and identifier "${productionPublisher.bundleIdentifier}"`;
+      appleQuery('/usr/bin/codesign', ['--verify', '--strict', '-R', `=${requirement}`, bootstrap], deadline);
+      storageAssert(context, deadline);
+      if (fstatSync(executable.fd, { bigint: true }).dev !==
+          fstatSync(bundle.fd, { bigint: true }).dev ||
+          physicalStamp(lstatSync(bootstrap, { bigint: true })) !== executable.stamp ||
+          realpathSync(bootstrap) !== bootstrap) return refuse();
+      // Process identity, read-only backing, full code signatures and every
+      // signed payload entry are checked inside the signed bootstrap.
+      const result = spawnSync(bootstrap, ['--arbol-verify-installed-package', String(mapping.image['hdid-pid'])], {
+        timeout: budget(deadline), killSignal: 'SIGKILL', stdio: ['ignore', 'ignore', 'ignore', bundle.fd, backing.fd],
+        env: { PATH: '/usr/bin:/bin' },
+      });
+      budget(deadline);
+      if (result.error || result.status !== 0) return refuse();
+      if (physicalStamp(fstatSync(executable.fd, { bigint: true })) !== executable.stamp ||
+          physicalStamp(lstatSync(bootstrap, { bigint: true })) !== executable.stamp) return refuse();
+      storageAssert(context, deadline);
+      return context;
+    } finally { closeSync(executable.fd); }
+  } catch (error) {
+    for (const description of descriptions) {
+      try { closeSync(description.fd); }
+      catch { /* Preserve the original refusal. */ }
+    }
+    return refuseVerification('storage-context', error);
+  }
+}
+
 /** Observe only the two stamps used by an existing failed comparison. Never
  * restat, retry or replace the original full-stamp verification predicate. */
 function stampFailurePhase(identity: SnapshotIdentityPhase, before: string | undefined,
@@ -810,7 +854,8 @@ export function assertStartupCandidateTrust(value: CandidateTrust, deadline: num
   if (poisonedTrust || value !== trustedCandidate) refuse();
   value.assertIdentity(deadline, true);
 }
-export function verifySignedBundle(bundle: string, deadline = Infinity, scope: PublisherScope = 'isolated'): SignedBundle {
+export function verifySignedBundle(bundle: string, deadline = Infinity, scope: PublisherScope = 'isolated',
+  installedStartupImage?: string): SignedBundle {
   const observed: SnapshotFailure = {};
   let phase: SignedVerificationPhase = 'bundle-selection';
   let storage: StorageContext | undefined, retained = false;
@@ -819,13 +864,18 @@ export function verifySignedBundle(bundle: string, deadline = Infinity, scope: P
     if (!bundle.endsWith('.app') || realpathSync(bundle) !== resolve(bundle)) refuse();
     const root = resolve(bundle);
     const expectedPublisher = scope === 'production' ? productionPublisher : publisher;
-    storage = discoverStorage(root, deadline);
+    const payloadRoot = resolve(fileURLToPath(new URL('../../', import.meta.url)));
+    const installedStartup = scope === 'production' && installedStartupImage !== undefined &&
+      root === dirname(dirname(dirname(payloadRoot))) && process.platform === 'darwin';
+    storage = installedStartup
+      ? verifyInstalledStartupStorage(root, installedStartupImage, deadline)
+      : discoverStorage(root, deadline);
     const mounted: MountedBundleRead | undefined = scope === 'production' && storage
       ? { device: fstatSync(storage.descriptions[0].fd, { bigint: true }).dev, files: new Map() }
       : undefined;
     const physical: Record<string, PhysicalEntry> = Object.create(null), afterPhysical: Record<string, PhysicalEntry> = Object.create(null);
     const check = (): Compatibility => {
-      signature(root, true, false, deadline, expectedPublisher);
+      if (!installedStartup) signature(root, true, false, deadline, expectedPublisher);
       phase = 'publisher';
       if (stable(boundedJson(join(root, 'Contents/Resources/publisher-requirement.json'), deadline)) !== stable(expectedPublisher)) refuse();
       phase = 'compatibility';
@@ -839,7 +889,7 @@ export function verifySignedBundle(bundle: string, deadline = Infinity, scope: P
       const payload = 'Contents/Resources/browser';
       function verifyFile(path: string, key: string, bytes: ReturnType<typeof physicalFile>): void {
         inventory[key] = bytes.digest;
-        if (['cffaedfe', 'cefaedfe', 'feedfacf', 'cafebabe', 'bebafeca'].includes(bytes.magic))
+        if (!installedStartup && ['cffaedfe', 'cefaedfe', 'feedfacf', 'cafebabe', 'bebafeca'].includes(bytes.magic))
           signature(path, false, key.startsWith(payload + '/runtime/Electron.app/') && key.includes('/Contents/MacOS/'),
             deadline, expectedPublisher);
       }
@@ -888,7 +938,8 @@ export function verifySignedBundle(bundle: string, deadline = Infinity, scope: P
     if (before !== after) refuseSnapshot('snapshot-encoded-mismatch', observed);
     if (stable(physical) !== stable(afterPhysical))
       refuseSnapshot(stampFailurePhase(physical['']?.stamp !== afterPhysical['']?.stamp ? 'snapshot-root-identity' : 'snapshot-entry-identity', physical['']?.stamp, afterPhysical['']?.stamp), observed);
-    revalidateStorage(root, storage, deadline);
+    if (installedStartup) storageAssert(storage, deadline);
+    else revalidateStorage(root, storage, deadline);
     // Snapshot validation cannot be bypassed by mutation through a caller-held object.
     function frozen<T>(value: T): T { if (value && typeof value === 'object') { for (const entry of Object.values(value)) frozen(entry); Object.freeze(value); } return value; }
     const manifest = frozen(initial);
@@ -921,7 +972,8 @@ export function verifySignedBundle(bundle: string, deadline = Infinity, scope: P
   } catch (error) { noteSnapshotFailure(observed, error, phase); throw error; }
   finally { if (!retained && storage) for (const d of storage.descriptions) { try { closeSync(d.fd); } catch { /* Preserve construction refusal. */ } } }
 }
-export function verifyNativeCandidate(bundle: string, deadline = Infinity, scope: PublisherScope = 'isolated'): CandidateTrust {
+export function verifyNativeCandidate(bundle: string, deadline = Infinity, scope: PublisherScope = 'isolated',
+  installedStartupImage?: string): CandidateTrust {
   if (poisonedTrust) refuse();
   if (trustedCandidate) {
     const expectedPublisher = scope === 'production' ? productionPublisher : publisher;
@@ -931,7 +983,7 @@ export function verifyNativeCandidate(bundle: string, deadline = Infinity, scope
     trustedCandidate.assertIdentity(deadline); return trustedCandidate;
   }
   if (attemptedTrust) refuse(); attemptedTrust = true;
-  try { trustedCandidate = verifySignedBundle(bundle, deadline, scope); return trustedCandidate; }
+  try { trustedCandidate = verifySignedBundle(bundle, deadline, scope, installedStartupImage); return trustedCandidate; }
   catch (error) { poisonedTrust = true; return refuseVerification('bundle-selection', error); }
 }
 
