@@ -168,10 +168,22 @@ void diagnostic(const Reply& reply, unsigned branch, unsigned phase) {
 
 int main(int argc, const char* argv[]) {
   @autoreleasepool {
-    if (argc != 3) return 4;
+    const bool prepared = argc == 4 && !strcmp(argv[3], "--wait-for-reservation");
+    if (argc != 3 && !prepared) return 4;
     NSString* application = [NSString stringWithUTF8String:argv[1]];
     NSString* request = [NSString stringWithUTF8String:argv[2]];
     if (!application.isAbsolutePath || !request.isAbsolutePath) return 4;
+    NSWorkspace* workspace = nil;
+    if (prepared) {
+      // Only LaunchServices initialization overlaps reservation. No request,
+      // profile lock, or native Claim is touched before the private gate.
+      @try { workspace = [NSWorkspace sharedWorkspace]; } @catch (NSException*) { return 4; }
+      struct stat gate{};
+      pollfd readable{STDIN_FILENO, POLLIN, 0};
+      char approved=0;
+      if (!workspace || fstat(STDIN_FILENO,&gate) || (!S_ISFIFO(gate.st_mode) && !S_ISSOCK(gate.st_mode)) ||
+          poll(&readable,1,60000)!=1 || !(readable.revents&POLLIN) || read(STDIN_FILENO,&approved,1)!=1 || approved!='1') return 4;
+    }
     double deadline=arbol_boundary::clockMs()+28000;
     NSDictionary* pending = nil; std::string requestRaw; Baseline baseline;
     { arbol_attempt::Claim claim; std::string raw; NSDictionary* attempt=nil; arbol_attempt::PackagedLayout layout;
@@ -205,7 +217,7 @@ int main(int argc, const char* argv[]) {
     const std::string requestPath = argv[2];
     const auto reply = std::make_shared<Reply>();
     try { @try {
-      [[NSWorkspace sharedWorkspace] openApplicationAtURL:[NSURL fileURLWithPath:application]
+      [(workspace ?: [NSWorkspace sharedWorkspace]) openApplicationAtURL:[NSURL fileURLWithPath:application]
       configuration:configuration completionHandler:^(NSRunningApplication* app, NSError* error) {
         { std::lock_guard<std::mutex> held(reply->mutex);
           if (reply->callback || reply->outcome != Outcome::pending) return;

@@ -1,5 +1,5 @@
 import { noteOpenCommand, type OpenCommandObservation } from './authorities.js';
-import { execFile } from 'node:child_process';
+import { execFile, type ChildProcess } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { userInfo } from 'node:os';
@@ -36,24 +36,48 @@ export interface LaunchAttemptPort {
   cancel(profile: ProfileSnapshot, request: string, deadline: number): Promise<LaunchWithdrawal>;
   admitted(profile: ProfileSnapshot, record: RuntimeRecord, deadline: number, request?: string, joiningStartup?: boolean): Promise<void>;
 }
+interface PreparedLaunch { submit(): Promise<number>; cancel(): void }
+
+function runLaunchHelper(selection: BuildSelection, requestPath: string, deadline: number,
+  signal?: AbortSignal, waitForReservation = false): PreparedLaunch {
+  assertTime(deadline);
+  if (signal?.aborted) throw unavailable('browser');
+  const layout = selectedLayout(selection, resolve(fileURLToPath(new URL('../../', import.meta.url))));
+  const account = userInfo();
+  if (account.uid !== process.geteuid?.()) throw profileUnavailable();
+  const timeout = Math.floor(deadline - now());
+  if (!Number.isFinite(timeout) || timeout < 1) throw profileUnavailable();
+  const args = [layout.bundle, requestPath];
+  if (waitForReservation) args.push('--wait-for-reservation');
+  let accept!: (pid: number) => void;
+  let refuse!: (error: Error) => void;
+  const result = new Promise<number>((resolve, reject) => { accept = resolve; refuse = reject; });
+  const child: ChildProcess = execFile(layout.launcher, args, { timeout, maxBuffer: 128, ...(signal ? { signal } : {}),
+    env: { HOME: account.homedir, USER: account.username, PATH: '/usr/bin:/bin' } }, (error, stdout) => {
+    if (error || !/^[1-9][0-9]*\n$/.test(stdout) || !Number.isSafeInteger(Number(stdout.trim()))) {
+      refuse(profileUnavailable()); return;
+    }
+    accept(Number(stdout.trim()));
+  });
+  void result.catch(() => {}); // Failure may arrive before the reservation ends.
+  const gate = child.stdin;
+  gate?.on('error', () => gate.destroy());
+  return {
+    async submit() {
+      assertTime(deadline);
+      if (signal?.aborted || (waitForReservation && (!gate || gate.destroyed))) throw unavailable('browser');
+      gate?.end(waitForReservation ? '1' : undefined);
+      return result;
+    },
+    cancel() { gate?.destroy(); },
+  };
+}
+
 export const launchServices: LaunchPort = Object.freeze({
-  launch(selection: BuildSelection, requestPath: string, deadline: number, signal?: AbortSignal): Promise<number> {
-    assertTime(deadline);
-    if (signal?.aborted) return Promise.reject(unavailable('browser'));
-    const layout = selectedLayout(selection, resolve(fileURLToPath(new URL('../../', import.meta.url))));
-    const account = userInfo(); if (account.uid !== process.geteuid?.()) return Promise.reject(profileUnavailable());
-    return new Promise((resolve, reject) => {
-      const timeout = Math.floor(deadline - now());
-      if (!Number.isFinite(timeout) || timeout < 1) { reject(profileUnavailable()); return; }
-      execFile(layout.launcher, [layout.bundle, requestPath],
-        { timeout, maxBuffer: 128, ...(signal ? { signal } : {}),
-          env: { HOME: account.homedir, USER: account.username, PATH: '/usr/bin:/bin' } }, (error, stdout) => {
-          if (error || !/^[1-9][0-9]*\n$/.test(stdout) || !Number.isSafeInteger(Number(stdout.trim()))) {
-            reject(profileUnavailable()); return;
-          }
-          resolve(Number(stdout.trim()));
-        });
-    });
+  async launch(selection: BuildSelection, requestPath: string, deadline: number, signal?: AbortSignal): Promise<number> {
+    const prepared = runLaunchHelper(selection, requestPath, deadline, signal);
+    try { return await prepared.submit(); }
+    finally { prepared.cancel(); }
   },
 });
 export interface RetainedStartup {
@@ -87,6 +111,7 @@ export function createStarter(options: { selection: BuildSelection; platform: Pl
     noteOpenCommand(options.observation, 'open-initial-build-lease');
     const guard = await options.acquireBuild(); let startup: HeldLock | undefined;
     let request = '', launched: number | undefined, attempted = false, resolved = false;
+    let preparation: PreparedLaunch | undefined;
     const release = () => { startup?.release(); guard.release(); resolved = true; };
     try {
       current(); await guard.assert(); current();
@@ -140,12 +165,14 @@ export function createStarter(options: { selection: BuildSelection; platform: Pl
       // Production temporarily takes Owner only inside verified reservation;
       // it releases that exact description before LaunchServices, never waits
       // for a host while retaining the temporary Owner.
+      if (options.attempts && !options.launch) preparation = runLaunchHelper(options.selection, path, admissionDeadline, signal, true);
       attempted = true;
       noteOpenCommand(options.observation, 'open-reservation');
       await options.attempts?.reserve(profile, request, admissionDeadline, guard, signal);
       current(admissionDeadline); await guard.assert(); current(admissionDeadline);
       noteOpenCommand(options.observation, 'open-launch');
-      launched = await (options.launch ?? launchServices).launch(options.selection, path, admissionDeadline, signal);
+      launched = preparation ? await preparation.submit() :
+        await (options.launch ?? launchServices).launch(options.selection, path, admissionDeadline, signal);
       current(admissionDeadline);
       await options.attempts?.launched(profile, request, launched, admissionDeadline, signal);
       noteOpenCommand(options.observation, 'open-native-ready-attachment');
@@ -175,6 +202,7 @@ export function createStarter(options: { selection: BuildSelection; platform: Pl
       } while (now() < admissionDeadline);
       throw profileUnavailable();
     } catch (error) {
+      preparation?.cancel();
       if (attempted && !resolved) {
         const attempt: RetainedStartup = Object.freeze({ profile, request,
           async resolve(limit: number) {
