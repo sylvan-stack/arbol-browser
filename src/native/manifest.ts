@@ -461,6 +461,90 @@ function revalidateStorage(root: string, context: StorageContext | undefined, de
   } catch (error) { return refuseVerification('storage-context', error); }
 }
 
+// The signed release bootstrap is a thin arm64 Mach-O with a SHA-256
+// CodeDirectory. Derive its live-code requirement from the original open
+// description, so a different executable cannot supply the expected hash.
+function startupCodeDirectoryHash(executable: StorageDescription, deadline: number): string {
+  const original = fstatSync(executable.fd, { bigint: true });
+  if (physicalStamp(original) !== executable.stamp || original.size < 32n || original.size > BigInt(nativeLimit)) return refuse();
+  const bytes = Buffer.alloc(Number(original.size));
+  for (let at = 0; at < bytes.length;) {
+    budget(deadline);
+    const count = readSync(executable.fd, bytes, at, bytes.length - at, at);
+    if (count < 1) return refuse();
+    at += count;
+  }
+  if (physicalStamp(fstatSync(executable.fd, { bigint: true })) !== executable.stamp ||
+      bytes.readUInt32LE(0) !== 0xfeedfacf || bytes.readUInt32LE(4) !== 0x0100000c) return refuse();
+  const end = 32 + bytes.readUInt32LE(20);
+  const count = bytes.readUInt32LE(16);
+  if (end > bytes.length || count < 1 || count > (end - 32) / 8) return refuse();
+  let signature: Buffer | undefined;
+  let at = 32;
+  for (let index = 0; index < count; ++index) {
+    if (at + 8 > end) return refuse();
+    const kind = bytes.readUInt32LE(at), size = bytes.readUInt32LE(at + 4);
+    if (size < 8 || size % 8 || at + size > end) return refuse();
+    if (kind === 0x1d) { // LC_CODE_SIGNATURE
+      if (signature || size !== 16) return refuse();
+      const start = bytes.readUInt32LE(at + 8), length = bytes.readUInt32LE(at + 12);
+      if (start < end || length < 12 || start + length > bytes.length) return refuse();
+      signature = bytes.subarray(start, start + length);
+    }
+    at += size;
+  }
+  if (at !== end || !signature || signature.readUInt32BE(0) !== 0xfade0cc0) return refuse(); // Embedded signature SuperBlob
+  const length = signature.readUInt32BE(4), slots = signature.readUInt32BE(8);
+  const tableEnd = 12 + slots * 8;
+  if (length > signature.length || tableEnd > length) return refuse();
+  let hash: string | undefined;
+  for (let index = 0; index < slots; ++index) {
+    const slot = 12 + index * 8;
+    if (signature.readUInt32BE(slot) !== 0) continue; // Primary CodeDirectory
+    const offset = signature.readUInt32BE(slot + 4);
+    if (hash || offset < tableEnd || offset + 44 > length || signature.readUInt32BE(offset) !== 0xfade0c02) return refuse();
+    const size = signature.readUInt32BE(offset + 4);
+    if (size < 44 || offset + size > length || signature[offset + 36] !== 32 || signature[offset + 37] !== 2) return refuse();
+    hash = createHash('sha256').update(signature.subarray(offset, offset + size)).digest('hex').slice(0, 40);
+  }
+  return hash ?? refuse();
+}
+
+const installedVerifierBroker = `
+ObjC.import('Foundation');
+function run(argv) {
+  const task = $.NSTask.alloc.init;
+  const gate = $.NSPipe.pipe;
+  const writer = gate.fileHandleForWriting;
+  const discard = $.NSFileHandle.fileHandleWithNullDevice;
+  task.launchPath = argv[0];
+  task.arguments = $(['--arbol-verify-installed-package', argv[1]]);
+  task.environment = $({ PATH: '/usr/bin:/bin' });
+  task.standardInput = gate;
+  task.standardOutput = $.NSFileHandle.alloc.initWithFileDescriptorCloseOnDealloc(3, false);
+  task.standardError = $.NSFileHandle.alloc.initWithFileDescriptorCloseOnDealloc(4, false);
+  try {
+    if (!task.launchAndReturnError(null)) return 'refused';
+    const verification = $.NSTask.alloc.init;
+    verification.launchPath = '/usr/bin/codesign';
+    verification.arguments = $(['--verify', '--strict', '-R', '=' + argv[2], String(task.processIdentifier)]);
+    verification.environment = task.environment;
+    verification.standardInput = discard;
+    verification.standardOutput = discard;
+    verification.standardError = discard;
+    if (!verification.launchAndReturnError(null)) return 'refused';
+    verification.waitUntilExit;
+    if (verification.terminationStatus !== 0 || !task.running) return 'refused';
+    writer.writeData($('1').dataUsingEncoding($.NSUTF8StringEncoding));
+    task.waitUntilExit;
+    return task.terminationStatus === 0 ? 'verified' : 'refused';
+  } finally {
+    writer.closeFile;
+    if (task.running) task.terminate;
+  }
+}
+`;
+
 function verifyInstalledStartupStorage(root: string, image: string, deadline: number): StorageContext {
   const descriptions: StorageDescription[] = [];
   try {
@@ -475,8 +559,9 @@ function verifyInstalledStartupStorage(root: string, image: string, deadline: nu
     const bootstrap = join(root, 'Contents/MacOS/arbol-browser-native');
     const executable = retainedDescription(bootstrap, false);
     try {
-      const requirement = productionPublisher.requirement + ` and identifier "${productionPublisher.bundleIdentifier}"`;
-      appleQuery('/usr/bin/codesign', ['--verify', '--strict', '-R', `=${requirement}`, bootstrap], deadline);
+      const cdhash = startupCodeDirectoryHash(executable, deadline);
+      const requirement = productionPublisher.requirement +
+        ` and identifier "${productionPublisher.bundleIdentifier}" and cdhash H"${cdhash}"`;
       storageAssert(context, deadline);
       if (fstatSync(executable.fd, { bigint: true }).dev !==
           fstatSync(bundle.fd, { bigint: true }).dev ||
@@ -484,12 +569,14 @@ function verifyInstalledStartupStorage(root: string, image: string, deadline: nu
           realpathSync(bootstrap) !== bootstrap) return refuse();
       // Process identity, read-only backing, full code signatures and every
       // signed payload entry are checked inside the signed bootstrap.
-      const result = spawnSync(bootstrap, ['--arbol-verify-installed-package', String(mapping.image['hdid-pid'])], {
-        timeout: budget(deadline), killSignal: 'SIGKILL', stdio: ['ignore', 'ignore', 'ignore', bundle.fd, backing.fd],
+      const result = spawnSync('/usr/bin/osascript', ['-l', 'JavaScript', '-e', installedVerifierBroker,
+        bootstrap, String(mapping.image['hdid-pid']), requirement], {
+        timeout: budget(deadline), killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'ignore', bundle.fd, backing.fd],
+        encoding: 'utf8', maxBuffer: nativeLimit,
         env: { PATH: '/usr/bin:/bin' },
       });
       budget(deadline);
-      if (result.error || result.status !== 0) return refuse();
+      if (result.error || result.status !== 0 || result.stdout !== 'verified\n') return refuse();
       if (physicalStamp(fstatSync(executable.fd, { bigint: true })) !== executable.stamp ||
           physicalStamp(lstatSync(bootstrap, { bigint: true })) !== executable.stamp) return refuse();
       storageAssert(context, deadline);

@@ -167,6 +167,12 @@ static bool payload(NSString* bundle, NSDictionary* manifest) {
 // This invocation only verifies the installed package. It never reads a
 // profile, takes ownership or admits a Browser process.
 static int verifyInstalledPackage(const arbol_attempt::PackagedLayout& layout, NSString* bundle, const char* helper) {
+  // Wait until the stock broker has authenticated this live process against
+  // the original executable's exact CodeDirectory and Publisher.
+  struct pollfd gate{STDIN_FILENO, POLLIN, 0};
+  char approval = 0;
+  if (!inTime() || poll(&gate, 1, int(std::min(5000.0, expiry - arbol_boundary::clockMs()))) != 1 ||
+      !(gate.revents & POLLIN) || read(STDIN_FILENO, &approval, 1) != 1 || approval != '1' || !inTime()) return 4;
   NSString* helperText = [NSString stringWithUTF8String:helper];
   if (!layout.installed || !arbol_attempt::pattern(helperText, @"^[1-9][0-9]{0,9}$") ||
       helperText.longLongValue <= 1 || helperText.longLongValue > INT_MAX) return 4;
@@ -193,8 +199,8 @@ static int verifyInstalledPackage(const arbol_attempt::PackagedLayout& layout, N
       !memcmp(&callerBundle.st_mtimespec, &namedBundle.st_mtimespec, sizeof(timespec)) &&
       !memcmp(&callerBundle.st_ctimespec, &namedBundle.st_ctimespec, sizeof(timespec));
   };
-  if (fstat(3, &callerBundle) || !S_ISDIR(callerBundle.st_mode) || !sameBundle() || fstat(4, &callerImage) ||
-      (fcntl(4, F_GETFL) & O_ACCMODE) != O_RDONLY ||
+  if (fstat(STDOUT_FILENO, &callerBundle) || !S_ISDIR(callerBundle.st_mode) || !sameBundle() ||
+      fstat(STDERR_FILENO, &callerImage) || (fcntl(STDERR_FILENO, F_GETFL) & O_ACCMODE) != O_RDONLY ||
       !image.openPath(imagePath, 0600, 1024LL * 1024 * 1024) ||
       !arbol_attempt::sameFile(callerImage, image.identity) ||
       !backing.capture(helperText.intValue, image) || !immutable.capture(layout, false) ||
@@ -237,6 +243,7 @@ int main(int argc, const char* argv[]) {
     try { @try {
       expiry=arbol_boundary::clockMs()+60000;
       if (argc == 3 && !strcmp(argv[1], "--arbol-verify-installed-package")) {
+        expiry=arbol_boundary::clockMs()+5000;
         NSString* bundle = NSBundle.mainBundle.bundlePath;
         arbol_attempt::PackagedLayout layout;
         if (!arbol_attempt::packagedLayout(bundle.fileSystemRepresentation, layout)) return 4;
