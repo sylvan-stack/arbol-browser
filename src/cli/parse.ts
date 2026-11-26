@@ -4,7 +4,7 @@ import { isSeqoyaProvider, seqoyaProfilePattern, type SeqoyaProvider } from '../
 
 export type Command =
   | { kind: 'info' }
-  | { kind: 'open'; profile: string; url?: string; profileInstance?: string }
+  | { kind: 'open'; profile: string; url?: string; profileInstance?: string; creationRequest?: string }
   | { kind: 'close'; profile: string }
   | { kind: 'seqoya-usage'; profile: string; profileInstance: string; provider: SeqoyaProvider }
   | { kind: 'agent'; profile: string; label: string }
@@ -65,16 +65,20 @@ export function parse(args: readonly string[]): Command {
     return { kind: 'seqoya-usage', profile, profileInstance: instance, provider };
   }
   if ((command === 'open' || command === 'close') && words.length === 1) {
-    allowed('--profile', ...(command === 'open' ? ['--url', '--profile-instance'] : []));
+    allowed('--profile', ...(command === 'open' ? ['--url', '--profile-instance', '--creation-request'] : []));
     const profile = selectedProfile(options.get('--profile') ?? 'default');
     if (command === 'open') {
       const url = options.get('--url');
       const instance = options.get('--profile-instance');
+      const request = options.get('--creation-request');
       if (instance !== undefined && (!options.has('--profile') || typeof instance !== 'string' ||
           instance.length !== 26 || !profileInstance.test(instance)))
         throw invalidInput();
+      if (request !== undefined && (typeof instance !== 'string' || typeof request !== 'string' ||
+          !creationRequest.test(request))) throw invalidInput();
       return { kind: 'open', profile, ...(typeof url === 'string' ? { url: checkedUrl(url) } : {}),
-        ...(typeof instance === 'string' ? { profileInstance: instance } : {}) };
+        ...(typeof instance === 'string' ? { profileInstance: instance } : {}),
+        ...(typeof request === 'string' ? { creationRequest: request } : {}) };
     }
     return { kind: 'close', profile };
   }

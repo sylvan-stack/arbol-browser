@@ -4,7 +4,7 @@ import type { RuntimeClient } from './transport.js';
 import type { SeqoyaParameters, SeqoyaResult } from './seqoya-wire.js';
 
 export interface Stdio { stdin: Readable; stdout: Writable; stderr: Writable }
-export interface OpenOptions { profile: string; url?: string; profileInstance?: string }
+export interface OpenOptions { profile: string; url?: string; profileInstance?: string; creationRequest?: string }
 export interface AgentAttachment {
   readonly profile: string;
   readonly label: string;

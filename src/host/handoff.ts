@@ -709,16 +709,20 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
           if (request.method === 'close') throw unavailable('browser');
           const host = windowForOpen();
           const url = request.params.url;
-          if (url !== undefined || tabs().all().length === 0) {
-            if (host.hasForegroundWork()) throw new ForegroundWorkRequired('window');
-            await tabs().openUser(host, userURL(url ?? 'about:blank'));
-          }
+          const destination = url !== undefined || tabs().all().length === 0 ? userURL(url ?? 'about:blank') : undefined;
+          if (destination !== undefined && host.hasForegroundWork()) throw new ForegroundWorkRequired('window');
           live();
           const registration = windows.get(host);
           if (!registration) throw unavailable('browser');
           assertShellRegistration(registration, host); await registration.show(deadline, signal, url !== undefined);
           live(); assertShellRegistration(registration, host);
           presented = true;
+          if (destination !== undefined) {
+            if (signal.aborted || performance.now() >= deadline) throw refused('control_refused');
+            if (host.hasForegroundWork()) throw new ForegroundWorkRequired('window');
+            await tabs().openUser(host, destination);
+            live(); assertShellRegistration(registration, host);
+          }
           const info = operations.info();
           value = { profile: info.profile, instance: info.instance, process: process.pid, alreadyRunning: true };
           proof = { kind: 'management', method: 'open' };
