@@ -318,7 +318,8 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
   let phase: 'prepared' | 'live' | 'closed' = 'prepared';
   let registry: TabRegistry | undefined, runtime: HostLifecycle | undefined, everBound = false;
   let presented = false;
-  const emptyPresentations = new WeakMap<ConnectionContext, number>();
+  const preparedPresentations = new WeakMap<ConnectionContext, { host: WindowHost; deadline: number; empty: boolean }>();
+  const openedDestinations = new WeakMap<TabTarget, { page: PageSurface; destination: string; committedURL: string }>();
   const windows = new Map<WindowHost, ShellRegistration>();
   const contexts = new Map<string, ConnectionContext>(), attempted = new WeakSet<ConnectionContext>();
   const disconnected = new WeakSet<ConnectionContext>(), cleanups = new Map<string, Promise<void>>();
@@ -713,12 +714,18 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
           const showEmpty = request.params.showEmpty === true;
           const empty = tabs().all().length === 0;
           const destination = !showEmpty && (url !== undefined || empty) ? userURL(url ?? 'about:blank') : undefined;
-          const preparedUntil = emptyPresentations.get(context);
-          emptyPresentations.delete(context);
-          const mustPreserveWork = () => host.hasForegroundWork() && !(preparedUntil !== undefined &&
-            performance.now() < preparedUntil && !host.window.isDestroyed() && host.window.isEnabled() &&
-            tabs().all().length === 0);
-          if (destination !== undefined && mustPreserveWork()) throw new ForegroundWorkRequired('window');
+          const prepared = preparedPresentations.get(context);
+          preparedPresentations.delete(context);
+          const isContinuation = () => url !== undefined && prepared?.host === host && performance.now() < prepared.deadline;
+          const opensInBackground = () => {
+            if (!host.hasForegroundWork()) return false;
+            if (!isContinuation() || host.window.isDestroyed() || !host.window.isEnabled())
+              throw new ForegroundWorkRequired('window');
+            if (prepared?.empty && tabs().all().length === 0) return false;
+            if (!tabs().selected(host)) throw new ForegroundWorkRequired('window');
+            return true;
+          };
+          if (destination !== undefined) opensInBackground();
           live();
           const registration = windows.get(host);
           if (!registration) throw unavailable('browser');
@@ -732,12 +739,24 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
             } : undefined);
             live(); assertShellRegistration(registration, host);
             presented = true;
-            if (showEmpty && tabs().all().length === 0) emptyPresentations.set(context, performance.now() + 60_000);
+            if (showEmpty) preparedPresentations.set(context, { host, deadline: performance.now() + 60_000, empty: tabs().all().length === 0 });
           }
           if (destination !== undefined) {
             if (signal.aborted || performance.now() >= deadline) throw refused('control_refused');
-            if (mustPreserveWork()) throw new ForegroundWorkRequired('window');
-            await tabs().openUser(host, destination);
+            const background = opensInBackground();
+            const previous = isContinuation() ? tabs().all().find(target => {
+              const opened = openedDestinations.get(target), page = target.page;
+              if (opened?.destination !== destination || opened.page !== page || page.window !== host ||
+                  page.retirement() || page.view.webContents.isDestroyed() || page.view.webContents.getURL() !== opened.committedURL) return false;
+              const state = tabs().state(target);
+              return state.controller.kind === 'user' && state.handoff === 'idle' && state.pageAvailability === 'ready';
+            }) : undefined;
+            if (previous) {
+              if (!background && tabs().selected(host) !== previous) tabs().select(host, previous.id);
+            } else {
+              const opened = await tabs().openUser(host, destination, background);
+              if (isContinuation()) openedDestinations.set(opened, { page: opened.page, destination, committedURL: opened.page.view.webContents.getURL() });
+            }
             live(); assertShellRegistration(registration, host);
           }
           const info = operations.info();

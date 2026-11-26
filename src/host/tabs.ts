@@ -42,7 +42,7 @@ export interface TabRegistry {
   all(): readonly TabTarget[];
   get(id: string): TabTarget;
   state(target: TabTarget): TabState;
-  openUser(window: WindowHost, url?: string): Promise<TabTarget>;
+  openUser(window: WindowHost, url?: string, background?: boolean): Promise<TabTarget>;
   openAgent(window: WindowHost, client: string, label: string, url: string, scope: AgentOpenScope): Promise<TabTarget>;
   select(window: WindowHost, id: string): TabTarget;
   selected(window: WindowHost): TabTarget | undefined;
@@ -253,7 +253,8 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
     all: () => [...tabs.values()].filter(target => registered.has(target) && !closing.has(target) && !windowClosures.has(target.page.window)),
     get(id: string) { const target = tabs.get(id); if (!target || !registered.has(target)) throw refused('tab_not_found'); assertTarget(target); return target; },
     state,
-    openUser: (window: WindowHost, url = 'about:blank') => open(window, url),
+    openUser: (window: WindowHost, url = 'about:blank', background = false) =>
+      open(window, url, undefined, undefined, undefined, background),
     openAgent: (window: WindowHost, client: string, label: string, url: string, scope: AgentOpenScope) => open(window, url, { id: client, label }, undefined, undefined, false, scope),
     select(window: WindowHost, id: string) {
       const target = registry.get(id); if (target.page.window !== window) throw refused('tab_not_found');

@@ -670,7 +670,8 @@ struct Context {
       originalGroupRetired=true;
     }
     groupPending=false; std::set<int> currentGaps;
-    auto inspect=[&](int pid,bool groupMember) {
+    std::vector<int> incompleteUIDReads;
+    auto inspect=[&](int pid,bool groupMember,bool deferIncomplete=false) {
       if(pid<=0) return;
       const double sampledAt=readback?clockMs():0;
       Identity id; Info info{}; int state=observe(pid,id,&info);
@@ -706,6 +707,9 @@ struct Context {
         return; // known originals remain in the full kernel reconciliation
       }
       if(state<0) {
+        // The system-wide list can race a process exiting. Keep the pass
+        // incomplete until a fresh kernel read gives a real answer.
+        if(deferIncomplete&&!groupMember) { incompleteUIDReads.push_back(pid); return; }
         if(groupMember) valid=reject(); // Original process-group scan.
         else valid=reject(); // Full scan of the owner's UID.
         return;
@@ -782,7 +786,8 @@ struct Context {
       lastFullCensus=began; fullCensusValid=false;
       int bytes=proc_listpids(PROC_UID_ONLY,main.uid,pids.data(),(int)(cap*sizeof(pid_t)));
       if(bytes<0||bytes%sizeof(pid_t)||(size_t)bytes>=cap*sizeof(pid_t)) return reject();
-      for(int i=0;i<bytes/(int)sizeof(pid_t);++i) inspect(pids[i],false);
+      for(int i=0;i<bytes/(int)sizeof(pid_t);++i) inspect(pids[i],false,true);
+      for(int pid:incompleteUIDReads) inspect(pid,false);
       fullCensusValid=valid;
     }
     if(!originalGroupRetired) {
