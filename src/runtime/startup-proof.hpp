@@ -86,7 +86,7 @@ inline NSDictionary* signedProvisionalPeer(int fd, const std::string& executable
   NSDictionary* process = arbol_attempt::processRecord(audit_token_to_pid(token));
   if (!process || [process[@"pidVersion"] intValue] != audit_token_to_pidversion(token) ||
       ![process[@"executable"] isEqual:[NSString stringWithUTF8String:executable.c_str()]]) return nil;
-  NSString* anchor = [@ARBOL_PRODUCTION_PUBLISHER_REQUIREMENT stringByAppendingFormat:@" and identifier \"%@\"",identifier];
+  NSString* anchor = [NSString stringWithFormat:@"anchor apple generic and identifier \"%@\" and certificate leaf[subject.OU] = \"7V372XL59S\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists",identifier];
   NSDictionary* attributes = @{(__bridge NSString*)kSecGuestAttributeAudit:[NSData dataWithBytes:&token length:sizeof(token)]};
   SecCodeRef code = nullptr;
   SecRequirementRef requirement = nullptr;
@@ -127,7 +127,7 @@ public:
     if (!arbol_attempt::pattern(digest,@"^[0-9a-f]{64}$")) return -1;
     Descriptor peer(accept(listener_.get(),nullptr,nullptr));
     if (peer.get()<0) return errno==EAGAIN || errno==EWOULDBLOCK || errno==EINTR ? 0 : -1;
-    NSDictionary* process = signedProvisionalPeer(peer.get(),layout.bootstrap,@ARBOL_PRODUCTION_BUNDLE_ID);
+    NSDictionary* process = signedProvisionalPeer(peer.get(),layout.bootstrap,@"com.sylvan-stack.arbol-browser");
     const int actual = [process[@"pid"] intValue];
     if (!process || actual<=1 || (expectedPid>1 && actual!=expectedPid) || [process[@"group"] intValue]!=actual) return 0;
     int noSignal = 1;
