@@ -3170,6 +3170,7 @@ struct OrdinaryMigrationAuthority {
   arbol_attempt::IsolatedMaintenance isolated;
   arbol_exit::NativeFile bundle;
   arbol_boundary::Lock guard;
+  const arbol_startup_proof::RetainedAppPackage* startupPackage=nullptr;
   struct stat identity{}; struct statfs filesystem{};
   NSString* state=nil; bool available=false;
   std::string runtimePath;
@@ -3179,13 +3180,19 @@ struct OrdinaryMigrationAuthority {
       !fstat(bundle.fd,&held)&&!lstat(layout.bundle.c_str(),&named)&&!fcntl(bundle.fd,F_GETPATH,path)&&layout.bundle==path&&
       stableSnapshotNode(identity,held)&&stableSnapshotNode(held,named)&&!fstatfs(bundle.fd,&fs)&&
       (fs.f_flags&MNT_RDONLY)&&(fs.f_flags&MNT_LOCAL)&&fs.f_fsid.val[0]==filesystem.f_fsid.val[0]&&fs.f_fsid.val[1]==filesystem.f_fsid.val[1]&&
-      policy.current()&&(!available||(layout.installed?runtime.current():isolated.current()));
+      policy.current()&&(!startupPackage||startupPackage->current())&&
+      (!available||(layout.installed?runtime.current():isolated.current()));
   }
-  bool open(const std::string& ownBundle,NSString* profile,const arbol_boundary::Lock& ownGuard,double deadline) {
+  bool open(const std::string& ownBundle,NSString* profile,const arbol_boundary::Lock& ownGuard,double deadline,
+            const arbol_startup_proof::RetainedAppPackage* candidate,NSString* snapshot) {
     using namespace arbol_attempt;
     if(profileFormat!=2||!packagedLayout(ownBundle,layout)||layout.guard!=ownGuard.path||ownGuard.heldMode!=LOCK_SH||
-       !arbol_boundary::lockIdentity(ownGuard)||!arbol_boundary::canonical(ownBundle)||
-       !signedIdentity(ownBundle,layout.installed?@"com.sylvan-stack.arbol-browser":@"com.sylvan-stack.arbol-browser.native-candidate",true)) return false;
+       !arbol_boundary::lockIdentity(ownGuard)||!arbol_boundary::canonical(ownBundle)) return false;
+    if(layout.installed&&candidate&&candidate->witnessed()&&candidate->matches(layout,snapshot)) {
+      if(!candidate->current()) return false;
+      startupPackage=candidate;
+      os_log(OS_LOG_DEFAULT,"arbol-browser receipt authority reused its verified installed package");
+    } else if(!signedIdentity(ownBundle,layout.installed?@"com.sylvan-stack.arbol-browser":@"com.sylvan-stack.arbol-browser.native-candidate",true)) return false;
     if(!layout.installed) {
       struct stat sealed{}; errno=0;
       if(lstat((ownBundle+"/Contents/Resources/maintenance-fixture.json").c_str(),&sealed)) return errno==ENOENT;
@@ -4376,13 +4383,27 @@ static bool inspectExit(ExitInspection& job) {
     job.result=bytes(result);
     return !job.result.empty()&&continuity();
   }
+  arbol_startup_proof::RetainedAppPackage reservationPackage;
+  const arbol_startup_proof::RetainedAppPackage* activePackage=nullptr;
   OrdinaryMigrationAuthority ordinaryAuthority;
   MaintenanceFile candidateFile; NSDictionary* candidateReceipt=nil;
   RetainedMigrationProof appliedProof; bool applied=false,wholeReceipt=false;
   struct ReceiptAuthorityScope { ExitInspection& job; ~ReceiptAuthorityScope() { job.receiptAuthority=nullptr; } } receiptAuthorityScope{job};
   if(profileFormat==2&&!migration) {
+    NSString* snapshot=nil;
+    if(prior||hostMode) {
+      snapshot=current[@"candidateDigest"];
+      activePackage=adoptedPackage.get();
+    } else if(reserve) {
+      PackagedLayout selection;
+      NSDictionary* pending=input[@"pending"];
+      snapshot=pending[@"candidateDigest"];
+      if(claimedLayout(pending,selection)&&selection.bundle==job.activeBundle&&selection.guard==job.nextBuild.path&&
+         reservationPackage.capture(selection,std::min(job.deadline,arbol_boundary::clockMs()+250),snapshot))
+        activePackage=&reservationPackage;
+    }
     if(job.activeBuild.fd<0||job.activeBundle.empty()||
-       !ordinaryAuthority.open(job.activeBundle,profile,job.activeBuild,job.deadline)) return false;
+       !ordinaryAuthority.open(job.activeBundle,profile,job.activeBuild,job.deadline,activePackage,snapshot)) return false;
     if(ordinaryAuthority.available) {
       const std::string path=ordinaryAuthority.runtimePath+"/browser-profile-migration/receipts/"+[input[@"profilePathHash"] UTF8String]+".json";
       struct stat st{}; errno=0;
@@ -4427,6 +4448,8 @@ static bool inspectExit(ExitInspection& job) {
   std::map<std::pair<std::string,std::string>,std::unique_ptr<arbol_startup_proof::RetainedAppPackage>> verifiedPackages;
   auto verifiedSignature=[&](const PackagedLayout& layout, NSDictionary* attempt) {
     NSString* digest=attempt[@"candidateDigest"];
+    if(reserve&&activePackage&&activePackage->witnessed()&&activePackage->matches(layout,digest))
+      return activePackage->current();
     if (!migration && (prior || hostMode) && adoptedPackage && adoptedPackage->matches(layout,digest))
       return adoptedPackage->current();
     // After watchdog enrollment, the process family admits no Apple tools.
