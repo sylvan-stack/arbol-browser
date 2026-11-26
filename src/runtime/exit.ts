@@ -160,10 +160,19 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
     let receiptWhole = false, receiptData = false;
     const payload = resolve(fileURLToPath(new URL('../../', import.meta.url)));
     if (mode !== 'withdraw') {
-      const ownFormat = startingHost ? Number(startingHost.identity.component.profileFormat) :
+      let receiptHost = startingHost;
+      if (!receiptHost && listingHost && actualMode === 'full') {
+        const manifestURL = new URL('../native/manifest.js', import.meta.url).href;
+        const { assertRetainedReadOnlyStorage } = await import(manifestURL) as typeof import('../native/manifest.js');
+        if (assertRetainedReadOnlyStorage(listingHost.signed, deadline)) {
+          await assertHostStartupContinuity(listingHost, deadline, deadline);
+          receiptHost = listingHost;
+        }
+      }
+      const ownFormat = receiptHost ? Number(receiptHost.identity.component.profileFormat) :
         ((await physicalJson(join(payload, 'metadata.json'), 1048576, deadline)).value as { component?: { profileFormat?: unknown } })?.component?.profileFormat;
       if (ownFormat === 2) {
-        const host = startingHost ?? await verifyPackagedHost(selection, payload, deadline);
+        const host = receiptHost ?? await verifyPackagedHost(selection, payload, deadline);
         assertVerifiedHostMetadata(host, deadline);
         if (Number(host.identity.component.profileFormat) !== 2 || host.policy.stateRoot !== profile.paths.state) throw unavailable('profile');
         const layout = host.identity.layout;
