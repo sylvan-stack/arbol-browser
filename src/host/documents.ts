@@ -186,11 +186,11 @@ export class HostDocuments implements DocumentAuthority {
       get availability() { return state.availability; }, get ready() { return state.valid && state.ready; } });
     this.receipts.set(receipt, { record, state }); record.current = receipt; record.state = state; return receipt;
   }
-  private frameEvent(record: PageRecord, process: number, routing: number): boolean {
-    if (!this.alive(record)) return false;
+  private frameEvent(record: PageRecord, process: number, routing: number): WebFrameMain | undefined {
+    if (!this.alive(record)) return;
     const frame = webFrameMain.fromId(process, routing);
-    return Boolean(frame && !frame.isDestroyed() && !frame.detached && webContents.fromFrame(frame) === record.page.view.webContents &&
-      record.page.view.webContents.mainFrame.framesInSubtree.includes(frame));
+    if (frame && !frame.isDestroyed() && !frame.detached && webContents.fromFrame(frame) === record.contents &&
+        record.contents.mainFrame.framesInSubtree.includes(frame)) return frame;
   }
   private originalRoot(record: PageRecord, ticket: Ticket): boolean {
     try {
@@ -213,8 +213,14 @@ export class HostDocuments implements DocumentAuthority {
       contents.on(name as never, receive); record.listeners.push(() => contents.removeListener(name as never, receive));
     };
     const committed = (process: number, routing: number, main: boolean, address: string, sameDocument: boolean) => {
-      if (!this.frameEvent(record, process, routing)) return;
-      let safe: string; try { safe = userURL(address); } catch { this.failPage(target, page, 'unavailable', 'navigation_policy'); return; }
+      const frame = this.frameEvent(record, process, routing);
+      if (!frame) return;
+      // An iframe's inline document still invalidates old frame references.
+      // Only Chromium's commit in a verified child can use this internal URL.
+      const inlineChild = !main && frame.parent !== null && address === 'about:srcdoc';
+      let safe: string;
+      try { safe = inlineChild ? address : userURL(address); }
+      catch { this.failPage(target, page, 'unavailable', 'navigation_policy'); return; }
       const ticket = record.ticket;
       const fragment = Boolean(ticket?.kind === 'fragment' && main && sameDocument && ticket.starts === 1 && ticket.commits === 0 &&
         safe === ticket.address && process === ticket.original.frame.process && routing === ticket.original.frame.routing && this.originalRoot(record, ticket));
