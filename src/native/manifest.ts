@@ -283,7 +283,11 @@ function run(argv) {
 }
 `;
 interface StorageDescription { readonly fd: number; readonly path: string; readonly stamp: string; readonly directory: boolean }
-interface StorageContext { readonly descriptions: readonly [StorageDescription, StorageDescription]; readonly mapping: string }
+interface StorageContext {
+  readonly descriptions: readonly [StorageDescription, StorageDescription];
+  readonly mapping: string;
+  readonly snapshotDigest?: string;
+}
 const installedStartupTopologies = new WeakMap<StorageContext, () => void>();
 const storageFinalizer = new FinalizationRegistry<readonly StorageDescription[]>(descriptions => {
   for (const description of descriptions) {
@@ -576,6 +580,7 @@ const retainedStartupVerifiers: Readonly<Record<string, string>> = Object.freeze
   '2d': '9fdb9ea348448ddbb73101fc64955600977cf5d7',
   '2e': '40b6b518a143ada94c05a0ec3a8cb9fb061bc416',
   '2f': 'efc1dab478035a09a3b7568fbfdbd1bfb67dfb1f',
+  '30': '76b0146cea972552dd4849ec397ba70d8073d97f',
 });
 function hasRetainedStartupVerifier(root: string, deadline: number): boolean {
   const expected = retainedStartupVerifiers[basename(dirname(dirname(root)))];
@@ -585,22 +590,37 @@ function hasRetainedStartupVerifier(root: string, deadline: number): boolean {
   finally { closeSync(file.fd); }
 }
 
+interface InstalledVerification { readonly verified: boolean; readonly snapshotDigest?: string }
+const verifierRefusal: InstalledVerification = Object.freeze({ verified: false });
+
 async function runInstalledVerifier(bootstrap: string, args: string[], requirement: string,
-  bundle: StorageDescription, backing: StorageDescription, deadline: number): Promise<boolean> {
+  bundle: StorageDescription, backing: StorageDescription, deadline: number): Promise<InstalledVerification> {
   const started = performance.now();
   const remaining = budget(deadline);
   const environment = { PATH: '/usr/bin:/bin' };
-  const child = spawn(bootstrap, ['--arbol-verify-installed-package', ...args], {
-    env: environment, stdio: ['pipe', bundle.fd, backing.fd],
+  const reportsSnapshot = args[0] === '0';
+  const child = spawn(bootstrap, ['--arbol-verify-installed-package', ...args, ...(reportsSnapshot ? ['--arbol-report-snapshot'] : [])], {
+    env: environment, stdio: ['pipe', bundle.fd, backing.fd, reportsSnapshot ? 'pipe' : 'ignore'],
   });
-  const result = new Promise<boolean>(resolve => {
-    child.once('error', () => resolve(false));
-    child.once('exit', code => resolve(code === 0));
+  const report = child.stdio[3];
+  let snapshotDigest = '', invalidReport = false;
+  report?.on('error', () => { invalidReport = true; });
+  report?.on('data', (chunk: Buffer) => {
+    if (snapshotDigest.length + chunk.length > 64) { invalidReport = true; report?.destroy(); return; }
+    snapshotDigest += chunk.toString('utf8');
+  });
+  const result = new Promise<InstalledVerification>(resolve => {
+    child.once('error', () => resolve(verifierRefusal));
+    child.once('close', code => {
+      if (code !== 0 || invalidReport) resolve(verifierRefusal);
+      else if (!snapshotDigest) resolve({ verified: true });
+      else resolve(/^[0-9a-f]{64}$/.test(snapshotDigest) ? { verified: true, snapshotDigest } : verifierRefusal);
+    });
   });
   const gate = child.stdin;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    if (!gate || !child.pid) return false;
+    if (!gate || !child.pid || (reportsSnapshot && !report)) return verifierRefusal;
     // The gated child receives approval only after stock Security verifies
     // this live exec against the original descriptor's exact CodeDirectory.
     const signature = spawnSync('/usr/bin/codesign', ['--verify', '--strict', '-R', '=' + requirement, String(child.pid)], {
@@ -608,21 +628,22 @@ async function runInstalledVerifier(bootstrap: string, args: string[], requireme
     });
     budget(deadline);
     const wait = Math.floor(started + remaining - performance.now());
-    if (wait < 1 || signature.error || signature.status !== 0 || child.exitCode !== null) return false;
-    const expired = new Promise<false>(resolve => {
-      timer = setTimeout(() => { gate.destroy(); resolve(false); }, wait);
+    if (wait < 1 || signature.error || signature.status !== 0 || child.exitCode !== null) return verifierRefusal;
+    const expired = new Promise<InstalledVerification>(resolve => {
+      timer = setTimeout(() => { gate.destroy(); report?.destroy(); resolve(verifierRefusal); }, wait);
     });
     const delivered = new Promise<boolean>(resolve => {
       gate.once('error', () => resolve(false));
       gate.end('1', () => resolve(gate.writableFinished && !gate.errored));
     });
-    const verification = Promise.all([delivered, result]).then(([approved, verified]) => approved && verified);
+    const verification = Promise.all([delivered, result]).then(([approved, verified]) => approved ? verified : verifierRefusal);
     const verified = await Promise.race([expired, verification]);
     budget(deadline);
-    return verified && performance.now() < started + remaining;
+    return performance.now() < started + remaining ? verified : verifierRefusal;
   } finally {
     clearTimeout(timer);
     gate?.destroy();
+    report?.destroy();
     // The native verifier has its own fixed cutoff. Closing the original
     // gate and releasing the wait never signals a process by a recycled PID.
     child.unref();
@@ -665,16 +686,17 @@ async function verifyInstalledStartupStorage(root: string, image: string, deadli
         budget(deadline);
         return !result.error && result.status === 0 && result.stdout === 'verified\n';
       };
-      const verify = (helper: string): boolean | Promise<boolean> => retainedVerifier === undefined
+      const verify = async (helper: string): Promise<InstalledVerification> => retainedVerifier === undefined
         ? runInstalledVerifier(bootstrap, [helper, ...(hostRequest ? [hostRequest] : [])], requirement, bundle, backing, deadline)
-        : verifyPrevious(helper);
+        : { verified: verifyPrevious(helper) };
       let verified = preliminary;
-      if (retainedVerifier !== undefined || !await verify('0')) {
+      const cached = retainedVerifier === undefined ? await verify('0') : verifierRefusal;
+      if (!cached.verified) {
         const mapping = storageMapping(root, deadline);
         if (!mapping.image || mapping.image['image-path'] !== image || storageMapping(image, deadline).image ||
-            !await verify(String(mapping.image['hdid-pid']))) return refuse();
+            !(await verify(String(mapping.image['hdid-pid']))).verified) return refuse();
         verified = context(mapping.key);
-      }
+      } else if (cached.snapshotDigest) verified = Object.freeze({ ...preliminary, snapshotDigest: cached.snapshotDigest });
       if (physicalStamp(fstatSync(executable.fd, { bigint: true })) !== executable.stamp ||
           physicalStamp(lstatSync(bootstrap, { bigint: true })) !== executable.stamp) return refuse();
       storageAssert(verified, deadline);
@@ -1182,17 +1204,24 @@ function assembleSignedBundle(bundle: string, deadline: number, scope: Publisher
       verifiedPayload = compiled.files;
     }
     const before = completeSnapshot(root, deadline, physical, observed, mounted, false, verifiedPayload);
+    const snapshotDigest = createHash('sha256').update(before).digest('hex');
     if (mounted) storageAssert(storage, deadline);
     const initial = check(), encoded = stable(initial);
     phase = 'final-snapshot';
     // The retained read-only image and backing file make the verified bytes
     // immutable. The final pass still checks every name, link and file stamp.
     if (mounted) storageAssert(storage, deadline);
-    const after = completeSnapshot(root, deadline, afterPhysical, observed, mounted, mounted !== undefined);
     phase = 'final-physical-comparison';
-    if (before !== after) refuseSnapshot('snapshot-encoded-mismatch', observed);
-    if (stable(physical) !== stable(afterPhysical))
-      refuseSnapshot(stampFailurePhase(physical['']?.stamp !== afterPhysical['']?.stamp ? 'snapshot-root-identity' : 'snapshot-entry-identity', physical['']?.stamp, afterPhysical['']?.stamp), observed);
+    if (storage?.snapshotDigest) {
+      // The authenticated native verifier retained this exact read-only
+      // image and the App's complete previously verified inventory digest.
+      if (snapshotDigest !== storage.snapshotDigest) refuseSnapshot('snapshot-encoded-mismatch', observed);
+    } else {
+      const after = completeSnapshot(root, deadline, afterPhysical, observed, mounted, mounted !== undefined);
+      if (before !== after) refuseSnapshot('snapshot-encoded-mismatch', observed);
+      if (stable(physical) !== stable(afterPhysical))
+        refuseSnapshot(stampFailurePhase(physical['']?.stamp !== afterPhysical['']?.stamp ? 'snapshot-root-identity' : 'snapshot-entry-identity', physical['']?.stamp, afterPhysical['']?.stamp), observed);
+    }
     if (installedStartup) storageAssert(storage, deadline);
     else revalidateStorage(root, storage, deadline);
     // Snapshot validation cannot be bypassed by mutation through a caller-held object.
@@ -1200,7 +1229,7 @@ function assembleSignedBundle(bundle: string, deadline: number, scope: Publisher
     const manifest = frozen(initial);
     const snapshot: FrozenSnapshot = { storage, mounted, encoded: before, physical: Object.freeze(physical), poisoned: false };
     const result: SignedBundle = Object.freeze({ bundle: root, manifest,
-      snapshotDigest: createHash('sha256').update(before).digest('hex'),
+      snapshotDigest,
       assertIdentity(limit = Infinity, retainStartupBytes = false) {
         const observed: SnapshotFailure = {};
         let repeatedPhase: SignedVerificationPhase = 'repeated-snapshot';

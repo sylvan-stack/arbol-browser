@@ -231,6 +231,7 @@ public:
   bool matches(const arbol_attempt::PackagedLayout& layout, NSString* snapshot) const {
     return proof_ && bundle_ == layout.bundle && [proof_[@"snapshot"] isEqual:snapshot];
   }
+  NSString* witnessedSnapshot() const { return witnessed_ ? proof_[@"snapshot"] : nil; }
   bool witnessed() const { return witnessed_; }
 };
 

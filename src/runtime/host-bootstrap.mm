@@ -196,7 +196,7 @@ public:
 // This invocation only verifies the installed package. It never reads a
 // profile, takes ownership or admits a Browser process.
 static int verifyInstalledPackage(const arbol_attempt::PackagedLayout& layout, NSString* bundle,
-                                  const char* helper, const char* requestPath) {
+                                  const char* helper, const char* requestPath, bool reportSnapshot) {
   // Wait until the stock broker has authenticated this live process against
   // the original executable's exact CodeDirectory and Publisher.
   struct pollfd gate{STDIN_FILENO, POLLIN, 0};
@@ -205,7 +205,7 @@ static int verifyInstalledPackage(const arbol_attempt::PackagedLayout& layout, N
       !(gate.revents & POLLIN) || read(STDIN_FILENO, &approval, 1) != 1 || approval != '1' || !inTime()) return 4;
   NSString* helperText = [NSString stringWithUTF8String:helper];
   const bool cachedOnly = [helperText isEqual:@"0"];
-  if (!layout.installed || (!cachedOnly && (!arbol_attempt::pattern(helperText, @"^[1-9][0-9]{0,9}$") ||
+  if (!layout.installed || (reportSnapshot && !cachedOnly) || (!cachedOnly && (!arbol_attempt::pattern(helperText, @"^[1-9][0-9]{0,9}$") ||
       helperText.longLongValue <= 1 || helperText.longLongValue > INT_MAX))) return 4;
   arbol_boundary::Identity self;
   std::string executable;
@@ -232,6 +232,16 @@ static int verifyInstalledPackage(const arbol_attempt::PackagedLayout& layout, N
     arbol_startup_proof::RetainedAppPackage cached;
     if (!cached.capture(layout, expiry) || !cached.matchesOriginal(STDOUT_FILENO, callerImage) ||
         !cached.current() || !sameBundle() || !inTime()) return 4;
+    if (reportSnapshot && cached.witnessed()) {
+      constexpr int report = 3;
+      struct stat channel{};
+      NSString* digest = cached.witnessedSnapshot();
+      if (!arbol_attempt::pattern(digest, @"^[0-9a-f]{64}$") ||
+          fstat(report, &channel) || (!S_ISFIFO(channel.st_mode) && !S_ISSOCK(channel.st_mode)) ||
+          fcntl(report, F_SETNOSIGPIPE, 1) || write(report, digest.UTF8String, 64) != 64 ||
+          !cached.current() || !sameBundle() || !inTime()) return 4;
+      os_log(OS_LOG_DEFAULT, "arbol-browser native verifier reported the authenticated startup snapshot");
+    }
     os_log(OS_LOG_DEFAULT, "arbol-browser native verifier reused installed App package proof");
     return 0;
   }
@@ -302,12 +312,14 @@ int main(int argc, const char* argv[]) {
     arbol_exit::NoUseOriginal noUse;
     try { @try {
       expiry=arbol_boundary::clockMs()+60000;
-      if ((argc == 3 || argc == 4) && !strcmp(argv[1], "--arbol-verify-installed-package")) {
+      const bool reportSnapshot = argc >= 4 && !strcmp(argv[argc-1], "--arbol-report-snapshot");
+      const int verifierArgc = argc - int(reportSnapshot);
+      if ((verifierArgc == 3 || verifierArgc == 4) && !strcmp(argv[1], "--arbol-verify-installed-package")) {
         expiry=arbol_boundary::clockMs()+5000;
         NSString* bundle = NSBundle.mainBundle.bundlePath;
         arbol_attempt::PackagedLayout layout;
         if (!arbol_attempt::packagedLayout(bundle.fileSystemRepresentation, layout)) return 4;
-        return verifyInstalledPackage(layout, bundle, argv[2], argc == 4 ? argv[3] : nullptr);
+        return verifyInstalledPackage(layout, bundle, argv[2], verifierArgc == 4 ? argv[3] : nullptr, reportSnapshot);
       }
       const bool profileOpen = argc == 4 && !strcmp(argv[1], "--arbol-profile-open");
       if ((!profileOpen && (argc != 3 || strcmp(argv[1], "--arbol-host-request") || argv[2][0] != '/')) ||
