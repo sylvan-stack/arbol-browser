@@ -314,7 +314,7 @@ export async function runHostEntry(): Promise<void> {
     const bootstrap = await import(bootstrapURL) as typeof import('./bootstrap.js');
     // This finite read-only budget is not new engine admission: Native owns
     // the immutable original expiry and its expired/cancelled terminal branch.
-    const native = await bootstrap.prepareNativeBoundary(bundle, localBudget, installedImagePath(layout));
+    const native = await bootstrap.prepareNativeBoundary(bundle, localBudget, installedImagePath(layout), args[1]);
     capture = captureHostBuild(native.platform, selection, bundle, args[1]);
     const authoritiesURL = new URL('./authorities.js', import.meta.url).href;
     const authorities = await import(authoritiesURL) as typeof import('./authorities.js');

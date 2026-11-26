@@ -1,5 +1,6 @@
 // Installed Browser entry. It uses only the account's installed image and guard.
 #include "attempt.hpp"
+#include "startup-proof.hpp"
 #include <poll.h>
 
 namespace {
@@ -365,8 +366,21 @@ int launch(int argc, const char* argv[], double deadline) {
   posix_spawn_file_actions_t actions;
   if (capsule.get() < 0 || posix_spawn_file_actions_init(&actions)) return 4;
   arbol_boundary::SpawnCopies copies;
+  const bool prepareRelay = arbol_attempt::profileFormat == 2 && first < argc && !strcmp(argv[first], "open") &&
+    std::any_of(argv + first + 1, argv + argc, [](const char* value) { return !strcmp(value, "--await-approval"); });
+  int channel[2] = {-1, -1};
+  if (prepareRelay && pipe(channel)) {
+    channel[0] = -1;
+    channel[1] = -1;
+  }
+  arbol_startup_proof::Relay relay(channel[0]);
+  FD writer(channel[1]);
+  FD retainedRoot(prepareRelay ? open(bundle.c_str(), O_DIRECTORY | O_RDONLY | O_NOFOLLOW | O_CLOEXEC) : -1);
+  const bool offerProof = writer.get() >= 0 && retainedRoot.get() >= 0;
   if (!copies.map(actions, guard.get(), arbol_attempt::cliBuildDescriptor) ||
-      !copies.map(actions, capsule.get(), arbol_attempt::cliCapsuleDescriptor)) {
+      !copies.map(actions, capsule.get(), arbol_attempt::cliCapsuleDescriptor) ||
+      (offerProof && (fcntl(channel[0], F_SETFD, FD_CLOEXEC) || fcntl(writer.get(), F_SETFD, FD_CLOEXEC) ||
+        !copies.map(actions, writer.get(), arbol_startup_proof::writerDescriptor)))) {
     posix_spawn_file_actions_destroy(&actions); return 4;
   }
   const std::string entry = layout.payload + "/lib/cli/main.mjs";
@@ -374,7 +388,8 @@ int launch(int argc, const char* argv[], double deadline) {
   std::string buildEnv = "ARBOL_BROWSER_SELECTION=" + arbol_attempt::bytes(@{@"format":@1, @"build":build,
     @"directory":root, @"guard":[NSString stringWithUTF8String:layout.guard.c_str()], @"explicit":@(first != 1)});
   char* environment[] = {homeEnv.data(), buildEnv.data(), (char*)"PATH=/usr/bin:/bin",
-    (char*)"ELECTRON_RUN_AS_NODE=1", (char*)"TMPDIR=/private/tmp", nullptr};
+    (char*)"ELECTRON_RUN_AS_NODE=1", (char*)"TMPDIR=/private/tmp",
+    offerProof ? (char*)"ARBOL_BROWSER_STARTUP_PROOF=1" : nullptr, nullptr};
   std::vector<char*> args{(char*)layout.engine.c_str(), (char*)entry.c_str()};
   for (int index = first; index < argc; ++index) args.push_back((char*)argv[index]);
   args.push_back(nullptr);
@@ -384,11 +399,27 @@ int launch(int argc, const char* argv[], double deadline) {
   posix_spawn_file_actions_destroy(&actions);
   copies.closeCopies();
   if (result) return 4;
+  (void)writer.closeNow();
   // The child's original Build guard now protects the running release.
   (void)flock(install.get(), LOCK_UN);
   int status = 0;
   pid_t waited;
-  do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+  NSDictionary* starter = offerProof ? arbol_attempt::processRecord(child) : nil;
+  if (starter && [starter[@"executable"] isEqual:[NSString stringWithUTF8String:layout.engine.c_str()]] &&
+      [starter[@"parentStartId"] isEqual:parent[@"startId"]] &&
+      [starter[@"parentPidVersion"] isEqual:parent[@"pidVersion"]] && relay.listenFor(starter)) {
+    do {
+      waited = waitpid(child, &status, WNOHANG);
+      if (waited == child || (waited < 0 && errno != EINTR)) break;
+      relay.advance(bundle, retainedRoot.get(), backing.get(), deadline);
+      usleep(1000);
+    } while (clockMs() < deadline);
+    if (!waited || (waited < 0 && errno == EINTR)) {
+      do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+    }
+  } else {
+    do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+  }
   if (waited != child) return 4;
   return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
 }

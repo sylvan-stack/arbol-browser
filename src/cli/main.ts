@@ -77,6 +77,7 @@ async function installedLaunch(cutoff: number): Promise<InstalledLaunch | undefi
   const manifestAddress = new URL('../native/manifest.js', import.meta.url).href;
   const manifest = await import(manifestAddress) as typeof import('../native/manifest.js');
   manifest.bindInstalledStartupTopology(host.signed, image, platform, Math.min(cutoff, deadline));
+  manifest.publishInstalledStartupProof(host.signed, Math.min(cutoff, deadline));
   return { selection, host, platform, lock, deadline: Math.min(cutoff, deadline) };
 }
 async function productionPorts(selection: BuildSelection, observation?: ColdObservation, openCutoff?: number,

@@ -47,12 +47,13 @@ let boundaryAttempted = false;
  * this exact platform instance. Both bundled host and physical bootstrap resolve
  * to the same physical lib/native and lib/runtime graph; no second cache/brand. */
 export async function prepareNativeBoundary(bundle: string, deadline = performance.now() + 10000,
-  installedImage?: string): Promise<NativeBoundaryPreparation> {
+  installedImage?: string, hostRequest?: string): Promise<NativeBoundaryPreparation> {
   if (boundaryAttempted || process.type !== 'browser') throw unavailable('browser');
   boundaryAttempted = true;
   const manifestUrl = new URL('../native/manifest.js', import.meta.url).href;
   const manifest = await import(manifestUrl) as typeof import('../native/manifest.js');
-  const trust = manifest.verifyNativeCandidate(bundle, deadline, installedImage === undefined ? 'isolated' : 'production', installedImage);
+  const trust = manifest.verifyNativeCandidate(bundle, deadline, installedImage === undefined ? 'isolated' : 'production',
+    installedImage, hostRequest);
   if (installedImage !== undefined) manifest.assertInstalledImage(trust, installedImage, deadline);
   const actualRuntime = { electron: process.versions.electron, chromium: process.versions.chrome, node: process.versions.node,
     napi: process.versions.napi, modules: process.versions.modules, platform: process.platform, arch: process.arch,

@@ -17,7 +17,7 @@ const names = ['src/runtime/platform.mm', 'src/runtime/host-launch.mm', 'src/run
 const installationConsumers = new Set([...names, 'watchdog/main.mm']);
 const installationSource = 'src/runtime/installation-paths.json';
 const productionPublisherSource = 'native/production-publisher-requirement.json';
-const closure = [...names, 'src/runtime/platform.ts', 'src/runtime/attempt.hpp', 'watchdog/boundary.hpp', 'watchdog/exit.hpp',
+const closure = [...names, 'src/runtime/platform.ts', 'src/runtime/attempt.hpp', 'src/runtime/startup-proof.hpp', 'watchdog/boundary.hpp', 'watchdog/exit.hpp',
   'package.json', 'arbol-build.json', installationSource, 'native/publisher-requirement.json', productionPublisherSource, 'scripts/compile-platform.mjs'];
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 async function installationInput() {
@@ -162,7 +162,9 @@ export async function compilePlatform(headers = officialHeaders) {
   for (const [source, name, frameworks] of [[names[1], 'host-launch', ['AppKit']], [names[2], 'host-bootstrap', ['Foundation', 'Security']],
     [names[3], 'stable-launch', ['Foundation', 'Security']]]) {
     const flags = [...input.installationPaths.flags, ...(source !== names[1] ? input.productionPublisher.flags : [])];
-    staticCommand('/usr/bin/xcrun', [...common, ...flags, source, ...frameworks.flatMap(value => ['-framework', value]), '-o', join(root, 'dist/native', name)]);
+    staticCommand('/usr/bin/xcrun', [...common, ...flags, source,
+      ...(source === names[1] ? [] : ['-lbsm']), ...frameworks.flatMap(value => ['-framework', value]),
+      '-o', join(root, 'dist/native', name)]);
   }
   const outputs = {};
   for (const name of platformCompilerPolicy.outputs) {

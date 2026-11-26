@@ -17,7 +17,7 @@ import { assertPlatform, type PlatformPort } from '../runtime/platform.js';
 const physicalFS = process.getBuiltinModule(typeof process.versions.electron === 'string' ? 'original-fs' : 'fs') as typeof import('node:fs') | undefined;
 if (!physicalFS || typeof physicalFS.openSync !== 'function' || !physicalFS.promises ||
     typeof physicalFS.promises.open !== 'function') throw new Error('native_candidate_unavailable');
-const { constants, lstatSync, openSync, fstatSync, readSync, closeSync, opendirSync, readlinkSync, realpathSync } = physicalFS;
+const { constants, lstatSync, openSync, fstatSync, readSync, writeSync, closeSync, opendirSync, readlinkSync, realpathSync } = physicalFS;
 
 export const publisher = Object.freeze({ team: '7V372XL59S', bundleIdentifier: 'com.sylvan-stack.arbol-browser.native-candidate',
   requirement: 'anchor apple generic and certificate leaf[subject.OU] = "7V372XL59S" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists' });
@@ -536,7 +536,9 @@ function run(argv) {
   const writer = gate.fileHandleForWriting;
   const discard = $.NSFileHandle.fileHandleWithNullDevice;
   task.launchPath = argv[0];
-  task.arguments = $(['--arbol-verify-installed-package', argv[1]]);
+  const requestArgs = ['--arbol-verify-installed-package', argv[1]];
+  if (argv[3]) requestArgs.push(argv[3]);
+  task.arguments = $(requestArgs);
   task.environment = $({ PATH: '/usr/bin:/bin' });
   task.standardInput = gate;
   task.standardOutput = $.NSFileHandle.alloc.initWithFileDescriptorCloseOnDealloc(3, false);
@@ -568,6 +570,7 @@ function run(argv) {
 const retainedStartupVerifiers: Readonly<Record<string, string>> = Object.freeze({
   '28': 'abf912a74384efe8fd2784796085a4d5cc570e2c',
   '29': '59afb189275a2aae342df4ae262658246d373390',
+  '2a': '5c33202dc2553264b50a31dbc36c2aa2d96b9738',
 });
 function hasRetainedStartupVerifier(root: string, deadline: number): boolean {
   const expected = retainedStartupVerifiers[basename(dirname(dirname(root)))];
@@ -577,7 +580,8 @@ function hasRetainedStartupVerifier(root: string, deadline: number): boolean {
   finally { closeSync(file.fd); }
 }
 
-function verifyInstalledStartupStorage(root: string, image: string, deadline: number, retainedVerifier?: string): StorageContext {
+function verifyInstalledStartupStorage(root: string, image: string, deadline: number, retainedVerifier?: string,
+  hostRequest?: string): StorageContext {
   const descriptions: StorageDescription[] = [];
   try {
     // Pin the same original names and descriptions before running any checks.
@@ -603,7 +607,7 @@ function verifyInstalledStartupStorage(root: string, image: string, deadline: nu
       // Process identity, read-only backing, full code signatures and every
       // signed payload entry are checked inside the signed bootstrap.
       const result = spawnSync('/usr/bin/osascript', ['-l', 'JavaScript', '-e', installedVerifierBroker,
-        bootstrap, String(mapping.image['hdid-pid']), requirement], {
+        bootstrap, String(mapping.image['hdid-pid']), requirement, ...(hostRequest ? [hostRequest] : [])], {
         timeout: budget(deadline), killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'ignore', bundle.fd, backing.fd],
         encoding: 'utf8', maxBuffer: nativeLimit,
         env: { PATH: '/usr/bin:/bin' },
@@ -935,6 +939,25 @@ export function bindInstalledStartupTopology(signed: SignedBundle, image: string
   });
 }
 
+/** Publish only the exact binding already verified by the child of the
+ * signed installed launcher. Losing this acceleration keeps the full path. */
+export function publishInstalledStartupProof(signed: SignedBundle, deadline: number): void {
+  const offered = process.env.ARBOL_BROWSER_STARTUP_PROOF;
+  delete process.env.ARBOL_BROWSER_STARTUP_PROOF;
+  if (offered !== '1') return;
+  const pipe = 12;
+  try {
+    const snapshot = signedSnapshots.get(signed), storage = snapshot?.storage;
+    if (!snapshot || snapshot.poisoned || !storage || !assertNativeStartupTopology(storage, deadline) ||
+        !fstatSync(pipe).isFIFO()) return;
+    const [root, backing] = storage.descriptions;
+    const encoded = JSON.stringify({ format: 1, bundle: signed.bundle, root: JSON.parse(root.stamp),
+      backing: JSON.parse(backing.stamp), snapshot: signed.snapshotDigest });
+    if (Buffer.byteLength(encoded) <= 4096) writeSync(pipe, encoded, null, 'utf8');
+  } catch { /* The original signed verifier is still available to the host. */ }
+  finally { try { if (fstatSync(pipe).isFIFO()) closeSync(pipe); } catch { /* Already closed or not inherited. */ } }
+}
+
 let attemptedTrust = false, poisonedTrust = false;
 let trustedCandidate: CandidateTrust | undefined;
 /** Complete physical signed bundle, including the outer seal and directories.
@@ -998,7 +1021,7 @@ export function assertStartupCandidateTrust(value: CandidateTrust, deadline: num
   value.assertIdentity(deadline, true);
 }
 export function verifySignedBundle(bundle: string, deadline = Infinity, scope: PublisherScope = 'isolated',
-  installedStartupImage?: string): SignedBundle {
+  installedStartupImage?: string, hostRequest?: string): SignedBundle {
   const observed: SnapshotFailure = {};
   let phase: SignedVerificationPhase = 'bundle-selection';
   let storage: StorageContext | undefined, retained = false;
@@ -1013,7 +1036,8 @@ export function verifySignedBundle(bundle: string, deadline = Infinity, scope: P
       (exactCurrent || hasRetainedStartupVerifier(root, deadline));
     storage = installedStartup
       ? verifyInstalledStartupStorage(root, installedStartupImage, deadline,
-        exactCurrent ? undefined : retainedStartupVerifiers[basename(dirname(dirname(root)))])
+        exactCurrent ? undefined : retainedStartupVerifiers[basename(dirname(dirname(root)))],
+        exactCurrent ? hostRequest : undefined)
       : discoverStorage(root, deadline);
     const mounted: MountedBundleRead | undefined = scope === 'production' && storage
       ? { device: fstatSync(storage.descriptions[0].fd, { bigint: true }).dev, files: new Map() }
@@ -1131,7 +1155,7 @@ export function verifySignedBundle(bundle: string, deadline = Infinity, scope: P
   finally { if (!retained && storage) for (const d of storage.descriptions) { try { closeSync(d.fd); } catch { /* Preserve construction refusal. */ } } }
 }
 export function verifyNativeCandidate(bundle: string, deadline = Infinity, scope: PublisherScope = 'isolated',
-  installedStartupImage?: string): CandidateTrust {
+  installedStartupImage?: string, hostRequest?: string): CandidateTrust {
   if (poisonedTrust) refuse();
   if (trustedCandidate) {
     const expectedPublisher = scope === 'production' ? productionPublisher : publisher;
@@ -1141,7 +1165,7 @@ export function verifyNativeCandidate(bundle: string, deadline = Infinity, scope
     trustedCandidate.assertIdentity(deadline); return trustedCandidate;
   }
   if (attemptedTrust) refuse(); attemptedTrust = true;
-  try { trustedCandidate = verifySignedBundle(bundle, deadline, scope, installedStartupImage); return trustedCandidate; }
+  try { trustedCandidate = verifySignedBundle(bundle, deadline, scope, installedStartupImage, hostRequest); return trustedCandidate; }
   catch (error) { poisonedTrust = true; return refuseVerification('bundle-selection', error); }
 }
 
