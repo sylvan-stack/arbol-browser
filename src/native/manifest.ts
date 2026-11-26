@@ -605,7 +605,7 @@ const verifierRefusal: InstalledVerification = Object.freeze({ verified: false }
 
 async function runInstalledVerifier(bootstrap: string, args: string[], requirement: string,
   bundle: StorageDescription, backing: StorageDescription, deadline: number,
-  captureInventory?: () => void): Promise<InstalledVerification> {
+  captureInventory?: (deadline: number) => void): Promise<InstalledVerification> {
   const started = performance.now();
   const remaining = budget(deadline);
   const environment = { PATH: '/usr/bin:/bin' };
@@ -638,15 +638,26 @@ async function runInstalledVerifier(bootstrap: string, args: string[], requireme
     const signatureOptions = { timeout: budget(deadline), killSignal: 'SIGKILL' as const, env: environment, stdio: 'ignore' as const };
     let signed: boolean;
     if (captureInventory) {
+      const signerDeadline = performance.now() + signatureOptions.timeout;
       const signature = spawn('/usr/bin/codesign', signatureArguments, signatureOptions);
       const completed = new Promise<boolean>(resolve => {
-        signature.once('error', () => resolve(false));
+        signature.once('error', () => { if (!signature.pid) resolve(false); });
         signature.once('close', code => resolve(code === 0));
+      });
+      let signerTimer: ReturnType<typeof setTimeout> | undefined;
+      const expired = new Promise<undefined>(resolve => {
+        signerTimer = setTimeout(resolve, Math.max(1, signerDeadline - performance.now()));
       });
       // This stays a private read-only observation until the signed verifier
       // independently attests to the same mounted package and digest.
-      try { captureInventory(); }
-      finally { signed = await completed; }
+      try {
+        try { captureInventory(Math.min(deadline, started + remaining, signerDeadline)); }
+        catch { /* Keep the original serial inventory path available. */ }
+        const outcome = await Promise.race([completed, expired]);
+        if (outcome === undefined || performance.now() >= signerDeadline)
+          return refuseVerification('verification-cutoff');
+        signed = outcome;
+      } finally { clearTimeout(signerTimer); signature.unref(); }
     } else {
       const signature = spawnSync('/usr/bin/codesign', signatureArguments, signatureOptions);
       signed = !signature.error && signature.status === 0;
@@ -718,8 +729,8 @@ async function verifyInstalledStartupStorage(root: string, image: string, deadli
       let verified = preliminary;
       let inventory: InstalledInventory | undefined;
       const cached = direct ? await runInstalledVerifier(bootstrap, ['0', ...(hostRequest ? [hostRequest] : [])],
-        requirement, bundle, backing, deadline, retainedVerifier === undefined ? () => {
-          inventory = captureInstalledInventory(root, preliminary, deadline);
+        requirement, bundle, backing, deadline, retainedVerifier === undefined ? inventoryDeadline => {
+          inventory = captureInstalledInventory(root, preliminary, inventoryDeadline);
         } : undefined) : verifierRefusal;
       if (!cached.verified) {
         const mapping = storageMapping(root, deadline);
@@ -728,7 +739,8 @@ async function verifyInstalledStartupStorage(root: string, image: string, deadli
         verified = context(mapping.key);
       } else if (cached.snapshotDigest) {
         verified = Object.freeze({ ...preliminary, snapshotDigest: cached.snapshotDigest });
-        if (inventory) installedInventories.set(verified, inventory);
+        if (inventory && createHash('sha256').update(inventory.snapshot).digest('hex') === cached.snapshotDigest)
+          installedInventories.set(verified, inventory);
       }
       if (physicalStamp(fstatSync(executable.fd, { bigint: true })) !== executable.stamp ||
           physicalStamp(lstatSync(bootstrap, { bigint: true })) !== executable.stamp) return refuse();
