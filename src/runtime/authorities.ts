@@ -515,8 +515,10 @@ async function verifySelectedHost(selection: BuildSelection, payload: string, de
   }
   noteHostVerification(observation, 'initial-verified-host');
   assertBudget(deadline); (maintenance ? maintenanceHosts : verifiedHosts).add(result);
-  // Ordinary Open already verified both complete snapshots in this factory.
-  if (ordinaryOpen) await assertHostStartupContinuity(result, deadline, deadline);
+  // The installed bootstrap already authenticated this exact read-only bundle.
+  // Keep its storage and guard current here without rescanning before custody.
+  if (ordinaryOpen || (bootstrapSigned !== undefined && image !== undefined))
+    await assertHostStartupContinuity(result, deadline, deadline);
   else await result.assertTrusted(deadline);
   return result;
 }

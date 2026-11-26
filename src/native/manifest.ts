@@ -748,17 +748,30 @@ let attemptedTrust = false, poisonedTrust = false;
 let trustedCandidate: CandidateTrust | undefined;
 /** Complete physical signed bundle, including the outer seal and directories.
  * No subprocess, expected-byte learning, or symlink traversal on later checks. */
-function completeSnapshot(root: string, deadline = Infinity, physical?: Record<string, PhysicalEntry>, observed: SnapshotFailure = {}): string {
+interface MountedBundleRead {
+  readonly device: bigint;
+  readonly files: Map<string, ReturnType<typeof physicalFile>>;
+}
+function completeSnapshot(root: string, deadline = Infinity, physical?: Record<string, PhysicalEntry>,
+  observed: SnapshotFailure = {}, mounted?: MountedBundleRead, confirmOnly = false): string {
   const entries: Record<string, string> = Object.create(null); let count = 0;
   function walk(directory: string): void {
     budget(deadline);
-    const original = snapshotFilesystem(() => lstatSync(directory), observed), originalStamp = physicalStamp(snapshotFilesystem(() => lstatSync(directory, { bigint: true }), observed)), names = synchronousNames(directory, deadline, completeEntryLimit - count, observed, directory === root ? 'snapshot-root-identity' : 'snapshot-entry-identity');
+    const original = snapshotFilesystem(() => lstatSync(directory), observed);
+    const identity = snapshotFilesystem(() => lstatSync(directory, { bigint: true }), observed);
+    if (mounted && identity.dev !== mounted.device)
+      refuseSnapshot(directory === root ? 'snapshot-root-identity' : 'snapshot-entry-identity', observed);
+    const originalStamp = physicalStamp(identity);
+    const names = synchronousNames(directory, deadline, completeEntryLimit - count, observed, directory === root ? 'snapshot-root-identity' : 'snapshot-entry-identity');
     count += names.length;
     if (snapshotFilesystem(() => realpathSync(directory), observed) !== directory || !original.isDirectory()) return refuseSnapshot(directory === root ? 'snapshot-root-identity' : 'snapshot-entry-identity', observed);
     if (physical) physical[relative(root, directory)] = Object.freeze({ stamp: originalStamp, kind: 'directory', children: Object.freeze(names) });
     for (const name of names) {
       budget(deadline);
-      const path = join(directory, name), key = relative(root, path), before = snapshotFilesystem(() => lstatSync(path), observed), beforeStamp = physicalStamp(snapshotFilesystem(() => lstatSync(path, { bigint: true }), observed));
+      const path = join(directory, name), key = relative(root, path), before = snapshotFilesystem(() => lstatSync(path), observed);
+      const identity = snapshotFilesystem(() => lstatSync(path, { bigint: true }), observed);
+      if (mounted && identity.dev !== mounted.device) refuseSnapshot('snapshot-entry-identity', observed);
+      const beforeStamp = physicalStamp(identity);
       if (before.isSymbolicLink()) {
         const link = snapshotFilesystem(() => readlinkSync(path), observed), target = snapshotFilesystem(() => realpathSync(path), observed);
         if (!target.startsWith(root + sep) || !resolve(dirname(path), link).startsWith(root + sep) || snapshotFilesystem(() => readlinkSync(path), observed) !== link) refuseSnapshot('snapshot-symlink', observed);
@@ -766,7 +779,10 @@ function completeSnapshot(root: string, deadline = Infinity, physical?: Record<s
         if (physical) physical[key] = Object.freeze({ stamp: beforeStamp, kind: 'symlink', link, target });
       } else if (before.isDirectory()) { entries[key] = `directory:${before.mode & 0o7777}`; walk(path); }
       else if (before.isFile()) {
-        entries[key] = `file:${before.mode & 0o7777}:${physicalFile(path, before, deadline, observed).digest}`;
+        const bytes = confirmOnly ? mounted?.files.get(key) : physicalFile(path, before, deadline, observed);
+        if (!bytes) return refuseSnapshot('snapshot-entry-identity', observed);
+        if (!confirmOnly) mounted?.files.set(key, bytes);
+        entries[key] = `file:${before.mode & 0o7777}:${bytes.digest}`;
         if (physical) physical[key] = Object.freeze({ stamp: beforeStamp, kind: 'file' });
       } else refuseSnapshot('snapshot-entry-identity', observed);
       const after = snapshotFilesystem(() => lstatSync(path), observed);
@@ -792,6 +808,10 @@ export function verifySignedBundle(bundle: string, deadline = Infinity, scope: P
     const root = resolve(bundle);
     const expectedPublisher = scope === 'production' ? productionPublisher : publisher;
     storage = discoverStorage(root, deadline);
+    const mounted: MountedBundleRead | undefined = scope === 'production' && storage
+      ? { device: fstatSync(storage.descriptions[0].fd, { bigint: true }).dev, files: new Map() }
+      : undefined;
+    const physical: Record<string, PhysicalEntry> = Object.create(null), afterPhysical: Record<string, PhysicalEntry> = Object.create(null);
     const check = (): Compatibility => {
       signature(root, true, false, deadline, expectedPublisher);
       phase = 'publisher';
@@ -804,6 +824,13 @@ export function verifySignedBundle(bundle: string, deadline = Infinity, scope: P
           stable(value.featureConfiguration) !== stable({ sitePerProcess: true, disabledFeatures: ['MacAccessibilityTextOperation'], extraChromiumArguments: [] })) refuse();
       phase = 'inventory';
       const inventory: Record<string, string> = Object.create(null); let count = 0;
+      const payload = 'Contents/Resources/browser';
+      function verifyFile(path: string, key: string, bytes: ReturnType<typeof physicalFile>): void {
+        inventory[key] = bytes.digest;
+        if (['cffaedfe', 'cefaedfe', 'feedfacf', 'cafebabe', 'bebafeca'].includes(bytes.magic))
+          signature(path, false, key.startsWith(payload + '/runtime/Electron.app/') && key.includes('/Contents/MacOS/'),
+            deadline, expectedPublisher);
+      }
       function walk(directory: string): void {
         const names = synchronousNames(directory, deadline, completeEntryLimit - count, observed); count += names.length;
         for (const name of names) {
@@ -814,24 +841,37 @@ export function verifySignedBundle(bundle: string, deadline = Infinity, scope: P
             if (!target.startsWith(root + sep) || !resolve(dirname(path), link).startsWith(root + sep)) refuseSnapshot('snapshot-symlink', observed);
             inventory[key] = createHash('sha256').update(`symlink\0${link}`).digest('hex');
           } else if (stat.isDirectory()) walk(path);
-          else if (stat.isFile()) {
-            const physical = physicalFile(path, stat, deadline, observed); inventory[key] = physical.digest;
-            if (['cffaedfe', 'cefaedfe', 'feedfacf', 'cafebabe', 'bebafeca'].includes(physical.magic))
-              signature(path, false, key.startsWith('Contents/Resources/browser/runtime/Electron.app/') && key.includes('/Contents/MacOS/'),
-                deadline, expectedPublisher);
-          } else refuseSnapshot('snapshot-entry-identity', observed);
+          else if (stat.isFile()) verifyFile(path, key, physicalFile(path, stat, deadline, observed));
+          else refuseSnapshot('snapshot-entry-identity', observed);
         }
       }
-      walk(join(root, 'Contents/Resources/browser'));
+      if (mounted) {
+        if (physical[payload]?.kind !== 'directory') return refuseSnapshot('snapshot-entry-identity', observed);
+        for (const [key, entry] of Object.entries(physical)) {
+          if (!key.startsWith(payload + '/')) continue;
+          budget(deadline);
+          if (entry.kind === 'symlink') inventory[key] = createHash('sha256').update(`symlink\0${entry.link}`).digest('hex');
+          else if (entry.kind === 'file') {
+            const path = join(root, key), bytes = mounted.files.get(key);
+            const named = snapshotFilesystem(() => lstatSync(path, { bigint: true }), observed);
+            if (!bytes || named.dev !== mounted.device || physicalStamp(named) !== entry.stamp)
+              return refuseSnapshot('snapshot-entry-identity', observed);
+            verifyFile(path, key, bytes);
+          }
+        }
+      } else walk(join(root, payload));
       if (stable(inventory) !== stable(value.files)) refuseSnapshot('snapshot-encoded-mismatch', observed);
       return value;
     };
-    const physical: Record<string, PhysicalEntry> = Object.create(null), afterPhysical: Record<string, PhysicalEntry> = Object.create(null);
     phase = 'initial-snapshot';
-    const before = completeSnapshot(root, deadline, physical, observed);
+    const before = completeSnapshot(root, deadline, physical, observed, mounted);
+    if (mounted) storageAssert(storage, deadline);
     const initial = check(), encoded = stable(initial);
     phase = 'final-snapshot';
-    const after = completeSnapshot(root, deadline, afterPhysical, observed);
+    // The retained read-only image and backing file make the verified bytes
+    // immutable. The final pass still checks every name, link and file stamp.
+    if (mounted) storageAssert(storage, deadline);
+    const after = completeSnapshot(root, deadline, afterPhysical, observed, mounted, mounted !== undefined);
     phase = 'final-physical-comparison';
     if (before !== after) refuseSnapshot('snapshot-encoded-mismatch', observed);
     if (stable(physical) !== stable(afterPhysical))
