@@ -13,11 +13,17 @@ import { unavailable } from '../contracts/errors.js';
 import { adoptHostBuildLease, assertAdoptedBuildContinuity, captureHostBuild, terminateCapturedHostBuild, type CapturedHostBuild, type BuildLease } from './build-lease.js';
 import { assertVerifiedHostMetadata, assertHostEngineAuthority, installedImagePath, type VerifiedHost } from './authorities.js';
 import { claimedHostAttempt } from './process.js';
-import { noteHostStartup, prepareHostCustody, abortUnadmittedHost, type HostCustody } from './custody.js';
-import type { NativeBoundaryPreparation } from './bootstrap.js';
+import { noteHostStartup, prepareHostCustody, prepareSharedProfileRuntime, assertSharedProfileRuntime,
+  abortUnadmittedHost, type HostCustody, type SharedProfileRuntime } from './custody.js';
+import type { NativeBoundaryPreparation, NativeFailureBoundary, NativeShellPort, TrustedShellIntegration } from './bootstrap.js';
 import type { NativeWatchdog } from '../native/watchdog.js';
 import type { OwnerLease } from '../profiles/locking.js';
-import type { PriorMarkerExpectation } from './platform.js';
+import type { PlatformPort, PriorMarkerExpectation } from './platform.js';
+import type { HostLifecycle, SharedProfileLifecycle } from './lifecycle.js';
+import type { ProductionExitAuthority } from './exit.js';
+import type { TransportServer } from './transport.js';
+import type { RendererControl } from '../host/recovery.js';
+import type { WindowHost } from '../host/windows.js';
 
 export interface HostRequest { readonly request: string; readonly profile: ProfileSnapshot; readonly selection: BuildSelection }
 export async function consumeHostRequest(args: readonly string[], packagedBuild: string, directory: string): Promise<HostRequest> {
@@ -141,7 +147,7 @@ export async function prepareHost(actualApp: ProfileApp, owned: OwnedHost, autho
     const engine = await prepareEngine(instance.owner, authority, stage => noteHostStartup(custody, stage));
     custody.assertRetained(); custody.assertMarker();
     noteHostStartup(custody, 'host-session-configure-before');
-    const binding = await configureProfileSession(actualApp, engine, custody);
+    const binding = await configureProfileSession(actualApp, engine, custody, custody.host.identity.layout.scope === 'installed');
     noteHostStartup(custody, 'host-session-configure-after');
     if (actualApp.isReady()) return custody.terminate();
     const prepared: HostPreparation = Object.freeze({ ...owned, engine, binding });
@@ -167,10 +173,11 @@ export async function bindHostSessions(prepared: HostPreparation, deadline: numb
 }
 interface ActualHostAssembly {
   closed: boolean;
-  control?: import('../host/recovery.js').RendererControl;
-  shell?: import('./bootstrap.js').TrustedShellIntegration;
-  transport?: import('./transport.js').TransportServer;
-  runtime?: import('./lifecycle.js').HostLifecycle;
+  control?: RendererControl;
+  shell?: TrustedShellIntegration;
+  transport?: TransportServer;
+  runtime?: HostLifecycle;
+  additional?: AdditionalProfiles;
 }
 function installApplicationMenu(): () => void {
   const zoomPage = (change?: number) => {
@@ -207,12 +214,119 @@ function installApplicationMenu(): () => void {
   return assertInstalled;
 }
 
+function usageFor(transports: typeof import('./transport.js'), platform: PlatformPort, instance: InstanceOwner,
+  guard: () => void, control: RendererControl, shell: TrustedShellIntegration,
+  currentLifecycle: () => HostLifecycle | undefined): NonNullable<Parameters<typeof transports.listenProtectedTransport>[4]> {
+  return async (params, deadline, signal) => {
+    const runtime = currentLifecycle();
+    if (!runtime) return { status: 'dashboard_unavailable' };
+    const current = instance.record;
+    const { SeqoyaPageRefusal } = await import('../host/seqoya-page.js');
+    const { captureSeqoyaUsage } = await import('../host/seqoya-usage.js');
+    const ownerBusy = () => shell.tabs.all().some(tab => control.ownership.lifecycle.state(tab).handoff !== 'idle');
+    const assertCurrent = () => { runtime.assertAdmission(); guard(); };
+    try {
+      assertCurrent();
+      await transports.admitSeqoyaCapture(platform, current, params, deadline, 'claim', signal);
+      assertCurrent();
+      if (instance.record !== current) return { status: 'dashboard_unavailable' };
+      const reading = await captureSeqoyaUsage(shell.host, params.provider, deadline, signal, ownerBusy);
+      assertCurrent();
+      if (instance.record !== current || signal.aborted || shell.host.hasForegroundWork() || ownerBusy())
+        return { status: 'deferred' };
+      return { status: 'read', reading };
+    } catch (error) {
+      return { status: error instanceof SeqoyaPageRefusal ? error.code : 'dashboard_unavailable' };
+    }
+  };
+}
+
+interface AdditionalProfiles {
+  openInWindow(source: WindowHost, target: ProfileSnapshot, deadline: number): Promise<void>;
+  fence(): void;
+  retire(deadline: number): Promise<void>;
+}
+function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, boundary: NativeFailureBoundary,
+  port: NativeShellPort, platform: PlatformPort, exits: ProductionExitAuthority,
+  bootstrap: typeof import('./bootstrap.js'), lifecycle: typeof import('./lifecycle.js'),
+  transports: typeof import('./transport.js')): AdditionalProfiles {
+  type Entry = { instance: string; opening?: Promise<void>; runtime?: SharedProfileLifecycle };
+  const profiles = new Map<string, Entry>();
+  let closing = false;
+  const assertCurrent = (source: WindowHost, deadline: number) => {
+    assertTime(deadline);
+    if (closing || state.closed || source.window !== state.shell?.host.window || !state.runtime) throw unavailable('profile');
+    state.runtime.assertAdmission(); custody.assertRetained(); source.assertHealthy();
+  };
+  async function openInWindow(source: WindowHost, target: ProfileSnapshot, deadline: number): Promise<void> {
+    assertCurrent(source, deadline);
+    const { id, instance } = target.record;
+    if (id === custody.instance.record.profile || target.paths.state !== custody.host.policy.stateRoot) throw unavailable('profile');
+    let entry = profiles.get(id);
+    if (!entry) { entry = { instance }; profiles.set(id, entry); }
+    if (entry.instance !== instance) throw unavailable('profile');
+    entry.opening ??= openEntry(entry, source, target, deadline);
+    await entry.opening;
+    assertCurrent(source, deadline);
+    entry.runtime!.assertAdmission();
+  }
+  async function openEntry(entry: Entry, source: WindowHost, target: ProfileSnapshot, deadline: number): Promise<void> {
+    let profile: SharedProfileRuntime | undefined, shell: TrustedShellIntegration | undefined, transport: TransportServer | undefined;
+    try {
+      const prepared = profile = await prepareSharedProfileRuntime(app, custody, target, exits, deadline);
+      assertCurrent(source, deadline);
+      const control = await bootstrap.prepareSharedRendererControl(boundary, prepared, deadline);
+      assertCurrent(source, deadline);
+      shell = await bootstrap.integrateSharedProfileShell(port, prepared, source, control.ownership.lifecycle,
+        control.ownership.shell, openInWindow, deadline);
+      assertCurrent(source, deadline);
+      control.bind(shell.tabs, shell.host, shell.registration);
+      const { instance } = prepared;
+      transport = await transports.listenProtectedTransport(instance.location, instance.record, platform, control.ownership.dispatch,
+        usageFor(transports, platform, instance, () => { assertSharedProfileRuntime(prepared); },
+          control, shell, () => entry.runtime), prepared);
+      const runtime = entry.runtime = lifecycle.createSharedProfileLifecycle(prepared, transport, control.ownership.control, deadline);
+      control.ownership.bindRuntime(runtime);
+      assertCurrent(source, deadline);
+      await shell.registration.load();
+      assertCurrent(source, deadline);
+      await runtime.ready();
+      assertCurrent(source, deadline);
+      shell.registration.setRuntimeReady(() => runtime.phase === 'ready' && !closing && !state.closed);
+    } catch (error) {
+      if (entry.runtime) await entry.runtime.close();
+      else {
+        transport?.closeAdmission();
+        await Promise.allSettled([
+          shell && shell.tabs.closeWindow(shell.host),
+          transport?.close(),
+          profile?.instance.phase('closing'),
+          profile?.sessions.flushStorage(),
+        ]);
+      }
+      if (!profile) profiles.delete(target.record.id);
+      throw error;
+    }
+  }
+  return Object.freeze({
+    openInWindow,
+    fence() {
+      closing = true;
+      for (const entry of profiles.values()) entry.runtime?.fence();
+    },
+    async retire(deadline: number) {
+      await Promise.allSettled([...profiles.values()].map(entry => entry.opening));
+      await Promise.all([...profiles.values()].map(entry => entry.runtime?.retire(deadline)));
+    },
+  });
+}
+
 /** Actual canonical ABR-11 control, hidden shell and protected transport.
  * Bind every owner/window/registration before load, then publish native ready. */
 async function assembleAfterReady(prepared: HostPreparation, sessions: ProfileSessions,
   boundary: import('./bootstrap.js').NativeFailureBoundary, request: HostRequest,
   state: ActualHostAssembly, deadline: number, platform: import('./platform.js').PlatformPort,
-  assertMenuInstalled: () => void, showEmptyWhenReady: boolean): Promise<void> {
+  assertMenuInstalled: () => void, showEmptyWhenReady: boolean, exits: ProductionExitAuthority): Promise<void> {
   assertOwnedHost(prepared); assertTime(deadline);
   const bootstrapURL = new URL('./bootstrap.js', import.meta.url).href;
   const lifecycleURL = new URL('./lifecycle.js', import.meta.url).href;
@@ -236,9 +350,12 @@ async function assembleAfterReady(prepared: HostPreparation, sessions: ProfileSe
     noteHostStartup(prepared.custody, 'host-shell-port-before');
     const port = await bootstrap.prepareNativeShellPort(boundary);
     noteHostStartup(prepared.custody, 'host-shell-port-after'); current();
+    const group = prepared.custody.host.identity.layout.scope === 'installed' ?
+      additionalProfiles(prepared.custody, state, boundary, port, platform, exits, bootstrap, lifecycle, transports) : undefined;
+    if (group) state.additional = group;
     noteHostStartup(prepared.custody, 'host-shell-integrate-before');
     const shell = await bootstrap.integrateTrustedShell(port, prepared, request.selection, sessions,
-      control.ownership.lifecycle, control.ownership.shell, deadline);
+      control.ownership.lifecycle, control.ownership.shell, deadline, group?.openInWindow);
     noteHostStartup(prepared.custody, 'host-shell-integrate-after');
     state.shell = shell; current();
     // Genuine physical shell is still hidden and empty. No load/show precedes
@@ -248,33 +365,14 @@ async function assembleAfterReady(prepared: HostPreparation, sessions: ProfileSe
     noteHostStartup(prepared.custody, 'host-control-bind-after');
     noteHostStartup(prepared.custody, 'host-listeners-before');
     const transport = await transports.listenProtectedTransport(prepared.instance.location, prepared.instance.record, platform,
-      control.ownership.dispatch, async (params, captureDeadline, signal) => {
-        const runtime = state.runtime;
-        if (!runtime) return { status: 'dashboard_unavailable' };
-        const currentRecord = prepared.instance.record;
-        const { SeqoyaPageRefusal } = await import('../host/seqoya-page.js');
-        const { captureSeqoyaUsage } = await import('../host/seqoya-usage.js');
-        const ownerBusy = () => shell.tabs.all().some(tab => control.ownership.lifecycle.state(tab).handoff !== 'idle');
-        try {
-          runtime.assertAdmission(); prepared.custody.assertRetained();
-          await transports.admitSeqoyaCapture(platform, currentRecord, params, captureDeadline, 'claim', signal);
-          runtime.assertAdmission(); prepared.custody.assertRetained();
-          if (prepared.instance.record !== currentRecord) return { status: 'dashboard_unavailable' };
-          const reading = await captureSeqoyaUsage(shell.host, params.provider, captureDeadline, signal, ownerBusy);
-          runtime.assertAdmission(); prepared.custody.assertRetained();
-          if (prepared.instance.record !== currentRecord || signal.aborted || shell.host.hasForegroundWork() || ownerBusy())
-            return { status: 'deferred' };
-          return { status: 'read', reading };
-        } catch (error) {
-          return { status: error instanceof SeqoyaPageRefusal ? error.code : 'dashboard_unavailable' };
-        }
-      });
+      control.ownership.dispatch, usageFor(transports, platform, prepared.instance,
+        () => prepared.custody.assertRetained(), control, shell, () => state.runtime));
     noteHostStartup(prepared.custody, 'host-listeners-after');
     state.transport = transport; current();
     const shutdown = sessionModule.productionSessionShutdown(sessions, prepared.custody);
     const native = bootstrap.createNativeLifetime(boundary, prepared, request.selection, () => shutdown.quit());
     noteHostStartup(prepared.custody, 'host-lifecycle-bind-before');
-    const runtime = lifecycle.createHostLifecycle(prepared, sessions, transport, control.ownership.control, native, deadline, platform);
+    const runtime = lifecycle.createHostLifecycle(prepared, sessions, transport, control.ownership.control, native, deadline, platform, group);
     state.runtime = runtime; control.ownership.bindRuntime(runtime);
     noteHostStartup(prepared.custody, 'host-lifecycle-bind-after');
     app.on('before-quit', event => {
@@ -356,7 +454,11 @@ export async function runHostEntry(): Promise<void> {
     owned = await prepareOwnedHost(app, request, host, native, previous, deadline, capture);
     if (!owned) return terminateCapturedHostBuild(capture);
     const effects: import('../native/fatal.js').FatalEffects = Object.freeze({
-      closeAdmission() { state.closed = true; state.control?.ownership.control.closeAdmission(); state.transport?.closeAdmission(); },
+      closeAdmission() {
+        state.closed = true;
+        try { state.additional?.fence(); }
+        finally { state.control?.ownership.control.closeAdmission(); state.transport?.closeAdmission(); }
+      },
       invalidate() { state.control?.ownership.authority.closeAdmission(); },
       hidePages() { const window = state.shell?.host.window; if (window && !window.isDestroyed()) window.hide(); },
     });
@@ -383,7 +485,8 @@ export async function runHostEntry(): Promise<void> {
         noteHostStartup(prepared.custody, 'host-session-bind-after');
         assertTime(deadline); prepared.custody.assertRetained();
         if (state.closed) return prepared.custody.terminate();
-        await assembleAfterReady(prepared, sessions, installed, request, state, deadline, native.platform, assertMenuInstalled, showEmptyWhenReady);
+        await assembleAfterReady(prepared, sessions, installed, request, state, deadline, native.platform,
+          assertMenuInstalled, showEmptyWhenReady, previous);
       } catch { state.closed = true; return installed.fatal.fail('native_boundary_unavailable'); }
     }, () => installed.fatal.fail('native_boundary_unavailable'));
   } catch (error) {

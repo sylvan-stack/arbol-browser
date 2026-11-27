@@ -53,7 +53,8 @@ async function labels(state: string): Promise<Map<string, { instance: string; la
 
 export function createProfileNavigation(custody: HostCustody, platform: PlatformPort,
   yieldPresentation: () => () => void, selectLocal: (profile: string, instance: string) => boolean,
-  shared?: Readonly<{ runtime?: SharedProfileRuntime; openInWindow(profile: ProfileSnapshot, deadline: number): Promise<void> }>): ProfileNavigation | undefined {
+  shared?: Readonly<{ runtime?: SharedProfileRuntime; isReady(profile: string, instance: string): boolean;
+    openInWindow(profile: ProfileSnapshot, deadline: number): Promise<void> }>): ProfileNavigation | undefined {
   assertHostCustody(custody);
   if (custody.host.identity.layout.scope !== 'installed') return undefined;
   if (shared?.runtime && assertSharedProfileRuntime(shared.runtime) !== custody) throw profileUnavailable();
@@ -76,7 +77,8 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
       for (const profile of records) {
         const { record } = profile;
         const name = names.get(record.id);
-        const blocked = record.id !== selected.record.id && await hasRetainedProfileLock(profile, platform);
+        const blocked = record.id !== selected.record.id && !shared?.isReady(record.id, record.instance) &&
+          await hasRetainedProfileLock(profile, platform) && !shared?.isReady(record.id, record.instance);
         profiles.push({ id: record.id, instance: record.instance,
           ...(name?.instance === record.instance ? { label: name.label } : {}),
           ...(blocked ? { unavailable: true } : {}) });

@@ -203,6 +203,8 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
       }
       return false;
     }, shared && { ...(shared.runtime ? { runtime: shared.runtime } : {}),
+      isReady: (id, instance) => [...nativePresentation.profiles.values()]
+        .some(member => member.id === id && member.instance === instance && member.ready()),
       openInWindow: (profile, deadline) => shared.openInWindow(host, profile, deadline) });
   const assertPresentable = () => { registration.assertLoaded(); authority.assertOperational(); };
   const current: Registration = { host, authority, snapshot, ...(profiles ? { profiles } : {}),
