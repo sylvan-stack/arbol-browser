@@ -8,7 +8,7 @@ import { setTimeout } from 'node:timers/promises';
 import { unavailable } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
 import { assertProfile, type ProfileSnapshot } from '../profiles/records.js';
-import { assertPlatform, type HeldLock, type PlatformPort, type ProcessProvenance } from './platform.js';
+import { assertPlatform, type CloseBudget, type HeldLock, type PlatformPort, type ProcessProvenance } from './platform.js';
 import { noteOpenCommand, type OpenCommandObservation, assertHostCloseContinuity, assertHostStartupContinuity,
   assertHostStartupSnapshot, assertVerifiedHostMetadata, type VerifiedHost } from './authorities.js';
 import { assertTime, now, readRuntime, runtimeLocation, type RuntimeLocation, type RuntimeRecord } from './instance.js';
@@ -338,8 +338,8 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
 /** Inspect/Close joins an existing exact host only. Neither operation starts a profile. */
 export async function inspectOrCloseProductionProfile(profile: ProfileSnapshot, record: RuntimeRecord,
   selection: import('./selection.js').BuildSelection, platform: PlatformPort,
-  exits: ProductionExitAuthority, deadline: number, verifiedHost?: VerifiedHost, operation: 'inspect' | 'close' = 'inspect'):
-  Promise<'standalone' | 'active' | 'dormant' | 'closed' | 'exiting'> {
+  exits: ProductionExitAuthority, deadline: number, verifiedHost?: VerifiedHost, operation: 'inspect' | 'close' = 'inspect',
+  budget?: CloseBudget): Promise<'standalone' | 'active' | 'dormant' | 'closing' | 'closed' | 'exiting'> {
   const lease = await acquireBuildLease(selection, platform);
   try {
     const address = new URL('./authorities.js', import.meta.url).href;
@@ -364,9 +364,12 @@ export async function inspectOrCloseProductionProfile(profile: ProfileSnapshot, 
         platform, deadline, 'Profile inspection');
       try {
         const scope = { profile: profile.record.id, profileInstance: profile.record.instance };
-        if (operation === 'close') return await requestProfileClosure(client, scope, deadline);
+        if (operation === 'close') {
+          if (!budget) throw unavailable('profile');
+          return await requestProfileClosure(client, scope, deadline, budget);
+        }
         const inspected = await requestProfileInspection(client, scope, deadline);
-        if (inspected === 'dormant') return inspected;
+        if (inspected === 'dormant' || inspected === 'closing') return inspected;
         if (JSON.stringify(inspected) !== JSON.stringify(record)) throw unavailable('profile');
         await lease.assert(); assertTime(deadline);
         return 'active';

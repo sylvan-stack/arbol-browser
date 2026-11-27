@@ -10,7 +10,7 @@ import { archiveRemovedRuntime, inspectOrCloseProductionProfile } from './proces
 import { assertPlatform, type PlatformPort, type GroupProcess } from './platform.js';
 import type { BuildSelection } from './selection.js';
 import { admitSeqoyaCapture, requestManagementClose, requestSeqoyaUsage, reserveManagementClose, openProtectedReady,
-  openSharedProtectedReady, connectRuntime, type Request, type ManagementCloseOpportunity, type RuntimeClient,
+  openSharedProtectedReady, connectRuntime, takeResidentExit, type ResidentCloseOpportunity, type Request, type ManagementCloseOpportunity, type RuntimeClient,
   type Endpoint, type TransportServer, type ConnectionContext } from './transport.js';
 import { runtimeLocation, readRuntime, originalAlive, now, startupDeadline, neverOpenedExit,
   token, assertTime, type RuntimeRecord, type PreviousExit } from './instance.js';
@@ -116,10 +116,10 @@ export function createProfileRuntime(platform: PlatformPort, selection: BuildSel
       const deadline = now() + 5000;
       if (isProductionExitAuthority(exits)) {
         const status = await inspectOrCloseProductionProfile(profile, record, selection, platform, exits, deadline, listingHost);
-        if (status === 'dormant') {
+        if (status === 'dormant' || status === 'closing') {
           await registry?.assert(); await assertProfile(profile);
           if (JSON.stringify(record) !== JSON.stringify(await readRuntime(location)) || !originalAlive(record, platform)) throw profileUnavailable();
-          return 'dormant' as const;
+          return status === 'closing' ? true : 'dormant' as const;
         }
       }
       const client = await connectRuntime(location, record, 'management', { ...selection, explicit: false }, platform, deadline, 'Profile inspection');
@@ -188,7 +188,7 @@ async function closeProductionProfile(profile: ProfileSnapshot, selection: Build
   let requested = false;
   if (originalAlive(original, platform) && original.phase === 'ready' && location && now() < grace) {
     const status = await within(grace, () => inspectOrCloseProductionProfile(profile, original,
-      selection, platform, exits, grace, closeHost, 'close'));
+      selection, platform, exits, grace, closeHost, 'close', command.native));
     if (status === 'closed' || status === 'dormant')
       return { profile: profile.record.id, closed: status === 'closed', dataRemoved: false };
     if (status === 'exiting') requested = true;
@@ -410,6 +410,12 @@ export interface HostLifecycle {
   lastWindowClosed(): void;
 }
 const hostLifecycles = new WeakSet<object>();
+const residentClosers = new WeakMap<HostLifecycle, (opportunity: ResidentCloseOpportunity) => Promise<void>>();
+export async function closeAdmittedResident(lifecycle: HostLifecycle, opportunity: ResidentCloseOpportunity): Promise<void> {
+  const close = residentClosers.get(lifecycle);
+  if (!close) throw unavailable('browser');
+  await close(opportunity);
+}
 export function assertHostLifecycle(value: HostLifecycle): void {
   if (!hostLifecycles.has(value)) throw unavailable('browser');
 }
@@ -705,5 +711,7 @@ export function createHostLifecycle(prepared: HostPreparation, sessions: Profile
     },
     lastWindowClosed() { if (control.windowCount() === 0) void shutdown().catch(() => {}); },
   });
+  if (production && additional) residentClosers.set(lifecycle, opportunity =>
+    shutdown(takeResidentExit(opportunity, transport)));
   hostLifecycles.add(lifecycle); return lifecycle;
 }

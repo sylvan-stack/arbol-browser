@@ -89,7 +89,7 @@ export function assertMaintenanceCustody(value: MaintenanceCustody): void {
 /** Genuine one-command native receipt; numeric fields are observations, never
  * transferable authority. The private native handle stays in this port. */
 export interface CloseBudget { readonly received: number; readonly grace: number; readonly overall: number }
-export interface CloseAdmission extends CloseBudget { readonly kind: 'management' | 'local-window' }
+export interface CloseAdmission extends CloseBudget { readonly kind: 'management' | 'local-window' | 'profile' }
 export interface WebsiteSessionReceipt {
   pagesRetired(): void;
   domRequested(): void;
@@ -109,7 +109,9 @@ export interface WatchdogCustody {
   prepareHost(input: HostFinalizationInput): void;
   ready(runtime: import('./instance.js').RuntimeRecord, agent: number, management: number): void;
   retainProfileOwner(owner: HeldLock, profile: string, instance: string): SharedProfileOwner;
+  retainSharedAppAdmission(): HeldLock;
   consumeClose(requestId: string, socketFd: number): CloseAdmission;
+  consumeProfileClose(requestId: string, socketFd: number): CloseAdmission;
   localClose(): CloseAdmission;
   beginSessionUse(factory: ActualSessionFactory): SessionUsePermit;
   assertHost(): void;
@@ -438,6 +440,8 @@ interface NativeSupport {
   beginCloseRetirement(handle: object): void;
   pollCloseRetirement(handle: object): number;
   consumeCloseRequest(handle: object, requestId: string, socketFd: number): CloseAdmission;
+  consumeProfileClose(handle: object, requestId: string, socketFd: number): CloseAdmission;
+  retainSharedAppAdmission(handle: object): object;
   armLocalClose(handle: object): CloseAdmission;
   beginHostMarkerMutation(handle: object, bytes: string): object;
   acceptHostMarkerMutation(handle: object): void;
@@ -513,7 +517,7 @@ export function loadPlatform(): PlatformPort {
   let native: NativeSupport;
   try {
     native = createRequire(import.meta.url)(fileURLToPath(new URL('../../native/platform.node', import.meta.url)));
-    for (const name of ['publishHostReady', 'publishSharedProfileReady', 'retainSharedProfileOwner', 'assertSharedProfileOwner', 'beginSharedProfileMarker', 'acceptSharedProfileMarker', 'assertSharedProfileMarker', 'abortSharedProfileMarker', 'beginSharedProfileSession', 'acceptSharedProfileSession', 'assertSharedProfileSession', 'beginExitInspection', 'pollExitInspection', 'cancelExitInspection', 'beginHostSessionUse', 'acceptHostSessionUse', 'abortHostSessionUse', 'recordPagesRetired', 'recordDOMRequested', 'recordCookieAcknowledged', 'recordQuitIntended', 'captureCloseBudget', 'beginCloseStamp', 'pollCloseStamp', 'cancelCloseStamp', 'beginCloseRetirement', 'pollCloseRetirement', 'consumeCloseRequest', 'armLocalClose', 'beginHostMarkerMutation', 'acceptHostMarkerMutation', 'assertHostMarker', 'abortHostMarkerMutation', 'latchWatchdogFatal', 'prepareHostFinalization', 'spawnWatchdog', 'assertHostFinalization', 'adoptHostBuild', 'terminateAdoptedHost', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
+    for (const name of ['publishHostReady', 'publishSharedProfileReady', 'retainSharedProfileOwner', 'assertSharedProfileOwner', 'beginSharedProfileMarker', 'acceptSharedProfileMarker', 'assertSharedProfileMarker', 'abortSharedProfileMarker', 'beginSharedProfileSession', 'acceptSharedProfileSession', 'assertSharedProfileSession', 'beginExitInspection', 'pollExitInspection', 'cancelExitInspection', 'beginHostSessionUse', 'acceptHostSessionUse', 'abortHostSessionUse', 'recordPagesRetired', 'recordDOMRequested', 'recordCookieAcknowledged', 'recordQuitIntended', 'captureCloseBudget', 'beginCloseStamp', 'pollCloseStamp', 'cancelCloseStamp', 'beginCloseRetirement', 'pollCloseRetirement', 'consumeCloseRequest', 'consumeProfileClose', 'retainSharedAppAdmission', 'armLocalClose', 'beginHostMarkerMutation', 'acceptHostMarkerMutation', 'assertHostMarker', 'abortHostMarkerMutation', 'latchWatchdogFatal', 'prepareHostFinalization', 'spawnWatchdog', 'assertHostFinalization', 'adoptHostBuild', 'terminateAdoptedHost', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
       if (typeof native[name] !== 'function') throw new Error('Missing process support');
   } catch { throw unavailable('profile'); }
   const call = <T>(operation: () => T): T => {
@@ -533,7 +537,7 @@ export function loadPlatform(): PlatformPort {
   };
   const closeAdmission = (value: CloseAdmission): CloseAdmission => {
     const budget = clockBudget(value);
-    if (value.kind !== 'management' && value.kind !== 'local-window') throw unavailable('browser');
+    if (value.kind !== 'management' && value.kind !== 'local-window' && value.kind !== 'profile') throw unavailable('browser');
     return Object.freeze({ ...budget, kind: value.kind });
   };
   const wrapLock = (handle: object, retained = false): HeldLock => {
@@ -614,7 +618,10 @@ export function loadPlatform(): PlatformPort {
             },
           });
         },
+        retainSharedAppAdmission: () => wrapLock(call(() => native.retainSharedAppAdmission(handle))),
         consumeClose: (requestId: string, socketFd: number) => closeAdmission(call(() => native.consumeCloseRequest(handle, requestId, socketFd))),
+        consumeProfileClose: (requestId: string, socketFd: number) =>
+          closeAdmission(call(() => native.consumeProfileClose(handle, requestId, socketFd))),
         localClose: () => closeAdmission(call(() => native.armLocalClose(handle))),
         beginSessionUse(factory: ActualSessionFactory): SessionUsePermit {
           assertActualSessionFactory(factory);

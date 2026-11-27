@@ -28,9 +28,11 @@ export interface HostCustody {
   assertRetained(): void;
   /** Retains storage ownership only. The additional Session needs its own admission. */
   retainProfileOwner(owner: OwnerLease): Promise<SharedProfileOwner>;
+  retainSharedAppAdmission(): import('./platform.js').HeldLock;
   /** Only actual protected management dispatch supplies this socket/request;
    * the original native holder authenticates and consumes the private carrier. */
   consumeClose(requestId: string, socketFd: number): import('./platform.js').CloseAdmission;
+  consumeProfileClose(requestId: string, socketFd: number): import('./platform.js').CloseAdmission;
   localClose(): import('./platform.js').CloseAdmission;
   beginSessionUse(factory: ActualSessionFactory): Readonly<{
     accept(seal: ActualSessionSeal): import('./platform.js').WebsiteSessionReceipt;
@@ -327,7 +329,9 @@ export async function prepareHostCustody(host: VerifiedHost, instance: InstanceO
         return native.retainProfileOwner(held, record.id, record.instance);
       });
     },
+    retainSharedAppAdmission() { assertHostCustody(receipt); return native.retainSharedAppAdmission(); },
     consumeClose(requestId: string, socketFd: number) { assertHostCustody(receipt); return native.consumeClose(requestId, socketFd); },
+    consumeProfileClose(requestId: string, socketFd: number) { assertHostCustody(receipt); return native.consumeProfileClose(requestId, socketFd); },
     localClose() { assertHostCustody(receipt); return native.localClose(); },
     beginSessionUse(factory: ActualSessionFactory) {
       assertHostCustody(receipt); assertActualSessionFactory(factory);

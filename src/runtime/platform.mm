@@ -2033,6 +2033,23 @@ static napi_value browserAppAvailable(napi_env env, napi_callback_info) {
   napi_value out; if(napi_get_boolean(env,ready,&out)!=napi_ok) return fail(env);
   return out;
 }
+static napi_value retainSharedAppAdmission(napi_env env,napi_callback_info info) {
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env);
+  auto* c=custodyArgument(env,arg);
+  if(!c||!c->context.app.pid||!c->bound||getpid()!=c->context.main.pid||!c->finalization.ready(c->context)) return fail(env);
+  arbol_boundary::Identity app;
+  const auto held=arbol_boundary::appAdmission(app);
+  if(held.fd<0) return fail(env);
+  if(!arbol_boundary::same(app,c->context.app)||!c->finalization.ready(c->context)) {
+    close(held.fd); return fail(env);
+  }
+  auto* lock=new HeldLock{held.fd,held.path,static_cast<dev_t>(held.device),held.inode,LOCK_SH};
+  struct stat identity{}; napi_value handle;
+  if(!matches(lock,&identity)||napi_create_external(env,lock,finalize,nullptr,&handle)!=napi_ok) {
+    finalize(env,lock,nullptr); return fail(env);
+  }
+  liveLocks.insert(lock); return handle;
+}
 static napi_value prepareWatchdogCustody(napi_env env, napi_callback_info info) {
   napi_value args[4]; size_t n = 4; std::string bundle; char digest[65]{}; size_t length = 0; void *a = nullptr, *b = nullptr;
   if (custodyAttempted) return fail(env); custodyAttempted = true;
@@ -2116,7 +2133,7 @@ static bool beginClosing(Custody* custody,arbol_attempt::Claim& claim,const std:
   next[@"phase"]=@"closing"; runtime[@"phase"]=@"closing"; next[@"runtime"]=runtime;
   return arbol_attempt::transition(current,next,arbol_attempt::Role::engine)&&arbol_attempt::replace(claim.at,raw,false,arbol_attempt::bytes(next));
 }
-static napi_value consumeCloseRequest(napi_env env,napi_callback_info info) {
+static napi_value consumeManagementClose(napi_env env,napi_callback_info info,bool physical) {
   napi_value args[3]; size_t n=3; std::string request; int socket;
   if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok||n!=3||!boundedText(env,args[1],request)||!integer(env,args[2],&socket)||
      !arbol_attempt::pattern([NSString stringWithUTF8String:request.c_str()],@"^req_[A-Za-z0-9_-]{22}$")) return fail(env);
@@ -2141,6 +2158,14 @@ static napi_value consumeCloseRequest(napi_env env,napi_callback_info info) {
        !arbol_attempt::uintNumber(value[@"overallUs"],overall)||!received||grace!=received+5000000||overall!=received+8000000||
        received>continuousUs()||![kernelPeer(socket) isEqual:peer]) return fail(env);
     if(continuousUs()>=grace) { (void)retireCloseFile(claim,filename,file); return fail(env); }
+    if(!physical) {
+      if(![current[@"phase"] isEqual:@"ready"]||c->finalization.shared()->closeReceivedUs.load(std::memory_order_acquire)||
+         !managementSocketPath(socket,false,current[@"runtime"][@"managementSocket"])||
+         !retireCloseFile(claim,filename,file)||continuousUs()>=grace) return fail(env);
+      napi_value out;
+      if(napi_create_object(env,&out)!=napi_ok||!budgetValue(env,out,received,grace,overall,"profile")) return fail(env);
+      return out;
+    }
     if(!beginClosing(c,claim,currentRaw,current,received,grace,overall)||![kernelPeer(socket) isEqual:peer]||
        !managementSocketPath(socket,false,current[@"runtime"][@"managementSocket"])||!retireCloseFile(claim,filename,file)) { c->finalization.shared()->poison(arbol_exit::admissionLoss|arbol_exit::forced); return fail(env); }
     if(continuousUs()>=c->finalization.shared()->closeGraceUs.load(std::memory_order_acquire)) return fail(env);
@@ -2148,7 +2173,13 @@ static napi_value consumeCloseRequest(napi_env env,napi_callback_info info) {
       c->finalization.shared()->closeReceivedUs.load(std::memory_order_acquire),c->finalization.shared()->closeGraceUs.load(std::memory_order_acquire),
       c->finalization.shared()->closeOverallUs.load(std::memory_order_acquire),"management")) return fail(env);
     return out;
-  } @catch(NSException*) { if(c->finalization.present()) c->finalization.shared()->poison(arbol_exit::admissionLoss|arbol_exit::forced); return fail(env); } }
+  } @catch(NSException*) { if(physical&&c->finalization.present()) c->finalization.shared()->poison(arbol_exit::admissionLoss|arbol_exit::forced); return fail(env); } }
+}
+static napi_value consumeCloseRequest(napi_env env,napi_callback_info info) {
+  return consumeManagementClose(env,info,true);
+}
+static napi_value consumeProfileClose(napi_env env,napi_callback_info info) {
+  return consumeManagementClose(env,info,false);
 }
 static napi_value armLocalClose(napi_env env,napi_callback_info info) {
   uint64_t received=continuousUs(); napi_value arg;
@@ -5510,6 +5541,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"beginCloseRetirement",nullptr,beginCloseRetirement,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"pollCloseRetirement",nullptr,pollCloseRetirement,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"consumeCloseRequest",nullptr,consumeCloseRequest,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"consumeProfileClose",nullptr,consumeProfileClose,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"armLocalClose",nullptr,armLocalClose,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"beginHostMarkerMutation",nullptr,beginHostMarkerMutation,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"acceptHostMarkerMutation",nullptr,acceptHostMarkerMutation,nullptr,nullptr,nullptr,napi_default,nullptr},
@@ -5537,6 +5569,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"processProvenance",nullptr,processProvenance,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"requestProfileOpen",nullptr,requestProfileOpen,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"browserAppAvailable",nullptr,browserAppAvailable,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"retainSharedAppAdmission",nullptr,retainSharedAppAdmission,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"activateProfileWindow",nullptr,activateProfileWindow,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"seqoyaBackendArguments",nullptr,seqoyaBackendArguments,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"readLaunchAttempt",nullptr,readLaunchAttempt,nullptr,nullptr,nullptr,napi_default,nullptr},
