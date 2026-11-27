@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
-import { join, basename, dirname, resolve } from 'node:path';
+import { join, basename, dirname, relative, resolve } from 'node:path';
 import { lstat, open, readdir, realpath } from 'node:fs/promises';
 import { setTimeout } from 'node:timers/promises';
 import { promisify } from 'node:util';
@@ -16,7 +16,8 @@ import { directory, identity, privateFile, sameIdentity, statOrAbsent } from '..
 import { ownerLock, withOwnerLockForCustody, type OwnerLease } from '../profiles/locking.js';
 import { acquireBuildLease, withBuildLockForCustody, type BuildLease } from './build-lease.js';
 import { assertHostCloseContinuity, assertHostStartupContinuity, assertHostStartupSnapshot, assertVerifiedHostMetadata, physicalJson, verifyPackagedHost, verifyPackagedOpenHost, type VerifiedHost } from './authorities.js';
-import { assertPlatform, assertExitInspectionReceipt, type PlatformPort, type ExitInspectionReceipt, type PriorMarkerExpectation } from './platform.js';
+import { assertPlatform, assertExitInspectionReceipt, assertSharedFamilyExitReceipt, type PlatformPort, type ExitInspectionReceipt,
+  type PriorMarkerExpectation, type SharedFamilyExitReceipt } from './platform.js';
 import { withLaunchAttempt, type LaunchAttempt } from './process.js';
 import { now, assertTime, runtimeLocation, type RuntimeRecord } from './instance.js';
 import { buildLocation, claimedLayout, selectedLayout, type BuildSelection, type PackagedLayout } from './selection.js';
@@ -29,6 +30,7 @@ export interface ProductionExitAuthority extends ExitAuthority, HostPreviousExit
   /** Only this poll treats protection contention/in-flight closure as pending.
    * It never certifies closure or invokes an external signal on uncertainty. */
   assertClosedUnderOwner(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease, deadline: number): Promise<void>;
+  verifySharedFamily(profile: ProfileSnapshot, owner: OwnerLease, request: string, deadline: number): Promise<SharedFamilyExitReceipt>;
   tryClosed(profile: ProfileSnapshot, original: RuntimeRecord, deadline: number, closeHost?: VerifiedHost): Promise<boolean>;
   /** Retires only the independently verified exact closed reservation, retaining
    * its native closed-claim history outside profile and transient socket roots. */
@@ -354,6 +356,49 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
     },
     async assertClosedUnderOwner(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease, deadline: number) {
       await inspect(profile, original, owner, 'full', deadline);
+    },
+    async verifySharedFamily(profile: ProfileSnapshot, owner: OwnerLease, request: string, deadline: number) {
+      assertTime(deadline);
+      if (owner.profile !== profile || !validator('browser.RequestId')(request)) throw unavailable('profile');
+      await owner.assert(); await assertProfile(profile);
+      const profilePathHash = createHash('sha256').update(profile.paths.root, 'utf8').digest('hex');
+      const recordPath = join(profile.paths.state, 'exit-evidence', profilePathHash, request, 'shared-owner.json');
+      const { value } = await readJson(recordPath, 262144);
+      // A private journal supplies a selection hint. The native verification
+      // reads the actual journal again under the target Owner and original Build.
+      const hint = (value as { group?: { build?: Record<string, unknown> } } | null)?.group?.build;
+      const number = hint?.number;
+      if (!hint || !validator('browser.Build')(number) ||
+          ![hint.sourceDigest, hint.productDigest, hint.candidateDigest].every(digest =>
+            typeof digest === 'string' && /^[0-9a-f]{64}$/.test(digest))) throw unavailable('profile');
+      const active = startingHost?.identity.layout ?? selectedLayout(selection, resolve(fileURLToPath(new URL('../../', import.meta.url))));
+      if (active.scope !== 'installed') throw unavailable('profile');
+      const directory = join(dirname(active.buildRoot), number);
+      const location = buildLocation(number, directory);
+      if (location?.scope !== 'installed') throw unavailable('profile');
+      const original: BuildSelection = Object.freeze({ build: number, directory, guard: location.guard, explicit: true });
+      const layout = selectedLayout(original, join(directory, relative(active.buildRoot, active.payload)));
+      const build = await acquireBuildLease(original, platform);
+      try {
+        if (process.type === 'browser') {
+          // The protected Browser family cannot spawn external mount helpers.
+          if (!await statOrAbsent(layout.bundle)) throw unavailable('profile');
+        } else await mountRetainedImage(layout, build, platform, deadline);
+        const host = startingHost?.identity.layout.buildRoot === layout.buildRoot ? startingHost :
+          await verifyPackagedOpenHost(original, layout.payload, deadline);
+        if (host.identity.layout.bundle !== layout.bundle || host.identity.layout.guard !== layout.guard ||
+            host.policy.stateRoot !== profile.paths.state || host.identity.sourceDigest !== hint.sourceDigest ||
+            host.identity.productDigest !== hint.productDigest || host.signed.snapshotDigest !== hint.candidateDigest)
+          throw unavailable('profile');
+        await assertHostStartupSnapshot(host, deadline);
+        const result = await withOwnerLockForCustody(owner, platform, heldOwner =>
+          withBuildLockForCustody(build, platform, heldBuild => platform.inspectSharedFamilyExit(heldOwner, heldBuild, {
+            profile: profile.paths.root, profileInstance: profile.record.instance, profilePathHash, bundle: layout.bundle, request,
+          }, deadline)));
+        assertSharedFamilyExitReceipt(result);
+        await owner.assert(); await build.assert(); assertTime(deadline);
+        return result;
+      } finally { build.release(); }
     },
     async tryClosed(profile: ProfileSnapshot, original: RuntimeRecord, deadline: number, closeHost?: VerifiedHost) {
       assertTime(deadline);
