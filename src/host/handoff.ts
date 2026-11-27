@@ -801,12 +801,12 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
                     contents.getURL() !== address || !isSubscriptionLanding(address, destination) ||
                     tabs().get(ready.id) !== ready) throw refused('control_refused');
                 const state = tabs().state(ready);
-                if (state.generation !== generation || state.controller.kind !== 'user' || state.handoff !== 'idle' ||
-                    state.pageAvailability !== 'ready')
+                if (state.generation !== generation || state.controller.kind !== 'user' || state.handoff !== 'idle')
                   throw refused('control_refused');
                 authority.assertDocument(ready, document);
               };
-              await registration.foreground(ready, deadline, signal, guard);
+              await registration.foreground(ready, deadline, signal, guard,
+                () => document.ready && tabs().state(ready).pageAvailability === 'ready');
               void registration.rememberSubscriptionHome(destination).catch(() => {});
               presented = true;
             }

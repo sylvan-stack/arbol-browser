@@ -1,3 +1,4 @@
+import { setTimeout as pause } from 'node:timers/promises';
 import { app, ipcMain, type IpcMainInvokeEvent, type WebContents } from 'electron';
 import type { Contract } from '../contracts/generated.js';
 import { validator } from '../contracts/schema.js';
@@ -32,7 +33,7 @@ export interface ShellRegistration {
   offerPresentation(): void;
   offerForegroundPresentation(deadline: number, mayShowEmpty: () => boolean): Promise<void>;
   show(deadline: number, signal: AbortSignal, raiseWindow?: boolean, guard?: () => void): Promise<void>;
-  foreground(target: TabTarget, deadline: number, signal: AbortSignal, guard: () => void): Promise<void>;
+  foreground(target: TabTarget, deadline: number, signal: AbortSignal, guard: () => void, ready: () => boolean): Promise<void>;
   subscriptionHome(): Promise<string | undefined>;
   rememberSubscriptionHome(url: string): Promise<void>;
   publish(): void;
@@ -320,7 +321,7 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
         break;
       }
     },
-    async foreground(target: TabTarget, deadline: number, signal: AbortSignal, guard: () => void) {
+    async foreground(target: TabTarget, deadline: number, signal: AbortSignal, guard: () => void, ready: () => boolean) {
       assertPresentable();
       if (!nativePresentation || !runtimeReady() || host.window.isDestroyed() ||
           !host.window.isEnabled()) throw unavailable('browser');
@@ -340,7 +341,13 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
         if (previous !== target) tabs.select(host, target.id);
         if (source[0] !== host) selectWindowProfile(source[0], host);
         await registration.show(deadline, signal, false, assertSelected);
+        // Placement temporarily fences the same document. Keep its identity
+        // pinned while the native readiness check settles in its new position.
         assertSelected();
+        while (!ready()) {
+          await pause(15, undefined, { signal });
+          assertSelected();
+        }
         if (!host.window.isVisible() || host.window.isMinimized()) throw unavailable('browser');
         app.focus({ steal: true });
         host.window.focus();
@@ -349,7 +356,8 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
         try {
           if (host.isActiveProfile() && tabs.selected(host) === target && member.canYield(true)) {
             if (source[0] !== host && source[1].ready() && source[1].canYield(true)) selectWindowProfile(host, source[0]);
-            else if (source[0] === host && previous && previous !== target && tabs.get(previous.id) === previous)
+            if ((source[0] === host || source[0].isActiveProfile()) && previous && previous !== target &&
+                tabs.selected(host) === target && tabs.get(previous.id) === previous)
               tabs.select(host, previous.id);
           }
         } catch { /* Keep the original presentation failure. */ }
