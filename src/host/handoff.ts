@@ -766,12 +766,11 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
           if (showEmpty && subscriptionProfile) {
             let shellRaised = false;
             try {
-              await registration.foregroundShell(deadline, signal, () => {
+              shellRaised = await registration.foregroundShell(deadline, signal, () => {
                 live();
                 if (signal.aborted || performance.now() >= deadline || context.canForegroundSubscription?.() !== true)
                   throw refused('control_refused');
               });
-              shellRaised = true;
               presented = true;
             } catch { /* The approved navigation can still present the window once ready. */ }
             preparedPresentations.set(context, { host, deadline: performance.now() + 60_000, empty, shellRaised });
@@ -819,7 +818,7 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
                 authority.assertDocument(ready, document);
               };
               await registration.foreground(ready, deadline, signal, guard,
-                () => document.ready && tabs().state(ready).pageAvailability === 'ready', prepared?.shellRaised);
+                () => document.ready && tabs().state(ready).pageAvailability === 'ready', isContinuation() && prepared?.shellRaised);
               void registration.rememberSubscriptionHome(destination).catch(() => {});
               presented = true;
             }

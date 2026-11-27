@@ -33,7 +33,7 @@ export interface ShellRegistration {
   offerPresentation(): void;
   offerForegroundPresentation(deadline: number, mayShowEmpty: () => boolean): Promise<void>;
   show(deadline: number, signal: AbortSignal, raiseWindow?: boolean, guard?: () => void): Promise<void>;
-  foregroundShell(deadline: number, signal: AbortSignal, guard: () => void): Promise<void>;
+  foregroundShell(deadline: number, signal: AbortSignal, guard: () => void): Promise<boolean>;
   foreground(target: TabTarget, deadline: number, signal: AbortSignal, guard: () => void,
     ready: () => boolean, shellRaised?: boolean): Promise<void>;
   subscriptionHome(): Promise<string | undefined>;
@@ -337,6 +337,12 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
       check();
       app.focus({ steal: true });
       host.window.focus();
+      const focusDeadline = Math.min(deadline, performance.now() + 150);
+      while (!host.window.isFocused() && performance.now() < focusDeadline) {
+        await pause(15, undefined, { signal });
+        check();
+      }
+      return host.window.isFocused();
     },
     async foreground(target: TabTarget, deadline: number, signal: AbortSignal, guard: () => void,
       ready: () => boolean, shellRaised = false) {
@@ -358,16 +364,17 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
         // Prepare the admitted selection in the target scope before revealing it.
         if (previous !== target) tabs.select(host, target.id);
         if (source[0] !== host) selectWindowProfile(source[0], host);
-        await registration.show(deadline, signal, false, assertSelected);
+        if (!shellRaised) await registration.show(deadline, signal, false, assertSelected);
         // Placement temporarily fences the same document. Keep its identity
         // pinned while the native readiness check settles in its new position.
         assertSelected();
         while (!ready()) {
+          if (shellRaised && (!host.window.isVisible() || host.window.isMinimized())) return;
           await pause(15, undefined, { signal });
           assertSelected();
         }
-        if (!host.window.isVisible() || host.window.isMinimized()) throw unavailable('browser');
         if (!shellRaised) {
+          if (!host.window.isVisible() || host.window.isMinimized()) throw unavailable('browser');
           app.focus({ steal: true });
           host.window.focus();
         }
