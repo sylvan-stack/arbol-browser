@@ -6,8 +6,8 @@ import { createProfile, managedProfiles } from '../profiles/create.js';
 import { registryLock } from '../profiles/locking.js';
 import { hasRetainedProfileLock } from '../profiles/manage.js';
 import { profileId, profilePaths, profileUnavailable, statOrAbsent } from '../profiles/paths.js';
-import { readJson, readProfile } from '../profiles/records.js';
-import { assertHostCustody, type HostCustody } from '../runtime/custody.js';
+import { readJson, readProfile, type ProfileSnapshot } from '../profiles/records.js';
+import { assertHostCustody, assertSharedProfileRuntime, type HostCustody, type SharedProfileRuntime } from '../runtime/custody.js';
 import { assertTime, now, originalAlive, readRuntime, recordProcess, runtimeLocation, startupDeadline, token } from '../runtime/instance.js';
 import type { PlatformPort } from '../runtime/platform.js';
 import { createLaunchTransactions } from '../runtime/process.js';
@@ -52,10 +52,12 @@ async function labels(state: string): Promise<Map<string, { instance: string; la
 }
 
 export function createProfileNavigation(custody: HostCustody, platform: PlatformPort,
-  yieldPresentation: () => () => void, selectLocal: (profile: string, instance: string) => boolean): ProfileNavigation | undefined {
+  yieldPresentation: () => () => void, selectLocal: (profile: string, instance: string) => boolean,
+  shared?: Readonly<{ runtime?: SharedProfileRuntime; openInWindow(profile: ProfileSnapshot, deadline: number): Promise<void> }>): ProfileNavigation | undefined {
   assertHostCustody(custody);
   if (custody.host.identity.layout.scope !== 'installed') return undefined;
-  const selected = custody.instance.owner.profile;
+  if (shared?.runtime && assertSharedProfileRuntime(shared.runtime) !== custody) throw profileUnavailable();
+  const selected = (shared?.runtime?.instance ?? custody.instance).owner.profile;
   const state = custody.host.policy.stateRoot;
   if (selected.paths.state !== state) throw profileUnavailable();
   const selection = { ...custody.build.selection, explicit: true };
@@ -91,6 +93,12 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
     check();
     if (selectLocal(id, instance)) return;
     const deadline = startupDeadline();
+    if (shared) {
+      await shared.openInWindow(profile, deadline);
+      check(); assertTime(deadline);
+      if (!selectLocal(id, instance)) throw unavailable('profile');
+      return;
+    }
     let requested = false;
     for (;;) {
       assertTime(deadline);
@@ -133,7 +141,10 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw invalidInput();
     const request = raw as Record<string, unknown>;
     const keys = Object.keys(request).sort().join(',');
-    const check = () => { assertCurrent(); assertHostCustody(custody); };
+    const check = () => {
+      assertCurrent(); assertHostCustody(custody);
+      if (shared?.runtime) assertSharedProfileRuntime(shared.runtime);
+    };
     if (request.method === 'list' && keys === 'method') return list(check);
     if (!((request.method === 'create' && keys === 'method,profile') ||
           (request.method === 'open' && keys === 'instance,method,profile'))) throw invalidInput();

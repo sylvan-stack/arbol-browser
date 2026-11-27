@@ -136,14 +136,16 @@ function preferences(session: Session) {
 /** Main-process contribution only. The installed boundary is supplied by bootstrap;
  * this creates no EngineAuthority and no document/input readiness. */
 export function createWindowHost(sessions: ProfileSessions, boundary: NativeFailureBoundary,
-  onCloseRequested: () => void, proof?: ArmedHostSnapshot): WindowHost {
+  onCloseRequested: () => void, proof?: ArmedHostSnapshot, existingHost?: WindowHost): WindowHost {
   if (proof) consumeArmedHostSnapshot(proof, boundary.native.trust, 'window', onCloseRequested);
   else assertCandidateTrust(boundary.native.trust);
   boundary.fatal.assertHealthy(); boundary.native.assertIntegrity();
   if (sessions.website === sessions.shell || sessions.shell.getStoragePath() !== null ||
       sessions.website.getStoragePath() === null || realpathSync(preloadPath) !== preloadPath ||
       realpathSync(fileURLToPath(shellURL)) !== fileURLToPath(shellURL)) throw unavailable('browser');
-  const frame = browserFrame(boundary);
+  if (existingHost) assertWindowHost(existingHost);
+  const frame = existingHost ? profileFrames.get(existingHost) : browserFrame(boundary);
+  if (!frame || frame !== browserFrames.get(boundary) || frame.closing) throw unavailable('browser');
   const { window } = frame;
   const shell = new WebContentsView({ webPreferences: { ...preferences(sessions.shell), preload: preloadPath } });
   shell.setVisible(false);

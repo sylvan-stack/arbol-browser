@@ -2,7 +2,8 @@ import { ipcMain, type IpcMainInvokeEvent, type WebContents } from 'electron';
 import type { Contract } from '../contracts/generated.js';
 import { validator } from '../contracts/schema.js';
 import { invalidInput, publicFailure, unavailable } from '../contracts/errors.js';
-import type { HostCustody } from '../runtime/custody.js';
+import { assertSharedProfileRuntime, type HostCustody, type SharedProfileRuntime } from '../runtime/custody.js';
+import type { ProfileSnapshot } from '../profiles/records.js';
 import type { PlatformPort } from '../runtime/platform.js';
 import { createProfileNavigation, type ProfileNavigation } from './profile-navigation.js';
 import { bindProfilePresentation } from './presentation.js';
@@ -133,10 +134,21 @@ export function assertShellRegistration(value: ShellRegistration, host: WindowHo
   host.assertHealthy(); current.authority.assertReady();
 }
 /** Called only by trusted main-process assembly with a real authority. No fallback is supplied. */
+export interface ShellProfileSource {
+  readonly custody: HostCustody;
+  readonly platform: PlatformPort;
+  readonly shared?: Readonly<{
+    runtime?: SharedProfileRuntime;
+    openInWindow(source: WindowHost, profile: ProfileSnapshot, deadline: number): Promise<void>;
+  }>;
+}
 export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority: ShellAuthority,
-  profileSource?: { custody: HostCustody; platform: PlatformPort }): ShellRegistration {
+  profileSource?: ShellProfileSource): ShellRegistration {
   assertWindowHost(host); assertTabRegistry(tabs); host.assertHealthy(); authority.assertReady();
   if (senders.has(host.shell.webContents)) throw unavailable('browser');
+  const shared = profileSource?.shared;
+  if (shared?.runtime && (assertSharedProfileRuntime(shared.runtime) !== profileSource?.custody ||
+      host.shell.webContents.session !== shared.runtime.sessions.shell)) throw unavailable('profile');
   let revision = 0, loaded = false, prepared = false, disposed = false;
   let runtimeReady = () => false;
   const ids = new Set<string>();
@@ -170,7 +182,7 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
       nativePresentations.set(host.window, nativePresentation);
     }
     if (nativePresentation.state !== state || nativePresentation.platform !== platform) throw unavailable('browser');
-    const { id, instance } = profileSource.custody.instance.owner.profile.record;
+    const { id, instance } = (shared?.runtime?.instance ?? profileSource.custody.instance).owner.profile.record;
     if ([...nativePresentation.profiles.values()].some(profile => profile.id === id)) throw unavailable('browser');
     nativePresentation.profiles.set(host, { id, instance,
       ready: () => runtimeReady() && prepared && !disposed,
@@ -190,7 +202,8 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
         return true;
       }
       return false;
-    });
+    }, shared && { ...(shared.runtime ? { runtime: shared.runtime } : {}),
+      openInWindow: (profile, deadline) => shared.openInWindow(host, profile, deadline) });
   const assertPresentable = () => { registration.assertLoaded(); authority.assertOperational(); };
   const current: Registration = { host, authority, snapshot, ...(profiles ? { profiles } : {}),
     async dispatch(request): Promise<Result> {

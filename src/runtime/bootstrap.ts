@@ -268,7 +268,7 @@ export function createNativeLifetime(boundary: NativeFailureBoundary, host: Host
 import type { ProfileSessions } from '../profiles/session.js';
 import type { TabLifecycle, TabRegistry } from '../host/tabs.js';
 import type { WindowHost } from '../host/windows.js';
-import type { ShellAuthority, ShellRegistration } from '../host/shell-ipc.js';
+import type { ShellAuthority, ShellProfileSource, ShellRegistration } from '../host/shell-ipc.js';
 import type { Contract } from '../contracts/generated.js';
 /** Opaque trusted main-process contribution, explicitly not production page authority. */
 export interface NativeShellPort { readonly pageAdmission: false }
@@ -315,7 +315,7 @@ function assertPreparationBuild(prepared: HostPreparation, deadline: number): Pr
  * entry above continues to refuse; this function is never invoked by this Beat. */
 export async function integrateTrustedShell(port: NativeShellPort, prepared: HostPreparation,
   selection: BuildSelection, sessions: ProfileSessions, lifecycle: TabLifecycle, authority: ShellAuthority,
-  deadline = performance.now() + 5000): Promise<TrustedShellIntegration> {
+  deadline = performance.now() + 5000, openInWindow?: NonNullable<ShellProfileSource['shared']>['openInWindow']): Promise<TrustedShellIntegration> {
   const value = nativeShellPorts.get(port);
   if (!value) throw unavailable('browser');
   const { boundary, modules } = value;
@@ -326,6 +326,33 @@ export async function integrateTrustedShell(port: NativeShellPort, prepared: Hos
   if (!selection.guard || prepared.instance.record.build !== selection.build) throw unavailable('browser');
   await assertHeldPath(selection.guard, ownership.build);
   boundary.fatal.assertHealthy(); boundary.native.assertIntegrity(); authority.assertReady();
+  const source: ShellProfileSource = { custody: prepared.custody, platform: ownership.prepared.platform,
+    ...(openInWindow ? { shared: { openInWindow } } : {}) };
+  return constructTrustedShell(modules, boundary, sessions, lifecycle, authority, source,
+    onClose => prepareStartupConstructionSnapshot(prepared.custody, boundary.native.trust, 'window', onClose, deadline));
+}
+
+export async function integrateSharedProfileShell(port: NativeShellPort, runtime: SharedProfileRuntime, existingHost: WindowHost,
+  lifecycle: TabLifecycle, authority: ShellAuthority, openInWindow: NonNullable<ShellProfileSource['shared']>['openInWindow'],
+  deadline: number): Promise<TrustedShellIntegration> {
+  const value = nativeShellPorts.get(port);
+  if (!value) throw unavailable('browser');
+  const { boundary, modules } = value;
+  const custody = assertSharedProfileRuntime(runtime, boundary.watchdog);
+  const ownership = handovers.get(boundary.watchdog);
+  if (!ownership || runtime.instance.record.phase !== 'starting') throw unavailable('profile');
+  assertNativeFailureBoundary(boundary);
+  await assertHeldPath(custody.build.selection.guard, ownership.build);
+  assertSharedProfileRuntime(runtime, boundary.watchdog); modules.windows.assertWindowHost(existingHost);
+  return constructTrustedShell(modules, boundary, runtime.sessions, lifecycle, authority,
+    { custody, platform: ownership.prepared.platform, shared: { runtime, openInWindow } },
+    onClose => prepareSharedProfileConstruction(runtime, boundary.native.trust, 'window', onClose, deadline), existingHost);
+}
+
+async function constructTrustedShell(modules: ShellModules, boundary: NativeFailureBoundary, sessions: ProfileSessions,
+  lifecycle: TabLifecycle, authority: ShellAuthority, source: ShellProfileSource,
+  prepareWindow: (onClose: () => void) => ReturnType<typeof prepareStartupConstructionSnapshot>,
+  existingHost?: WindowHost): Promise<TrustedShellIntegration> {
   const guardedLifecycle: TabLifecycle = {
     assertAdmission() { boundary.fatal.assertHealthy(); boundary.native.assertIntegrity(); authority.assertReady(); lifecycle.assertAdmission(); },
     connected: client => lifecycle.connected(client),
@@ -343,21 +370,24 @@ export async function integrateTrustedShell(port: NativeShellPort, prepared: Hos
     execute: (request, target) => boundary.native.guard(() => authority.execute(request, target)),
     subscribe: changed => authority.subscribe(changed), exhausted: () => authority.exhausted(),
   };
-  let host: WindowHost;
+  let host: WindowHost | undefined;
   try {
     const onClose = () => {
-      void tabs.closeWindow(host).catch(() => boundary.fatal.fail('native_retirement_unavailable'));
+      if (host) void tabs.closeWindow(host).catch(() => boundary.fatal.fail('native_retirement_unavailable'));
     };
-    const proof = await prepareStartupConstructionSnapshot(prepared.custody, boundary.native.trust, 'window', onClose, deadline);
-    host = modules.windows.createWindowHost(sessions, boundary, onClose, proof);
-    const registration = modules.ipc.registerShellIPC(host, tabs, guardedAuthority,
-      { custody: prepared.custody, platform: ownership.prepared.platform });
+    const proof = await prepareWindow(onClose);
+    host = modules.windows.createWindowHost(sessions, boundary, onClose, proof, existingHost);
+    const registration = modules.ipc.registerShellIPC(host, tabs, guardedAuthority, source);
     // Return the actual registered hidden resources before any asynchronous
     // loading. Assembly must bind ownership/window closure first, then await
     // registration.load and genuine lifecycle.ready before showing the shell.
     return Object.freeze({ pageAdmission: false as const, host, tabs, registration,
       agentTabs: (recipient: string) => modules.projections.projectAgentTabs(tabs, recipient, client => lifecycle.connected(client)) });
-  } catch { return boundary.fatal.fail('native_boundary_unavailable'); }
+  } catch (error) {
+    if (!existingHost) return boundary.fatal.fail('native_boundary_unavailable');
+    if (host) await host.close();
+    throw error;
+  }
 }
 
 /** ABR-11's real control-only producers, loaded in the same physical graph as
