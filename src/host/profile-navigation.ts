@@ -6,7 +6,7 @@ import { validator } from '../contracts/schema.js';
 import { createProfile, managedProfiles } from '../profiles/create.js';
 import { registryLock } from '../profiles/locking.js';
 import { hasRetainedProfileLock } from '../profiles/manage.js';
-import { profileId, profilePaths, profileUnavailable, statOrAbsent, syncDirectory } from '../profiles/paths.js';
+import { assertDirectory, directory, ensureDirectory, profileId, profilePaths, profileUnavailable, statOrAbsent, syncDirectory } from '../profiles/paths.js';
 import { assertProfile, readJson, readProfile, writeNewFile, type ProfileSnapshot } from '../profiles/records.js';
 import { assertHostCustody, assertSharedProfileRuntime, type HostCustody, type SharedProfileRuntime } from '../runtime/custody.js';
 import { assertTime, now, originalAlive, readRuntime, recordProcess, runtimeLocation, startupDeadline, token } from '../runtime/instance.js';
@@ -38,25 +38,33 @@ export function isSubscriptionHome(url: unknown): url is string {
 }
 
 export async function readSubscriptionHome(profile: ProfileSnapshot): Promise<string | undefined> {
-  const path = join(profile.paths.root, 'subscription-home.json');
+  const preferences = join(profile.paths.state, 'subscription-homes');
+  if (!await statOrAbsent(preferences)) return undefined;
+  const root = await directory(preferences);
+  const path = join(preferences, profile.record.id + '.json');
   if (!await statOrAbsent(path)) return undefined;
   const { value } = await readJson(path, 2048);
+  await assertDirectory(preferences, root);
   const entry = value as { format?: unknown; instance?: unknown; url?: unknown } | null;
-  if (entry?.format === 1 && entry.instance === profile.record.instance && isSubscriptionHome(entry.url)) return entry.url;
+  if (entry?.format === 1 && Object.keys(entry).sort().join(',') === 'format,instance,url' &&
+      entry.instance === profile.record.instance && isSubscriptionHome(entry.url)) return entry.url;
   return undefined;
 }
 
 export async function rememberSubscriptionHome(profile: ProfileSnapshot, url: string): Promise<void> {
   if (!isSubscriptionHome(url)) throw invalidInput();
   if (await readSubscriptionHome(profile) === url) return;
-  const path = join(profile.paths.root, 'subscription-home.json');
-  const temporary = join(profile.paths.root, '.' + token('req') + '.home');
+  const preferences = join(profile.paths.state, 'subscription-homes');
+  const path = join(preferences, profile.record.id + '.json');
+  const temporary = join(preferences, '.' + token('req') + '.home');
   await assertProfile(profile);
+  const root = await ensureDirectory(preferences);
   await writeNewFile(temporary, JSON.stringify({ format: 1, instance: profile.record.instance, url }) + '\n');
   try {
     await assertProfile(profile);
+    await assertDirectory(preferences, root);
     await rename(temporary, path);
-    await syncDirectory(profile.paths.root);
+    await syncDirectory(preferences);
   } finally { await rm(temporary, { force: true }); }
 }
 
@@ -120,8 +128,6 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
   }
 
   async function open(id: string, instance: string, check: () => void, isFocused: () => boolean): Promise<void> {
-    check();
-    if (shared && selectLocal(id, instance)) return;
     const profile = await readProfile(profilePaths(id, state));
     if (profile.record.instance !== instance) throw profileUnavailable();
     check();

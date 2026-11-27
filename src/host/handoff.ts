@@ -21,6 +21,19 @@ import { validator } from '../contracts/schema.js';
 import { seqoyaProfilePattern } from '../runtime/seqoya-wire.js';
 import { isSubscriptionHome } from './profile-navigation.js';
 
+function isSubscriptionDashboard(address: string, destination: string): boolean {
+  return address === destination || (destination === 'https://chatgpt.com/settings/usage' && address === destination + '?tab=overview');
+}
+
+function isSubscriptionLanding(address: string, destination: string): boolean {
+  if (isSubscriptionDashboard(address, destination)) return true;
+  const current = URL.parse(address), expected = URL.parse(destination);
+  // A first-party sign-in can be shown to the person in their own profile.
+  return !!current && current.origin === expected?.origin && !current.username && !current.password &&
+    (/^\/(?:auth\/)?(?:login|log-in|signin|sign-in)\/?$/.test(current.pathname) ||
+      (current.origin === 'https://claude.ai' && current.pathname === '/new'));
+}
+
 export interface HandoffResult { readonly state: TabState; readonly settledAction?: Contract<'browser.SettledAction'> }
 /** Actual admitted engine work and unfinished sequence tracking, supplied by
  * the action owner. A resolved CDP call is never a balanced-sequence receipt. */
@@ -719,7 +732,7 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
           if (request.method === 'close') throw unavailable('browser');
           const host = windowForOpen();
           const info = operations.info();
-          const subscriptionProfile = seqoyaProfilePattern.test(info.profile);
+          const subscriptionProfile = seqoyaProfilePattern.test(info.profile) && context.canForegroundSubscription?.() === true;
           const registration = windows.get(host);
           if (!registration) throw unavailable('browser');
           assertShellRegistration(registration, host);
@@ -733,7 +746,7 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
           const prepared = preparedPresentations.get(context);
           preparedPresentations.delete(context);
           const isContinuation = () => url !== undefined && prepared?.host === host && performance.now() < prepared.deadline;
-          const subscriptionOpen = subscriptionProfile && isSubscriptionHome(destination) && isContinuation();
+          const subscriptionOpen = subscriptionProfile && url !== undefined && isSubscriptionHome(destination);
           const opensInBackground = () => {
             if (!host.hasForegroundWork()) return false;
             if (!isContinuation() || host.window.isDestroyed() || !host.window.isEnabled())
@@ -742,7 +755,7 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
             if (!tabs().selected(host)) throw new ForegroundWorkRequired('window');
             return true;
           };
-          if (destination !== undefined) opensInBackground();
+          if (destination !== undefined && !subscriptionOpen) opensInBackground();
           live();
           assertShellRegistration(registration, host);
           const mayShowEarly = () => tabs().all().length === 0 || (host.window.isVisible() && !host.window.isMinimized());
@@ -759,30 +772,39 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
           }
           if (destination !== undefined) {
             if (signal.aborted || performance.now() >= deadline) throw refused('control_refused');
-            const background = opensInBackground();
-            const previous = isContinuation() ? tabs().all().find(target => {
+            const background = subscriptionOpen || opensInBackground();
+            const previous = subscriptionOpen || isContinuation() ? tabs().all().find(target => {
               const opened = openedDestinations.get(target), page = target.page;
               if (page.window !== host || page.retirement() || page.view.webContents.isDestroyed()) return false;
               const address = page.view.webContents.getURL();
-              const sameDashboard = subscriptionOpen && (address === destination ||
-                (destination === 'https://chatgpt.com/settings/usage' && address === destination + '?tab=overview'));
-              if (!sameDashboard && (opened?.destination !== destination || opened.page !== page || address !== opened.committedURL))
-                return false;
+              if (subscriptionOpen ? !isSubscriptionDashboard(address, destination) :
+                (opened?.destination !== destination || opened.page !== page || address !== opened.committedURL)) return false;
               const state = tabs().state(target);
               return state.controller.kind === 'user' && state.handoff === 'idle' && state.pageAvailability === 'ready';
             }) : undefined;
-            if (previous) {
-              if (!background && tabs().selected(host) !== previous) tabs().select(host, previous.id);
+            let target = previous;
+            if (target) {
+              if (!background && tabs().selected(host) !== target) tabs().select(host, target.id);
             } else {
-              const opened = await tabs().openUser(host, destination, background);
-              if (isContinuation()) openedDestinations.set(opened, { page: opened.page, destination, committedURL: opened.page.view.webContents.getURL() });
+              target = await tabs().openUser(host, destination, background);
+              if (!subscriptionOpen && isContinuation())
+                openedDestinations.set(target, { page: target.page, destination, committedURL: target.page.view.webContents.getURL() });
             }
             if (subscriptionOpen) {
-              await registration.rememberSubscriptionHome(destination).catch(() => {});
-              if (signal.aborted || !isContinuation() || performance.now() >= deadline) throw refused('control_refused');
-              await registration.show(deadline, signal, true);
-              if (signal.aborted || performance.now() >= deadline) throw refused('control_refused');
-              registration.foreground();
+              const ready = target, page = ready.page, contents = page.view.webContents;
+              const address = contents.getURL();
+              const guard = () => {
+                if (signal.aborted || performance.now() >= deadline || context.canForegroundSubscription?.() !== true ||
+                    ready.page !== page || page.window !== host || page.retirement() || contents.isDestroyed() ||
+                    contents.getURL() !== address || !isSubscriptionLanding(address, destination) ||
+                    tabs().get(ready.id) !== ready) throw refused('control_refused');
+                const state = tabs().state(ready);
+                if (state.controller.kind !== 'user' || state.handoff !== 'idle' || state.pageAvailability !== 'ready')
+                  throw refused('control_refused');
+              };
+              await registration.show(deadline, signal, true, guard);
+              registration.foreground(ready, guard);
+              void registration.rememberSubscriptionHome(destination).catch(() => {});
               presented = true;
             }
             live(); assertShellRegistration(registration, host);

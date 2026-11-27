@@ -12,7 +12,7 @@ import { assertSocket, now, token, originalAlive, sameProcess, recordProcess,
   type RuntimeRecord, type RuntimeLocation } from './instance.js';
 import { assertSharedProfileRuntime, isHostCustody, noteHostStartup, type HostCustody, type SharedProfileRuntime } from './custody.js';
 import { expectedBuild, type BuildSelection } from './selection.js';
-import { isSeqoyaReply, isSeqoyaRequest, isSeqoyaResult, plain, seqoyaUsageLimit,
+import { isSeqoyaReply, isSeqoyaRequest, isSeqoyaResult, plain, seqoyaProfilePattern, seqoyaUsageLimit,
   type SeqoyaParameters, type SeqoyaReply, type SeqoyaRequest, type SeqoyaResult } from './seqoya-wire.js';
 
 export type Endpoint = 'agent' | 'management';
@@ -21,6 +21,7 @@ export interface ConnectionContext {
   readonly endpoint: Endpoint; readonly peer: ProcessIdentity;
   readonly attachment?: Readonly<Contract<'browser.ClientIdentity'>>;
   readonly signal: AbortSignal;
+  canForegroundSubscription?(): boolean;
 }
 export interface DispatchPort {
   /** Synchronous authority checks precede scheduling; check again in execute. */
@@ -134,6 +135,30 @@ function assertSeqoyaBackend(platform: PlatformPort, home: string, runtime: stri
   if (realpathSync(python) !== python || realpathSync(entry) !== entry ||
       platform.seqoyaBackendArguments?.(socket, python, entry, lockPath) !== true)
     throw unavailable('browser');
+}
+
+function assertSeqoyaOpenClient(platform: PlatformPort, identity: ProcessIdentity, build: string): void {
+  const home = homedir(), runtime = join(home, '.arbol', 'runtime');
+  const browser = join(home, 'Applications', 'Arbol Browser');
+  const engine = join(browser, '.mounted', 'arbol-browser', build, 'app', 'ArbolBrowser.app',
+    'Contents', 'Resources', 'browser', 'runtime', 'Electron.app', 'Contents', 'MacOS', 'Electron');
+  const client = platform.processProvenance(identity.pid);
+  if (!client || !sameProcess(client, identity) || client.executable !== engine || client.session !== client.group ||
+      client.pid === client.group) throw unavailable('browser');
+  // The Backend starts a fresh session for the stable launcher. Its exact CLI
+  // child shares that session and carries the launcher's original kernel identity.
+  const launcher = platform.processProvenance(client.group);
+  if (!launcher || launcher.executable !== join(browser, 'bin', 'arbol-browser') ||
+      launcher.pid !== launcher.session || launcher.pid !== launcher.group ||
+      client.parentStartId !== launcher.startId || client.parentPidVersion !== launcher.pidVersion)
+    throw unavailable('browser');
+  const lock: unknown = JSON.parse(readBackendRecord(join(runtime, 'backend.lock'), 64, 0o077));
+  if (!plain(lock) || Object.keys(lock).length !== 1 || typeof lock.pid !== 'number' || !Number.isSafeInteger(lock.pid) || lock.pid < 2)
+    throw unavailable('browser');
+  const backend = platform.processProvenance(lock.pid);
+  if (!backend || launcher.parentStartId !== backend.startId || launcher.parentPidVersion !== backend.pidVersion)
+    throw unavailable('browser');
+  assertSeqoyaBackend(platform, home, runtime, backend);
 }
 
 /** Confirm the current proof at the Backend that issued this single-use claim. */
@@ -428,7 +453,16 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
           if (!admission || !ordinaryPeer() || (endpoint === 'agent' ? agents >= 32 : management >= 32)) throw capacityFailure();
           checkPeer(); seen.add(value.id); handshaking = false;
           const attachment = endpoint === 'agent' ? Object.freeze({ id: token('att'), label: sanitizedLabel(p.label) }) : undefined;
-          context = Object.freeze({ endpoint, peer: identity, signal: connection.signal, ...(attachment ? { attachment } : {}) });
+          const subscription = protectedPort && endpoint === 'management' && seqoyaProfilePattern.test(record.profile);
+          const canForegroundSubscription = () => {
+            try {
+              if (dead || sealed || !admission || !profileEnabled || connection.signal.aborted) return false;
+              checkPeer(); assertSeqoyaOpenClient(platform, identity, record.build); checkPeer();
+              return true;
+            } catch { return false; }
+          };
+          context = Object.freeze({ endpoint, peer: identity, signal: connection.signal, ...(attachment ? { attachment } : {}),
+            ...(subscription ? { canForegroundSubscription } : {}) });
           if (endpoint === 'agent') ++agents; else ++management;
           if (protectedPort && endpoint === 'management') {
             const captured = context;
