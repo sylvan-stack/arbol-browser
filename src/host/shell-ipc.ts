@@ -166,7 +166,7 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
     ? (shared?.runtime?.instance ?? profileSource.custody.instance).owner.profile : undefined;
   let openingHome: Promise<void> | undefined;
   let revision = 0, loaded = false, prepared = false, disposed = false;
-  let lastSidebarTabs = '';
+  let lastSidebarTabs: string | null = null;
   let runtimeReady = () => false;
   const ids = new Set<string>();
   const snapshot = (): Event => {
@@ -437,11 +437,13 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
       assertShellRegistration(registration, host);
       const value = snapshot();
       if (loaded && host.shell.webContents.getURL() === shellURL) host.shell.webContents.send('browser-shell:state', value);
-      const sidebarTabs = JSON.stringify(nativePresentation?.profiles.get(host)?.sidebarTabs() ?? []);
+      const member = nativePresentation?.profiles.get(host);
+      const sidebarTabs = member?.ready() ? JSON.stringify(member.sidebarTabs()) : null;
       if (sidebarTabs !== lastSidebarTabs) {
         lastSidebarTabs = sidebarTabs;
         if (!host.isActiveProfile()) {
-          const current = [...(nativePresentation?.profiles ?? [])].find(([member]) => member.isActiveProfile());
+          const current = [...(nativePresentation?.profiles ?? [])].find(([view, profile]) =>
+            view.isActiveProfile() && profile.ready());
           current?.[1].publish();
         }
       }
