@@ -295,8 +295,11 @@ struct Deadline {
     usleep(5000);
   }
 }
-[[noreturn]] static void protocolLoop(Context& c,Channel& pair,bool primary,double start,arbol_exit::ExitWatch& watch,arbol_exit::HostCapability* cap) {
+[[noreturn]] static void protocolLoop(Context& c,Channel& pair,bool primary,double start,arbol_exit::ExitWatch& watch,arbol_exit::HostCapability* cap,int owners) {
   Channel host(primary?0:6,primary?1:7); Deadline deadline(start);
+  // A partially acknowledged lease must survive a local stack unwind into
+  // retainedRefusal just as the initial inherited Owner descriptor does.
+  static std::map<std::string,arbol_exit::AdditionalOwner> additionalOwners;
   struct Pending { uint64_t sequence; double sent; }; std::deque<Pending> pending;
   if(primary) host.send("R 1 "+std::to_string(c.main.pid)+"\n");
   double blockedWrite=0,responseExpires=0,terminalExpires=0; bool terminal=false,terminalHostDrained=false;
@@ -409,6 +412,18 @@ struct Deadline {
     double now=clockMs();
     if(!c.ownerRunning()) deadline.lost(now);
     if(!watch.poll()) { deadline.lost(now); poison(cap,arbol_exit::watchLoss); }
+    if(owners>=0&&!terminal&&!deadline.expired(now)) {
+      pollfd input{owners,POLLIN,0};
+      int pendingOwner=poll(&input,1,0);
+      if((pendingOwner<0&&errno!=EINTR)||(pendingOwner>0&&(input.revents&~POLLIN))) owners=-1;
+      else if(pendingOwner>0&&(input.revents&POLLIN)) {
+        @autoreleasepool {
+          if(!cap||!cap->ready(c)||!watch.enrolledAlive(c.main)||
+             !arbol_exit::receiveAdditionalOwner(owners,cap->value()[@"attempt"][@"profile"],additionalOwners))
+            owners=-1; // Existing descriptors stay held. The main receives no acknowledgement.
+        }
+      }
+    }
     if(cap) {
       if(!cap->present()) deadline.lost(now);
       else {
@@ -507,7 +522,7 @@ static void pipeDescriptors(int (&out)[2]) {
   out[0]=fcntl(raw[0],F_DUPFD_CLOEXEC,64); out[1]=fcntl(raw[1],F_DUPFD_CLOEXEC,64); close(raw[0]); close(raw[1]);
   if(out[0]<0||out[1]<0) throw 4;
 }
-static Channel launchCustody(Context& c,double deadline,arbol_exit::HostCapability* cap) {
+static Channel launchCustody(Context& c,double deadline,arbol_exit::HostCapability* cap,bool sharedOwners) {
   int init= capsuleDescriptor(capsuleBytes(c,false)),forward[2],reply[2]; if(init<0) throw 4; pipeDescriptors(forward); pipeDescriptors(reply);
   int owner=fcntl(3,F_DUPFD_CLOEXEC,64),build=fcntl(4,F_DUPFD_CLOEXEC,64);
   posix_spawn_file_actions_t actions; posix_spawnattr_t attr; SpawnCopies copies;
@@ -517,10 +532,14 @@ static Channel launchCustody(Context& c,double deadline,arbol_exit::HostCapabili
     !posix_spawn_file_actions_addopen(&actions,0,"/dev/null",O_RDONLY,0)&&!posix_spawn_file_actions_addopen(&actions,1,"/dev/null",O_WRONLY,0)&&!posix_spawn_file_actions_addopen(&actions,2,"/dev/null",O_WRONLY,0)&&
     !posix_spawnattr_setpgroup(&attr,c.main.group)&&!posix_spawnattr_setflags(&attr,POSIX_SPAWN_SETPGROUP|POSIX_SPAWN_CLOEXEC_DEFAULT);
   if(ok&&cap) ok=cap->spawnBindings(actions,copies,2);
-  std::string helper=c.helper(); char* args[]={helper.data(),(char*)"--custody",cap?(char*)"--host-finalization":nullptr,nullptr}; char* env[]={(char*)"PATH=/usr/bin:/bin",nullptr}; pid_t pid=0;
+  if(ok&&sharedOwners) ok=copies.map(actions,arbol_exit::childOwnerEndpoint,arbol_exit::additionalOwnerEndpoint);
+  std::string helper=c.helper();
+  char* args[]={helper.data(),(char*)"--custody",cap?(char*)"--host-finalization":nullptr,nullptr};
+  char* env[]={(char*)"PATH=/usr/bin:/bin",nullptr}; pid_t pid=0;
   int result=ok?posix_spawn(&pid,helper.c_str(),&actions,&attr,args,env):EINVAL;
   posix_spawn_file_actions_destroy(&actions); posix_spawnattr_destroy(&attr);
   bool copiesClosed=copies.closeCopies();
+  if(sharedOwners&&close(arbol_exit::childOwnerEndpoint)) copiesClosed=false;
   close(owner); close(build); close(init); close(forward[0]); close(reply[1]);
   if(result) throw 4;
   if(cap&&!cap->spawned(2)) copiesClosed=false;
@@ -539,12 +558,12 @@ static bool liveStart(Context& c,double deadline,arbol_exit::HostCapability* cap
   return clockMs()<deadline&&c.ownerRunning()&&c.initial()&&lockIdentity(c.owner)&&lockIdentity(c.build)&&
     (!cap||(cap->present()&&cap->metadata()&&!cap->shared()->fatal.load(std::memory_order_acquire)));
 }
-static int runPrimary(Context& c,double deadline,arbol_exit::ExitWatch& watch,arbol_exit::HostCapability* cap) {
+static int runPrimary(Context& c,double deadline,arbol_exit::ExitWatch& watch,arbol_exit::HostCapability* cap,bool sharedOwners) {
   // authenticateBirth deliberately granted cleanup only. Live original-main
   // proof is needed before any child handover or external readiness.
   c.cleanupOnly=false;
   if(!liveStart(c,deadline,cap)||!c.monitor(c.primary,true)||!watch.enrolledAlive(c.main)) { c.cleanupOnly=true; throw 4; }
-  Channel pair=launchCustody(c,deadline,cap); // primary still anchors the old group
+  Channel pair=launchCustody(c,deadline,cap,sharedOwners); // primary still anchors the old group
   if(!liveStart(c,deadline,cap)||!c.monitor(c.primary,true)||!c.monitor(c.custody,true)) { c.cleanupOnly=true; throw 4; }
   // C acknowledged actual descriptors/provenance in this continuously held
   // group. It now has a real second anchor; only this transition leaves it.
@@ -558,9 +577,10 @@ static int runPrimary(Context& c,double deadline,arbol_exit::ExitWatch& watch,ar
   }
   if(!liveStart(c,deadline,cap)||!c.primaryMonitor()||!c.monitor(c.custody,true)||(cap&&!cap->ready(c))) throw 4;
   if(!watch.enrolledAlive(c.main)) throw 4;
-  protocolLoop(c,pair,true,deadline-1000,watch,cap);
+  if(sharedOwners&&!arbol_exit::announceOwnerChannel(arbol_exit::additionalOwnerEndpoint,c.primary)) throw 4;
+  protocolLoop(c,pair,true,deadline-1000,watch,cap,sharedOwners?arbol_exit::additionalOwnerEndpoint:-1);
 }
-static int runCustody(Context& c,double deadline,arbol_exit::ExitWatch& watch,arbol_exit::HostCapability* cap) {
+static int runCustody(Context& c,double deadline,arbol_exit::ExitWatch& watch,arbol_exit::HostCapability* cap,bool sharedOwners) {
   c.cleanupOnly=false;
   if(!liveStart(c,deadline,cap)||!c.monitor(c.primary,true)||!c.monitor(c.custody,true)||!watch.enrolledAlive(c.main)) { c.cleanupOnly=true; throw 4; }
   Channel pair(6,7); pair.send("C 1 "+std::to_string(c.custody.pid)+" "+std::to_string(c.custody.start)+"\n");
@@ -574,10 +594,11 @@ static int runCustody(Context& c,double deadline,arbol_exit::ExitWatch& watch,ar
     if(!lines.empty()) throw 4; usleep(1000);
   }
   if(!liveStart(c,deadline,cap)||!c.primaryMonitor()||(cap&&!cap->ready(c))) throw 4;
+  if(sharedOwners&&!arbol_exit::announceOwnerChannel(arbol_exit::additionalOwnerEndpoint,c.custody)) throw 4;
   pair.send("J 1\n");
   while(!pair.outgoing.empty()) { if(!liveStart(c,deadline,cap)||pair.failed||!c.primaryMonitor()) throw 4; pair.flush(); usleep(1000); }
   if(!watch.enrolledAlive(c.main)) throw 4;
-  protocolLoop(c,pair,false,deadline-1000,watch,cap);
+  protocolLoop(c,pair,false,deadline-1000,watch,cap,sharedOwners?arbol_exit::additionalOwnerEndpoint:-1);
 }
 
 #ifdef ARBOL_APP_WATCHDOG_ENTRY
@@ -599,9 +620,16 @@ int main(int argc,const char* argv[]) {
       Identity producer; std::string raw=startup(deadline); c=record(raw,primary,producer); parsed=true;
       if(!c.authenticateBirth(birth,birthInfo,birthSession,producer,primary)) throw 4;
       if(host&&!hostCap.load(c,primary,deadline)) throw 4;
+      const bool sharedOwners=host&&arbol_exit::ownerChannel(arbol_exit::additionalOwnerEndpoint);
+      if(sharedOwners) {
+        if(primary&&!arbol_exit::ownerChannel(arbol_exit::childOwnerEndpoint)) throw 4;
+        nonblocking(arbol_exit::additionalOwnerEndpoint);
+        if(primary) nonblocking(arbol_exit::childOwnerEndpoint);
+      }
       if(!watch.enroll(c.main)) throw 4;
       if(host&&!hostCap.enrolled(c,primary,watch)) throw 4;
-      return primary?runPrimary(c,deadline,watch,host?&hostCap:nullptr):runCustody(c,deadline,watch,host?&hostCap:nullptr);
+      return primary?runPrimary(c,deadline,watch,host?&hostCap:nullptr,sharedOwners):
+        runCustody(c,deadline,watch,host?&hostCap:nullptr,sharedOwners);
     } catch(...) { c.cleanupOnly=true; retainedRefusal(parsed?&c:nullptr,hostWanted?&hostCap:nullptr); } } @catch(NSException*) { c.cleanupOnly=true; retainedRefusal(parsed?&c:nullptr,hostWanted?&hostCap:nullptr); }
   }
 }

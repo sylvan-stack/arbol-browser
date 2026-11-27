@@ -6,7 +6,7 @@ import { assertProfile } from '../profiles/records.js';
 import { withOwnerLockForCustody, type OwnerLease } from '../profiles/locking.js';
 import { terminateAdoptedBuild, withBuildLockForCustody, type BuildLease } from './build-lease.js';
 import { assertVerifiedHostMetadata, bindArmedHost, type VerifiedHost } from './authorities.js';
-import { assertPlatform, assertWatchdogCustody, type PlatformPort, type WatchdogCustody, type PriorMarkerExpectation, type HostStartupStage } from './platform.js';
+import { assertPlatform, assertWatchdogCustody, type PlatformPort, type WatchdogCustody, type PriorMarkerExpectation, type HostStartupStage, type SharedProfileOwner } from './platform.js';
 import { assertTime, type InstanceOwner } from './instance.js';
 import { claimedHostAttempt } from './process.js';
 import type { NativeBoundaryPreparation } from './bootstrap.js';
@@ -23,6 +23,8 @@ export interface HostCustody {
    * already-prepared native descriptions and one-use private capability. */
   arm(prepared: NativeBoundaryPreparation, deadline: number): Promise<NativeWatchdog>;
   assertRetained(): void;
+  /** Retains storage ownership only. The additional Session needs its own admission. */
+  retainProfileOwner(owner: OwnerLease): Promise<SharedProfileOwner>;
   /** Only actual protected management dispatch supplies this socket/request;
    * the original native holder authenticates and consumes the private carrier. */
   consumeClose(requestId: string, socketFd: number): import('./platform.js').CloseAdmission;
@@ -171,6 +173,17 @@ export async function prepareHostCustody(host: VerifiedHost, instance: InstanceO
       } catch { return native.terminate(); }
     },
     assertRetained() { assertHostCustody(receipt); },
+    async retainProfileOwner(owner: OwnerLease) {
+      const primary = instance.owner.profile;
+      const { record, paths } = owner.profile;
+      if (paths.state !== primary.paths.state || record.id === primary.record.id ||
+          instance.record.phase !== 'ready') throw unavailable('browser');
+      return withOwnerLockForCustody(owner, platform, held => {
+        assertHostCustody(receipt);
+        if (instance.record.phase !== 'ready') throw unavailable('browser');
+        return native.retainProfileOwner(held, record.id, record.instance);
+      });
+    },
     consumeClose(requestId: string, socketFd: number) { assertHostCustody(receipt); return native.consumeClose(requestId, socketFd); },
     localClose() { assertHostCustody(receipt); return native.localClose(); },
     beginSessionUse(factory: ActualSessionFactory) {

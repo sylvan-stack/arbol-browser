@@ -1858,11 +1858,15 @@ struct Custody {
   arbol_exit::HostCapability finalization;
   int reader=-1,writer=-1; bool endpointsPublished=false;
   RetainedPipe retainedReader,retainedWriter;
+  arbol_exit::NativeFile profileChannels[2];
+  bool profileChannelsReady=false;
+  std::map<std::string,arbol_exit::AdditionalOwner> additionalOwners;
   MarkerPermit* mutation=nullptr; bool markerAttempted=false;
   SessionUseNative* sessionUse=nullptr; WebsiteSessionNative* websiteSession=nullptr; bool sessionAttempted=false,readyAttempted=false;
   std::string policyDigest,compatibilityDigest;
 };
 static std::set<Custody*> nativeCustodies;
+static std::map<const arbol_exit::AdditionalOwner*,Custody*> sharedOwnerReceipts;
 static bool custodyAttempted = false;
 static Custody* custodyArgument(napi_env env, napi_value value) {
   void* data = nullptr; if (napi_get_value_external(env,value,&data) != napi_ok) return nullptr;
@@ -2157,6 +2161,13 @@ static bool nativePipe(int (&ends)[2]) {
   close(raw[0]); close(raw[1]);
   if(ends[0]<0||ends[1]<0) { if(ends[0]>=0) close(ends[0]); if(ends[1]>=0) close(ends[1]); return false; } return true;
 }
+static bool nativeOwnerChannel(arbol_exit::NativeFile& main,arbol_exit::NativeFile& monitor) {
+  int ends[2];
+  if(socketpair(AF_UNIX,SOCK_DGRAM,0,ends)) return false;
+  main.fd=ends[0]; monitor.fd=ends[1];
+  return !fcntl(main.fd,F_SETFD,FD_CLOEXEC)&&!fcntl(monitor.fd,F_SETFD,FD_CLOEXEC)&&
+    arbol_exit::ownerChannel(main.fd)&&arbol_exit::ownerChannel(monitor.fd);
+}
 static napi_value spawnWatchdog(napi_env env,napi_callback_info info) {
   napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg);
   if(!c||c->spawned||c->bound||(c->continuousBuild&&!c->hostRequired)||(c->hostRequired&&!c->finalization.present())) return fail(env);
@@ -2177,6 +2188,9 @@ static napi_value spawnWatchdog(napi_env env,napi_callback_info info) {
       c->finalization.shared()->transfer.store(1,std::memory_order_release);
     }
     if(!c->context.initial()) return fail(env);
+    arbol_exit::NativeFile primaryOwners,custodyOwners;
+    if(c->hostRequired&&(!nativeOwnerChannel(c->profileChannels[0],primaryOwners)||
+                        !nativeOwnerChannel(c->profileChannels[1],custodyOwners))) return fail(env);
     int down[2]{-1,-1},up[2]{-1,-1};
     if(!nativePipe(down)) return fail(env);
     if(!nativePipe(up)) { close(down[0]); close(down[1]); return fail(env); }
@@ -2191,11 +2205,15 @@ static napi_value spawnWatchdog(napi_env env,napi_callback_info info) {
       copies.map(actions,c->capsule,5)&&copies.map(actions,down[0],0)&&copies.map(actions,up[1],1)&&!posix_spawn_file_actions_addopen(&actions,2,"/dev/null",O_WRONLY,0)&&
       !posix_spawnattr_setflags(&attr,POSIX_SPAWN_CLOEXEC_DEFAULT);
     if(ok&&c->hostRequired) ok=c->finalization.spawnBindings(actions,copies,1);
+    if(ok&&c->hostRequired) ok=copies.map(actions,primaryOwners.fd,arbol_exit::additionalOwnerEndpoint)&&
+      copies.map(actions,custodyOwners.fd,arbol_exit::childOwnerEndpoint);
     std::string helper=c->context.helper(); char* argv[]={helper.data(),(char*)"--watchdog",c->hostRequired?(char*)"--host-finalization":nullptr,nullptr};
     char* environment[]={(char*)"PATH=/usr/bin:/bin",nullptr}; pid_t pid=0;
     int result=ok?posix_spawn(&pid,helper.c_str(),&actions,&attr,argv,environment):EINVAL;
     if(actionsReady) posix_spawn_file_actions_destroy(&actions); if(attrReady) posix_spawnattr_destroy(&attr);
     bool copiesClosed=copies.closeCopies();
+    const bool primaryEndpointClosed=primaryOwners.finish(),custodyEndpointClosed=custodyOwners.finish();
+    if(!primaryEndpointClosed||!custodyEndpointClosed) copiesClosed=false;
     close(down[0]); close(up[1]);
     if(result) return fail(env);
     if(c->hostRequired&&!c->finalization.spawned(1)) copiesClosed=false;
@@ -2251,6 +2269,18 @@ static napi_value watchdogBind(napi_env env,napi_callback_info info) {
     if(!arbol_attempt::transition(current,next,arbol_attempt::Role::engine)||
        !arbol_attempt::replace(claim.at,raw,false,arbol_attempt::bytes(next))) return fail(env);
     c->finalization.shared()->transfer.store(2,std::memory_order_release);
+    bool sharedProfiles=true;
+    const arbol_boundary::Identity peers[2]{c->context.primary,c->context.custody};
+    for(unsigned i=0;i<2;++i) {
+      char hello[arbol_exit::ownerPacketLimit];
+      const auto expected=arbol_exit::ownerChannelHello(peers[i]);
+      const ssize_t count=recv(c->profileChannels[i].fd,hello,sizeof(hello),MSG_DONTWAIT);
+      if(count<0&&(errno==EAGAIN||errno==EWOULDBLOCK)) sharedProfiles=false;
+      else if(count!=(ssize_t)expected.size()||memcmp(hello,expected.data(),expected.size())) return fail(env);
+    }
+    // Older installed supervisor Builds send neither introduction. They can
+    // finish legacy single-profile startup, with no warm profile retention.
+    c->profileChannelsReady=sharedProfiles;
   }
   c->bound=true; observeHostStartup(c,0);
   napi_value out; napi_get_undefined(env,&out); return out;
@@ -2638,6 +2668,79 @@ static napi_value assertHostFinalization(napi_env env,napi_callback_info info) {
   napi_value arg; if(!argument(env,info,&arg)) return fail(env); auto* c=custodyArgument(env,arg);
   if(!c||!c->hostRequired||!c->bound||!c->finalization.ready(c->context)||
      c->finalization.shared()->transfer.load(std::memory_order_acquire)!=2) return fail(env);
+  napi_value out; napi_get_undefined(env,&out); return out;
+}
+static napi_value retainSharedProfileOwner(napi_env env,napi_callback_info info) {
+  napi_value args[4]; size_t n=4;
+  std::string id,instance;
+  if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok||n!=4||
+     !boundedText(env,args[2],id,64)||!boundedText(env,args[3],instance,26)) return fail(env);
+  auto* c=custodyArgument(env,args[0]);
+  auto* owner=claimLock(env,args[1]);
+  if(!c||!owner||!c->bound||!c->hostRequired||!c->profileChannelsReady||!c->websiteSession||c->mutation||c->sessionUse||
+     !c->finalization.ready(c->context)||c->additionalOwners.count(id)||
+     !arbol_exit::ownerChannel(c->profileChannels[0].fd)||!arbol_exit::ownerChannel(c->profileChannels[1].fd))
+    return fail(env);
+  auto* state=c->finalization.shared();
+  if(state->fatal.load(std::memory_order_acquire)||state->closeReceivedUs.load(std::memory_order_acquire)) return fail(env);
+  @autoreleasepool { @try { try {
+    auto lock=duplicateHeld(owner);
+    arbol_exit::NativeFile retained; retained.fd=lock.fd;
+    NSString* primary=c->finalization.value()[@"attempt"][@"profile"];
+    std::string packet=arbol_attempt::bytes(@{
+      @"id":[NSString stringWithUTF8String:id.c_str()],@"instance":[NSString stringWithUTF8String:instance.c_str()],
+      @"device":[NSString stringWithUTF8String:std::to_string(lock.device).c_str()],
+      @"inode":[NSString stringWithUTF8String:std::to_string(lock.inode).c_str()]});
+    arbol_exit::AdditionalOwner exact;
+    if(!arbol_exit::validateAdditionalOwner(primary,packet,retained.fd,exact)||exact.lock.path!=lock.path||
+       (exact.lock.inode==c->context.owner.inode&&exact.lock.device==c->context.owner.device)||
+       !arbol_exit::retainAdditionalOwner(c->additionalOwners,std::move(exact))) return fail(env);
+    // Retain in the main process before transferring to either peer. The two
+    // acknowledgements have no admission or release effect on their own.
+    retained.fd=-1;
+    const double deadline=arbol_boundary::clockMs()+250;
+    pollfd channels[2]{{c->profileChannels[0].fd,POLLIN,0},{c->profileChannels[1].fd,POLLIN,0}};
+    for(const auto& channel:channels)
+      if(!arbol_exit::sendAdditionalOwner(channel.fd,lock.fd,packet)) terminateCustody(c);
+    unsigned remaining=2;
+    while(remaining) {
+      const double now=arbol_boundary::clockMs();
+      if(now>=deadline) terminateCustody(c);
+      const int ready=poll(channels,2,std::max(1,(int)std::ceil(deadline-now)));
+      if(ready<0&&errno==EINTR) continue;
+      if(ready<=0) terminateCustody(c);
+      for(auto& channel:channels) if(channel.revents) {
+        char ack[arbol_exit::ownerPacketLimit];
+        if(channel.revents!=POLLIN||recv(channel.fd,ack,sizeof(ack),MSG_DONTWAIT)!=(ssize_t)packet.size()||
+           memcmp(ack,packet.data(),packet.size())) terminateCustody(c);
+        channel.fd=-1; --remaining;
+      }
+    }
+    if(arbol_boundary::clockMs()>=deadline||!arbol_boundary::lockIdentity(lock)||
+       !c->finalization.ready(c->context)||state->fatal.load(std::memory_order_acquire)||
+       state->closeReceivedUs.load(std::memory_order_acquire)) terminateCustody(c);
+    auto* receipt=&c->additionalOwners.at(id);
+    napi_value out;
+    if(!sharedOwnerReceipts.emplace(receipt,c).second||
+       napi_create_external(env,receipt,nullptr,nullptr,&out)!=napi_ok)
+      terminateCustody(c);
+    return out;
+  } catch(...) { terminateCustody(c); } } @catch(NSException*) { terminateCustody(c); } }
+}
+static napi_value assertSharedProfileOwner(napi_env env,napi_callback_info info) {
+  napi_value arg; void* raw=nullptr;
+  if(!argument(env,info,&arg)||napi_get_value_external(env,arg,&raw)!=napi_ok) return fail(env);
+  const auto* receipt=static_cast<const arbol_exit::AdditionalOwner*>(raw);
+  auto known=sharedOwnerReceipts.find(receipt);
+  if(known==sharedOwnerReceipts.end()) return fail(env);
+  auto* custody=known->second;
+  auto* state=custody->finalization.shared();
+  @autoreleasepool { @try {
+    arbol_exit::AdditionalOwner checked;
+    if(!custody->finalization.ready(custody->context)||state->fatal.load(std::memory_order_acquire)||
+       !arbol_exit::validateAdditionalOwner(custody->finalization.value()[@"attempt"][@"profile"],
+         receipt->packet,receipt->lock.fd,checked)) return fail(env);
+  } @catch(NSException*) { return fail(env); } }
   napi_value out; napi_get_undefined(env,&out); return out;
 }
 static napi_value latchWatchdogFatal(napi_env env,napi_callback_info info) {
@@ -4818,6 +4921,8 @@ static napi_value init(napi_env env, napi_value exports) {
     {"writeLaunchAttempt",nullptr,writeLaunchAttempt,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"terminateProfileNow",nullptr,terminateProfileNow,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"prepareWatchdogCustody",nullptr,prepareWatchdogCustody,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"retainSharedProfileOwner",nullptr,retainSharedProfileOwner,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"assertSharedProfileOwner",nullptr,assertSharedProfileOwner,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"custodyDescriptors",nullptr,custodyDescriptors,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"captureWatchdog",nullptr,captureWatchdog,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"watchdogBind",nullptr,watchdogBind,nullptr,nullptr,nullptr,napi_default,nullptr},

@@ -770,6 +770,118 @@ inline bool readNativeFile(int directory,const std::string& name,std::string& ra
     arbol_attempt::sameFile(first,last)&&arbol_attempt::sameFile(last,after);
   if(!file.finish()) ok=false; if(ok) identity=last; return ok;
 }
+
+// These endpoints carry Owner descriptors only. The existing heartbeat and
+// the startup/exit capabilities keep their independent channels and formats.
+constexpr int additionalOwnerEndpoint=21, childOwnerEndpoint=22;
+constexpr size_t ownerPacketLimit=512, additionalOwnerLimit=4095;
+
+inline bool ownerChannel(int fd) {
+  int type=0; socklen_t size=sizeof(type);
+  struct sockaddr_storage peer{}; socklen_t peerSize=sizeof(peer);
+  return fd>=0&&!getsockopt(fd,SOL_SOCKET,SO_TYPE,&type,&size)&&type==SOCK_DGRAM&&
+    !getpeername(fd,(struct sockaddr*)&peer,&peerSize)&&peer.ss_family==AF_UNIX;
+}
+inline std::string ownerChannelHello(const Identity& monitor) {
+  return "OWNER 1 "+std::to_string(monitor.pid)+" "+std::to_string(monitor.start);
+}
+inline bool announceOwnerChannel(int fd,const Identity& monitor) {
+  const auto hello=ownerChannelHello(monitor);
+  return send(fd,hello.data(),hello.size(),MSG_DONTWAIT)==(ssize_t)hello.size();
+}
+
+inline bool sendAdditionalOwner(int channel,int owner,const std::string& packet) {
+  if(packet.empty()||packet.size()>=ownerPacketLimit) return false;
+  alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))]{};
+  iovec data{const_cast<char*>(packet.data()),packet.size()};
+  msghdr message{};
+  message.msg_iov=&data; message.msg_iovlen=1;
+  message.msg_control=control; message.msg_controllen=sizeof(control);
+  auto* descriptor=CMSG_FIRSTHDR(&message);
+  descriptor->cmsg_level=SOL_SOCKET; descriptor->cmsg_type=SCM_RIGHTS;
+  descriptor->cmsg_len=CMSG_LEN(sizeof(int));
+  memcpy(CMSG_DATA(descriptor),&owner,sizeof(owner));
+  return sendmsg(channel,&message,MSG_DONTWAIT)==(ssize_t)packet.size();
+}
+
+struct AdditionalOwner {
+  arbol_boundary::Lock lock;
+  std::string id, packet;
+};
+
+// The originating profile is the state-root authority. Neither the packet
+// nor any numeric descriptor can choose a different directory tree.
+inline bool validateAdditionalOwner(NSString* primary,const std::string& packet,int fd,AdditionalOwner& result) {
+  NSDictionary* value=arbol_attempt::json(packet);
+  if(!primary||!arbol_attempt::keys(value,@[@"id",@"instance",@"device",@"inode"])||
+     !arbol_attempt::pattern(value[@"id"],@"^[a-z]([a-z0-9-]{0,62}[a-z0-9])?$")||
+     !arbol_attempt::pattern(value[@"instance"],@"^prf_[A-Za-z0-9_-]{22}$")) return false;
+  NSString* profiles=primary.stringByDeletingLastPathComponent;
+  if(![profiles.lastPathComponent isEqual:@"profiles"]||[value[@"id"] isEqual:primary.lastPathComponent]) return false;
+  NSString* path=[profiles stringByAppendingPathComponent:value[@"id"]];
+  NSString* ownerPath=[path stringByAppendingPathComponent:@"owner.lock"];
+  if(!arbol_boundary::canonical(path.fileSystemRepresentation)) return false;
+  NativeFile root;
+  root.fd=open(path.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+  struct stat original{},named{},owner{},ownerNamed{},record{};
+  std::string profileRaw;
+  if(root.fd<0||fstat(root.fd,&original)||!S_ISDIR(original.st_mode)||original.st_uid!=geteuid()||
+     (original.st_mode&07777)!=0700||fstat(fd,&owner)||!arbol_attempt::privateFile(owner)||
+     fstatat(root.fd,"owner.lock",&ownerNamed,AT_SYMLINK_NOFOLLOW)||!arbol_attempt::sameFile(owner,ownerNamed)||
+     ![value[@"device"] isEqual:[NSString stringWithUTF8String:std::to_string(owner.st_dev).c_str()]]||
+     ![value[@"inode"] isEqual:[NSString stringWithUTF8String:std::to_string(owner.st_ino).c_str()]]||
+     !readNativeFile(root.fd,"profile.json",profileRaw,record,arbol_attempt::limit)) return false;
+  NSDictionary* profile=strictManagementObject(profileRaw);
+  if(!arbol_attempt::keys(profile,@[@"format",@"id",@"instance",@"creationRequest",@"createdAt"])||
+     ![profile[@"format"] isEqual:@(arbol_attempt::profileFormat)]||![profile[@"id"] isEqual:value[@"id"]]||
+     ![profile[@"instance"] isEqual:value[@"instance"]]||lstat(path.fileSystemRepresentation,&named)||
+     !arbol_attempt::sameFile(original,named)||!root.finish()) return false;
+  result={{fd,ownerPath.fileSystemRepresentation,(uint64_t)owner.st_dev,owner.st_ino,owner.st_uid,0600,LOCK_EX},
+    [value[@"id"] UTF8String],packet};
+  return arbol_boundary::lockIdentity(result.lock);
+}
+
+inline bool retainAdditionalOwner(std::map<std::string,AdditionalOwner>& retained,AdditionalOwner value) {
+  if(retained.size()>=additionalOwnerLimit) return false;
+  for(const auto& item:retained)
+    if(item.second.lock.device==value.lock.device&&item.second.lock.inode==value.lock.inode) return false;
+  auto id=value.id;
+  return retained.emplace(std::move(id),std::move(value)).second;
+}
+
+inline bool receiveAdditionalOwner(int channel,NSString* primary,std::map<std::string,AdditionalOwner>& retained) {
+  char packet[ownerPacketLimit];
+  alignas(cmsghdr) char control[CMSG_SPACE(4*sizeof(int))]{};
+  iovec data{packet,sizeof(packet)};
+  msghdr message{};
+  message.msg_iov=&data; message.msg_iovlen=1;
+  message.msg_control=control; message.msg_controllen=sizeof(control);
+  const ssize_t count=recvmsg(channel,&message,MSG_DONTWAIT);
+  if(count<0) return errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR;
+  NativeFile received;
+  bool complete=count>0&&count<(ssize_t)sizeof(packet)&&!(message.msg_flags&(MSG_TRUNC|MSG_CTRUNC));
+  for(auto* part=CMSG_FIRSTHDR(&message);part;part=CMSG_NXTHDR(&message,part)) {
+    if(part->cmsg_level!=SOL_SOCKET||part->cmsg_type!=SCM_RIGHTS||part->cmsg_len<CMSG_LEN(0)) {
+      complete=false; continue;
+    }
+    size_t size=part->cmsg_len-CMSG_LEN(0);
+    if(size!=sizeof(int)) complete=false;
+    for(size_t offset=0;offset+sizeof(int)<=size;offset+=sizeof(int)) {
+      int descriptor=-1;
+      memcpy(&descriptor,CMSG_DATA(part)+offset,sizeof(descriptor));
+      if(received.fd<0) received.fd=descriptor;
+      else { close(descriptor); complete=false; }
+    }
+  }
+  if(!complete||received.fd<0||fcntl(received.fd,F_SETFD,FD_CLOEXEC)) return false;
+  AdditionalOwner owner;
+  if(!validateAdditionalOwner(primary,std::string(packet,count),received.fd,owner)||
+     !retainAdditionalOwner(retained,std::move(owner))) return false;
+  // The same actual description stays open until this monitor exits, even
+  // if publishing the acknowledgement fails or the original main dies.
+  received.fd=-1;
+  return send(channel,packet,count,MSG_DONTWAIT)==count;
+}
 inline bool writeNativeFile(int directory,const std::string& temporary,const std::string& raw,double deadline,NativeFile& file) {
   if(raw.empty()||raw.size()>exitReceiptLimit||arbol_boundary::clockMs()>=deadline) return false;
   file.fd=openat(directory,temporary.c_str(),O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC,0600);
