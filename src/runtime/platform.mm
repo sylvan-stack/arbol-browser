@@ -2425,14 +2425,13 @@ static bool emptyNativeDirectory(NSString* path) {
   while(auto* entry=readdir(directory)) if(strcmp(entry->d_name,".")&&strcmp(entry->d_name,"..")) { empty=false; break; }
   if(errno) empty=false; if(closedir(directory)) empty=false; return empty;
 }
-static bool absentEngineRootStorage(NSDictionary* capability,double deadline) {
-  NSString* profile=capability[@"attempt"][@"profile"];
+static bool absentEngineRootStorage(NSString* profile,NSDictionary* directory,double deadline) {
   if(arbol_boundary::clockMs()>=deadline||!arbol_boundary::canonical(profile.fileSystemRepresentation)) return false;
   int fd=open(profile.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC); if(fd<0) return false;
   struct stat held{},after{},named{};
   std::vector<std::string> names;
   bool ok=!fstat(fd,&held)&&S_ISDIR(held.st_mode)&&(held.st_mode&07777)==0700&&held.st_uid==geteuid()&&
-    [arbol_exit::fileIdentity(held) isEqual:capability[@"profileDirectory"]]&&arbol_exit::storageNames(fd,deadline,names)&&
+    [arbol_exit::fileIdentity(held) isEqual:directory]&&arbol_exit::storageNames(fd,deadline,names)&&
     std::none_of(names.begin(),names.end(),arbol_exit::engineRootStorageName)&&
     !fstat(fd,&after)&&!lstat(profile.fileSystemRepresentation,&named)&&
     arbol_exit::sameStorageNode(held,after)&&arbol_exit::sameStorageNode(after,named);
@@ -2460,35 +2459,48 @@ static bool priorMarkerMatches(Custody* c,const std::string& raw,const struct st
     [marker[@"identity"] isEqual:arbol_exit::fileIdentity(st)]&&[marker[@"digest"] isEqual:arbol_attempt::digest(raw)]&&
     [marker[@"value"] isEqual:arbol_attempt::json(raw)];
 }
-static bool signedDirty(Custody* c,const std::string& dirtyRaw,const std::string& previous,bool absent,double deadline) {
-  NSDictionary* dirty=arbol_attempt::json(dirtyRaw),*attempt=c->finalization.value()[@"attempt"];
+static NSDictionary* signedDirtyMarker(Custody* c,NSString* profile,NSString* instance,NSDictionary* directory,
+  const std::string& previous,bool absent,double deadline) {
+  NSDictionary* attempt=c->finalization.value()[@"attempt"];
   std::string policyHash,compatibilityHash;
   NSDictionary* policy=sealedObject(c,SignedObjectPurpose::policy,c->policyDigest,deadline,policyHash);
   NSDictionary* compatibility=sealedObject(c,SignedObjectPurpose::compatibility,c->compatibilityDigest,deadline,compatibilityHash);
   arbol_attempt::PackagedLayout layout;
-  if(!arbol_attempt::claimedLayout(attempt,layout)) return false;
+  if(!arbol_attempt::claimedLayout(attempt,layout)) return nil;
   NSString* stateRoot=arbol_attempt::policyStateRoot(policy,layout);
   NSString* readerPrefix=layout.installed?@"host-production:1:":@"host-isolated:1:";
-  if(policyHash!=c->policyDigest||compatibilityHash!=c->compatibilityDigest||!policy||!compatibility||!nativeMarker(dirty)||![dirty[@"cleanExit"] isEqual:@NO]||
+  uint64_t dataEpoch;
+  if(policyHash!=c->policyDigest||compatibilityHash!=c->compatibilityDigest||!policy||!compatibility||
      !stateRoot||![policy[@"sourceDigest"] isEqual:attempt[@"sourceDigest"]]||
      ![policy[@"productDigest"] isEqual:attempt[@"productDigest"]]||
-     ![stateRoot isEqual:[attempt[@"profile"] stringByDeletingLastPathComponent].stringByDeletingLastPathComponent]||
+     ![profile.stringByDeletingLastPathComponent isEqual:[stateRoot stringByAppendingPathComponent:@"profiles"]]||
      ![policy[@"readerKey"] isEqual:[readerPrefix stringByAppendingString:attempt[@"productDigest"]]]||
      ![compatibility[@"writerKey"] isEqual:policy[@"readerKey"]]||
      ![compatibility[@"compatibleReaderKeys"] isEqual:policy[@"readableReaderKeys"]]||
      ![compatibility[@"readableDataEpochs"] isEqual:policy[@"readableDataEpochs"]]||
      ![compatibility[@"runtime"][@"electron"] isEqual:@"45.3.2"]||![compatibility[@"runtime"][@"chromium"] isEqual:@"156.0.8078.100"]||
-     ![dirty[@"profileInstance"] isEqual:attempt[@"profileInstance"]]||![dirty[@"lastWriterBuild"] isEqual:attempt[@"build"]]||
-     ![dirty[@"lastWriterChromium"] isEqual:compatibility[@"runtime"][@"chromium"]]||
-     ![dirty[@"lastWriterElectron"] isEqual:compatibility[@"runtime"][@"electron"]]||
-     ![dirty[@"requiredReader"] isEqual:policy[@"readerKey"]]||![dirty[@"dataEpoch"] isEqual:compatibility[@"dataEpoch"]]) return false;
-  if(absent) return [dirty[@"dataEpoch"] isEqual:@1]&&
-    emptyNativeDirectory([attempt[@"profile"] stringByAppendingPathComponent:@"data"])&&
-    emptyNativeDirectory([attempt[@"profile"] stringByAppendingPathComponent:@"userData"])&&
-    absentEngineRootStorage(c->finalization.value(),deadline);
-  NSDictionary* old=arbol_attempt::json(previous);
-  return nativeMarker(old)&&[policy[@"readableReaderKeys"] containsObject:old[@"requiredReader"]]&&
-    [policy[@"readableDataEpochs"] containsObject:old[@"dataEpoch"]];
+     !arbol_attempt::uintNumber(compatibility[@"dataEpoch"],dataEpoch)||!arbol_attempt::pattern(instance,@"^prf_[A-Za-z0-9_-]{22}$")) return nil;
+  NSDictionary* dirty=@{@"format":@(arbol_attempt::profileFormat),@"profileInstance":instance,@"engine":@"chromium",
+    @"dataEpoch":@(dataEpoch),@"lastWriterBuild":attempt[@"build"],@"lastWriterChromium":compatibility[@"runtime"][@"chromium"],
+    @"lastWriterElectron":compatibility[@"runtime"][@"electron"],@"requiredReader":policy[@"readerKey"],@"cleanExit":@NO};
+  if(!nativeMarker(dirty)) return nil;
+  if(absent) {
+    if(dataEpoch!=1||!emptyNativeDirectory([profile stringByAppendingPathComponent:@"data"])||
+       !emptyNativeDirectory([profile stringByAppendingPathComponent:@"userData"])||!absentEngineRootStorage(profile,directory,deadline)) return nil;
+  } else {
+    NSDictionary* old=arbol_attempt::json(previous);
+    if(!nativeMarker(old)||![old[@"profileInstance"] isEqual:instance]||![policy[@"readableReaderKeys"] containsObject:old[@"requiredReader"]]||
+       ![policy[@"readableDataEpochs"] containsObject:old[@"dataEpoch"]]) return nil;
+  }
+  return arbol_boundary::clockMs()<deadline?dirty:nil;
+}
+static bool signedDirty(Custody* c,const std::string& dirtyRaw,const std::string& previous,bool absent,double deadline) {
+  NSDictionary* dirty=arbol_attempt::json(dirtyRaw);
+  if(!nativeMarker(dirty)) return false;
+  NSDictionary* capability=c->finalization.value(),*attempt=capability[@"attempt"];
+  NSDictionary* expected=signedDirtyMarker(c,attempt[@"profile"],attempt[@"profileInstance"],capability[@"profileDirectory"],
+    previous,absent,deadline);
+  return [dirty isEqual:expected];
 }
 static napi_value beginHostMarkerMutation(napi_env env,napi_callback_info info) {
   napi_value args[2]; size_t n=2; std::string dirty;
@@ -2757,8 +2769,10 @@ static napi_value retainSharedProfileOwner(napi_env env,napi_callback_info info)
         lock,c->context.build,raw,identity,absent);
     };
     std::string previousRaw; struct stat previousIdentity{}; bool previousAbsent;
-    if(!readMarker(previousRaw,previousIdentity,previousAbsent)||
-       !arbol_exit::retainAdditionalOwner(c->additionalOwners,std::move(exact))) return fail(env);
+    if(!readMarker(previousRaw,previousIdentity,previousAbsent)) return fail(env);
+    NSDictionary* planned=signedDirtyMarker(c,storage[@"profile"],storage[@"request"][@"instance"],storage[@"root"],
+      previousRaw,previousAbsent,arbol_boundary::clockMs()+500);
+    if(!planned||!arbol_exit::retainAdditionalOwner(c->additionalOwners,std::move(exact))) return fail(env);
     auto* receipt=&c->additionalOwners.at(profileId);
     const auto& expected=receipt->acknowledgement;
     // Retain in the main process before transferring to either peer. The two
@@ -2814,7 +2828,7 @@ static napi_value retainSharedProfileOwner(napi_env env,napi_callback_info info)
     arbol_attempt::MaintenanceDirectory family;
     if(!family.openPath([familyDirectory[@"path"] fileSystemRepresentation],familyDirectory[@"identity"])||
        !retainImmutableExitRecord(family,"shared-family.json",sharedFamilyReference(attempt[@"request"],group[@"capabilityDigest"]),recordDeadline)||
-       !ownership.publish(*receipt,group,previous,recordDeadline)||!readyClaim(verifiedRaw,verified)||verifiedRaw!=readyRaw||
+       !ownership.publish(*receipt,group,previous,planned,recordDeadline)||!readyClaim(verifiedRaw,verified)||verifiedRaw!=readyRaw||
        !arbol_exit::validateAdditionalOwner(primary,packet,lock.fd,checked)||checked.acknowledgement!=expected||
        !readMarker(checkedMarker,checkedIdentity,checkedAbsent)||checkedAbsent!=previousAbsent||checkedMarker!=previousRaw||
        (!previousAbsent&&!arbol_attempt::sameFile(previousIdentity,checkedIdentity))||
