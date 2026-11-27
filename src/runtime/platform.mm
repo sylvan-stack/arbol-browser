@@ -1866,7 +1866,11 @@ struct Custody {
   std::string policyDigest,compatibilityDigest;
 };
 static std::set<Custody*> nativeCustodies;
-static std::map<const arbol_exit::AdditionalOwner*,Custody*> sharedOwnerReceipts;
+struct SharedProfileRetention {
+  Custody* custody;
+  arbol_exit::SharedProfileOwnership ownership;
+};
+static std::map<const arbol_exit::AdditionalOwner*,SharedProfileRetention> sharedOwnerReceipts;
 static bool custodyAttempted = false;
 static Custody* custodyArgument(napi_env env, napi_value value) {
   void* data = nullptr; if (napi_get_value_external(env,value,&data) != napi_ok) return nullptr;
@@ -2732,8 +2736,32 @@ static napi_value retainSharedProfileOwner(napi_env env,napi_callback_info info)
        checked.acknowledgement!=expected||arbol_boundary::clockMs()>=deadline||
        !c->finalization.ready(c->context)||state->fatal.load(std::memory_order_acquire)||
        state->closeReceivedUs.load(std::memory_order_acquire)) return fail(env);
+
+    const double recordDeadline=arbol_boundary::clockMs()+500;
+    auto readyClaim=[&](std::string& raw,NSDictionary* __strong& attempt) {
+      arbol_attempt::Claim claim;
+      return c->finalization.ready(c->context)&&!state->closeReceivedUs.load(std::memory_order_acquire)&&
+        c->finalization.currentAttempt(c->context,claim,raw,attempt,recordDeadline)&&
+        [attempt[@"phase"] isEqual:@"ready"]&&[attempt[@"stage"] isEqual:@"admitted"];
+    };
+    NSDictionary* attempt=nil; std::string readyRaw;
+    if(!readyClaim(readyRaw,attempt)) return fail(env);
+    NSDictionary* group=@{@"bootSession":c->finalization.value()[@"bootSession"],
+      @"capabilityDigest":arbol_attempt::digest(c->finalization.raw()),
+      @"claim":@{@"request":attempt[@"request"],@"profileInstance":attempt[@"profileInstance"],
+        @"profilePathHash":attempt[@"profilePathHash"],@"digest":arbol_attempt::digest(readyRaw)},
+      @"build":@{@"number":attempt[@"build"],@"sourceDigest":attempt[@"sourceDigest"],
+        @"productDigest":attempt[@"productDigest"],@"candidateDigest":attempt[@"candidateDigest"]},
+      @"main":arbol_boundary::capsuleIdentity(c->context.main,c->context.session),
+      @"primary":arbol_boundary::capsuleIdentity(c->context.primary),
+      @"custody":arbol_boundary::capsuleIdentity(c->context.custody)};
+    arbol_exit::SharedProfileOwnership ownership;
+    NSDictionary* verified=nil; std::string verifiedRaw;
+    if(!ownership.publish(*receipt,group,recordDeadline)||!readyClaim(verifiedRaw,verified)||verifiedRaw!=readyRaw||
+       !arbol_exit::validateAdditionalOwner(primary,packet,lock.fd,checked)||checked.acknowledgement!=expected||
+       arbol_boundary::clockMs()>=recordDeadline) return fail(env);
     napi_value out;
-    if(!sharedOwnerReceipts.emplace(receipt,c).second||
+    if(!sharedOwnerReceipts.emplace(receipt,SharedProfileRetention{c,std::move(ownership)}).second||
        napi_create_external(env,receipt,nullptr,nullptr,&out)!=napi_ok)
       return fail(env);
     return out;
@@ -2745,11 +2773,12 @@ static napi_value assertSharedProfileOwner(napi_env env,napi_callback_info info)
   const auto* receipt=static_cast<const arbol_exit::AdditionalOwner*>(raw);
   auto known=sharedOwnerReceipts.find(receipt);
   if(known==sharedOwnerReceipts.end()) return fail(env);
-  auto* custody=known->second;
+  auto* custody=known->second.custody;
   auto* state=custody->finalization.shared();
   @autoreleasepool { @try {
     arbol_exit::AdditionalOwner checked;
     if(!custody->finalization.ready(custody->context)||state->fatal.load(std::memory_order_acquire)||
+       !known->second.ownership.current()||
        !arbol_exit::validateAdditionalOwner(custody->finalization.value()[@"attempt"][@"profile"],
          receipt->packet,receipt->lock.fd,checked)||checked.acknowledgement!=receipt->acknowledgement) return fail(env);
   } @catch(NSException*) { return fail(env); } }

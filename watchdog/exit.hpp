@@ -807,6 +807,7 @@ inline bool sendAdditionalOwner(int channel,int owner,const std::string& packet)
 struct AdditionalOwner {
   arbol_boundary::Lock lock;
   std::string id, packet, acknowledgement;
+  NSDictionary* storage=nil;
 };
 
 inline bool additionalStorageDirectory(int parent,const char* name,dev_t device,struct stat& stored) {
@@ -849,12 +850,13 @@ inline bool validateAdditionalOwner(NSString* primary,const std::string& packet,
      !additionalStorageDirectory(root.fd,"data",original.st_dev,data)||
      !additionalStorageDirectory(root.fd,"userData",original.st_dev,userData)||lstat(path.fileSystemRepresentation,&named)||
      !sameStorageNode(original,named)||!root.finish()) return false;
-  const auto metadata=arbol_attempt::bytes(@{@"profile":path,@"request":value,@"root":fileIdentity(original),
+  NSDictionary* storage=@{@"profile":path,@"request":value,@"root":fileIdentity(original),
     @"record":fileIdentity(record),@"recordDigest":arbol_attempt::digest(profileRaw),
-    @"data":fileIdentity(data),@"userData":fileIdentity(userData)});
+    @"data":fileIdentity(data),@"userData":fileIdentity(userData)};
+  const auto metadata=arbol_attempt::bytes(storage);
   if(metadata.empty()) return false;
   result={{fd,ownerPath.fileSystemRepresentation,(uint64_t)owner.st_dev,owner.st_ino,owner.st_uid,0600,LOCK_EX},
-    [value[@"id"] UTF8String],packet,[arbol_attempt::digest(metadata) UTF8String]};
+    [value[@"id"] UTF8String],packet,[arbol_attempt::digest(metadata) UTF8String],storage};
   return arbol_boundary::lockIdentity(result.lock);
 }
 
@@ -935,6 +937,47 @@ inline bool publishNativeReceipt(int directory,const std::string& name,const std
   if(renameatx_np(directory,temporary.c_str(),directory,name.c_str(),RENAME_EXCL)) return false;
   return publishedNativeFile(directory,name,raw,file,identity,deadline)&&file.finish();
 }
+
+// This record binds storage custody to the already-running signed process
+// family. Engine mutation and Session admission require separate evidence.
+class SharedProfileOwnership {
+  std::string directory_,record_;
+  struct stat parent_{},identity_{};
+  static constexpr const char* filename="shared-owner.json";
+public:
+  bool current() const {
+    arbol_attempt::MaintenanceDirectory held;
+    if(record_.empty()||!held.openPath(directory_,fileIdentity(parent_))) return false;
+    std::string actual; struct stat named{};
+    return readNativeFile(held.fd,filename,actual,named,exitReceiptLimit)&&
+      arbol_attempt::sameFile(named,identity_)&&actual==record_&&held.current();
+  }
+  bool publish(const AdditionalOwner& owner,NSDictionary* group,double deadline) {
+    if(!directory_.empty()||!arbol_boundary::lockIdentity(owner.lock)) return false;
+    NSString* profile=owner.storage[@"profile"],*request=group[@"claim"][@"request"];
+    if(!profile||!arbol_attempt::pattern(request,@"^req_[A-Za-z0-9_-]{22}$")) return false;
+    NSString* hash=arbol_attempt::digest(profile.fileSystemRepresentation);
+    if(!arbol_attempt::pattern(hash,@"^[0-9a-f]{64}$")) return false;
+    NSString* state=profile.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent;
+    auto parent=std::make_unique<arbol_attempt::MaintenanceDirectory>();
+    if(!parent->openPath(state.fileSystemRepresentation)||static_cast<uint64_t>(parent->identity.st_dev)!=owner.lock.device) return false;
+    for(NSString* name in @[@"exit-evidence",hash,request]) {
+      struct stat physical{};
+      auto child=std::make_unique<arbol_attempt::MaintenanceDirectory>();
+      if(arbol_boundary::clockMs()>=deadline||!parent->current()||
+         !privateDirectoryAt(parent->fd,name.UTF8String,physical)||static_cast<uint64_t>(physical.st_dev)!=owner.lock.device||
+         !child->openPath(parent->path+"/"+name.UTF8String,fileIdentity(physical))||!parent->current()) return false;
+      parent=std::move(child);
+    }
+    directory_=parent->path; parent_=parent->identity;
+    auto raw=exitReceiptBytes(@{@"format":@1,@"kind":@"shared-profile-owner",@"profilePathHash":hash,
+      @"storage":owner.storage,@"group":group});
+    if(raw.empty()||!parent->current()||!arbol_boundary::lockIdentity(owner.lock)||
+       !publishNativeReceipt(parent->fd,filename,raw,deadline,identity_)||!parent->current()) return false;
+    record_=std::move(raw);
+    return current()&&arbol_boundary::clockMs()<deadline&&arbol_boundary::lockIdentity(owner.lock);
+  }
+};
 inline bool terminalEngineMarker(NSDictionary* value) {
   uint64_t epoch;
   return arbol_attempt::keys(value,@[@"format",@"profileInstance",@"engine",@"dataEpoch",@"lastWriterBuild",@"lastWriterChromium",@"lastWriterElectron",@"requiredReader",@"cleanExit"])&&
