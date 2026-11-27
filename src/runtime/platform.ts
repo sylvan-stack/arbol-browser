@@ -148,6 +148,20 @@ export interface ExitInspectionReceipt {
   readonly kind: 'never-opened' | 'activated' | 'terminal' | 'withdrawn'; readonly clean: boolean;
   readonly prior: PriorMarkerExpectation; readonly request: string | null;
 }
+export interface SharedFamilyExitInput {
+  readonly profile: string;
+  readonly profileInstance: string;
+  readonly profilePathHash: string;
+  readonly bundle: string;
+  readonly request: string;
+}
+export interface SharedFamilyExitReceipt {
+  readonly request: string;
+  readonly profileInstance: string;
+  readonly profilePathHash: string;
+  readonly capabilityDigest: string;
+  readonly ownershipDigest: string;
+}
 export interface MigrationSourceObservation {
   readonly bundle: MaintenanceFileEvidence['identity']; readonly bundleStamp: string;
   readonly policy: MaintenanceFileEvidence; readonly policyStamp: string;
@@ -212,6 +226,10 @@ export function assertMigrationInspectionReceipt(value: MigrationInspectionRecei
 const exitInspectionReceipts = new WeakSet<object>();
 export function assertExitInspectionReceipt(value: ExitInspectionReceipt): void {
   if (!exitInspectionReceipts.has(value)) throw unavailable('profile');
+}
+const sharedFamilyExitReceipts = new WeakSet<object>();
+export function assertSharedFamilyExitReceipt(value: SharedFamilyExitReceipt): void {
+  if (!sharedFamilyExitReceipts.has(value)) throw unavailable('profile');
 }
 export interface HostFinalizationInput {
   readonly requestPath: string;
@@ -321,6 +339,8 @@ export interface PlatformPort {
    * complete receipts, physical metadata/marker/frontiers and full original
    * absence are verified off the caller event loop under the original bound. */
   inspectExit(owner: HeldLock, build: HeldLock, input: NativeExitInput, deadline: number, guards?: Readonly<{ data?: HeldLock; next?: HeldLock }>): Promise<ExitInspectionReceipt>;
+  /** Verifies the owning process family under the target Owner and original signed Build. */
+  inspectSharedFamilyExit(owner: HeldLock, build: HeldLock, input: SharedFamilyExitInput, deadline: number): Promise<SharedFamilyExitReceipt>;
   inspectMigration(custody: MaintenanceCustody, registry: HeldLock, owner: HeldLock, build: HeldLock | MaintenanceGuard,
     input: NativeMigrationInput, deadline: number, data?: HeldLock | MaintenanceGuard): Promise<MigrationInspectionReceipt>;
   commitMigration(custody: MaintenanceCustody, registry: HeldLock, owner: HeldLock, build: HeldLock | MaintenanceGuard,
@@ -1046,6 +1066,39 @@ export function loadPlatform(): PlatformPort {
         }
         throw unavailable('profile');
       } finally { if (!transferred) call(() => native.cancelExitInspection(handle)); }
+    },
+    async inspectSharedFamilyExit(owner: HeldLock, build: HeldLock, input: SharedFamilyExitInput, deadline: number): Promise<SharedFamilyExitReceipt> {
+      const actualOwner = locks.get(owner), actualBuild = locks.get(build);
+      if (!actualOwner || !actualBuild || !Number.isFinite(deadline)) throw unavailable('profile');
+      owner.assertIdentity(); build.assertIdentity();
+      const nativeNow = call(() => native.continuousTime()), sampled = performance.now();
+      if (sampled >= deadline) throw unavailable('profile');
+      const nativeDeadline = nativeNow + Math.min(10000, deadline - sampled);
+      const { request, profileInstance, profilePathHash } = input;
+      const handle = call(() => native.beginExitInspection(actualOwner, actualBuild,
+        JSON.stringify({ ...input, format: 1, mode: 'shared-family', attempt: null, dataAttempt: null, pending: null }),
+        nativeDeadline, null, null));
+      try {
+        while (performance.now() < deadline && call(() => native.continuousTime()) < nativeDeadline) {
+          const raw = call(() => native.pollExitInspection(handle));
+          if (raw !== null) {
+            if (typeof raw !== 'string' || !raw.length || Buffer.byteLength(raw) > 1024) throw unavailable('profile');
+            const value = JSON.parse(raw) as SharedFamilyExitReceipt & { format: number; kind: string };
+            if (!value || Object.keys(value).sort().join(',') !== 'capabilityDigest,format,kind,ownershipDigest,profileInstance,profilePathHash,request' ||
+                value.format !== 1 || value.kind !== 'shared-family-exited' || value.request !== request ||
+                value.profileInstance !== profileInstance || value.profilePathHash !== profilePathHash ||
+                ![value.capabilityDigest, value.ownershipDigest].every(digest => typeof digest === 'string' && /^[0-9a-f]{64}$/.test(digest)))
+              throw unavailable('profile');
+            owner.assertIdentity(); build.assertIdentity();
+            if (performance.now() >= deadline || call(() => native.continuousTime()) >= nativeDeadline) throw unavailable('profile');
+            const receipt = Object.freeze({ request, profileInstance, profilePathHash,
+              capabilityDigest: value.capabilityDigest, ownershipDigest: value.ownershipDigest });
+            sharedFamilyExitReceipts.add(receipt); return receipt;
+          }
+          await setTimeout(Math.min(5, Math.max(1, deadline - performance.now())));
+        }
+        throw unavailable('profile');
+      } finally { call(() => native.cancelExitInspection(handle)); }
     },
     async inspectExit(owner: HeldLock, build: HeldLock, input: NativeExitInput, deadline: number, guards?: Readonly<{ data?: HeldLock; next?: HeldLock }>): Promise<ExitInspectionReceipt> {
       const actualOwner = locks.get(owner), actualBuild = locks.get(build);

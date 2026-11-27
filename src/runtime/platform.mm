@@ -2816,6 +2816,8 @@ static napi_value retainSharedProfileOwner(napi_env env,napi_callback_info info)
     NSDictionary* group=@{@"bootSession":c->finalization.value()[@"bootSession"],
       @"capabilityDigest":arbol_attempt::digest(c->finalization.raw()),
       @"claim":readyReference,@"build":sharedFamilyBuild(attempt),
+      @"profileOwner":arbol_boundary::capsuleLock(c->context.owner),
+      @"receiptDirectory":c->finalization.value()[@"receiptDirectory"],
       @"main":arbol_boundary::capsuleIdentity(c->context.main,c->context.session),
       @"primary":arbol_boundary::capsuleIdentity(c->context.primary),
       @"custody":arbol_boundary::capsuleIdentity(c->context.custody)};
@@ -3663,8 +3665,11 @@ static bool exitReceiptAt(NSString* path,std::string& raw,NSDictionary* __strong
   if(directory.fd<0||!arbol_exit::readNativeFile(directory.fd,path.lastPathComponent.UTF8String,raw,identity,arbol_exit::exitReceiptLimit)) return false;
   object=arbol_exit::parseExitReceipt(raw); return object&&directory.finish();
 }
+static std::string sharedFamilyRuntimeLeaf(NSString* hash) {
+  return "/private/tmp/ab-"+std::to_string(geteuid())+"/"+[[hash substringToIndex:32] UTF8String];
+}
 static bool readLiveSharedClaim(NSString* hash,std::string& raw) {
-  std::string path="/private/tmp/ab-"+std::to_string(geteuid())+"/"+[[hash substringToIndex:32] UTF8String]+"/claim.lock";
+  const std::string path=sharedFamilyRuntimeLeaf(hash)+"/claim.lock";
   arbol_exit::NativeFile lock;
   lock.fd=open(path.c_str(),O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
   arbol_attempt::Location location; bool absent;
@@ -3675,6 +3680,7 @@ static bool readLiveSharedClaim(NSString* hash,std::string& raw) {
 }
 static NSDictionary* resolveSharedClosedClaim(NSString* state,NSDictionary* group,double deadline) {
   using namespace arbol_attempt;
+  if(!path(state)||![group isKindOfClass:NSDictionary.class]) return nil;
   NSDictionary* ready=group[@"claim"];
   if(arbol_boundary::clockMs()>=deadline||!keys(ready,@[@"request",@"profileInstance",@"profilePathHash",@"digest"])||
      !pattern(ready[@"profilePathHash"],@"^[0-9a-f]{64}$")||!pattern(ready[@"digest"],@"^[0-9a-f]{64}$")||
@@ -3912,7 +3918,8 @@ static bool ordinaryReceipt(NSDictionary* ordinary,NSDictionary* storage,NSDicti
     collected<=started&&started<=completed&&completed<deadline;
 }
 static bool verifyClosedReceipt(NSDictionary* closed,NSDictionary* __strong& capability,NSDictionary* __strong& receipt,
-  NSDictionary* __strong& frontier,ExitInspection& job,const arbol_boundary::Lock& proofBuild,NSString* bundle) {
+  NSDictionary* __strong& frontier,ExitInspection& job,const arbol_boundary::Lock& proofBuild,NSString* bundle,
+  NSDictionary* sharedFamily=nil) {
   arbol_attempt::PackagedLayout layout;
   if(!arbol_attempt::record(closed)||!arbol_attempt::claimedLayout(closed,layout)||layout.bundle!=bundle.UTF8String||
      (!job.migrated&&layout.guard!=proofBuild.path)||![closed[@"phase"] isEqual:@"closed"]||closed[@"terminal"]==NSNull.null||closed[@"engine"]==NSNull.null) return false;
@@ -3966,14 +3973,16 @@ static bool verifyClosedReceipt(NSDictionary* closed,NSDictionary* __strong& cap
     id original=[role isEqual:@"main"]?receipt[@"main"]:[role isEqual:@"primary"]?receipt[@"primary"]:[role isEqual:@"custody"]?receipt[@"custody"]:nil;
     if(!receiptIdentity(receipt[@"lastHolder"],last,true)||!receiptIdentity(original,expected,[role isEqual:@"main"])||!arbol_boundary::same(last,expected)) return false;
   }
+  NSString* runtimeLeaf=sharedFamily?[NSString stringWithUTF8String:sharedFamilyRuntimeLeaf(closed[@"profilePathHash"]).c_str()]:job.input[@"runtimeLeaf"];
+  NSDictionary* profileOwner=sharedFamily?sharedFamily[@"profileOwner"]:arbol_boundary::capsuleLock(job.owner);
   if(!arbol_attempt::keys(capability,@[@"format",@"kind",@"bootSession",@"bundle",@"main",@"locks",@"attempt",@"attemptPath",@"profileDirectory",@"profileRecord",@"profileRecordDigest",@"directories",@"receiptDirectory",@"family",@"runtime",@"markerPath",@"prior"])||
      ![capability[@"format"] isEqual:@1]||![capability[@"kind"] isEqual:@"host-finalization"]||
      !arbol_attempt::record(capability[@"attempt"])||!arbol_attempt::immutable(capability[@"attempt"],closed)||
      ![capability[@"attempt"][@"engine"] isEqual:closed[@"engine"]]||![capability[@"attempt"][@"bootstrap"] isEqual:closed[@"bootstrap"]]||
      !arbol_attempt::sameRuntimeBinding(capability[@"runtime"],closed[@"runtime"])||
-     ![capability[@"attemptPath"] isEqual:[job.input[@"runtimeLeaf"] stringByAppendingPathComponent:@"claim.json"]]||
+     ![capability[@"attemptPath"] isEqual:[runtimeLeaf stringByAppendingPathComponent:@"claim.json"]]||
      ![capability[@"bundle"] isEqual:bundle]||![capability[@"markerPath"] isEqual:[profile stringByAppendingPathComponent:@"engine.json"]]||
-     ![capability[@"locks"][@"owner"] isEqual:arbol_boundary::capsuleLock(job.owner)]||
+     ![capability[@"locks"][@"owner"] isEqual:profileOwner]||
      !job.historicalBuildLock(capability[@"locks"][@"build"],proofBuild,closed)||
      ![receipt[@"format"] isEqual:@1]||![receipt[@"bootSession"] isEqual:capability[@"bootSession"]]||
      ![receipt[@"profileDirectory"] isEqual:capability[@"profileDirectory"]]||
@@ -3996,8 +4005,16 @@ static bool verifyClosedReceipt(NSDictionary* closed,NSDictionary* __strong& cap
     if(![expected isEqual:marker[@"value"]]||!receiptIdentity(receipt[@"lastHolder"],last,true)||!receiptIdentity(receipt[@"primary"],primary)||
        !arbol_boundary::same(last,primary)||last.group!=(uint32_t)last.pid) return false;
   }
-  if(!receiptMetadata(capability,closed,job)||!receiptFrontier(capability,frontier,receipt[@"capabilityDigest"],job)||
-     !exitAllOriginalsGone(capability,receipt,job)) return false;
+  arbol_attempt::MaintenanceDirectory retainedFamily;
+  if(sharedFamily) {
+    NSDictionary* directory=capability[@"receiptDirectory"];
+    if(![directory isEqual:sharedFamily[@"receiptDirectory"]]||![directory[@"path"] isEqual:parent]||
+       ![profileOwner[@"path"] isEqual:[profile stringByAppendingPathComponent:@"owner.lock"]]||
+       ![receipt[@"capabilityDigest"] isEqual:sharedFamily[@"capabilityDigest"]]||
+       !retainedFamily.openPath(parent.fileSystemRepresentation,directory[@"identity"])) return false;
+  } else if(!receiptMetadata(capability,closed,job)) return false;
+  if(!receiptFrontier(capability,frontier,receipt[@"capabilityDigest"],job)||
+     !exitAllOriginalsGone(capability,receipt,job)||(sharedFamily&&!retainedFamily.current())) return false;
   if(auto* proof=job.qualificationProofCapture) {
     proof->files.emplace_back(path.fileSystemRepresentation,identity);
     if(clean) proof->files.emplace_back([[parent stringByAppendingPathComponent:@"proof.json"] fileSystemRepresentation],journalIdentity);
@@ -4366,9 +4383,57 @@ static bool publishMigration(ExitInspection& job,NSDictionary* closed,NSDictiona
   return !job.result.empty()&&current();
 }
 
+static bool inspectSharedFamilyExit(ExitInspection& job) {
+  using namespace arbol_attempt;
+  NSDictionary* input=job.input;
+  if(!job.within()||job.maintenance||job.dataBuild.fd>=0||job.nextBuild.fd>=0||
+     !keys(input,@[@"format",@"mode",@"profile",@"profileInstance",@"profilePathHash",@"bundle",@"request",@"attempt",@"dataAttempt",@"pending"])||
+     ![input[@"format"] isEqual:@1]||input[@"attempt"]!=NSNull.null||input[@"dataAttempt"]!=NSNull.null||input[@"pending"]!=NSNull.null||
+     !path(input[@"profile"])||!path(input[@"bundle"])||!pattern(input[@"profileInstance"],@"^prf_[A-Za-z0-9_-]{22}$")||
+     !pattern(input[@"request"],@"^req_[A-Za-z0-9_-]{22}$")) return false;
+  NSString* profile=input[@"profile"],*request=input[@"request"],*hash=digest(profile.fileSystemRepresentation);
+  NSString* state=profile.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent;
+  if(![hash isEqual:input[@"profilePathHash"]]||job.owner.path!=std::string(profile.fileSystemRepresentation)+"/owner.lock") return false;
+  NSString* familyEntry=[[[state stringByAppendingPathComponent:@"exit-evidence"] stringByAppendingPathComponent:hash] stringByAppendingPathComponent:request];
+  MaintenanceFile ownerRecord;
+  if(!ownerRecord.openPath([[familyEntry stringByAppendingPathComponent:@"shared-owner.json"] fileSystemRepresentation],
+       0600,arbol_exit::exitReceiptLimit,true)) return false;
+  NSDictionary* ownership=arbol_exit::parseExitReceipt(ownerRecord.content);
+  if(!keys(ownership,@[@"format",@"kind",@"profilePathHash",@"storage",@"group",@"priorMarker",@"plannedMarker"])||
+     ![ownership[@"format"] isEqual:@1]||![ownership[@"kind"] isEqual:@"shared-profile-owner"]||
+     ![ownership[@"profilePathHash"] isEqual:hash]) return false;
+  NSDictionary* group=ownership[@"group"],*storage=ownership[@"storage"];
+  if(!keys(group,@[@"bootSession",@"capabilityDigest",@"claim",@"build",@"profileOwner",@"receiptDirectory",@"main",@"primary",@"custody"])||
+     ![storage isKindOfClass:NSDictionary.class]||![storage[@"profile"] isEqual:profile]||
+     !keys(storage[@"request"],@[@"id",@"instance",@"device",@"inode"])||
+     ![storage[@"request"][@"instance"] isEqual:input[@"profileInstance"]]) return false;
+  NSDictionary* closed=resolveSharedClosedClaim(state,group,job.deadline);
+  PackagedLayout layout;
+  if(!closed||![closed[@"request"] isEqual:request]||!claimedLayout(closed,layout)||
+     layout.bundle!=[input[@"bundle"] UTF8String]||layout.guard!=job.build.path) return false;
+  const auto packet=bytes(storage[@"request"]);
+  auto exactTarget=[&] {
+    arbol_exit::AdditionalOwner actual;
+    return ownerRecord.current()&&arbol_exit::validateAdditionalOwner(closed[@"profile"],packet,job.owner.fd,actual)&&[actual.storage isEqual:storage];
+  };
+  arbol_startup_proof::RetainedAppPackage package;
+  if(!exactTarget()||!package.capture(layout,job.deadline,closed[@"candidateDigest"])) return false;
+  MaintenanceFile policy;
+  if(!policy.openPath(layout.bundle+"/Contents/Resources/host-policy.json",0600,limit,true)||
+     ![policyStateRoot(json(policy.content),layout) isEqual:state]) return false;
+  NSDictionary* capability=nil,*receipt=nil,*frontier=nil;
+  if(!verifyClosedReceipt(closed,capability,receipt,frontier,job,job.build,input[@"bundle"],group)||
+     ![resolveSharedClosedClaim(state,group,job.deadline) isEqual:closed]||
+     !exactTarget()||!policy.current()||!package.current()||!job.within()) return false;
+  job.result=bytes(@{@"format":@1,@"kind":@"shared-family-exited",@"request":request,@"profileInstance":input[@"profileInstance"],
+    @"profilePathHash":hash,@"capabilityDigest":receipt[@"capabilityDigest"],@"ownershipDigest":digest(ownerRecord.content)});
+  return !job.result.empty()&&job.within();
+}
+
 static bool inspectExit(ExitInspection& job) {
   using namespace arbol_attempt;
   NSDictionary* input=job.input,*expected=input[@"attempt"]; NSString* leaf=input[@"runtimeLeaf"],*profile=input[@"profile"];
+  if([input[@"mode"] isEqual:@"shared-family"]) return inspectSharedFamilyExit(job);
   bool prior=[input[@"mode"] isEqual:@"prior"],hostMode=[input[@"mode"] isEqual:@"host"],
     retire=[input[@"mode"] isEqual:@"retire"],reserve=[input[@"mode"] isEqual:@"reserve"],withdraw=[input[@"mode"] isEqual:@"withdraw"];
   bool progress=[input[@"mode"] isEqual:@"migrate-receipt-progress"],checked=[input[@"mode"] isEqual:@"migrate-committed-check"],
