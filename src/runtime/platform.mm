@@ -2685,6 +2685,13 @@ static napi_value retainSharedProfileOwner(napi_env env,napi_callback_info info)
     return fail(env);
   auto* state=c->finalization.shared();
   if(state->fatal.load(std::memory_order_acquire)||state->closeReceivedUs.load(std::memory_order_acquire)) return fail(env);
+  auto refuseTransfer=[&] {
+    // A late acknowledgement must not be consumed by another request. Any
+    // copies sent so far stay retained until normal supervisor exit. No
+    // session receipt or marker permission has been issued for this profile.
+    c->profileChannelsReady=false;
+    return fail(env);
+  };
   @autoreleasepool { @try { try {
     auto lock=duplicateHeld(owner);
     arbol_exit::NativeFile retained; retained.fd=lock.fd;
@@ -2705,18 +2712,18 @@ static napi_value retainSharedProfileOwner(napi_env env,napi_callback_info info)
     const double deadline=arbol_boundary::clockMs()+250;
     pollfd channels[2]{{c->profileChannels[0].fd,POLLIN,0},{c->profileChannels[1].fd,POLLIN,0}};
     for(const auto& channel:channels)
-      if(!arbol_exit::sendAdditionalOwner(channel.fd,lock.fd,packet)) terminateCustody(c);
+      if(!arbol_exit::sendAdditionalOwner(channel.fd,lock.fd,packet)) return refuseTransfer();
     unsigned remaining=2;
     while(remaining) {
       const double now=arbol_boundary::clockMs();
-      if(now>=deadline) terminateCustody(c);
+      if(now>=deadline) return refuseTransfer();
       const int ready=poll(channels,2,std::max(1,(int)std::ceil(deadline-now)));
       if(ready<0&&errno==EINTR) continue;
-      if(ready<=0) terminateCustody(c);
+      if(ready<=0) return refuseTransfer();
       for(auto& channel:channels) if(channel.revents) {
         char ack[arbol_exit::ownerPacketLimit];
         if(channel.revents!=POLLIN||recv(channel.fd,ack,sizeof(ack),MSG_DONTWAIT)!=(ssize_t)expected.size()||
-           memcmp(ack,expected.data(),expected.size())) terminateCustody(c);
+           memcmp(ack,expected.data(),expected.size())) return refuseTransfer();
         channel.fd=-1; --remaining;
       }
     }
@@ -2724,13 +2731,13 @@ static napi_value retainSharedProfileOwner(napi_env env,napi_callback_info info)
     if(arbol_boundary::clockMs()>=deadline||!arbol_exit::validateAdditionalOwner(primary,packet,lock.fd,checked)||
        checked.acknowledgement!=expected||arbol_boundary::clockMs()>=deadline||
        !c->finalization.ready(c->context)||state->fatal.load(std::memory_order_acquire)||
-       state->closeReceivedUs.load(std::memory_order_acquire)) terminateCustody(c);
+       state->closeReceivedUs.load(std::memory_order_acquire)) return fail(env);
     napi_value out;
     if(!sharedOwnerReceipts.emplace(receipt,c).second||
        napi_create_external(env,receipt,nullptr,nullptr,&out)!=napi_ok)
-      terminateCustody(c);
+      return fail(env);
     return out;
-  } catch(...) { terminateCustody(c); } } @catch(NSException*) { terminateCustody(c); } }
+  } catch(...) { return refuseTransfer(); } } @catch(NSException*) { return refuseTransfer(); } }
 }
 static napi_value assertSharedProfileOwner(napi_env env,napi_callback_info info) {
   napi_value arg; void* raw=nullptr;
