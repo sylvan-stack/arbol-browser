@@ -938,7 +938,7 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
       prepared(); assertTabRegistry(registryValue); assertWindowHost(host); assertShellRegistration(registration, host);
       if ((registry && registry !== registryValue) || windows.has(host)) throw unavailable('browser');
       registry = registryValue; everBound = true; windows.set(host, registration);
-      host.window.once('closed', () => { windows.delete(host); runtime?.lastWindowClosed(); });
+      host.onClosed(() => { windows.delete(host); runtime?.lastWindowClosed(); });
     },
     bindRuntime(value) {
       prepared(); assertHostLifecycle(value);

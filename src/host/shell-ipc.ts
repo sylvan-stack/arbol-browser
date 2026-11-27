@@ -6,7 +6,7 @@ import type { HostCustody } from '../runtime/custody.js';
 import type { PlatformPort } from '../runtime/platform.js';
 import { createProfileNavigation, type ProfileNavigation } from './profile-navigation.js';
 import { bindProfilePresentation } from './presentation.js';
-import { assertWindowHost, shellURL, type WindowHost } from './windows.js';
+import { assertWindowHost, selectWindowProfile, shellURL, type WindowHost } from './windows.js';
 import { assertTabRegistry, refused, userURL, type TabRegistry, type TabTarget } from './tabs.js';
 
 type Request = Contract<'browser.ShellRequest'>;
@@ -43,6 +43,18 @@ interface Registration {
 }
 const registrations = new WeakMap<ShellRegistration, Registration>();
 const senders = new Map<WebContents, Registration>();
+type NativePresentation = {
+  readonly state: string;
+  readonly platform: PlatformPort;
+  readonly profiles: Map<WindowHost, {
+    readonly id: string;
+    readonly instance: string;
+    ready(): boolean;
+    canYield(ownerSwitch: boolean): boolean;
+  }>;
+  readonly value: ReturnType<typeof bindProfilePresentation>;
+};
+const nativePresentations = new WeakMap<WindowHost['window'], NativePresentation>();
 let installed = false;
 const requestShape = validator('browser.ShellRequest'), eventShape = validator('browser.ShellEvent');
 const successShape = validator('browser.ShellSuccess'), failureShape = validator('browser.ShellFailure');
@@ -76,6 +88,7 @@ function installTransport() {
   // No request-supplied identity, role, sender or channel is accepted.
   ipcMain.handle('browser-shell:request', async (event, raw: unknown) => {
     const current = authenticated(event); // before inspecting privileged parameters
+    if (!current.host.isActiveProfile()) throw refused('control_refused');
     if (!requestShape(raw)) throw invalidInput();
     let size: number;
     try { size = Buffer.byteLength(JSON.stringify(raw), 'utf8'); } catch { throw invalidInput(); }
@@ -83,7 +96,7 @@ function installTransport() {
     const result = await current.dispatch(raw as Request);
     // Closing destroys the original sender; every other asynchronous reply is fenced again.
     if ((raw as Request).method !== 'close_window') {
-      if (authenticated(event) !== current) throw unavailable('browser');
+      if (authenticated(event) !== current || !current.host.isActiveProfile()) throw unavailable('browser');
     }
     return result;
   });
@@ -102,7 +115,7 @@ function installTransport() {
     };
     try {
       check();
-      const isFocused = () => current.host.window.isFocused();
+      const isFocused = () => current.host.isActiveProfile() && current.host.window.isFocused();
       if ((request as { method?: unknown } | null)?.method !== 'list' && !isFocused()) throw refused('control_refused');
       const state = await current.profiles(request, check, isFocused);
       if (authenticated(event) !== current) throw unavailable('browser');
@@ -142,12 +155,42 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
     if (!eventShape(value)) throw unavailable('browser');
     return value;
   };
-  const presentation = profileSource?.custody.host.identity.layout.scope === 'installed'
-    ? bindProfilePresentation(host.window, profileSource.custody.host.policy.stateRoot, profileSource.platform, ownerSwitch =>
-      !host.window.isDestroyed() && host.window.isEnabled() && (ownerSwitch || !host.window.isFocused()) &&
-      tabs.all().filter(target => target.page.window === host).every(target => tabs.state(target).handoff === 'idle'))
-    : undefined;
-  const profiles = profileSource && presentation && createProfileNavigation(profileSource.custody, profileSource.platform, presentation.yieldForSwitch);
+  let nativePresentation: NativePresentation | undefined;
+  if (profileSource?.custody.host.identity.layout.scope === 'installed') {
+    const { platform } = profileSource;
+    const state = profileSource.custody.host.policy.stateRoot;
+    nativePresentation = nativePresentations.get(host.window);
+    if (!nativePresentation) {
+      const profiles: NativePresentation['profiles'] = new Map();
+      const value = bindProfilePresentation(host.window, state, platform, ownerSwitch => {
+        for (const [member, profile] of profiles) if (member.isActiveProfile()) return profile.canYield(ownerSwitch);
+        return false;
+      });
+      nativePresentation = { state, platform, profiles, value };
+      nativePresentations.set(host.window, nativePresentation);
+    }
+    if (nativePresentation.state !== state || nativePresentation.platform !== platform) throw unavailable('browser');
+    const { id, instance } = profileSource.custody.instance.owner.profile.record;
+    if ([...nativePresentation.profiles.values()].some(profile => profile.id === id)) throw unavailable('browser');
+    nativePresentation.profiles.set(host, { id, instance,
+      ready: () => runtimeReady() && prepared && !disposed,
+      canYield: ownerSwitch =>
+        !host.window.isDestroyed() && host.window.isEnabled() && (ownerSwitch || !host.window.isFocused()) &&
+        tabs.all().filter(target => target.page.window === host).every(target => tabs.state(target).handoff === 'idle') });
+  }
+  const presentation = nativePresentation?.value;
+  const profiles = profileSource && nativePresentation && createProfileNavigation(profileSource.custody, profileSource.platform,
+    nativePresentation.value.yieldForSwitch, (id, instance) => {
+      const members = nativePresentation.profiles;
+      for (const [target, profile] of members) {
+        if (profile.id !== id) continue;
+        if (profile.instance !== instance || !profile.ready() || !members.get(host)?.canYield(true))
+          throw refused('control_refused');
+        selectWindowProfile(host, target);
+        return true;
+      }
+      return false;
+    });
   const assertPresentable = () => { registration.assertLoaded(); authority.assertOperational(); };
   const current: Registration = { host, authority, snapshot, ...(profiles ? { profiles } : {}),
     async dispatch(request): Promise<Result> {
@@ -216,11 +259,13 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
     },
     offerPresentation() {
       assertPresentable();
+      if (!host.isActiveProfile()) return;
       if (presentation) { presentation.offer(); return; }
       if (!host.window.isVisible()) host.window.showInactive();
     },
     async offerForegroundPresentation(deadline: number, mayShowEmpty: () => boolean) {
       assertPresentable();
+      if (!host.isActiveProfile()) return;
       if (presentation) { await presentation.offerForeground(deadline, assertPresentable, mayShowEmpty); return; }
       if (mayShowEmpty()) registration.offerPresentation();
     },
@@ -239,6 +284,7 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
     dispose() {
       if (disposed) return; disposed = true;
       unsubscribe(); unsubscribePresentation(); unsubscribeChrome(); clearTimeout(chromeTimer);
+      nativePresentation?.profiles.delete(host);
       senders.delete(host.shell.webContents); registrations.delete(registration);
     },
   });

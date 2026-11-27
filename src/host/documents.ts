@@ -131,7 +131,7 @@ export class HostDocuments implements DocumentAuthority {
       pages => { for (const page of pages) this.fencePresentation(page); },
       pages => { for (const page of pages) this.presentationChanged(page); });
     this.windows.set(host, remove);
-    host.window.once('closed', () => { remove(); this.windows.delete(host); });
+    host.onClosed(() => { remove(); this.windows.delete(host); });
   }
   private authority(): TabAuthority { if (!this.owner || !this.preparation || !this.onFault) throw unavailable('browser'); return this.owner; }
   private synchronous(work: () => void): void {

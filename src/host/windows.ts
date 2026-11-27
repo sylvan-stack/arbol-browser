@@ -41,6 +41,7 @@ export interface WindowHost {
   readonly origin: string;
   createPage(): PageSurface;
   assertHealthy(): void;
+  isActiveProfile(): boolean;
   hasForegroundWork(): boolean;
   select(page: PageSurface, commit?: () => void): void;
   /** Physical selection, independent of a logical tab retaining a retired page. */
@@ -50,11 +51,66 @@ export interface WindowHost {
   presentationStable(): boolean;
   onPresentation(fence: (pages: readonly PageSurface[]) => void, changed: (pages: readonly PageSurface[]) => void): () => void;
   onTabChromeChange(changed: () => void): () => void;
+  onClosed(closed: () => void): void;
   guardRetirementTransition(operation: () => void): void;
   close(): Promise<void>;
 }
 const hosts = new WeakSet<object>(), surfaces = new WeakSet<object>();
+interface ProfilePlacement {
+  refresh(): void;
+  changed(): void;
+  canSwitch(): boolean;
+  requestClose(): void;
+}
+interface BrowserFrame {
+  readonly window: BaseWindow;
+  readonly profiles: Map<WindowHost, ProfilePlacement>;
+  active: WindowHost | undefined;
+  switching: boolean;
+  closing: boolean;
+}
+const browserFrames = new WeakMap<NativeFailureBoundary, BrowserFrame>();
+const profileFrames = new WeakMap<WindowHost, BrowserFrame>();
 const retirementRecords = new WeakMap<PageSurface, PageRetirement>();
+function browserFrame(boundary: NativeFailureBoundary): BrowserFrame {
+  const existing = browserFrames.get(boundary);
+  if (existing) {
+    if (existing.closing || existing.window.isDestroyed()) throw unavailable('browser');
+    return existing;
+  }
+  const window = new BaseWindow({ width: 1120, height: 800, minWidth: 560, minHeight: 480,
+    title: 'Arbol Browser', titleBarStyle: 'hidden', trafficLightPosition: { x: 14, y: 16 }, show: false });
+  const frame: BrowserFrame = { window, profiles: new Map(), active: undefined, switching: false, closing: false };
+  browserFrames.set(boundary, frame);
+  window.on('close', event => {
+    event.preventDefault();
+    if (frame.closing) return;
+    frame.closing = true;
+    for (const profile of frame.profiles.values()) profile.requestClose();
+  });
+  return frame;
+}
+/** Both profiles must already have been admitted in this exact native window.
+ * The caller owns profile authentication and the owner-initiated switch. */
+export function selectWindowProfile(source: WindowHost, destination: WindowHost): void {
+  assertWindowHost(source); assertWindowHost(destination);
+  const frame = profileFrames.get(source);
+  const oldProfile = frame?.profiles.get(source), newProfile = frame?.profiles.get(destination);
+  if (!frame || frame !== profileFrames.get(destination) || frame.closing || frame.switching ||
+      frame.active !== source || !oldProfile?.canSwitch() || !newProfile?.canSwitch())
+    throw unavailable('browser');
+  if (source === destination) return;
+  const focused = frame.window.isFocused();
+  frame.switching = true;
+  try {
+    frame.active = undefined;
+    oldProfile.refresh();
+    frame.active = destination;
+    newProfile.refresh();
+  } finally { frame.switching = false; }
+  if (focused && frame.window.isFocused()) destination.shell.webContents.focus();
+  newProfile.changed();
+}
 export function assertPageRetirement(page: PageSurface, receipt: PageRetirement): void {
   if (!surfaces.has(page) || retirementRecords.get(page) !== receipt || receipt.page !== page || receipt.phase === 'failed')
     throw unavailable('browser');
@@ -87,9 +143,10 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
   if (sessions.website === sessions.shell || sessions.shell.getStoragePath() !== null ||
       sessions.website.getStoragePath() === null || realpathSync(preloadPath) !== preloadPath ||
       realpathSync(fileURLToPath(shellURL)) !== fileURLToPath(shellURL)) throw unavailable('browser');
-  const window = new BaseWindow({ width: 1120, height: 800, minWidth: 560, minHeight: 480,
-    title: 'Arbol Browser', titleBarStyle: 'hidden', trafficLightPosition: { x: 14, y: 16 }, show: false });
+  const frame = browserFrame(boundary);
+  const { window } = frame;
   const shell = new WebContentsView({ webPreferences: { ...preferences(sessions.shell), preload: preloadPath } });
+  shell.setVisible(false);
   let shellBinding = boundary.native.ownership.bind(window.getNativeWindowHandle(), shell.webContents.id,
     () => { window.contentView.addChildView(shell); });
   // Chromium shell roots have no implicit native bypass. Only this bound shell is enabled.
@@ -108,10 +165,12 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
   const pendingPresentation = new Set<PageSurface>(), categories = new Map<PageSurface, string>();
   const observers = new Set<{ fence: (pages: readonly PageSurface[]) => void; changed: (pages: readonly PageSurface[]) => void }>();
   const chromeObservers = new Set<() => void>();
+  const closedObservers = new Set<() => void>();
+  const active = () => frame.active === host;
   const category = (page: PageSurface) => {
-    const active = selected === page, visible = page.view.getVisible();
-    if (!active && visible) return 'invalid';
-    return active && visible && window.isVisible() && !window.isMinimized() ? 'presented' : 'hidden';
+    const foreground = active() && selected === page, visible = page.view.getVisible();
+    if (!foreground && visible) return 'invalid';
+    return foreground && visible && window.isVisible() && !window.isMinimized() ? 'presented' : 'hidden';
   };
   const synchronous = (work: () => void) => {
     const result: unknown = work(); if (result !== undefined) return boundary.fatal.fail('native_retirement_unavailable');
@@ -121,7 +180,7 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
   };
   const presentSelection = (next: PageSurface | undefined, owns = () => true) => {
     for (const page of pages) if (!page.retirement()) {
-      if (!owns()) throw unavailable('browser'); page.present(page === next);
+      if (!owns()) throw unavailable('browser'); page.present(active() && page === next);
       if (!owns()) throw unavailable('browser');
     }
   };
@@ -167,17 +226,20 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
   };
   const host: WindowHost = Object.freeze({ window, shell, origin: shellURL,
     assertHealthy() { assertWindowHost(host); boundary.fatal.assertHealthy(); boundary.native.assertIntegrity(); },
+    isActiveProfile: active,
     // An attached AppKit sheet can be key while its parent window is disabled.
-    hasForegroundWork: () => !window.isDestroyed() && (window.isFocused() || !window.isEnabled()),
+    hasForegroundWork: () => active() && !window.isDestroyed() && (window.isFocused() || !window.isEnabled()),
     createPage(): PageSurface {
       assertWindowHost(host); boundary.fatal.assertHealthy(); boundary.native.assertIntegrity();
       if (closing) throw unavailable('browser');
       const view = new WebContentsView({ webPreferences: { ...preferences(sessions.website), disableHtmlFullscreenWindowResize: true } });
+      view.setVisible(false);
       let current = boundary.native.ownership.bind(window.getNativeWindowHandle(), view.webContents.id,
         () => { window.contentView.addChildView(view); });
       let retired = false;
       const shield = new View();
       shield.setBackgroundColor('#00000000');
+      shield.setVisible(false);
       window.contentView.addChildView(shield);
       view.webContents.on('before-input-event', (event, input) => {
         if (retired || current.blocked || clipboardShortcut(input)) event.preventDefault();
@@ -192,7 +254,7 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
         setNativeBlocked(blocked: boolean) {
           if (retired) throw unavailable('browser');
           current = boundary.native.ownership.mark(bindingKey(current), blocked);
-          shield.setVisible(selected === page && current.blocked); return current;
+          shield.setVisible(active() && selected === page && current.blocked); return current;
         },
         restorePresentation() {
           // restore unhides native subviews. It is never a background probe.
@@ -248,7 +310,7 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
         return boundary.fatal.fail('native_boundary_unavailable');
       const dialog = async (info: unknown, reply: DialogReply) => {
         if (typeof reply !== 'function') return boundary.fatal.fail('native_boundary_unavailable');
-        if (closing || retired || selected !== page || window.isDestroyed() || !window.isFocused() ||
+      if (closing || retired || !active() || selected !== page || window.isDestroyed() || !window.isFocused() ||
             !view.getVisible() || page.binding().blocked) return reply(false, '');
         return Reflect.apply(stock, contents, [info, reply]);
       };
@@ -272,7 +334,7 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
     },
     selected() { assertWindowHost(host); return selected; },
     owns(page: PageSurface) { return page.window === host && pages.has(page) && !page.retirement(); },
-    presentationStable: () => !closing && placementDepth === 0,
+    presentationStable: () => !closing && !frame.switching && placementDepth === 0,
     onPresentation(fence: (pages: readonly PageSurface[]) => void, changed: (pages: readonly PageSurface[]) => void) {
       assertWindowHost(host); const observer = { fence, changed }; observers.add(observer);
       return () => { observers.delete(observer); };
@@ -280,6 +342,9 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
     onTabChromeChange(changed: () => void) {
       assertWindowHost(host); chromeObservers.add(changed);
       return () => { chromeObservers.delete(changed); };
+    },
+    onClosed(closed: () => void) {
+      assertWindowHost(host); closedObservers.add(closed);
     },
     clearSelection(page: PageSurface, commit: () => void = () => {}) {
       assertPageSurface(page);
@@ -310,18 +375,38 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
       if (closing) throw unavailable('browser'); closing = true;
       await Promise.all([...pages].map(page => page.retire()));
       await boundary.retire(bindingKey(shellBinding), window.contentView, shell);
-      window.destroy(); hosts.delete(host);
+      window.removeListener('resize', layout);
+      window.removeListener('show', windowPresentation); window.removeListener('hide', windowPresentation);
+      window.removeListener('minimize', windowPresentation); window.removeListener('restore', windowPresentation);
+      hosts.delete(host); profileFrames.delete(host); frame.profiles.delete(host);
+      if (frame.active === host) {
+        frame.active = frame.closing ? undefined : frame.profiles.keys().next().value;
+        const next = frame.active && frame.profiles.get(frame.active);
+        if (next) { next.refresh(); next.changed(); }
+      }
+      if (!frame.profiles.size) window.destroy();
+      for (const closed of closedObservers) observe(closed);
+      closedObservers.clear();
     },
   });
-  hosts.add(host);
-  window.on('resize', layout);
   const windowPresentation = () => {
     if (closing || window.isDestroyed()) return;
     const affected = [...pages].filter(page => !page.retirement() && categories.get(page) !== category(page));
     if (affected.length) selectPhysical(selected, () => {}, affected);
   };
+  const refresh = () => {
+    try {
+      const affected = [...pages].filter(page => !page.retirement());
+      selectPhysical(selected, () => { shell.setVisible(active()); }, affected);
+    } catch { return boundary.fatal.fail('native_retirement_unavailable'); }
+  };
+  hosts.add(host); profileFrames.set(host, frame);
+  frame.profiles.set(host, { refresh, canSwitch: () => !closing && placementDepth === 0 && window.isEnabled(),
+    requestClose: () => { if (!closing) onCloseRequested(); },
+    changed: () => { for (const changed of chromeObservers) changed(); } });
+  frame.active ??= host;
+  window.on('resize', layout);
   window.on('show', windowPresentation); window.on('hide', windowPresentation);
   window.on('minimize', windowPresentation); window.on('restore', windowPresentation);
-  window.on('close', event => { event.preventDefault(); if (!closing) onCloseRequested(); });
-  layout(); return host;
+  layout(); refresh(); return host;
 }

@@ -389,7 +389,7 @@ export function createRendererControl(boundary: NativeFailureBoundary, identity:
     bind(tabs: TabRegistry, host: WindowHost, registration: ShellRegistration) {
       ownership.bind(tabs, host, registration); documents.bindWindow(host); recovery.bind(tabs);
       registrations.set(host, registration);
-      host.window.once('closed', () => { registrations.delete(host); });
+      host.onClosed(() => { registrations.delete(host); });
     },
   });
 }

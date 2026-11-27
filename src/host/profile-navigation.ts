@@ -52,7 +52,7 @@ async function labels(state: string): Promise<Map<string, { instance: string; la
 }
 
 export function createProfileNavigation(custody: HostCustody, platform: PlatformPort,
-  yieldPresentation: () => () => void): ProfileNavigation | undefined {
+  yieldPresentation: () => () => void, selectLocal: (profile: string, instance: string) => boolean): ProfileNavigation | undefined {
   assertHostCustody(custody);
   if (custody.host.identity.layout.scope !== 'installed') return undefined;
   const selected = custody.instance.owner.profile;
@@ -88,6 +88,8 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
   async function open(id: string, instance: string, check: () => void, isFocused: () => boolean): Promise<void> {
     const profile = await readProfile(profilePaths(id, state));
     if (profile.record.instance !== instance) throw profileUnavailable();
+    check();
+    if (selectLocal(id, instance)) return;
     const deadline = startupDeadline();
     let requested = false;
     for (;;) {
