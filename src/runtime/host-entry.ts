@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import { configureProfileSession, type SessionBinding, type ProfileSessions, type ProfileApp } from '../profiles/session.js';
 import { prepareEngine, type EngineAuthority, type EngineTransaction } from '../profiles/compatibility.js';
-import { acquireInstance, runtimeLocation, assertTime, type InstanceOwner, type PreviousExit, type RuntimeRecord } from './instance.js';
+import { acquireInstance, runtimeLocation, assertTime, startupDeadline, type InstanceOwner, type PreviousExit, type RuntimeRecord } from './instance.js';
 import { readJson, readProfile, type ProfileSnapshot } from '../profiles/records.js';
 import { profilePaths } from '../profiles/paths.js';
 import { consumeSelection, type BuildSelection } from './selection.js';
@@ -249,6 +249,7 @@ function hasHandoff(control: RendererControl, shell: TrustedShellIntegration): b
 
 interface AdditionalProfiles {
   openInWindow(source: WindowHost, target: ProfileSnapshot, deadline: number): Promise<void>;
+  prepareInWindow(source: WindowHost, targets: readonly ProfileSnapshot[]): void;
   admit: NonNullable<Parameters<typeof import('./transport.js').listenProtectedTransport>[6]>;
   bindPrimary(scope: LogicalProfile): void;
   primaryActive(): boolean;
@@ -272,6 +273,10 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
   transports: typeof import('./transport.js')): AdditionalProfiles {
   type Entry = { instance: string; opening?: Promise<LogicalProfile>; runtime?: SharedProfileLifecycle; scope?: LogicalProfile };
   const profiles = new Map<string, Entry>();
+  const queued = new Map<string, ProfileSnapshot>();
+  const tried = new Map<string, string>();
+  let worker: NodeJS.Immediate | undefined;
+  let preparing = false;
   let primary: LogicalProfile | undefined;
   let closing = false;
   const activeHandoff = () => [...profiles.values()].some(({ scope }) =>
@@ -281,7 +286,8 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
     if (closing || state.closed || source.window !== state.shell?.host.window || !state.runtime) throw unavailable('profile');
     state.runtime.assertAdmission(); custody.assertRetained(); source.assertHealthy();
   };
-  async function openProfile(source: WindowHost, target: ProfileSnapshot, deadline: number, signal?: AbortSignal): Promise<RuntimeRecord> {
+  async function openProfile(source: WindowHost, target: ProfileSnapshot, deadline: number,
+    signal?: AbortSignal, prepareOnly = false): Promise<RuntimeRecord> {
     assertCurrent(source, deadline);
     if (signal?.aborted) throw unavailable('profile');
     const appAdmission = custody.retainSharedAppAdmission();
@@ -293,6 +299,7 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
     try {
       assertOpeningCurrent();
       const { id, instance } = target.record;
+      queued.delete(id);
       if (target.paths.state !== custody.host.policy.stateRoot) throw unavailable('profile');
       if (id === custody.instance.record.profile) {
         if (!primary || instance !== primary.instance.record.profileInstance) throw unavailable('profile');
@@ -305,11 +312,42 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
         delete entry.opening;
         throw error;
       });
-      return await activate(await entry.opening, assertOpeningCurrent);
+      const ready = await entry.opening;
+      assertOpeningCurrent();
+      return prepareOnly ? ready.instance.record : await activate(ready, assertOpeningCurrent);
     } finally { appAdmission.release(); }
   }
   async function openInWindow(source: WindowHost, target: ProfileSnapshot, deadline: number): Promise<void> {
     await openProfile(source, target, deadline);
+  }
+  function schedulePreparation(): void {
+    if (closing || preparing || worker || queued.size === 0) return;
+    const source = primary?.shell.host;
+    if (!source || !source.window.isVisible() || source.window.isMinimized()) return;
+    worker = setImmediate(() => {
+      worker = undefined;
+      if (closing || !source.window.isVisible() || source.window.isMinimized()) return;
+      // The next explicit selection can reuse this preparation or start its
+      // own immediately. There is only one speculative opening at a time.
+      const target = [...queued.values()].find(item => item.record.id !== 'default') ?? queued.get('default');
+      if (!target) return;
+      const { id, instance } = target.record;
+      tried.set(id, instance);
+      preparing = true;
+      void openProfile(source, target, startupDeadline(), undefined, true).catch(() => {}).finally(() => {
+        queued.delete(id);
+        preparing = false;
+        schedulePreparation();
+      });
+    });
+  }
+  function prepareInWindow(source: WindowHost, targets: readonly ProfileSnapshot[]): void {
+    if (closing || source.window !== primary?.shell.host.window || !source.isActiveProfile()) return;
+    for (const target of targets) {
+      const { id, instance } = target.record;
+      if (id !== primary.instance.record.profile && !profiles.has(id) && tried.get(id) !== instance) queued.set(id, target);
+    }
+    schedulePreparation();
   }
   async function openEntry(entry: Entry, source: WindowHost, target: ProfileSnapshot, deadline: number,
     assertOpeningCurrent: () => void): Promise<LogicalProfile> {
@@ -320,7 +358,7 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
       const control = await bootstrap.prepareSharedRendererControl(boundary, prepared, deadline);
       assertOpeningCurrent();
       shell = await bootstrap.integrateSharedProfileShell(port, prepared, source, control.ownership.lifecycle,
-        control.ownership.shell, openInWindow, deadline);
+        control.ownership.shell, { openInWindow, prepareInWindow }, deadline);
       assertOpeningCurrent();
       control.bind(shell.tabs, shell.host, shell.registration);
       const { instance } = prepared;
@@ -337,7 +375,7 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
       assertOpeningCurrent();
       await runtime.ready();
       assertCurrent(source, deadline);
-      const scope: LogicalProfile = { instance, runtime, control, shell, transport, phase: 'active',
+      const scope: LogicalProfile = { instance, runtime, control, shell, transport, phase: 'dormant',
         flush: () => prepared.sessions.flushStorage() };
       shell.registration.setRuntimeReady(() => scope.phase === 'active' && runtime.phase === 'ready' && !closing && !state.closed);
       entry.scope = scope;
@@ -420,9 +458,12 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
   }
   return Object.freeze({
     openInWindow,
+    prepareInWindow,
     bindPrimary(scope: LogicalProfile) {
       if (primary || scope.instance !== custody.instance || scope.runtime !== state.runtime || scope.shell !== state.shell) throw unavailable('profile');
       primary = scope;
+      scope.shell.host.window.on('show', schedulePreparation);
+      scope.shell.host.window.on('restore', schedulePreparation);
     },
     primaryActive: () => primary?.phase === 'active' && !closing,
     activeHandoff,
@@ -454,6 +495,8 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
     },
     fence() {
       closing = true;
+      queued.clear();
+      clearImmediate(worker);
       for (const entry of profiles.values()) entry.runtime?.fence();
     },
     async retire(deadline: number) {
@@ -497,7 +540,7 @@ async function assembleAfterReady(prepared: HostPreparation, sessions: ProfileSe
     if (group) state.additional = group;
     noteHostStartup(prepared.custody, 'host-shell-integrate-before');
     const shell = await bootstrap.integrateTrustedShell(port, prepared, request.selection, sessions,
-      control.ownership.lifecycle, control.ownership.shell, deadline, group?.openInWindow);
+      control.ownership.lifecycle, control.ownership.shell, deadline, group);
     noteHostStartup(prepared.custody, 'host-shell-integrate-after');
     state.shell = shell; current();
     // Genuine physical shell is still hidden and empty. No load/show precedes

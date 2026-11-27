@@ -153,6 +153,7 @@ export interface ShellProfileSource {
   readonly shared?: Readonly<{
     runtime?: SharedProfileRuntime;
     openInWindow(source: WindowHost, profile: ProfileSnapshot, deadline: number): Promise<void>;
+    prepareInWindow(source: WindowHost, profiles: readonly ProfileSnapshot[]): void;
   }>;
 }
 export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority: ShellAuthority,
@@ -259,6 +260,7 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
     }, shared && { ...(shared.runtime ? { runtime: shared.runtime } : {}),
       isReady: (id, instance) => [...nativePresentation.profiles.values()]
         .some(member => member.id === id && member.instance === instance),
+      prepareInWindow: profiles => shared.prepareInWindow(host, profiles),
       openInWindow: (profile, deadline) => shared.openInWindow(host, profile, deadline) });
   const assertPresentable = () => { registration.assertLoaded(); authority.assertOperational(); };
   const current: Registration = { host, authority, snapshot, ...(profiles ? { profiles } : {}),

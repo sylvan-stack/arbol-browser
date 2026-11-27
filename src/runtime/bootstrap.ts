@@ -315,7 +315,7 @@ function assertPreparationBuild(prepared: HostPreparation, deadline: number): Pr
  * entry above continues to refuse; this function is never invoked by this Beat. */
 export async function integrateTrustedShell(port: NativeShellPort, prepared: HostPreparation,
   selection: BuildSelection, sessions: ProfileSessions, lifecycle: TabLifecycle, authority: ShellAuthority,
-  deadline = performance.now() + 5000, openInWindow?: NonNullable<ShellProfileSource['shared']>['openInWindow']): Promise<TrustedShellIntegration> {
+  deadline = performance.now() + 5000, shared?: ShellProfileSource['shared']): Promise<TrustedShellIntegration> {
   const value = nativeShellPorts.get(port);
   if (!value) throw unavailable('browser');
   const { boundary, modules } = value;
@@ -327,13 +327,13 @@ export async function integrateTrustedShell(port: NativeShellPort, prepared: Hos
   await assertHeldPath(selection.guard, ownership.build);
   boundary.fatal.assertHealthy(); boundary.native.assertIntegrity(); authority.assertReady();
   const source: ShellProfileSource = { custody: prepared.custody, platform: ownership.prepared.platform,
-    ...(openInWindow ? { shared: { openInWindow } } : {}) };
+    ...(shared ? { shared } : {}) };
   return constructTrustedShell(modules, boundary, sessions, lifecycle, authority, source,
     onClose => prepareStartupConstructionSnapshot(prepared.custody, boundary.native.trust, 'window', onClose, deadline));
 }
 
 export async function integrateSharedProfileShell(port: NativeShellPort, runtime: SharedProfileRuntime, existingHost: WindowHost,
-  lifecycle: TabLifecycle, authority: ShellAuthority, openInWindow: NonNullable<ShellProfileSource['shared']>['openInWindow'],
+  lifecycle: TabLifecycle, authority: ShellAuthority, shared: NonNullable<ShellProfileSource['shared']>,
   deadline: number): Promise<TrustedShellIntegration> {
   const value = nativeShellPorts.get(port);
   if (!value) throw unavailable('browser');
@@ -345,7 +345,7 @@ export async function integrateSharedProfileShell(port: NativeShellPort, runtime
   await assertHeldPath(custody.build.selection.guard, ownership.build);
   assertSharedProfileRuntime(runtime, boundary.watchdog); modules.windows.assertWindowHost(existingHost);
   return constructTrustedShell(modules, boundary, runtime.sessions, lifecycle, authority,
-    { custody, platform: ownership.prepared.platform, shared: { runtime, openInWindow } },
+    { custody, platform: ownership.prepared.platform, shared: { ...shared, runtime } },
     onClose => prepareSharedProfileConstruction(runtime, boundary.native.trust, 'window', onClose, deadline), existingHost);
 }
 

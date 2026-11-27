@@ -92,6 +92,7 @@ async function labels(state: string): Promise<Map<string, { instance: string; la
 export function createProfileNavigation(custody: HostCustody, platform: PlatformPort,
   yieldPresentation: () => () => void, selectLocal: (profile: string, instance: string, tab?: string) => boolean,
   shared?: Readonly<{ runtime?: SharedProfileRuntime; isReady(profile: string, instance: string): boolean;
+    prepareInWindow(profiles: readonly ProfileSnapshot[]): void;
     openInWindow(profile: ProfileSnapshot, deadline: number): Promise<void> }>): ProfileNavigation | undefined {
   assertHostCustody(custody);
   if (custody.host.identity.layout.scope !== 'installed') return undefined;
@@ -106,6 +107,7 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
 
   async function list(check: () => void): Promise<ProfileNavigationState> {
     check();
+    const available: ProfileSnapshot[] = [];
     const registry = await registryLock(state, platform);
     try {
       const [records, names] = await Promise.all([managedProfiles(registry), labels(state)]);
@@ -117,14 +119,17 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
         const name = names.get(record.id);
         const blocked = record.id !== selected.record.id && !shared?.isReady(record.id, record.instance) &&
           await hasRetainedProfileLock(profile, platform) && !shared?.isReady(record.id, record.instance);
+        if (!blocked) available.push(profile);
         profiles.push({ id: record.id, instance: record.instance,
           ...(name?.instance === record.instance ? { label: name.label } : {}),
           ...(blocked ? { unavailable: true } : {}) });
       }
       await registry.assert();
       check();
-      return catalogue = { current: selected.record.id, profiles };
+      catalogue = { current: selected.record.id, profiles };
     } finally { registry.release(); }
+    shared?.prepareInWindow(available);
+    return catalogue;
   }
 
   async function open(id: string, instance: string, check: () => void, isFocused: () => boolean, tab?: string): Promise<void> {

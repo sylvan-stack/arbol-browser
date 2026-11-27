@@ -373,7 +373,9 @@ export function listenProtectedTransport(location: RuntimeLocation, record: Runt
 async function listenServer(location: RuntimeLocation, record: RuntimeRecord, platform: PlatformPort,
   dispatch: DispatchPort | ProtectedDispatchPort, protectedPort?: ProtectedDispatchPort,
   privateUsage?: PrivateUsage, shared?: SharedProfileRuntime, privateProfileAdmission?: PrivateProfileAdmission): Promise<TransportServer> {
-  let admission = false, sealed = false, profileEnabled = true, agents = 0, management = 0;
+  // A shared profile can finish native admission while its shell is hidden.
+  // Its ordinary sockets stay closed to traffic until the explicit open.
+  let admission = false, sealed = false, profileEnabled = !shared, agents = 0, management = 0;
   const connections = new Set<() => void>(), retainedCloseStops = new Map<() => void, () => void>(), servers: Server[] = [], scheduler = new Scheduler();
   const residentCommands = new Set<() => void>();
   const privateProfileWork = new Set<Promise<void>>();
