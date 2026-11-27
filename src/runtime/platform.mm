@@ -4467,6 +4467,77 @@ struct HistoricalBrowserPackage {
   }
 };
 
+// Signed production Build 3f rejected both profile-owner destinations in
+// SpawnCopies before posix_spawn. This applies only to that product and its
+// cancelled transferring claim. It does not supply a new data-writer receipt.
+struct FailedBuild3fStartup {
+  arbol_exit::NativeFile descriptor;
+  HistoricalBrowserPackage package;
+  arbol_attempt::MaintenanceDirectory evidence;
+  arbol_attempt::MaintenanceFile ledgers[3];
+  arbol_boundary::Context context;
+  arbol_boundary::OriginalExit starterExit, bootstrapExit;
+  arbol_boundary::Identity starter{}, bootstrap{};
+
+  bool capture(NSDictionary* attempt, NSString* state, NSString* history, ExitInspection& job) {
+    using namespace arbol_attempt;
+    if(![attempt[@"build"] isEqual:@"3f"]||
+       ![attempt[@"productDigest"] isEqual:@"835944ae8fc1e9b83c8203458a8e6146e21a2681dcbaf845cce12a845eb0b8d4"]||
+       ![attempt[@"phase"] isEqual:@"cancelled"]||![attempt[@"stage"] isEqual:@"transferring"]||
+       attempt[@"terminal"]!=NSNull.null||[attempt[@"expires"] doubleValue]>arbol_boundary::clockMs()) return false;
+    NSDictionary* engine=attempt[@"engine"],*originalBootstrap=attempt[@"bootstrap"],*originalStarter=attempt[@"starter"];
+    NSDictionary* starting=attempt[@"runtime"];
+    PackagedLayout layout;
+    if(!claimedLayout(attempt,layout)||!layout.installed||!process(engine)||!process(originalBootstrap)||!process(originalStarter)||
+       ![engine[@"executable"] isEqual:[NSString stringWithUTF8String:layout.engine.c_str()]]||
+       ![originalBootstrap[@"executable"] isEqual:[NSString stringWithUTF8String:layout.bootstrap.c_str()]]||
+       ![originalStarter[@"executable"] isEqual:engine[@"executable"]]||
+       ![engine[@"pid"] isEqual:originalBootstrap[@"pid"]]||![engine[@"startId"] isEqual:originalBootstrap[@"startId"]]||
+       !runtime(starting,attempt)||![starting[@"phase"] isEqual:@"starting"]||
+       ![starting[@"pid"] isEqual:engine[@"pid"]]||![starting[@"processStartId"] isEqual:engine[@"startId"]]) return false;
+
+    struct stat held{};
+    descriptor.fd=open(layout.guard.c_str(),O_RDWR|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
+    if(descriptor.fd<0||fstat(descriptor.fd,&held)||flock(descriptor.fd,LOCK_SH|LOCK_NB)) return false;
+    context.build={descriptor.fd,layout.guard,(uint64_t)held.st_dev,held.st_ino,held.st_uid,0600,LOCK_SH};
+    if(!arbol_boundary::lockIdentity(context.build)||!package.capture(layout,attempt,state,job.deadline)) return false;
+    auto identity=[](NSDictionary* value) -> arbol_boundary::Identity {
+      return {[value[@"pid"] intValue],std::stoull([value[@"startId"] UTF8String]),[value[@"pidVersion"] intValue],
+        [value[@"uid"] unsignedIntValue],[value[@"group"] unsignedIntValue]};
+    };
+    starter=identity(originalStarter); bootstrap=identity(originalBootstrap); context.main=identity(engine);
+    context.owner=job.owner; context.session=[engine[@"session"] intValue]; context.bundle=layout.bundle; context.authenticated=true;
+    const std::string entry=std::string(history.fileSystemRepresentation)+"/"+[attempt[@"request"] UTF8String];
+    if(!evidence.openPath(entry)) return false;
+    std::string capability;
+    NSArray<NSString*>* names=@[@"family-main.log",@"family-primary.log",@"family-custody.log"];
+    for(unsigned role=0;role<3;++role) {
+      auto& file=ledgers[role];
+      arbol_exit::LedgerHeader header{},expected{};
+      if(!file.openPath(entry+"/"+names[role].UTF8String,0600,sizeof(header),true)||file.content.size()!=sizeof(header)) return false;
+      memcpy(&header,file.content.data(),sizeof(header));
+      if(memcmp(header.magic,expected.magic,sizeof(header.magic))||header.format!=expected.format||header.role!=role||
+         memcmp(header.reserved,expected.reserved,sizeof(header.reserved))||header.capabilityDigest[64]||header.nonce[64]||
+         !pattern([NSString stringWithUTF8String:header.capabilityDigest],@"^[0-9a-f]{64}$")||
+         !pattern([NSString stringWithUTF8String:header.nonce],@"^[0-9a-f]{64}$")) return false;
+      if(role==0) capability=header.capabilityDigest;
+      else if(capability!=header.capabilityDigest) return false;
+    }
+    while(job.within()) {
+      if(current(job)) return true;
+      if(context.familyUncertain) break;
+      usleep(5000);
+    }
+    return false;
+  }
+
+  bool current(ExitInspection& job) {
+    if(!job.within()||!arbol_boundary::lockIdentity(context.build)||!package.current()||!evidence.current()) return false;
+    for(const auto& ledger:ledgers) if(!ledger.current()) return false;
+    return starterExit.absent(starter)&&bootstrapExit.absent(bootstrap)&&context.engineGone()&&job.within();
+  }
+};
+
 static bool inspectSharedFamilyExit(ExitInspection& job) {
   using namespace arbol_attempt;
   NSDictionary* input=job.input;
@@ -4785,7 +4856,13 @@ static bool inspectExit(ExitInspection& job) {
   bool unclaimed=current&&[current[@"stage"] isEqual:@"untransferred"]&&current[@"bootstrap"]==NSNull.null&&
     current[@"engine"]==NSNull.null&&current[@"runtime"]==NSNull.null&&current[@"terminal"]==NSNull.null&&
     ([current[@"phase"] isEqual:@"cancelled"]||([current[@"phase"] isEqual:@"pending"]&&[current[@"expires"] doubleValue]<=arbol_boundary::clockMs()));
-  if(current&&![current[@"phase"] isEqual:@"closed"]&&!(unclaimed&&(reserve||[current[@"phase"] isEqual:@"cancelled"]))) {
+  std::unique_ptr<FailedBuild3fStartup> preSpawn;
+  if(closed&&!historyMissing&&!migration&&(reserve||[input[@"mode"] isEqual:@"full"])&&
+     [current[@"build"] isEqual:@"3f"]&&[current[@"stage"] isEqual:@"transferring"]) {
+    auto candidate=std::make_unique<FailedBuild3fStartup>();
+    if(candidate->capture(current,state,historyPath,job)) preSpawn=std::move(candidate);
+  }
+  if(current&&![current[@"phase"] isEqual:@"closed"]&&!preSpawn&&!(unclaimed&&(reserve||[current[@"phase"] isEqual:@"cancelled"]))) {
     bool host=(prior||hostMode)&&[current[@"phase"] isEqual:@"claimed"]&&currentProcess(current[@"engine"],true)&&
       [current[@"expires"] doubleValue]>arbol_boundary::clockMs()&&
       [current[@"stage"] isEqual:prior?@"untransferred":@"retained"];
@@ -5016,7 +5093,8 @@ static bool inspectExit(ExitInspection& job) {
         bool prefix=unused&&runtime(previous,closed)&&[previous[@"phase"] isEqual:@"starting"]&&
           [previous[@"pid"] isEqual:unusedReceipt[@"actor"][@"pid"]]&&
           [previous[@"processStartId"] isEqual:unusedReceipt[@"actor"][@"startId"]];
-        if(!latest&&!writer&&!prefix&&!sharedRuntime(previous)) return false;
+        bool abandoned=preSpawn&&[previous isEqual:current[@"runtime"]];
+        if(!latest&&!writer&&!prefix&&!abandoned&&!sharedRuntime(previous)) return false;
       }
     if(!data&&!prior&&!shared) {
       arbol_exit::NativeFile root; root.fd=open(profile.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
@@ -5034,7 +5112,7 @@ static bool inspectExit(ExitInspection& job) {
       if(!exitReceiptAt(closed[@"terminal"][@"path"],raw,checked,identity)||
          ![digest(raw) isEqual:closed[@"terminal"][@"digest"]]||![checked isEqual:unusedReceipt]) return false;
     }
-    return job.within()&&(!shared||currentSharedPredecessor(job,historyPath));
+    return job.within()&&(!preSpawn||preSpawn->current(job))&&(!shared||currentSharedPredecessor(job,historyPath));
   };
   if(!verify()||!physical()||(!runtimeMissing&&!unchanged(claim.at))||!reclaim()) return false;
   reverify=[&] { return verify()&&physical()&&(!runtimeMissing?unchanged(claim.at):missingRuntime.current()); };
@@ -5064,6 +5142,16 @@ static bool inspectExit(ExitInspection& job) {
        job.nextBuild.path!=std::string([next[@"buildGuard"] UTF8String])||
        !verifiedSignature(nextLayout,next)||
        (current&&[current[@"request"] isEqual:next[@"request"]])||historyMissing||!preserveSharedFamily()) return false;
+    if(preSpawn) {
+      std::string runtimeRaw; bool runtimeAbsent;
+      if(!readAt(claim.at.directory,"runtime.json",runtimeRaw,runtimeAbsent)||
+         !retainImmutableExitRecord(preSpawn->evidence,"abandoned-claim.json",currentRaw,job.deadline)||!preSpawn->current(job)) return false;
+      // An interruption here still leaves the same provably unused Claim.
+      // Remove only its exact transient starting record, never a later shared
+      // runtime or either profile storage directory.
+      if(!runtimeAbsent&&[json(runtimeRaw) isEqual:current[@"runtime"]]&&
+         (unlinkat(claim.at.directory,"runtime.json",0)||fsync(claim.at.directory)||!unchanged(claim.at))) return false;
+    }
     // Persist predecessor first, newest immutable reservation second, and only
     // then install pending atomically. Interrupted publication fails closed:
     // a missing/mismatched newest claim cannot fall back to an older witness.
