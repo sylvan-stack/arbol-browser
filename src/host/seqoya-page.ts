@@ -15,7 +15,9 @@ const active = new WeakSet<BaseWindow>();
 const redirect = (provider: SeqoyaProvider, target: URL, address: string): boolean => {
   try {
     const url = new URL(address);
-    return url.origin === target.origin && !url.username && !url.password && !url.search && !url.hash &&
+    const chatgptOverview = (provider === 'codex/chatgpt' || provider === 'pi/chatgpt') &&
+      url.search === '?tab=overview';
+    return url.origin === target.origin && !url.username && !url.password && (!url.search || chatgptOverview) && !url.hash &&
       (url.pathname === target.pathname || url.pathname === target.pathname + '/' ||
        (provider === 'claude/anthropic' && url.pathname === '/new'));
   } catch {
@@ -79,7 +81,14 @@ export async function readSeqoyaPage<T>(
     contents.on('will-navigate', event => limitNavigation(event, event.url, true));
     contents.on('will-frame-navigate', event => limitNavigation(event, event.url, event.isMainFrame));
     contents.on('will-redirect', (event, address, _, main) => limitNavigation(event, address, main));
-    contents.on('did-start-navigation', event => { if (event.isMainFrame) navigation++; });
+    contents.on('did-start-navigation', event => {
+      if (event.isMainFrame && (!event.isSameDocument || !redirect(provider, target, event.url))) navigation++;
+    });
+    contents.on('did-navigate-in-page', (_, address, main) => {
+      if (main && !redirect(provider, target, address)) {
+        refuse(new SeqoyaPageRefusal('authentication_required'));
+      }
+    });
     contents.on('will-prevent-unload', event => event.preventDefault());
     contents.once('render-process-gone', unavailable);
     contents.once('destroyed', unavailable);

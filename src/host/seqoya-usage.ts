@@ -30,19 +30,34 @@ export interface SeqoyaUsage {
 function extractUsage(provider: SeqoyaProvider, observedAt: string): SeqoyaUsage | null {
   const when = Date.parse(observedAt);
   const dialog = provider === 'claude/anthropic';
+  const chatgpt = provider === 'codex/chatgpt' || provider === 'pi/chatgpt';
   const roots = [...document.querySelectorAll<HTMLElement>(dialog ? '[role="dialog"]' : 'main')];
   const shown = (node: HTMLElement) => {
     const style = getComputedStyle(node);
     return node.getClientRects().length > 0 && style.visibility === 'visible' && style.display !== 'none';
   };
+  const text = (node: HTMLElement) => node.innerText.trim().replace(/\s+/g, ' ');
+  const labels = 'h1,h2,h3,h4,h5,dt,label,span,p,div,strong,button';
+  const visibleLeaves = (scope: HTMLElement) => [...scope.querySelectorAll<HTMLElement>(labels)]
+    .slice(0, 12_000).filter(node => node.childElementCount === 0 && shown(node));
+  const overview = () => {
+    const headings = [...document.querySelectorAll<HTMLElement>('h1,h2,h3,h4,h5,h6,[role="heading"]')]
+      .slice(0, 256).filter(node => shown(node) && text(node) === 'Usage');
+    if (headings.length !== 1) return undefined;
+    let scope = headings[0]?.parentElement;
+    for (let depth = 0; scope && scope !== document.body && depth < 8; depth++, scope = scope.parentElement) {
+      const names = new Set(visibleLeaves(scope).map(text));
+      if (names.has('Plan limits') && (names.has('ChatGPT Plus') || names.has('ChatGPT Pro') || names.has('ChatGPT Pro 200')))
+        return scope;
+    }
+    return undefined;
+  };
   const scopes = roots.filter(shown);
-  if (scopes.length !== 1 || !scopes[0]) return null;
-  const root = scopes[0];
+  const root = (chatgpt ? overview() : undefined) ?? (scopes.length === 1 ? scopes[0] : undefined);
+  if (!root) return null;
   if (root.querySelector('input[type="password"],input[autocomplete="one-time-code"]')) return null;
   const result: SeqoyaUsage = { observedAt, windows: [] };
-  const leaves = [...root.querySelectorAll<HTMLElement>('h1,h2,h3,h4,h5,dt,label,span,p,div,strong,button')]
-    .slice(0, 12_000).filter(node => node.childElementCount === 0 && shown(node));
-  const text = (node: HTMLElement) => node.innerText.trim().replace(/\s+/g, ' ');
+  const leaves = visibleLeaves(root);
   const contains = (value: string) => leaves.some(node => text(node) === value);
   const around = <T>(label: string, parse: (lines: string[]) => T | undefined, region = root): T | undefined => {
     for (const anchor of leaves) {
@@ -52,9 +67,14 @@ function extractUsage(provider: SeqoyaProvider, observedAt: string): SeqoyaUsage
         const value = block.innerText;
         if (value.length > 4096) break;
         const lines = value.split('\n').map(line => line.trim().replace(/\s+/g, ' ')).filter(Boolean);
-        const start = lines.indexOf(label);
-        if (start < 0 || lines.lastIndexOf(label) !== start) continue;
-        const parsed = parse(lines.slice(start + 1));
+        const afterLabel = (items: string[]) => {
+          const start = items.indexOf(label);
+          return start >= 0 && items.lastIndexOf(label) === start ? parse(items.slice(start + 1)) : undefined;
+        };
+        // Inline quota labels may have separate visible elements without
+        // line breaks in the surrounding card's innerText.
+        const parsed = afterLabel(lines) ?? (chatgpt
+          ? afterLabel(leaves.filter(node => block?.contains(node)).map(text)) : undefined);
         if (parsed !== undefined) return parsed;
       }
     }
@@ -123,9 +143,9 @@ function extractUsage(provider: SeqoyaProvider, observedAt: string): SeqoyaUsage
       result.plan = plus ? 'plus' : pro200 && provider === 'codex/chatgpt' ? 'pro-200' : 'pro';
       for (const [minutes, label] of [[300, '5-hour limit'], [10080, 'Weekly limit']] as const) {
         const reading = around(label, rows => {
-          const reset = countdown(rows[0]);
-          const left = percentage(rows[1], ' left');
-          return reset && left !== undefined ? { reset, left } : undefined;
+          const resets = rows.map(countdown).filter((value): value is string => value !== undefined);
+          const remaining = rows.map(line => percentage(line, ' left')).filter((value): value is number => value !== undefined);
+          return resets.length === 1 && remaining.length === 1 ? { reset: resets[0], left: remaining[0]! } : undefined;
         });
         if (reading) addWindow(minutes, 100 - reading.left, reading.reset);
       }
