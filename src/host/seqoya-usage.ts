@@ -59,13 +59,22 @@ function extractUsage(provider: SeqoyaProvider, observedAt: string): SeqoyaUsage
   const result: SeqoyaUsage = { observedAt, windows: [] };
   const leaves = visibleLeaves(root);
   const contains = (value: string) => leaves.some(node => text(node) === value);
-  const around = <T>(label: string, parse: (lines: string[]) => T | undefined, region = root): T | undefined => {
+  const around = <T>(
+    label: string,
+    parse: (lines: string[]) => T | undefined,
+    region = root,
+    cardBoundaries?: ReadonlySet<string>,
+  ): T | undefined => {
     for (const anchor of leaves) {
       if (!region.contains(anchor) || text(anchor) !== label) continue;
       let block: HTMLElement | null = anchor.parentElement;
       for (let depth = 0; block && region.contains(block) && block !== root && depth < 5; depth++, block = block.parentElement) {
         const value = block.innerText;
         if (value.length > 4096) break;
+        const scope = block;
+        const blockLeaves = chatgpt ? leaves.filter(node => scope.contains(node)) : [];
+        // A common wrapper can merge another card's heading into an innerText line.
+        if (cardBoundaries && blockLeaves.some(node => node !== anchor && cardBoundaries.has(text(node)))) break;
         const lines = value.split('\n').map(line => line.trim().replace(/\s+/g, ' ')).filter(Boolean);
         const afterLabel = (items: string[]) => {
           const start = items.indexOf(label);
@@ -73,8 +82,7 @@ function extractUsage(provider: SeqoyaProvider, observedAt: string): SeqoyaUsage
         };
         // Inline quota labels may have separate visible elements without
         // line breaks in the surrounding card's innerText.
-        const parsed = afterLabel(lines) ?? (chatgpt
-          ? afterLabel(leaves.filter(node => block?.contains(node)).map(text)) : undefined);
+        const parsed = afterLabel(lines) ?? (chatgpt ? afterLabel(blockLeaves.map(text)) : undefined);
         if (parsed !== undefined) return parsed;
       }
     }
@@ -141,6 +149,7 @@ function extractUsage(provider: SeqoyaProvider, observedAt: string): SeqoyaUsage
       const pro = pro200 || contains('ChatGPT Pro');
       if (plus === pro) return null;
       result.plan = plus ? 'plus' : pro200 && provider === 'codex/chatgpt' ? 'pro-200' : 'pro';
+      const cardBoundaries = new Set(['5-hour limit', 'Weekly limit', 'Usage limit resets', 'Credits', 'Connected App Limits']);
       for (const [minutes, label] of [[300, '5-hour limit'], [10080, 'Weekly limit']] as const) {
         const reading = around(label, rows => {
           const nextSection = rows.findIndex(row =>
@@ -149,7 +158,7 @@ function extractUsage(provider: SeqoyaProvider, observedAt: string): SeqoyaUsage
           const resets = card.map(countdown).filter((value): value is string => value !== undefined);
           const remaining = card.map(line => percentage(line, ' left')).filter((value): value is number => value !== undefined);
           return resets.length === 1 && remaining.length === 1 ? { reset: resets[0], left: remaining[0]! } : undefined;
-        });
+        }, root, cardBoundaries);
         if (reading) addWindow(minutes, 100 - reading.left, reading.reset);
       }
       if (provider === 'pi/chatgpt') {
