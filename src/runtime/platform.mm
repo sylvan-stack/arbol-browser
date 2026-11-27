@@ -2274,8 +2274,10 @@ static napi_value watchdogBind(napi_env env,napi_callback_info info) {
     for(unsigned i=0;i<2;++i) {
       char hello[arbol_exit::ownerPacketLimit];
       const auto expected=arbol_exit::ownerChannelHello(peers[i]);
+      const auto older=arbol_exit::ownerChannelHello(peers[i],1);
       const ssize_t count=recv(c->profileChannels[i].fd,hello,sizeof(hello),MSG_DONTWAIT);
-      if(count<0&&(errno==EAGAIN||errno==EWOULDBLOCK)) sharedProfiles=false;
+      if((count<0&&(errno==EAGAIN||errno==EWOULDBLOCK))||
+         (count==(ssize_t)older.size()&&!memcmp(hello,older.data(),older.size()))) sharedProfiles=false;
       else if(count!=(ssize_t)expected.size()||memcmp(hello,expected.data(),expected.size())) return fail(env);
     }
     // Older installed supervisor Builds send neither introduction. They can
@@ -2695,6 +2697,8 @@ static napi_value retainSharedProfileOwner(napi_env env,napi_callback_info info)
     if(!arbol_exit::validateAdditionalOwner(primary,packet,retained.fd,exact)||exact.lock.path!=lock.path||
        (exact.lock.inode==c->context.owner.inode&&exact.lock.device==c->context.owner.device)||
        !arbol_exit::retainAdditionalOwner(c->additionalOwners,std::move(exact))) return fail(env);
+    auto* receipt=&c->additionalOwners.at(id);
+    const auto& expected=receipt->acknowledgement;
     // Retain in the main process before transferring to either peer. The two
     // acknowledgements have no admission or release effect on their own.
     retained.fd=-1;
@@ -2711,15 +2715,16 @@ static napi_value retainSharedProfileOwner(napi_env env,napi_callback_info info)
       if(ready<=0) terminateCustody(c);
       for(auto& channel:channels) if(channel.revents) {
         char ack[arbol_exit::ownerPacketLimit];
-        if(channel.revents!=POLLIN||recv(channel.fd,ack,sizeof(ack),MSG_DONTWAIT)!=(ssize_t)packet.size()||
-           memcmp(ack,packet.data(),packet.size())) terminateCustody(c);
+        if(channel.revents!=POLLIN||recv(channel.fd,ack,sizeof(ack),MSG_DONTWAIT)!=(ssize_t)expected.size()||
+           memcmp(ack,expected.data(),expected.size())) terminateCustody(c);
         channel.fd=-1; --remaining;
       }
     }
-    if(arbol_boundary::clockMs()>=deadline||!arbol_boundary::lockIdentity(lock)||
+    arbol_exit::AdditionalOwner checked;
+    if(arbol_boundary::clockMs()>=deadline||!arbol_exit::validateAdditionalOwner(primary,packet,lock.fd,checked)||
+       checked.acknowledgement!=expected||arbol_boundary::clockMs()>=deadline||
        !c->finalization.ready(c->context)||state->fatal.load(std::memory_order_acquire)||
        state->closeReceivedUs.load(std::memory_order_acquire)) terminateCustody(c);
-    auto* receipt=&c->additionalOwners.at(id);
     napi_value out;
     if(!sharedOwnerReceipts.emplace(receipt,c).second||
        napi_create_external(env,receipt,nullptr,nullptr,&out)!=napi_ok)
@@ -2739,7 +2744,7 @@ static napi_value assertSharedProfileOwner(napi_env env,napi_callback_info info)
     arbol_exit::AdditionalOwner checked;
     if(!custody->finalization.ready(custody->context)||state->fatal.load(std::memory_order_acquire)||
        !arbol_exit::validateAdditionalOwner(custody->finalization.value()[@"attempt"][@"profile"],
-         receipt->packet,receipt->lock.fd,checked)) return fail(env);
+         receipt->packet,receipt->lock.fd,checked)||checked.acknowledgement!=receipt->acknowledgement) return fail(env);
   } @catch(NSException*) { return fail(env); } }
   napi_value out; napi_get_undefined(env,&out); return out;
 }

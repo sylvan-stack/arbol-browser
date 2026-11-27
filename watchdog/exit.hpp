@@ -782,8 +782,8 @@ inline bool ownerChannel(int fd) {
   return fd>=0&&!getsockopt(fd,SOL_SOCKET,SO_TYPE,&type,&size)&&type==SOCK_DGRAM&&
     !getpeername(fd,(struct sockaddr*)&peer,&peerSize)&&peer.ss_family==AF_UNIX;
 }
-inline std::string ownerChannelHello(const Identity& monitor) {
-  return "OWNER 1 "+std::to_string(monitor.pid)+" "+std::to_string(monitor.start);
+inline std::string ownerChannelHello(const Identity& monitor,unsigned version=2) {
+  return "OWNER "+std::to_string(version)+" "+std::to_string(monitor.pid)+" "+std::to_string(monitor.start);
 }
 inline bool announceOwnerChannel(int fd,const Identity& monitor) {
   const auto hello=ownerChannelHello(monitor);
@@ -806,8 +806,18 @@ inline bool sendAdditionalOwner(int channel,int owner,const std::string& packet)
 
 struct AdditionalOwner {
   arbol_boundary::Lock lock;
-  std::string id, packet;
+  std::string id, packet, acknowledgement;
 };
+
+inline bool additionalStorageDirectory(int parent,const char* name,dev_t device,struct stat& stored) {
+  NativeFile directory;
+  directory.fd=openat(parent,name,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+  struct stat named{};
+  return directory.fd>=0&&!fstat(directory.fd,&stored)&&S_ISDIR(stored.st_mode)&&
+    stored.st_dev==device&&stored.st_uid==geteuid()&&(stored.st_mode&07777)==0700&&
+    !fstatat(parent,name,&named,AT_SYMLINK_NOFOLLOW)&&stored.st_dev==named.st_dev&&stored.st_ino==named.st_ino&&
+    stored.st_uid==named.st_uid&&stored.st_mode==named.st_mode&&directory.finish();
+}
 
 // The originating profile is the state-root authority. Neither the packet
 // nor any numeric descriptor can choose a different directory tree.
@@ -820,24 +830,31 @@ inline bool validateAdditionalOwner(NSString* primary,const std::string& packet,
   if(![profiles.lastPathComponent isEqual:@"profiles"]||[value[@"id"] isEqual:primary.lastPathComponent]) return false;
   NSString* path=[profiles stringByAppendingPathComponent:value[@"id"]];
   NSString* ownerPath=[path stringByAppendingPathComponent:@"owner.lock"];
-  if(!arbol_boundary::canonical(path.fileSystemRepresentation)) return false;
+  if(!arbol_boundary::canonical(path.fileSystemRepresentation)||
+     !arbol_boundary::privateAncestors(ownerPath.fileSystemRepresentation)) return false;
   NativeFile root;
   root.fd=open(path.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
-  struct stat original{},named{},owner{},ownerNamed{},record{};
+  struct stat original{},named{},owner{},ownerNamed{},record{},data{},userData{};
   std::string profileRaw;
   if(root.fd<0||fstat(root.fd,&original)||!S_ISDIR(original.st_mode)||original.st_uid!=geteuid()||
-     (original.st_mode&07777)!=0700||fstat(fd,&owner)||!arbol_attempt::privateFile(owner)||
+     (original.st_mode&07777)!=0700||fstat(fd,&owner)||!arbol_attempt::privateFile(owner)||owner.st_dev!=original.st_dev||
      fstatat(root.fd,"owner.lock",&ownerNamed,AT_SYMLINK_NOFOLLOW)||!arbol_attempt::sameFile(owner,ownerNamed)||
      ![value[@"device"] isEqual:[NSString stringWithUTF8String:std::to_string(owner.st_dev).c_str()]]||
      ![value[@"inode"] isEqual:[NSString stringWithUTF8String:std::to_string(owner.st_ino).c_str()]]||
      !readNativeFile(root.fd,"profile.json",profileRaw,record,arbol_attempt::limit)) return false;
   NSDictionary* profile=strictManagementObject(profileRaw);
-  if(!arbol_attempt::keys(profile,@[@"format",@"id",@"instance",@"creationRequest",@"createdAt"])||
+  if(!arbol_attempt::keys(profile,@[@"format",@"id",@"instance",@"creationRequest",@"createdAt"])||record.st_dev!=original.st_dev||
      ![profile[@"format"] isEqual:@(arbol_attempt::profileFormat)]||![profile[@"id"] isEqual:value[@"id"]]||
-     ![profile[@"instance"] isEqual:value[@"instance"]]||lstat(path.fileSystemRepresentation,&named)||
-     !arbol_attempt::sameFile(original,named)||!root.finish()) return false;
+     ![profile[@"instance"] isEqual:value[@"instance"]]||
+     !additionalStorageDirectory(root.fd,"data",original.st_dev,data)||
+     !additionalStorageDirectory(root.fd,"userData",original.st_dev,userData)||lstat(path.fileSystemRepresentation,&named)||
+     !sameStorageNode(original,named)||!root.finish()) return false;
+  const auto metadata=arbol_attempt::bytes(@{@"profile":path,@"request":value,@"root":fileIdentity(original),
+    @"record":fileIdentity(record),@"recordDigest":arbol_attempt::digest(profileRaw),
+    @"data":fileIdentity(data),@"userData":fileIdentity(userData)});
+  if(metadata.empty()) return false;
   result={{fd,ownerPath.fileSystemRepresentation,(uint64_t)owner.st_dev,owner.st_ino,owner.st_uid,0600,LOCK_EX},
-    [value[@"id"] UTF8String],packet};
+    [value[@"id"] UTF8String],packet,[arbol_attempt::digest(metadata) UTF8String]};
   return arbol_boundary::lockIdentity(result.lock);
 }
 
@@ -875,12 +892,13 @@ inline bool receiveAdditionalOwner(int channel,NSString* primary,std::map<std::s
   }
   if(!complete||received.fd<0||fcntl(received.fd,F_SETFD,FD_CLOEXEC)) return false;
   AdditionalOwner owner;
-  if(!validateAdditionalOwner(primary,std::string(packet,count),received.fd,owner)||
-     !retainAdditionalOwner(retained,std::move(owner))) return false;
+  if(!validateAdditionalOwner(primary,std::string(packet,count),received.fd,owner)) return false;
+  const auto acknowledgement=owner.acknowledgement;
+  if(!retainAdditionalOwner(retained,std::move(owner))) return false;
   // The same actual description stays open until this monitor exits, even
   // if publishing the acknowledgement fails or the original main dies.
   received.fd=-1;
-  return send(channel,packet,count,MSG_DONTWAIT)==count;
+  return send(channel,acknowledgement.data(),acknowledgement.size(),MSG_DONTWAIT)==(ssize_t)acknowledgement.size();
 }
 inline bool writeNativeFile(int directory,const std::string& temporary,const std::string& raw,double deadline,NativeFile& file) {
   if(raw.empty()||raw.size()>exitReceiptLimit||arbol_boundary::clockMs()>=deadline) return false;
