@@ -143,6 +143,7 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
     // Pre-arm reads outside-profile proof only; marker inspection is explicitly
     // behind the actual native enrolled host capability in the separate mode.
     const actualMode = mode === 'prior' && current?.stage === 'retained' ? 'host' : mode;
+    const reuseProfileProof = actualMode === 'full' || actualMode === 'retire';
     let candidate: LaunchAttempt | undefined, dataAttempt: LaunchAttempt | undefined;
     if (mode === 'withdraw') candidate = current;
     else if (current?.phase === 'closed') candidate = closedCandidate(current, profile, location.hash);
@@ -165,7 +166,7 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
     const payload = resolve(fileURLToPath(new URL('../../', import.meta.url)));
     if (mode !== 'withdraw') {
       let receiptHost = startingHost;
-      if (!receiptHost && listingHost && actualMode === 'full') {
+      if (!receiptHost && listingHost && reuseProfileProof) {
         const manifestURL = new URL('../native/manifest.js', import.meta.url).href;
         const { assertRetainedReadOnlyStorage } = await import(manifestURL) as typeof import('../native/manifest.js');
         if (assertRetainedReadOnlyStorage(listingHost.signed, deadline)) {
@@ -244,7 +245,7 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
       const matchesAttempt = (host: VerifiedHost) => host.policy.stateRoot === profile.paths.state &&
         host.signed.snapshotDigest === attempt.candidateDigest && host.identity.sourceDigest === attempt.sourceDigest &&
         host.identity.productDigest === attempt.productDigest;
-      let host = actualMode === 'full' ? listingBuilds?.get(oldSelection.directory) : undefined;
+      let host = reuseProfileProof ? listingBuilds?.get(oldSelection.directory) : undefined;
       const verifyListingBuild = async (verified: VerifiedHost) => {
         assertVerifiedHostMetadata(verified, deadline);
         if (!matchesAttempt(verified) || verified.identity.layout.build !== oldSelection.build ||
@@ -284,12 +285,13 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
         if (!startingHost || layout.scope !== 'installed' || !await statOrAbsent(layout.bundle)) throw unavailable('profile');
       } else if (!host) {
         if (attempt.phase === 'closed') await mountRetainedImage(layout, build, platform, deadline);
-        const startup = layout.scope === 'installed' && (actualMode === 'reserve' || actualMode === 'prior');
+        const startup = layout.scope === 'installed' &&
+          (actualMode === 'reserve' || actualMode === 'prior' || (listingBuilds !== undefined && reuseProfileProof));
         host = startup
           ? await verifyPackagedOpenHost(oldSelection, layout.payload, deadline)
           : await verifyPackagedHost(oldSelection, layout.payload, deadline);
         if (!matchesAttempt(host)) throw unavailable('profile');
-        if (listingBuilds && actualMode === 'full' && layout.scope === 'installed') {
+        if (listingBuilds && reuseProfileProof && layout.scope === 'installed') {
           await verifyListingBuild(host);
           if (listingBuilds.size < 16) listingBuilds.set(oldSelection.directory, host);
         } else if (startup) await assertHostStartupSnapshot(host, deadline);
