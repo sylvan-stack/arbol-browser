@@ -802,8 +802,7 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
                 if (state.controller.kind !== 'user' || state.handoff !== 'idle' || state.pageAvailability !== 'ready')
                   throw refused('control_refused');
               };
-              await registration.show(deadline, signal, true, guard);
-              registration.foreground(ready, guard);
+              await registration.foreground(ready, deadline, signal, guard);
               void registration.rememberSubscriptionHome(destination).catch(() => {});
               presented = true;
             }

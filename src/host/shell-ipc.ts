@@ -32,7 +32,7 @@ export interface ShellRegistration {
   offerPresentation(): void;
   offerForegroundPresentation(deadline: number, mayShowEmpty: () => boolean): Promise<void>;
   show(deadline: number, signal: AbortSignal, raiseWindow?: boolean, guard?: () => void): Promise<void>;
-  foreground(target: TabTarget, guard: () => void): void;
+  foreground(target: TabTarget, deadline: number, signal: AbortSignal, guard: () => void): Promise<void>;
   subscriptionHome(): Promise<string | undefined>;
   rememberSubscriptionHome(url: string): Promise<void>;
   publish(): void;
@@ -320,21 +320,26 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
         break;
       }
     },
-    foreground(target: TabTarget, guard: () => void) {
+    async foreground(target: TabTarget, deadline: number, signal: AbortSignal, guard: () => void) {
       assertPresentable();
       if (!nativePresentation || !runtimeReady() || host.window.isDestroyed() ||
-          !host.window.isEnabled() || !host.window.isVisible() || host.window.isMinimized()) throw unavailable('browser');
+          !host.window.isEnabled()) throw unavailable('browser');
       const member = nativePresentation.profiles.get(host);
       if (!member?.ready() || !member.canYield(true)) throw unavailable('profile');
+      const source = [...nativePresentation.profiles].find(([member]) => member.isActiveProfile());
+      if (!source?.[1].ready() || !source[1].canYield(true)) throw unavailable('profile');
       guard();
-      if (!host.isActiveProfile()) {
-        const source = [...nativePresentation.profiles].find(([member]) => member.isActiveProfile());
-        if (!source?.[1].ready() || !source[1].canYield(true)) throw unavailable('profile');
-        selectWindowProfile(source[0], host);
-      }
-      if (!host.isActiveProfile()) throw unavailable('profile');
+      // Prepare the admitted selection in the target scope before revealing it.
       if (tabs.selected(host) !== target) tabs.select(host, target.id);
-      guard();
+      if (source[0] !== host) selectWindowProfile(source[0], host);
+      const assertSelected = () => {
+        guard();
+        if (!host.isActiveProfile() || tabs.selected(host) !== target || !member.ready() || !member.canYield(true))
+          throw unavailable('profile');
+      };
+      await registration.show(deadline, signal, false, assertSelected);
+      assertSelected();
+      if (!host.window.isVisible() || host.window.isMinimized()) throw unavailable('browser');
       app.focus({ steal: true });
       host.window.focus();
     },
