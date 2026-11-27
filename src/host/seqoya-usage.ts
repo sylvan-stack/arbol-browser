@@ -265,7 +265,7 @@ function extractUsage(provider: SeqoyaProvider, observedAt: string): SeqoyaUsage
       break;
     }
     case 'pi/minimax': {
-      if (contains('Not subscribed to M Plan')) return 'minimax-billing';
+      if (root.innerText.split('\n').some(line => line.trim() === 'Not subscribed to M Plan')) return 'minimax-billing';
       const activePlan = contains('Plan Details');
       if (!activePlan) return null;
       const credits = around('Credits', rows => amount(rows[rows.indexOf('credits') - 1]));
@@ -296,16 +296,20 @@ function extractUsage(provider: SeqoyaProvider, observedAt: string): SeqoyaUsage
 }
 
 function extractMiniMaxBilling(observedAt: string): SeqoyaUsage | null {
-  const main = document.querySelector('main');
-  if (!main || main.querySelector('input[type="password"],input[autocomplete="one-time-code"]')) return null;
+  const visible = (node: HTMLElement) => node.getClientRects().length > 0
+    && getComputedStyle(node).visibility === 'visible';
+  const mains = [...document.querySelectorAll('main')].filter(visible);
+  const main = mains[0];
+  if (mains.length !== 1 || !main || main.querySelector('input[type="password"],input[autocomplete="one-time-code"]')) return null;
   const named = (node: HTMLElement, label: string) => {
     if (node.getAttribute('aria-label') === label) return true;
     const reference = node.getAttribute('aria-labelledby');
     return !!reference && document.getElementById(reference)?.textContent?.trim() === label;
   };
-  const breakdown = [...main.querySelectorAll<HTMLElement>('[aria-label],[aria-labelledby]')]
-    .find(node => named(node, 'Balance breakdown'));
-  if (!breakdown) return null;
+  const breakdowns = [...main.querySelectorAll<HTMLElement>('[aria-label],[aria-labelledby]')]
+    .filter(node => visible(node) && named(node, 'Balance breakdown'));
+  const breakdown = breakdowns[0];
+  if (breakdowns.length !== 1 || !breakdown) return null;
   const lines = breakdown.innerText.split('\n').map(line => line.trim()).filter(Boolean);
   const cash = lines.indexOf('Cash');
   const amount = (value: string | undefined) => {
@@ -315,22 +319,24 @@ function extractMiniMaxBilling(observedAt: string): SeqoyaUsage | null {
   const balance = amount(lines[cash + 1]);
   if (cash < 0 || cash !== lines.lastIndexOf('Cash') || !lines.includes('Available balance (USD)') || !balance) return null;
   const summary: NonNullable<SeqoyaUsage['minimaxApi']> = { balance };
-  const table = [...main.querySelectorAll('table')].find(node => named(node, 'Payment History'));
-  const headings = [...(table?.tHead?.rows[0]?.cells ?? [])].map(cell => cell.innerText.trim());
+  const tables = [...main.querySelectorAll('table')].filter(node => visible(node) && named(node, 'Payment History'));
+  const table = tables[0];
+  if (tables.length !== 1 || !table) return null;
+  const headings = [...(table.tHead?.rows[0]?.cells ?? [])].map(cell => cell.innerText.trim());
   const date = headings.indexOf('Date (UTC+0)');
   const status = headings.indexOf('Results');
-  if (date >= 0 && status === date + 2) {
-    for (const row of [...(table?.tBodies[0]?.rows ?? [])]) {
-      const paymentAt = row.cells[date]?.innerText.trim();
-      const paid = amount(row.cells[date + 1]?.innerText.trim());
-      if (row.cells[status]?.innerText.trim() !== 'Success' || !paid || Number(paid) <= 0
-        || !paymentAt || !/^20\d\d-\d\d-\d\d \d\d:\d\d:\d\d$/.test(paymentAt)) continue;
-      const stamp = Date.parse(paymentAt.replace(' ', 'T') + 'Z');
-      if (Number.isFinite(stamp) && stamp <= Date.parse(observedAt) &&
-        (summary.paymentAt === undefined || paymentAt > summary.paymentAt)) {
-        summary.paymentAt = paymentAt;
-        summary.paid = paid;
-      }
+  const charged = headings.indexOf('Amount (tax included)');
+  if (date < 0 || charged < 0 || status < 0) return null;
+  for (const row of [...(table.tBodies[0]?.rows ?? [])].filter(visible)) {
+    const paymentAt = row.cells[date]?.innerText.trim();
+    const paid = amount(row.cells[charged]?.innerText.trim());
+    if (row.cells[status]?.innerText.trim() !== 'Success' || !paid || Number(paid) <= 0
+      || !paymentAt || !/^20\d\d-\d\d-\d\d \d\d:\d\d:\d\d$/.test(paymentAt)) continue;
+    const stamp = Date.parse(paymentAt.replace(' ', 'T') + 'Z');
+    if (Number.isFinite(stamp) && stamp <= Date.parse(observedAt) &&
+      (summary.paymentAt === undefined || paymentAt > summary.paymentAt)) {
+      summary.paymentAt = paymentAt;
+      summary.paid = paid;
     }
   }
   return { observedAt, windows: [], minimaxApi: summary };
