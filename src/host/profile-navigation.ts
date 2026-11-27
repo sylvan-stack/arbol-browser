@@ -1,16 +1,18 @@
 import { join } from 'node:path';
+import { rename, rm } from 'node:fs/promises';
 import { setTimeout } from 'node:timers/promises';
 import { invalidInput, unavailable } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
 import { createProfile, managedProfiles } from '../profiles/create.js';
 import { registryLock } from '../profiles/locking.js';
 import { hasRetainedProfileLock } from '../profiles/manage.js';
-import { profileId, profilePaths, profileUnavailable, statOrAbsent } from '../profiles/paths.js';
-import { readJson, readProfile, type ProfileSnapshot } from '../profiles/records.js';
+import { profileId, profilePaths, profileUnavailable, statOrAbsent, syncDirectory } from '../profiles/paths.js';
+import { assertProfile, readJson, readProfile, writeNewFile, type ProfileSnapshot } from '../profiles/records.js';
 import { assertHostCustody, assertSharedProfileRuntime, type HostCustody, type SharedProfileRuntime } from '../runtime/custody.js';
 import { assertTime, now, originalAlive, readRuntime, recordProcess, runtimeLocation, startupDeadline, token } from '../runtime/instance.js';
 import type { PlatformPort } from '../runtime/platform.js';
 import { createLaunchTransactions } from '../runtime/process.js';
+import { seqoyaDestinations } from '../runtime/seqoya-wire.js';
 import { connectRuntime } from '../runtime/transport.js';
 
 export type ProfileNavigationRequest = { method: 'list' } |
@@ -29,6 +31,34 @@ export interface ProfileNavigationState {
 export type ProfileNavigation = (raw: unknown, assertCurrent: () => void, isFocused: () => boolean) => Promise<ProfileNavigationState>;
 const openResult = validator('wire.OpenResult');
 const instancePattern = /^prf_[A-Za-z0-9_-]{22}$/;
+const subscriptionHomes = new Set<string>(Object.values(seqoyaDestinations));
+
+export function isSubscriptionHome(url: unknown): url is string {
+  return typeof url === 'string' && subscriptionHomes.has(url);
+}
+
+export async function readSubscriptionHome(profile: ProfileSnapshot): Promise<string | undefined> {
+  const path = join(profile.paths.root, 'subscription-home.json');
+  if (!await statOrAbsent(path)) return undefined;
+  const { value } = await readJson(path, 2048);
+  const entry = value as { format?: unknown; instance?: unknown; url?: unknown } | null;
+  if (entry?.format === 1 && entry.instance === profile.record.instance && isSubscriptionHome(entry.url)) return entry.url;
+  return undefined;
+}
+
+export async function rememberSubscriptionHome(profile: ProfileSnapshot, url: string): Promise<void> {
+  if (!isSubscriptionHome(url)) throw invalidInput();
+  if (await readSubscriptionHome(profile) === url) return;
+  const path = join(profile.paths.root, 'subscription-home.json');
+  const temporary = join(profile.paths.root, '.' + token('req') + '.home');
+  await assertProfile(profile);
+  await writeNewFile(temporary, JSON.stringify({ format: 1, instance: profile.record.instance, url }) + '\n');
+  try {
+    await assertProfile(profile);
+    await rename(temporary, path);
+    await syncDirectory(profile.paths.root);
+  } finally { await rm(temporary, { force: true }); }
+}
 
 async function labels(state: string): Promise<Map<string, { instance: string; label: string }>> {
   const path = join(state, 'profile-labels.json');
@@ -64,13 +94,13 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
   const selection = { ...custody.build.selection, explicit: true };
   const attempts = createLaunchTransactions(custody.host, platform);
   let changing = false;
+  let catalogue: ProfileNavigationState | undefined;
 
   async function list(check: () => void): Promise<ProfileNavigationState> {
     check();
     const registry = await registryLock(state, platform);
     try {
-      const records = await managedProfiles(registry);
-      const names = await labels(state);
+      const [records, names] = await Promise.all([managedProfiles(registry), labels(state)]);
       if (!records.some(({ record }) => record.id === selected.record.id && record.instance === selected.record.instance))
         throw profileUnavailable();
       const profiles: ProfileNavigationEntry[] = [];
@@ -85,11 +115,13 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
       }
       await registry.assert();
       check();
-      return { current: selected.record.id, profiles };
+      return catalogue = { current: selected.record.id, profiles };
     } finally { registry.release(); }
   }
 
   async function open(id: string, instance: string, check: () => void, isFocused: () => boolean): Promise<void> {
+    check();
+    if (shared && selectLocal(id, instance)) return;
     const profile = await readProfile(profilePaths(id, state));
     if (profile.record.instance !== instance) throw profileUnavailable();
     check();
@@ -161,12 +193,11 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
       } else {
         const { instance } = request;
         if (typeof instance !== 'string' || !instancePattern.test(instance)) throw invalidInput();
-        const snapshot = await list(check);
+        const snapshot = catalogue ?? await list(check);
         if (!snapshot.profiles.some(profile => profile.id === id && profile.instance === instance && !profile.unavailable))
           throw profileUnavailable();
-        if ((await readProfile(selected.paths)).record.instance !== selected.record.instance) throw profileUnavailable();
-        check();
         if (id !== selected.record.id) await open(id, instance, check, isFocused);
+        return snapshot;
       }
       return await list(check);
     } finally { changing = false; }

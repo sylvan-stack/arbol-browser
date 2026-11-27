@@ -18,6 +18,8 @@ import { assertHostLifecycle, type HostControlPort, type HostLifecycle } from '.
 import type { ConnectionContext, ProtectedDispatchPort, Request, ControlFrameKind } from '../runtime/transport.js';
 import { BrowserFailure, ForegroundWorkRequired, unavailable } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
+import { seqoyaProfilePattern } from '../runtime/seqoya-wire.js';
+import { isSubscriptionHome } from './profile-navigation.js';
 
 export interface HandoffResult { readonly state: TabState; readonly settledAction?: Contract<'browser.SettledAction'> }
 /** Actual admitted engine work and unfinished sequence tracking, supplied by
@@ -716,13 +718,22 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
           // fabricated provider acknowledgement or agent-accessible close.
           if (request.method === 'close') throw unavailable('browser');
           const host = windowForOpen();
+          const info = operations.info();
+          const subscriptionProfile = seqoyaProfilePattern.test(info.profile);
+          const registration = windows.get(host);
+          if (!registration) throw unavailable('browser');
+          assertShellRegistration(registration, host);
           const url = request.params.url;
           const showEmpty = request.params.showEmpty === true;
           const empty = tabs().all().length === 0;
-          const destination = !showEmpty && (url !== undefined || empty) ? userURL(url ?? 'about:blank') : undefined;
+          const home = !showEmpty && url === undefined && empty
+            ? await registration.subscriptionHome().catch(() => undefined) : undefined;
+          const destination = !showEmpty && (url !== undefined || (empty && tabs().all().length === 0))
+            ? userURL(url ?? home ?? 'about:blank') : undefined;
           const prepared = preparedPresentations.get(context);
           preparedPresentations.delete(context);
           const isContinuation = () => url !== undefined && prepared?.host === host && performance.now() < prepared.deadline;
+          const subscriptionOpen = subscriptionProfile && isSubscriptionHome(destination) && isContinuation();
           const opensInBackground = () => {
             if (!host.hasForegroundWork()) return false;
             if (!isContinuation() || host.window.isDestroyed() || !host.window.isEnabled())
@@ -733,13 +744,12 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
           };
           if (destination !== undefined) opensInBackground();
           live();
-          const registration = windows.get(host);
-          if (!registration) throw unavailable('browser');
           assertShellRegistration(registration, host);
-          // Before approval, reveal only chrome or raise an already visible window.
-          // A hidden profile with tabs stays hidden until the normal verified open.
           const mayShowEarly = () => tabs().all().length === 0 || (host.window.isVisible() && !host.window.isMinimized());
-          if (!showEmpty || mayShowEarly()) {
+          // The subscription preparation reserves this handoff without showing a blank window.
+          if (showEmpty && subscriptionProfile) {
+            preparedPresentations.set(context, { host, deadline: performance.now() + 60_000, empty });
+          } else if (!subscriptionOpen && (!showEmpty || mayShowEarly())) {
             await registration.show(deadline, signal, showEmpty || url !== undefined, showEmpty ? () => {
               if (!mayShowEarly()) throw refused('control_refused');
             } : undefined);
@@ -752,8 +762,12 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
             const background = opensInBackground();
             const previous = isContinuation() ? tabs().all().find(target => {
               const opened = openedDestinations.get(target), page = target.page;
-              if (opened?.destination !== destination || opened.page !== page || page.window !== host ||
-                  page.retirement() || page.view.webContents.isDestroyed() || page.view.webContents.getURL() !== opened.committedURL) return false;
+              if (page.window !== host || page.retirement() || page.view.webContents.isDestroyed()) return false;
+              const address = page.view.webContents.getURL();
+              const sameDashboard = subscriptionOpen && (address === destination ||
+                (destination === 'https://chatgpt.com/settings/usage' && address === destination + '?tab=overview'));
+              if (!sameDashboard && (opened?.destination !== destination || opened.page !== page || address !== opened.committedURL))
+                return false;
               const state = tabs().state(target);
               return state.controller.kind === 'user' && state.handoff === 'idle' && state.pageAvailability === 'ready';
             }) : undefined;
@@ -763,9 +777,16 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
               const opened = await tabs().openUser(host, destination, background);
               if (isContinuation()) openedDestinations.set(opened, { page: opened.page, destination, committedURL: opened.page.view.webContents.getURL() });
             }
+            if (subscriptionOpen) {
+              await registration.rememberSubscriptionHome(destination).catch(() => {});
+              if (signal.aborted || !isContinuation() || performance.now() >= deadline) throw refused('control_refused');
+              await registration.show(deadline, signal, true);
+              if (signal.aborted || performance.now() >= deadline) throw refused('control_refused');
+              registration.foreground();
+              presented = true;
+            }
             live(); assertShellRegistration(registration, host);
           }
-          const info = operations.info();
           value = { profile: info.profile, instance: info.instance, process: process.pid, alreadyRunning: true };
           proof = { kind: 'management', method: 'open' };
         } else {

@@ -1,11 +1,11 @@
-import { ipcMain, type IpcMainInvokeEvent, type WebContents } from 'electron';
+import { app, ipcMain, type IpcMainInvokeEvent, type WebContents } from 'electron';
 import type { Contract } from '../contracts/generated.js';
 import { validator } from '../contracts/schema.js';
 import { invalidInput, publicFailure, unavailable } from '../contracts/errors.js';
 import { assertSharedProfileRuntime, type HostCustody, type SharedProfileRuntime } from '../runtime/custody.js';
 import type { ProfileSnapshot } from '../profiles/records.js';
 import type { PlatformPort } from '../runtime/platform.js';
-import { createProfileNavigation, type ProfileNavigation } from './profile-navigation.js';
+import { createProfileNavigation, readSubscriptionHome, rememberSubscriptionHome, type ProfileNavigation } from './profile-navigation.js';
 import { bindProfilePresentation } from './presentation.js';
 import { assertWindowHost, selectWindowProfile, shellURL, type WindowHost } from './windows.js';
 import { assertTabRegistry, refused, userURL, type TabRegistry, type TabTarget } from './tabs.js';
@@ -32,6 +32,9 @@ export interface ShellRegistration {
   offerPresentation(): void;
   offerForegroundPresentation(deadline: number, mayShowEmpty: () => boolean): Promise<void>;
   show(deadline: number, signal: AbortSignal, raiseWindow?: boolean, guard?: () => void): Promise<void>;
+  foreground(): void;
+  subscriptionHome(): Promise<string | undefined>;
+  rememberSubscriptionHome(url: string): Promise<void>;
   publish(): void;
   dispose(): void;
 }
@@ -52,6 +55,7 @@ type NativePresentation = {
     readonly instance: string;
     ready(): boolean;
     canYield(ownerSwitch: boolean): boolean;
+    openHome(): void;
   }>;
   readonly value: ReturnType<typeof bindProfilePresentation>;
 };
@@ -149,6 +153,9 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
   const shared = profileSource?.shared;
   if (shared?.runtime && (assertSharedProfileRuntime(shared.runtime) !== profileSource?.custody ||
       host.shell.webContents.session !== shared.runtime.sessions.shell)) throw unavailable('profile');
+  const installedProfile = profileSource?.custody.host.identity.layout.scope === 'installed'
+    ? (shared?.runtime?.instance ?? profileSource.custody.instance).owner.profile : undefined;
+  let openingHome: Promise<void> | undefined;
   let revision = 0, loaded = false, prepared = false, disposed = false;
   let runtimeReady = () => false;
   const ids = new Set<string>();
@@ -188,7 +195,16 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
       ready: () => runtimeReady() && prepared && !disposed,
       canYield: ownerSwitch =>
         !host.window.isDestroyed() && host.window.isEnabled() && (ownerSwitch || !host.window.isFocused()) &&
-        tabs.all().filter(target => target.page.window === host).every(target => tabs.state(target).handoff === 'idle') });
+        tabs.all().filter(target => target.page.window === host).every(target => tabs.state(target).handoff === 'idle'),
+      openHome() {
+        if (!installedProfile || openingHome || tabs.all().length !== 0) return;
+        openingHome = readSubscriptionHome(installedProfile).then(async home => {
+          if (!home || !host.isActiveProfile() || tabs.all().length !== 0) return;
+          assertPresentable();
+          await tabs.openUser(host, home);
+        }).catch(() => {}).finally(() => { openingHome = undefined; });
+      },
+    });
   }
   const presentation = nativePresentation?.value;
   const profiles = profileSource && nativePresentation && createProfileNavigation(profileSource.custody, profileSource.platform,
@@ -200,6 +216,7 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
           throw refused('control_refused');
         if (!profile.ready()) return false;
         selectWindowProfile(host, target);
+        profile.openHome();
         return true;
       }
       return false;
@@ -302,6 +319,27 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
         selectWindowProfile(source, host);
         break;
       }
+    },
+    foreground() {
+      assertPresentable();
+      if (!nativePresentation || !runtimeReady() || host.window.isDestroyed() ||
+          !host.window.isEnabled() || !host.window.isVisible() || host.window.isMinimized()) throw unavailable('browser');
+      if (!host.isActiveProfile()) {
+        const source = [...nativePresentation.profiles].find(([member]) => member.isActiveProfile());
+        if (!source?.[1].ready() || !source[1].canYield(true)) throw unavailable('profile');
+        selectWindowProfile(source[0], host);
+      }
+      if (!host.isActiveProfile()) throw unavailable('profile');
+      app.focus({ steal: true });
+      host.window.focus();
+    },
+    async subscriptionHome() {
+      if (installedProfile) return readSubscriptionHome(installedProfile);
+      return undefined;
+    },
+    async rememberSubscriptionHome(url: string) {
+      if (!installedProfile) throw unavailable('profile');
+      await rememberSubscriptionHome(installedProfile, url);
     },
     publish() {
       if (!host.presentationStable()) return; // a real placement co-commit will notify the consistent state

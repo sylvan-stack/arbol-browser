@@ -9,6 +9,7 @@ import { isProductionExitAuthority, type ProductionExitAuthority } from './exit.
 import { archiveRemovedRuntime, inspectOrCloseProductionProfile } from './process.js';
 import { assertPlatform, type PlatformPort, type GroupProcess } from './platform.js';
 import type { BuildSelection } from './selection.js';
+import { seqoyaDestinations, seqoyaProfilePattern } from './seqoya-wire.js';
 import { admitSeqoyaCapture, requestManagementClose, requestSeqoyaUsage, reserveManagementClose, openProtectedReady,
   openSharedProtectedReady, connectRuntime, takeResidentExit, type ResidentCloseOpportunity, type Request, type ManagementCloseOpportunity, type RuntimeClient,
   type Endpoint, type TransportServer, type ConnectionContext } from './transport.js';
@@ -305,9 +306,11 @@ export function createProcessService(options: { selection: BuildSelection; platf
       noteOpenCommand(options.observation, 'open-current-signed-start');
       if (input.approve && (input.url === undefined || input.profileInstance === undefined ||
           input.creationRequest === undefined)) throw profileUnavailable();
+      const subscriptionOpen = input.creationRequest !== undefined && seqoyaProfilePattern.test(profile.record.id) &&
+        Object.values(seqoyaDestinations).some(url => url === input.url);
       const attached = await acquireWithin(deadline,
         () => integration.start(profile, 'management', deadline, contentionDeadline, undefined, undefined,
-          input.approve !== undefined), result => result.client.close());
+          !subscriptionOpen && input.approve !== undefined), result => result.client.close());
       try {
         if (input.profileInstance !== undefined && attached.record.profileInstance !== input.profileInstance) throw profileUnavailable();
         noteOpenCommand(options.observation, 'open-reply');
@@ -318,9 +321,9 @@ export function createProcessService(options: { selection: BuildSelection; platf
               result.profile !== profile.record.id) throw unavailable('browser');
           return result;
         };
-        if (input.approve) {
+        if (input.approve || subscriptionOpen) {
           await requestOpen({ showEmpty: true });
-          await input.approve(deadline);
+          await input.approve?.(deadline);
           assertTime(deadline);
         }
         const result = await requestOpen(input.url === undefined ? {} : { url: input.url });
