@@ -11,13 +11,15 @@ import { assertProfile, type ProfileSnapshot } from '../profiles/records.js';
 import { assertPlatform, type HeldLock, type PlatformPort, type ProcessProvenance } from './platform.js';
 import { noteOpenCommand, type OpenCommandObservation, assertHostCloseContinuity, assertHostStartupContinuity,
   assertHostStartupSnapshot, assertVerifiedHostMetadata, type VerifiedHost } from './authorities.js';
-import { assertTime, now, runtimeLocation, type RuntimeLocation, type RuntimeRecord } from './instance.js';
+import { assertTime, now, readRuntime, runtimeLocation, type RuntimeLocation, type RuntimeRecord } from './instance.js';
 import { createStarter, type LaunchAttemptPort, type LaunchWithdrawal } from './start.js';
 import type { ProcessIntegration } from './lifecycle.js';
 import { claimedLayout, selectedLayout, type BuildSelection } from './selection.js';
 import { ownerLock, withOwnerLockForCustody, type OwnerLease, type RegistryLease } from '../profiles/locking.js';
 import { acquireBuildLease, withBuildLockForCustody, type BuildLease } from './build-lease.js';
 import { createProductionExitAuthority, assertProductionExitAuthority, type ProductionExitAuthority } from './exit.js';
+import { discoverInstalledResident, electInstalledStartup, type ResidentRuntime } from './resident.js';
+import { connectRuntime, requestProfileAdmission, type Endpoint } from './transport.js';
 
 export interface LaunchAttempt {
   readonly format: 1; readonly request: string; readonly nonce: string;
@@ -370,6 +372,25 @@ export function createProductionProcessIntegration(host: VerifiedHost, selection
   const assertAppAvailable = () => {
     if (host.identity.layout.scope === 'installed' && !platform.browserAppAvailable?.()) throw unavailable('browser');
   };
+  async function attachResident(resident: ResidentRuntime, target: ProfileSnapshot, endpoint: Endpoint,
+    attempts: LaunchAttemptPort, deadline: number, label?: string, signal?: AbortSignal) {
+    await attempts.admitted(resident.profile, resident.record, deadline);
+    if (selection.explicit && selection.build !== resident.record.build) throw unavailable('browser');
+    let location = resident.location, record = resident.record;
+    const profile = target.record.id, profileInstance = target.record.instance;
+    if (profile !== record.profile) {
+      const management = await connectRuntime(location, record, 'management', selection, platform, deadline, label, signal);
+      try { record = await requestProfileAdmission(management, { profile, profileInstance }, deadline); }
+      finally { management.close(); }
+      const targetLocation = await runtimeLocation(target);
+      if (!targetLocation || JSON.stringify(record) !== JSON.stringify(await readRuntime(targetLocation))) throw unavailable('profile');
+      location = targetLocation;
+    }
+    if (record.profile !== profile || record.profileInstance !== profileInstance) throw unavailable('profile');
+    assertTime(deadline);
+    const client = await connectRuntime(location, record, endpoint, selection, platform, deadline, label, signal);
+    return { client, record, alreadyRunning: true };
+  }
   return Object.freeze({
     async assertAdmissionAvailable(deadline = now() + 5000) {
       assertAppAvailable();
@@ -416,7 +437,15 @@ export function createProductionProcessIntegration(host: VerifiedHost, selection
           },
         },
       });
-      return starter(profile, endpoint, deadline, contentionDeadline, label, signal, showEmptyWhenReady);
+      const start = () => starter(profile, endpoint, deadline, contentionDeadline, label, signal, showEmptyWhenReady);
+      if (host.identity.layout.scope !== 'installed') return start();
+      const gate = await electInstalledStartup(profile.paths.state, platform, contentionDeadline, signal);
+      let resident: ResidentRuntime | undefined;
+      try {
+        resident = await discoverInstalledResident(profile.paths.state, platform, gate, deadline, signal);
+        if (!resident) return await start();
+      } finally { gate.release(); }
+      return attachResident(resident, profile, endpoint, attempts, deadline, label, signal);
     },
   });
 }

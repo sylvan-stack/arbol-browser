@@ -24,6 +24,7 @@ import type { ProductionExitAuthority } from './exit.js';
 import type { TransportServer } from './transport.js';
 import type { RendererControl } from '../host/recovery.js';
 import type { WindowHost } from '../host/windows.js';
+import { retainInstalledResidence } from './resident.js';
 
 export interface HostRequest { readonly request: string; readonly profile: ProfileSnapshot; readonly selection: BuildSelection }
 export async function consumeHostRequest(args: readonly string[], packagedBuild: string, directory: string): Promise<HostRequest> {
@@ -178,6 +179,7 @@ interface ActualHostAssembly {
   transport?: TransportServer;
   runtime?: HostLifecycle;
   additional?: AdditionalProfiles;
+  residence?: Awaited<ReturnType<typeof retainInstalledResidence>>;
 }
 function installApplicationMenu(): () => void {
   const zoomPage = (change?: number) => {
@@ -369,7 +371,7 @@ async function assembleAfterReady(prepared: HostPreparation, sessions: ProfileSe
     noteHostStartup(prepared.custody, 'host-shell-port-before');
     const port = await bootstrap.prepareNativeShellPort(boundary);
     noteHostStartup(prepared.custody, 'host-shell-port-after'); current();
-    const group = prepared.custody.host.identity.layout.scope === 'installed' ?
+    const group = state.residence ?
       additionalProfiles(prepared.custody, state, boundary, port, platform, exits, bootstrap, lifecycle, transports) : undefined;
     if (group) state.additional = group;
     noteHostStartup(prepared.custody, 'host-shell-integrate-before');
@@ -467,11 +469,14 @@ export async function runHostEntry(): Promise<void> {
     // shorten this original deadline, never extend it by the sampling gap.
     const sampled = performance.now(), nativeNow = native.platform.continuousTime();
     const deadline = Math.min(localBudget, sampled + attempt.expires - nativeNow); assertTime(deadline);
+    if (layout.scope === 'installed')
+      state.residence = await retainInstalledResidence(host.policy.stateRoot, native.platform, deadline);
     const exitURL = new URL('./exit.js', import.meta.url).href;
     const exits = await import(exitURL) as typeof import('./exit.js');
     const previous = exits.createProductionExitAuthority(native.platform, request.selection, host);
     owned = await prepareOwnedHost(app, request, host, native, previous, deadline, capture);
     if (!owned) return terminateCapturedHostBuild(capture);
+    await state.residence?.publish(owned.instance);
     const effects: import('../native/fatal.js').FatalEffects = Object.freeze({
       closeAdmission() {
         state.closed = true;
