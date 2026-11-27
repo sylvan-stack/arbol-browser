@@ -248,8 +248,9 @@ function hasHandoff(control: RendererControl, shell: TrustedShellIntegration): b
 }
 
 interface AdditionalProfiles {
-  openInWindow(source: WindowHost, target: ProfileSnapshot, deadline: number): Promise<void>;
+  openInWindow(source: WindowHost, target: ProfileSnapshot, deadline: number, assertSelection: () => void): Promise<void>;
   prepareInWindow(source: WindowHost, targets: readonly ProfileSnapshot[]): void;
+  isOpening(source: WindowHost, id: string, instance: string): boolean;
   admit: NonNullable<Parameters<typeof import('./transport.js').listenProtectedTransport>[6]>;
   bindPrimary(scope: LogicalProfile): void;
   primaryActive(): boolean;
@@ -271,12 +272,14 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
   port: NativeShellPort, platform: PlatformPort, exits: ProductionExitAuthority,
   bootstrap: typeof import('./bootstrap.js'), lifecycle: typeof import('./lifecycle.js'),
   transports: typeof import('./transport.js')): AdditionalProfiles {
-  type Entry = { instance: string; opening?: Promise<LogicalProfile>; runtime?: SharedProfileLifecycle; scope?: LogicalProfile };
+  type Entry = { instance: string; speculative: boolean;
+    opening?: Promise<LogicalProfile>; runtime?: SharedProfileLifecycle; scope?: LogicalProfile };
   const profiles = new Map<string, Entry>();
   const queued = new Map<string, ProfileSnapshot>();
   const tried = new Map<string, string>();
   let worker: NodeJS.Immediate | undefined;
-  let preparing = false;
+  let background: { controller: AbortController; done: Promise<void>; mutating: boolean } | undefined;
+  let closingProfiles = 0;
   let primary: LogicalProfile | undefined;
   let closing = false;
   const activeHandoff = () => [...profiles.values()].some(({ scope }) =>
@@ -287,7 +290,7 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
     state.runtime.assertAdmission(); custody.assertRetained(); source.assertHealthy();
   };
   async function openProfile(source: WindowHost, target: ProfileSnapshot, deadline: number,
-    signal?: AbortSignal, prepareOnly = false): Promise<RuntimeRecord> {
+    signal?: AbortSignal, prepareOnly = false, assertSelection?: () => void): Promise<RuntimeRecord> {
     assertCurrent(source, deadline);
     if (signal?.aborted) throw unavailable('profile');
     const appAdmission = custody.retainSharedAppAdmission();
@@ -296,6 +299,7 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
       if (signal?.aborted) throw unavailable('profile');
       appAdmission.assertIdentity();
     };
+    const assertActivation = () => { assertOpeningCurrent(); assertSelection?.(); };
     try {
       assertOpeningCurrent();
       const { id, instance } = target.record;
@@ -303,42 +307,61 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
       if (target.paths.state !== custody.host.policy.stateRoot) throw unavailable('profile');
       if (id === custody.instance.record.profile) {
         if (!primary || instance !== primary.instance.record.profileInstance) throw unavailable('profile');
-        return await activate(primary, assertOpeningCurrent);
+        return await activate(primary, assertActivation);
       }
       let entry = profiles.get(id);
-      if (!entry) { entry = { instance }; profiles.set(id, entry); }
+      if (!entry) { entry = { instance, speculative: prepareOnly }; profiles.set(id, entry); }
       if (entry.instance !== instance) throw unavailable('profile');
-      entry.opening ??= openEntry(entry, source, target, deadline, assertOpeningCurrent).catch(error => {
+      entry.opening ??= openEntry(entry, source, target, deadline, assertOpeningCurrent,
+        prepareOnly ? signal : undefined, prepareOnly ? () => {
+          if (!background || background.controller.signal !== signal) throw unavailable('profile');
+          background.mutating = true;
+        } : undefined).catch(error => {
         delete entry.opening;
         throw error;
       });
-      const ready = await entry.opening;
+      let ready: LogicalProfile;
+      try { ready = await entry.opening; }
+      catch (error) {
+        // Missing background proof leaves no admitted scope. A real selection
+        // can retry using the ordinary, fully verified fallback.
+        if (prepareOnly || !entry.speculative || profiles.has(id)) throw error;
+        assertActivation();
+        return await openProfile(source, target, deadline, signal, false, assertSelection);
+      }
       assertOpeningCurrent();
-      return prepareOnly ? ready.instance.record : await activate(ready, assertOpeningCurrent);
+      if (prepareOnly) return ready.instance.record;
+      const record = await activate(ready, assertActivation);
+      entry.speculative = false;
+      schedulePreparation();
+      return record;
     } finally { appAdmission.release(); }
   }
-  async function openInWindow(source: WindowHost, target: ProfileSnapshot, deadline: number): Promise<void> {
-    await openProfile(source, target, deadline);
+  async function openInWindow(source: WindowHost, target: ProfileSnapshot, deadline: number, assertSelection: () => void): Promise<void> {
+    await openProfile(source, target, deadline, undefined, false, assertSelection);
   }
   function schedulePreparation(): void {
-    if (closing || preparing || worker || queued.size === 0) return;
+    if (closing || closingProfiles || background || worker || queued.size === 0) return;
+    // Bound hidden renderer overhead even when the catalogue has many entries.
+    if ([...profiles.values()].filter(entry => entry.speculative && entry.scope?.phase === 'dormant').length >= 8) return;
     const source = primary?.shell.host;
     if (!source || !source.window.isVisible() || source.window.isMinimized()) return;
     worker = setImmediate(() => {
       worker = undefined;
-      if (closing || !source.window.isVisible() || source.window.isMinimized()) return;
+      if (closing || closingProfiles || !source.window.isVisible() || source.window.isMinimized()) return;
       // The next explicit selection can reuse this preparation or start its
       // own immediately. There is only one speculative opening at a time.
       const target = [...queued.values()].find(item => item.record.id !== 'default') ?? queued.get('default');
       if (!target) return;
       const { id, instance } = target.record;
       tried.set(id, instance);
-      preparing = true;
-      void openProfile(source, target, startupDeadline(), undefined, true).catch(() => {}).finally(() => {
+      const controller = new AbortController();
+      const done = openProfile(source, target, startupDeadline(), controller.signal, true).then(() => {}, () => {}).finally(() => {
         queued.delete(id);
-        preparing = false;
+        background = undefined;
         schedulePreparation();
       });
+      background = { controller, done, mutating: false };
     });
   }
   function prepareInWindow(source: WindowHost, targets: readonly ProfileSnapshot[]): void {
@@ -349,16 +372,21 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
     }
     schedulePreparation();
   }
+  function isOpening(source: WindowHost, id: string, instance: string): boolean {
+    const entry = profiles.get(id);
+    return !closing && source.window === primary?.shell.host.window && entry?.instance === instance && entry.opening !== undefined;
+  }
   async function openEntry(entry: Entry, source: WindowHost, target: ProfileSnapshot, deadline: number,
-    assertOpeningCurrent: () => void): Promise<LogicalProfile> {
+    assertOpeningCurrent: () => void, preparation?: AbortSignal, beginPreparationMutation?: () => void): Promise<LogicalProfile> {
     let profile: SharedProfileRuntime | undefined, shell: TrustedShellIntegration | undefined, transport: TransportServer | undefined;
     try {
-      const prepared = profile = await prepareSharedProfileRuntime(app, custody, target, exits, deadline);
+      const prepared = profile = await prepareSharedProfileRuntime(app, custody, target, exits, deadline,
+        preparation, beginPreparationMutation);
       assertOpeningCurrent();
       const control = await bootstrap.prepareSharedRendererControl(boundary, prepared, deadline);
       assertOpeningCurrent();
       shell = await bootstrap.integrateSharedProfileShell(port, prepared, source, control.ownership.lifecycle,
-        control.ownership.shell, { openInWindow, prepareInWindow }, deadline);
+        control.ownership.shell, { openInWindow, prepareInWindow, isOpening }, deadline);
       assertOpeningCurrent();
       control.bind(shell.tabs, shell.host, shell.registration);
       const { instance } = prepared;
@@ -459,6 +487,7 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
   return Object.freeze({
     openInWindow,
     prepareInWindow,
+    isOpening,
     bindPrimary(scope: LogicalProfile) {
       if (primary || scope.instance !== custody.instance || scope.runtime !== state.runtime || scope.shell !== state.shell) throw unavailable('profile');
       primary = scope;
@@ -487,7 +516,18 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
       guard();
       if (scope.operation === 'close') {
         if (!authorizeClose) throw unavailable('profile');
-        return closeProfile(selected, guard, authorizeClose);
+        closingProfiles++;
+        try {
+          const pending = background;
+          if (pending) {
+            // Once the exact marker/Session transition has begun, let its
+            // real ownership publication settle before closing another scope.
+            if (!pending.mutating) pending.controller.abort();
+            await pending.done;
+          }
+          guard();
+          return await closeProfile(selected, guard, authorizeClose);
+        } finally { closingProfiles--; schedulePreparation(); }
       }
       selected.runtime.assertAdmission();
       if (selected.phase === 'closing') return { result: 'closing' };
@@ -497,6 +537,7 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
       closing = true;
       queued.clear();
       clearImmediate(worker);
+      background?.controller.abort();
       for (const entry of profiles.values()) entry.runtime?.fence();
     },
     async retire(deadline: number) {

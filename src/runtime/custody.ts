@@ -47,7 +47,8 @@ const receipts = new WeakMap<HostCustody, { native: WatchdogCustody; platform: P
 /** Prepare storage for an additional profile through the same signed policy
  * and transaction as cold startup. The caller retains the exact Owner lease. */
 async function prepareSharedProfileEngine(custody: HostCustody, owner: OwnerLease, baseline: SharedMutationBaseline,
-  deadline: number): Promise<Readonly<{ retained: SharedProfileOwner; engine: EngineTransaction }>> {
+  deadline: number, preparation?: AbortSignal, beginPreparationMutation?: () => void):
+  Promise<Readonly<{ retained: SharedProfileOwner; engine: EngineTransaction }>> {
   const primary = custody.instance.owner.profile, target = owner.profile;
   const current = () => {
     assertTime(deadline); assertHostCustody(custody);
@@ -70,8 +71,10 @@ async function prepareSharedProfileEngine(custody: HostCustody, owner: OwnerLeas
       current();
     },
     async beginMutation(lease, marker) {
+      preparation?.throwIfAborted();
       current();
       if (lease !== owner) throw unavailable('profile');
+      beginPreparationMutation?.();
       const retained = await custody.retainProfileOwner(owner);
       current();
       const permit = retained.beginMarkerMutation(baseline, `${JSON.stringify(marker)}\n`);
@@ -94,11 +97,13 @@ export interface SharedProfileRuntime {
 }
 const sharedProfileRuntimes = new WeakMap<SharedProfileRuntime, HostCustody>();
 export async function prepareSharedProfileRuntime(app: ProfileApp, custody: HostCustody, target: ProfileSnapshot,
-  exit: ProductionExitAuthority, deadline: number): Promise<SharedProfileRuntime> {
+  exit: ProductionExitAuthority, deadline: number, signal?: AbortSignal,
+  beginPreparationMutation?: () => void): Promise<SharedProfileRuntime> {
   assertProductionExitAuthority(exit);
   assertHostCustody(custody);
   const primary = custody.instance.owner.profile, { platform } = receipts.get(custody)!;
   const current = async () => {
+    signal?.throwIfAborted();
     assertTime(deadline); assertHostCustody(custody);
     if (custody.instance.record.phase !== 'ready' || custody.host.identity.layout.scope !== 'installed' ||
         target.paths.state !== primary.paths.state || target.record.id === primary.record.id) throw unavailable('profile');
@@ -110,14 +115,16 @@ export async function prepareSharedProfileRuntime(app: ProfileApp, custody: Host
   const instance = await acquireInstance(target, platform, custody.build.selection.build, {
     async assertExited(profile, previous, owner) {
       if (profile !== target || !owner) throw unavailable('profile');
-      preparation.baseline = await exit.verifySharedBaseline(target, previous, owner, deadline);
+      preparation.baseline = await exit.verifySharedBaseline(target, previous, owner, deadline, signal);
+      signal?.throwIfAborted();
     },
   }, deadline, {
     assertAdmission: current,
     async prepare(owner) {
       await current();
       if (!preparation.baseline) throw unavailable('profile');
-      preparation.engine = await prepareSharedProfileEngine(custody, owner, preparation.baseline, deadline);
+      preparation.engine = await prepareSharedProfileEngine(custody, owner, preparation.baseline, deadline,
+        signal, beginPreparationMutation);
       preparation.sessions = await bindSharedProfileSessions(app, preparation.engine.engine, preparation.engine.retained);
       await current();
     },

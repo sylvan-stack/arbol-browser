@@ -30,8 +30,10 @@ export interface ProductionExitAuthority extends ExitAuthority, HostPreviousExit
   /** Only this poll treats protection contention/in-flight closure as pending.
    * It never certifies closure or invokes an external signal on uncertainty. */
   assertClosedUnderOwner(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease, deadline: number): Promise<void>;
-  verifySharedBaseline(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease, deadline: number): Promise<SharedMutationBaseline>;
-  verifySharedFamily(profile: ProfileSnapshot, owner: OwnerLease, request: string, deadline: number): Promise<SharedFamilyExitReceipt>;
+  verifySharedBaseline(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease,
+    deadline: number, preparation?: AbortSignal): Promise<SharedMutationBaseline>;
+  verifySharedFamily(profile: ProfileSnapshot, owner: OwnerLease, request: string,
+    deadline: number, signal?: AbortSignal): Promise<SharedFamilyExitReceipt>;
   tryClosed(profile: ProfileSnapshot, original: RuntimeRecord, deadline: number, closeHost?: VerifiedHost): Promise<boolean>;
   /** Retires only the independently verified exact closed reservation, retaining
    * its native closed-claim history outside profile and transient socket roots. */
@@ -331,7 +333,7 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
       return result;
     } finally { for (const build of new Set(release)) build.release(); }
   };
-  const readSharedPredecessor = async (profile: ProfileSnapshot, owner: OwnerLease, deadline: number):
+  const readSharedPredecessor = async (profile: ProfileSnapshot, owner: OwnerLease, deadline: number, signal?: AbortSignal):
     Promise<SharedFamilyExitReceipt | undefined> => {
     assertTime(deadline);
     if (owner.profile !== profile) throw unavailable('profile');
@@ -342,7 +344,7 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
     const { value } = await readJson(cursor, 16384);
     const request = (value as { request?: unknown } | null)?.request;
     if (!validator('browser.RequestId')(request)) throw unavailable('profile');
-    return authority.verifySharedFamily(profile, owner, request, deadline);
+    return authority.verifySharedFamily(profile, owner, request, deadline, signal);
   };
   const inspectLatest = async (profile: ProfileSnapshot, previous: RuntimeRecord | undefined, owner: OwnerLease,
     mode: 'prior' | 'full' | 'retire' | 'reserve', deadline: number, build?: BuildLease,
@@ -398,13 +400,20 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
     async assertClosedUnderOwner(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease, deadline: number) {
       await inspectLatest(profile, original, owner, 'full', deadline);
     },
-    async verifySharedBaseline(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease, deadline: number) {
+    async verifySharedBaseline(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease, deadline: number,
+      preparation?: AbortSignal) {
+      if (preparation) {
+        const shared = await readSharedPredecessor(profile, owner, deadline, preparation);
+        if (!shared) throw unavailable('profile');
+        return shared;
+      }
       let shared: SharedFamilyExitReceipt | undefined;
       try { shared = await readSharedPredecessor(profile, owner, deadline); }
       catch { assertTime(deadline); }
       return shared ?? inspect(profile, original, owner, 'full', deadline);
     },
-    async verifySharedFamily(profile: ProfileSnapshot, owner: OwnerLease, request: string, deadline: number) {
+    async verifySharedFamily(profile: ProfileSnapshot, owner: OwnerLease, request: string, deadline: number, signal?: AbortSignal) {
+      signal?.throwIfAborted();
       assertTime(deadline);
       if (owner.profile !== profile || !validator('browser.RequestId')(request)) throw unavailable('profile');
       await owner.assert(); await assertProfile(profile);
@@ -443,7 +452,7 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
         const result = await withOwnerLockForCustody(owner, platform, heldOwner =>
           withBuildLockForCustody(build, platform, heldBuild => platform.inspectSharedFamilyExit(heldOwner, heldBuild, {
             profile: profile.paths.root, profileInstance: profile.record.instance, profilePathHash, bundle: layout.bundle, request,
-          }, deadline)));
+          }, deadline, signal)));
         assertSharedFamilyExitReceipt(result);
         await owner.assert(); await build.assert(); assertTime(deadline);
         return result;

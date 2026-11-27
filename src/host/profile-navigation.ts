@@ -93,7 +93,7 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
   yieldPresentation: () => () => void, selectLocal: (profile: string, instance: string, tab?: string) => boolean,
   shared?: Readonly<{ runtime?: SharedProfileRuntime; isReady(profile: string, instance: string): boolean;
     prepareInWindow(profiles: readonly ProfileSnapshot[]): void;
-    openInWindow(profile: ProfileSnapshot, deadline: number): Promise<void> }>): ProfileNavigation | undefined {
+    openInWindow(profile: ProfileSnapshot, deadline: number, assertSelection: () => void): Promise<void> }>): ProfileNavigation | undefined {
   assertHostCustody(custody);
   if (custody.host.identity.layout.scope !== 'installed') return undefined;
   if (shared?.runtime && assertSharedProfileRuntime(shared.runtime) !== custody) throw profileUnavailable();
@@ -141,7 +141,10 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
     if (selectLocal(id, instance)) return;
     const deadline = startupDeadline();
     if (shared) {
-      await shared.openInWindow(profile, deadline);
+      await shared.openInWindow(profile, deadline, () => {
+        check();
+        if (!isFocused()) throw profileUnavailable();
+      });
       check(); assertTime(deadline);
       if (!selectLocal(id, instance)) throw unavailable('profile');
       return;

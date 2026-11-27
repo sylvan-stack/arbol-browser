@@ -152,8 +152,9 @@ export interface ShellProfileSource {
   readonly platform: PlatformPort;
   readonly shared?: Readonly<{
     runtime?: SharedProfileRuntime;
-    openInWindow(source: WindowHost, profile: ProfileSnapshot, deadline: number): Promise<void>;
+    openInWindow(source: WindowHost, profile: ProfileSnapshot, deadline: number, assertSelection: () => void): Promise<void>;
     prepareInWindow(source: WindowHost, profiles: readonly ProfileSnapshot[]): void;
+    isOpening(source: WindowHost, id: string, instance: string): boolean;
   }>;
 }
 export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority: ShellAuthority,
@@ -258,10 +259,10 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
       }
       return false;
     }, shared && { ...(shared.runtime ? { runtime: shared.runtime } : {}),
-      isReady: (id, instance) => [...nativePresentation.profiles.values()]
-        .some(member => member.id === id && member.instance === instance),
+      isReady: (id, instance) => shared.isOpening(host, id, instance) ||
+        [...nativePresentation.profiles.values()].some(member => member.id === id && member.instance === instance),
       prepareInWindow: profiles => shared.prepareInWindow(host, profiles),
-      openInWindow: (profile, deadline) => shared.openInWindow(host, profile, deadline) });
+      openInWindow: (profile, deadline, assertSelection) => shared.openInWindow(host, profile, deadline, assertSelection) });
   const assertPresentable = () => { registration.assertLoaded(); authority.assertOperational(); };
   const current: Registration = { host, authority, snapshot, ...(profiles ? { profiles } : {}),
     async dispatch(request): Promise<Result> {
