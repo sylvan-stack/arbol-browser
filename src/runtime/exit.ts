@@ -126,7 +126,7 @@ export async function mountRetainedImage(layout: PackagedLayout, build: Pick<Bui
 export function createProductionExitAuthority(platform: PlatformPort, selection: BuildSelection, startingHost?: VerifiedHost,
   listingHost?: VerifiedHost): ProductionExitAuthority {
   assertPlatform(platform);
-  type OldProof = { host: VerifiedHost; build: BuildLease };
+  type OldProof = { build: BuildLease };
   const priorProofs = new WeakMap<OwnerLease, Map<string, OldProof>>();
   const priorSharedProofs = new WeakMap<OwnerLease, SharedFamilyExitReceipt>();
   // The command creates this authority once. Retain immutable package proofs,
@@ -238,7 +238,7 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
         const manifest = await import(manifestURL) as typeof import('../native/manifest.js');
         if (sameGuard && manifest.assertRetainedReadOnlyStorage(closeHost.signed, deadline)) {
           await assertHostCloseContinuity(closeHost, deadline); await build.assert();
-          return { host: closeHost, build };
+          return { build };
         }
       }
       const matchesAttempt = (host: VerifiedHost) => host.policy.stateRoot === profile.paths.state &&
@@ -278,7 +278,11 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
           }
         }
       }
-      if (!host) {
+      if (!host && process.type === 'browser') {
+        // The native reader independently authenticates this historical
+        // signed package on its mounted, immutable volume.
+        if (!startingHost || layout.scope !== 'installed' || !await statOrAbsent(layout.bundle)) throw unavailable('profile');
+      } else if (!host) {
         if (attempt.phase === 'closed') await mountRetainedImage(layout, build, platform, deadline);
         const startup = layout.scope === 'installed' && (actualMode === 'reserve' || actualMode === 'prior');
         host = startup
@@ -293,10 +297,10 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
       }
       await build.assert();
       if (actualMode === 'prior') {
-        const proofs = priorProofs.get(owner) ?? new Map<string, OldProof>(); proofs.set(key, { host, build }); priorProofs.set(owner, proofs);
+        const proofs = priorProofs.get(owner) ?? new Map<string, OldProof>(); proofs.set(key, { build }); priorProofs.set(owner, proofs);
         release.splice(release.indexOf(build), 1);
       }
-      return { host, build };
+      return { build };
     };
     try {
       const build = candidate && !receiptWhole ? (await oldProof(candidate)).build : currentBuild ?? await acquireBuildLease(selection, platform);
@@ -422,16 +426,18 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
       const build = await acquireBuildLease(original, platform);
       try {
         if (process.type === 'browser') {
-          // The protected Browser family cannot spawn external mount helpers.
-          if (!await statOrAbsent(layout.bundle)) throw unavailable('profile');
-        } else await mountRetainedImage(layout, build, platform, deadline);
-        const host = startingHost?.identity.layout.buildRoot === layout.buildRoot ? startingHost :
-          await verifyPackagedOpenHost(original, layout.payload, deadline);
-        if (host.identity.layout.bundle !== layout.bundle || host.identity.layout.guard !== layout.guard ||
-            host.policy.stateRoot !== profile.paths.state || host.identity.sourceDigest !== hint.sourceDigest ||
-            host.identity.productDigest !== hint.productDigest || host.signed.snapshotDigest !== hint.candidateDigest)
-          throw unavailable('profile');
-        await assertHostStartupSnapshot(host, deadline);
+          if (!startingHost || startingHost.policy.stateRoot !== profile.paths.state || !await statOrAbsent(layout.bundle))
+            throw unavailable('profile');
+        } else {
+          await mountRetainedImage(layout, build, platform, deadline);
+          const host = startingHost?.identity.layout.buildRoot === layout.buildRoot ? startingHost :
+            await verifyPackagedOpenHost(original, layout.payload, deadline);
+          if (host.identity.layout.bundle !== layout.bundle || host.identity.layout.guard !== layout.guard ||
+              host.policy.stateRoot !== profile.paths.state || host.identity.sourceDigest !== hint.sourceDigest ||
+              host.identity.productDigest !== hint.productDigest || host.signed.snapshotDigest !== hint.candidateDigest)
+            throw unavailable('profile');
+          await assertHostStartupSnapshot(host, deadline);
+        }
         const result = await withOwnerLockForCustody(owner, platform, heldOwner =>
           withBuildLockForCustody(build, platform, heldBuild => platform.inspectSharedFamilyExit(heldOwner, heldBuild, {
             profile: profile.paths.root, profileInstance: profile.record.instance, profilePathHash, bundle: layout.bundle, request,

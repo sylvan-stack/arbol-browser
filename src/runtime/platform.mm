@@ -3513,7 +3513,7 @@ struct ExitInspection {
   // or global nativeCustodies container.
   arbol_boundary::Context hostContext; arbol_exit::SharedState* hostState=nullptr;
   NSDictionary* hostCapability=nil;
-  bool maintenance = false;
+  bool maintenance = false, guardedBrowser = false;
   RetainedMigrationProof* migrated = nullptr; // stack-owned native validator only; never a JS option
   MigrationPublication* publication = nullptr;
   OrdinaryMigrationAuthority* receiptAuthority = nullptr;
@@ -4416,6 +4416,26 @@ static bool publishMigration(ExitInspection& job,NSDictionary* closed,NSDictiona
   return !job.result.empty()&&current();
 }
 
+// An enrolled Browser may verify a historical package already mounted on its
+// exact installation path. No helper may be started from this process family.
+struct HistoricalBrowserPackage {
+  arbol_attempt::MaintenancePayload mounted;
+  arbol_attempt::MaintenanceFile policy;
+  bool current() const { return mounted.current()&&policy.current(); }
+  bool capture(const arbol_attempt::PackagedLayout& layout,NSDictionary* claim,NSString* state,double deadline) {
+    using namespace arbol_attempt;
+    const auto& bundle=layout.bundle;
+    if(!layout.installed||arbol_boundary::clockMs()>=deadline||!mounted.capture(layout,false,false)||
+       !policy.openPath(bundle+"/Contents/Resources/host-policy.json",0600,limit,true)||
+       !signedIdentity(bundle,@"com.sylvan-stack.arbol-browser",true)) return false;
+    auto metadata=json(policy.content);
+    if(![policyStateRoot(metadata,layout) isEqual:state]||![metadata[@"sourceDigest"] isEqual:claim[@"sourceDigest"]]||
+       ![metadata[@"productDigest"] isEqual:claim[@"productDigest"]]) return false;
+    auto hold=[&] { return arbol_boundary::clockMs()<deadline&&current(); };
+    return [nativeCandidateDigest(bundle,deadline,hold) isEqual:claim[@"candidateDigest"]]&&hold();
+  }
+};
+
 static bool inspectSharedFamilyExit(ExitInspection& job) {
   using namespace arbol_attempt;
   NSDictionary* input=job.input;
@@ -4457,15 +4477,12 @@ static bool inspectSharedFamilyExit(ExitInspection& job) {
     arbol_exit::AdditionalOwner actual;
     return ownerRecord.current()&&arbol_exit::validateAdditionalOwner(closed[@"profile"],packet,job.owner.fd,actual)&&[actual.storage isEqual:storage];
   };
-  arbol_startup_proof::RetainedAppPackage package;
-  if(!exactTarget()||!package.capture(layout,job.deadline,closed[@"candidateDigest"])) return false;
-  MaintenanceFile policy;
-  if(!policy.openPath(layout.bundle+"/Contents/Resources/host-policy.json",0600,limit,true)||
-     ![policyStateRoot(json(policy.content),layout) isEqual:state]) return false;
+  HistoricalBrowserPackage package;
+  if(!exactTarget()||!package.capture(layout,closed,state,job.deadline)) return false;
   NSDictionary* capability=nil,*receipt=nil,*frontier=nil;
   if(!verifyClosedReceipt(closed,capability,receipt,frontier,job,job.build,input[@"bundle"],group)||
      ![resolveSharedClosedClaim(state,group,job.deadline) isEqual:closed]||
-     !exactTarget()||!policy.current()||!package.current()||!job.within()) return false;
+     !exactTarget()||!package.current()||!job.within()) return false;
   std::string marker; struct stat markerIdentity{}; bool absent;
   if(!currentProfileMarker(profile,input[@"profileInstance"],storage[@"root"],job.owner,job.build,marker,markerIdentity,absent)) return false;
   id actualMarker=markerObservation(marker,markerIdentity,absent);
@@ -4882,6 +4899,7 @@ static bool inspectExit(ExitInspection& job) {
   NSDictionary* data=nil,*capability=nil,*receipt=nil,*frontier=nil,*unusedReceipt=nil;
   bool unused=closed&&[[closed[@"terminal"][@"path"] lastPathComponent] isEqual:@"unused.json"];
   std::map<std::pair<std::string,std::string>,std::unique_ptr<arbol_startup_proof::RetainedAppPackage>> verifiedPackages;
+  std::map<std::pair<std::string,std::string>,std::unique_ptr<HistoricalBrowserPackage>> historicalPackages;
   bool reusedReservationPackage=false;
   auto verifiedSignature=[&](const PackagedLayout& layout, NSDictionary* attempt) {
     NSString* digest=attempt[@"candidateDigest"];
@@ -4891,6 +4909,16 @@ static bool inspectExit(ExitInspection& job) {
     }
     if (!migration && (prior || hostMode) && adoptedPackage && adoptedPackage->matches(layout,digest))
       return adoptedPackage->current();
+    if(!migration&&job.guardedBrowser&&layout.installed) {
+      if(!pattern(digest,@"^[0-9a-f]{64}$")) return false;
+      auto key=std::make_pair(layout.bundle,std::string(digest.UTF8String));
+      auto [entry,inserted]=historicalPackages.try_emplace(key);
+      if(inserted) {
+        auto proof=std::make_unique<HistoricalBrowserPackage>();
+        if(proof->capture(layout,attempt,state,job.deadline)) entry->second=std::move(proof);
+      }
+      return entry->second&&entry->second->current();
+    }
     // After watchdog enrollment, the process family admits no Apple tools.
     if (!migration && (prior || reserve) && layout.installed) {
       if (!pattern(digest,@"^[0-9a-f]{64}$")) return false;
@@ -4967,6 +4995,7 @@ static bool inspectExit(ExitInspection& job) {
     return job.within();
   };
   auto physical=[&] {
+    for(const auto& entry:historicalPackages) if(!entry.second||!entry.second->current()) return false;
     if(data&&!withReceipt([&] { return receiptMetadata(capability,data,job)&&receiptFrontier(capability,frontier,receipt[@"capabilityDigest"],job)&&
        (prior||shared||receiptMarker(capability,receipt[@"marker"],job)); })) return false;
     if(unused) {
@@ -5115,6 +5144,10 @@ static napi_value beginExitInspection(napi_env env,napi_callback_info info) {
   // each complete 16 KiB native attempt grammar independently below.
   job->input=[parsed isKindOfClass:NSDictionary.class]?parsed:nil;
   job->maintenance=migration;
+  // The real Electron main inherits the exact signed engine executable.
+  // The Node-mode CLI may use the same image, but it has already prepared
+  // any historical mount before entering this in-process verifier.
+  job->guardedBrowser=!job->activeBundle.empty()&&!migration;
   job->qualificationPoint=qualificationPoint; job->qualificationStaged=qualificationStaged;
   job->qualificationStagingParent=qualificationStagingParent;
   if(registry) job->registry=duplicateHeld(registry);

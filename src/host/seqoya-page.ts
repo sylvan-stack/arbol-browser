@@ -1,4 +1,4 @@
-import type { WebContents } from 'electron';
+import type { BaseWindow, WebContents } from 'electron';
 import { now } from '../runtime/instance.js';
 import { seqoyaDestinations, type SeqoyaProvider } from '../runtime/seqoya-wire.js';
 import { assertWindowHost, type WindowHost } from './windows.js';
@@ -11,7 +11,7 @@ export class SeqoyaPageRefusal extends Error {
   }
 }
 
-const active = new WeakSet<WindowHost>();
+const active = new WeakSet<BaseWindow>();
 const redirect = (provider: SeqoyaProvider, target: URL, address: string): boolean => {
   try {
     const url = new URL(address);
@@ -29,14 +29,15 @@ export async function readSeqoyaPage<T>(
   ownerBusy: () => boolean, read: (contents: WebContents, check: () => void) => Promise<T>,
 ): Promise<T> {
   assertWindowHost(host);
-  const idle = () => !host.hasForegroundWork() && !ownerBusy() && host.presentationStable();
-  if (active.has(host) || !idle()) throw new SeqoyaPageRefusal('deferred');
+  const window = host.window;
+  const idle = () => !window.isDestroyed() && !window.isFocused() && window.isEnabled() && !ownerBusy() && host.presentationStable();
+  if (active.has(window) || !idle()) throw new SeqoyaPageRefusal('deferred');
   if (!Number.isFinite(deadline) || deadline <= now() || signal.aborted) {
     throw new SeqoyaPageRefusal('dashboard_unavailable');
   }
   const target = new URL(seqoyaDestinations[provider]);
   const page = host.createPage();
-  active.add(host);
+  active.add(window);
   const contents = page.view.webContents;
   let navigation = 0;
   let inspectedNavigation: number | undefined;
@@ -107,6 +108,6 @@ export async function readSeqoyaPage<T>(
     signal.removeEventListener('abort', unavailable);
     host.window.removeListener('focus', deferral);
     contents.removeListener('destroyed', unavailable);
-    try { await page.retire(); } finally { active.delete(host); }
+    try { await page.retire(); } finally { active.delete(window); }
   }
 }

@@ -218,14 +218,15 @@ function installApplicationMenu(): () => void {
 
 function usageFor(transports: typeof import('./transport.js'), platform: PlatformPort, instance: InstanceOwner,
   guard: () => void, control: RendererControl, shell: TrustedShellIntegration,
-  currentLifecycle: () => HostLifecycle | undefined): NonNullable<Parameters<typeof transports.listenProtectedTransport>[4]> {
+  currentLifecycle: () => HostLifecycle | undefined,
+  otherActiveHandoff: () => boolean): NonNullable<Parameters<typeof transports.listenProtectedTransport>[4]> {
   return async (params, deadline, signal) => {
     const runtime = currentLifecycle();
     if (!runtime) return { status: 'dashboard_unavailable' };
     const current = instance.record;
     const { SeqoyaPageRefusal } = await import('../host/seqoya-page.js');
     const { captureSeqoyaUsage } = await import('../host/seqoya-usage.js');
-    const ownerBusy = () => shell.tabs.all().some(tab => control.ownership.lifecycle.state(tab).handoff !== 'idle');
+    const ownerBusy = () => otherActiveHandoff() || hasHandoff(control, shell);
     const assertCurrent = () => { runtime.assertAdmission(); guard(); };
     try {
       assertCurrent();
@@ -234,7 +235,7 @@ function usageFor(transports: typeof import('./transport.js'), platform: Platfor
       if (instance.record !== current) return { status: 'dashboard_unavailable' };
       const reading = await captureSeqoyaUsage(shell.host, params.provider, deadline, signal, ownerBusy);
       assertCurrent();
-      if (instance.record !== current || signal.aborted || shell.host.hasForegroundWork() || ownerBusy())
+      if (instance.record !== current || signal.aborted || shell.host.window.isFocused() || !shell.host.window.isEnabled() || ownerBusy())
         return { status: 'deferred' };
       return { status: 'read', reading };
     } catch (error) {
@@ -242,10 +243,14 @@ function usageFor(transports: typeof import('./transport.js'), platform: Platfor
     }
   };
 }
+function hasHandoff(control: RendererControl, shell: TrustedShellIntegration): boolean {
+  return shell.tabs.all().some(tab => control.ownership.lifecycle.state(tab).handoff !== 'idle');
+}
 
 interface AdditionalProfiles {
   openInWindow(source: WindowHost, target: ProfileSnapshot, deadline: number): Promise<void>;
   admit: NonNullable<Parameters<typeof import('./transport.js').listenProtectedTransport>[6]>;
+  activeHandoff(): boolean;
   fence(): void;
   retire(deadline: number): Promise<void>;
 }
@@ -253,9 +258,10 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
   port: NativeShellPort, platform: PlatformPort, exits: ProductionExitAuthority,
   bootstrap: typeof import('./bootstrap.js'), lifecycle: typeof import('./lifecycle.js'),
   transports: typeof import('./transport.js')): AdditionalProfiles {
-  type Entry = { instance: string; opening?: Promise<SharedProfileRuntime>; runtime?: SharedProfileLifecycle };
+  type Entry = { instance: string; opening?: Promise<SharedProfileRuntime>; runtime?: SharedProfileLifecycle; activeHandoff?: () => boolean };
   const profiles = new Map<string, Entry>();
   let closing = false;
+  const activeHandoff = () => [...profiles.values()].some(entry => entry.activeHandoff?.());
   const assertCurrent = (source: WindowHost, deadline: number) => {
     assertTime(deadline);
     if (closing || state.closed || source.window !== state.shell?.host.window || !state.runtime) throw unavailable('profile');
@@ -291,12 +297,17 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
       assertOpeningCurrent();
       shell = await bootstrap.integrateSharedProfileShell(port, prepared, source, control.ownership.lifecycle,
         control.ownership.shell, openInWindow, deadline);
+      const exactShell = shell;
+      entry.activeHandoff = () => exactShell.host.isActiveProfile() && hasHandoff(control, exactShell);
       assertOpeningCurrent();
       control.bind(shell.tabs, shell.host, shell.registration);
       const { instance } = prepared;
       transport = await transports.listenProtectedTransport(instance.location, instance.record, platform, control.ownership.dispatch,
         usageFor(transports, platform, instance, () => { assertSharedProfileRuntime(prepared); },
-          control, shell, () => entry.runtime), prepared);
+          control, shell, () => entry.runtime, () => {
+            const primary = state.shell, primaryControl = state.control;
+            return activeHandoff() || !!(primary && primaryControl && primary.host.isActiveProfile() && hasHandoff(primaryControl, primary));
+          }), prepared);
       const runtime = entry.runtime = lifecycle.createSharedProfileLifecycle(prepared, transport, control.ownership.control, deadline);
       control.ownership.bindRuntime(runtime);
       assertOpeningCurrent();
@@ -323,6 +334,7 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
   }
   return Object.freeze({
     openInWindow,
+    activeHandoff,
     async admit(scope: Parameters<AdditionalProfiles['admit']>[0], deadline: number, signal: AbortSignal) {
       const source = state.shell?.host;
       if (!source || signal.aborted) throw unavailable('profile');
@@ -398,7 +410,8 @@ async function assembleAfterReady(prepared: HostPreparation, sessions: ProfileSe
     noteHostStartup(prepared.custody, 'host-listeners-before');
     const transport = await transports.listenProtectedTransport(prepared.instance.location, prepared.instance.record, platform,
       control.ownership.dispatch, usageFor(transports, platform, prepared.instance,
-        () => prepared.custody.assertRetained(), control, shell, () => state.runtime), undefined, group?.admit);
+        () => prepared.custody.assertRetained(), control, shell, () => state.runtime, () => group?.activeHandoff() === true),
+      undefined, group?.admit);
     noteHostStartup(prepared.custody, 'host-listeners-after');
     state.transport = transport; current();
     const shutdown = sessionModule.productionSessionShutdown(sessions, prepared.custody);
