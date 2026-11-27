@@ -4,12 +4,14 @@ import type { Contract } from '../contracts/generated.js';
 import { unavailable, BrowserFailure } from '../contracts/errors.js';
 import { nativeLifetimeReadiness, preflightPageAdmission } from './bootstrap.js';
 import { assertAdoptedBuildClosing } from './build-lease.js';
-import { noteHostStartup, isHostCustody } from './custody.js';
+import { assertSharedProfileRuntime, noteHostStartup, isHostCustody, type SharedProfileRuntime } from './custody.js';
 import { isProductionExitAuthority, type ProductionExitAuthority } from './exit.js';
 import { archiveRemovedRuntime, assertProductionCloseReady } from './process.js';
 import { assertPlatform, type PlatformPort, type GroupProcess } from './platform.js';
 import type { BuildSelection } from './selection.js';
-import { admitSeqoyaCapture, requestManagementClose, requestSeqoyaUsage, reserveManagementClose, openProtectedReady, connectRuntime, type Request, type ManagementCloseOpportunity, type RuntimeClient, type Endpoint, type TransportServer, type ConnectionContext } from './transport.js';
+import { admitSeqoyaCapture, requestManagementClose, requestSeqoyaUsage, reserveManagementClose, openProtectedReady,
+  openSharedProtectedReady, connectRuntime, type Request, type ManagementCloseOpportunity, type RuntimeClient,
+  type Endpoint, type TransportServer, type ConnectionContext } from './transport.js';
 import { runtimeLocation, readRuntime, originalAlive, now, startupDeadline, neverOpenedExit,
   token, assertTime, type RuntimeRecord, type PreviousExit } from './instance.js';
 import { assertProfile, type ProfileSnapshot } from '../profiles/records.js';
@@ -397,6 +399,109 @@ const hostLifecycles = new WeakSet<object>();
 export function assertHostLifecycle(value: HostLifecycle): void {
   if (!hostLifecycles.has(value)) throw unavailable('browser');
 }
+function trackHostDisconnections(control: HostControlPort, fatal: () => void) {
+  const pending = new Set<Promise<void>>();
+  const disconnected = new WeakSet<ConnectionContext>();
+  return {
+    pending,
+    disconnect(context: ConnectionContext) {
+      if (!context.attachment || disconnected.has(context)) return;
+      disconnected.add(context);
+      const id = context.attachment.id;
+      try {
+        const result: unknown = control.disconnect(id);
+        if (result !== undefined) throw unavailable('browser');
+      } catch { fatal(); return; }
+      const deadline = now() + 6000;
+      const timer = globalThis.setTimeout(() => { try { fatal(); } catch { /* admission is fenced */ } }, 6000);
+      const cleanup = Promise.resolve().then(() => control.settleDisconnect(id, deadline));
+      pending.add(cleanup);
+      void cleanup.catch(() => fatal()).finally(() => { clearTimeout(timer); pending.delete(cleanup); }).catch(() => {});
+    },
+  };
+}
+
+export interface SharedProfileLifecycle extends HostLifecycle {
+  fence(): void;
+  retire(deadline: number): Promise<void>;
+}
+export function createSharedProfileLifecycle(profile: SharedProfileRuntime, transport: TransportServer,
+  control: HostControlPort, deadline: number): SharedProfileLifecycle {
+  const primary = assertSharedProfileRuntime(profile);
+  const { instance, sessions } = profile;
+  let phase: HostLifecycle['phase'] = 'starting', admitted = false;
+  let starting: Promise<void> | undefined, publication: Promise<void> | undefined, retirement: Promise<void> | undefined;
+  const phaseNow = () => phase;
+  const seal = () => {
+    admitted = false;
+    try { control.closeAdmission(); } finally { transport.closeAdmission(); }
+  };
+  function fatal() {
+    if (phase === 'fatal') return;
+    phase = 'fatal'; seal();
+  }
+  const disconnections = trackHostDisconnections(control, fatal);
+  function fence() {
+    if (phase === 'closing' || phase === 'fatal') return;
+    phase = 'closing'; seal();
+  }
+  const retire = (limit: number) => {
+    fence();
+    return retirement ??= within(limit, async () => {
+      const publishClosing = async () => {
+        // A refused ready write must not prevent the target's cleanup.
+        await publication?.catch(() => {});
+        if (instance.record.phase !== 'closing') await instance.phase('closing');
+      };
+      const retirePages = async () => {
+        await Promise.all([control.retireAll(limit), ...disconnections.pending]);
+        await sessions.flushStorage();
+        await instance.owner.assert();
+      };
+      const results = await Promise.allSettled([publishClosing(), retirePages(), transport.close()]);
+      for (const result of results) if (result.status === 'rejected') throw result.reason;
+      // Electron retains this Session. Native custody retains its Owner
+      // until the whole original process family has ceased using the data.
+    });
+  };
+  const lifecycle: SharedProfileLifecycle = Object.freeze({
+    get phase() { return phase; }, fatal, disconnect: disconnections.disconnect, fence, retire,
+    ready() {
+      return starting ??= Promise.resolve().then(async () => {
+        try {
+          const beforePublication = () => {
+            assertTime(deadline);
+            if (phase !== 'starting' || primary.instance.record.phase !== 'ready') throw unavailable('profile');
+            assertSharedProfileRuntime(profile);
+          };
+          beforePublication(); control.assertPrepared();
+          if (control.windowCount() < 1 || instance.record.phase !== 'starting') throw unavailable('profile');
+          await profile.engine.assertReady(); await instance.owner.assert();
+          beforePublication(); publication = instance.phase('ready'); await publication;
+          beforePublication();
+          const generation = instance.record;
+          phase = 'ready';
+          const guard = () => {
+            assertTime(deadline);
+            if (phase !== 'ready' || instance.record !== generation || primary.instance.record.phase !== 'ready')
+              throw unavailable('profile');
+            assertSharedProfileRuntime(profile);
+          };
+          openSharedProtectedReady(transport, profile, guard, () => control.openAdmission());
+          admitted = true;
+        } catch (error) { if (phaseNow() !== 'closing') fatal(); throw error; }
+      });
+    },
+    assertAdmission() {
+      if (phase !== 'ready' || !admitted || primary.instance.record.phase !== 'ready') throw unavailable('profile');
+      assertSharedProfileRuntime(profile);
+    },
+    close: () => retire(now() + 5000),
+    beginManagementClose() { throw unavailable('profile'); },
+    lastWindowClosed() { if (control.windowCount() === 0) void retire(now() + 5000).catch(() => fatal()); },
+  });
+  hostLifecycles.add(lifecycle); return lifecycle;
+}
 /** Canonical host-only dynamic boundary: never import Electron through the Node
  * CLI static graph. No provider, profile or native capability is defaulted. */
 export async function prepareOwnershipControl(boundary: import('./bootstrap.js').NativeFailureBoundary,
@@ -426,7 +531,8 @@ export interface HostNativeLifetime {
 }
 /** One authoritative host; no automatic restart and no saved action/lease state. */
 export function createHostLifecycle(prepared: HostPreparation, sessions: ProfileSessions, transport: TransportServer,
-  control: HostControlPort, native: HostNativeLifetime, productionDeadline?: number, productionPlatform?: PlatformPort): HostLifecycle {
+  control: HostControlPort, native: HostNativeLifetime, productionDeadline?: number, productionPlatform?: PlatformPort,
+  additional?: Readonly<{ fence(): void; retire(deadline: number): Promise<void> }>): HostLifecycle {
   const production = isHostCustody(prepared.custody);
   if (production && (productionDeadline === undefined || !Number.isFinite(productionDeadline) || now() >= productionDeadline))
     return prepared.custody.terminate();
@@ -437,23 +543,24 @@ export function createHostLifecycle(prepared: HostPreparation, sessions: Profile
   let closing: Promise<void> | undefined;
   let arming: Promise<void> | undefined, readyPublication: Promise<void> | undefined;
   let readyAttempt: Promise<void> | undefined;
-  const pending = new Set<Promise<void>>();
-  const disconnected = new WeakSet<ConnectionContext>();
   const currentPhase = (): HostLifecycle['phase'] => phase;
   const arm = (startup = false) => arming ??= Promise.resolve().then(() => {
     if (!startup || phase !== 'starting' || productionDeadline === undefined) return native.armRetainedLifetime(prepared);
     return native.armRetainedLifetime(prepared, { deadline: productionDeadline, stillStarting: () => phase === 'starting' });
   });
   function synchronous(work: () => void): void { const result: unknown = work(); if (result !== undefined) throw unavailable('browser'); }
-  function closeAdmission() { admitted = false; synchronous(() => control.closeAdmission()); synchronous(() => transport.closeAdmission()); }
+  function closeAdmission() {
+    admitted = false;
+    try { synchronous(() => additional?.fence()); }
+    finally { try { synchronous(() => control.closeAdmission()); } finally { synchronous(() => transport.closeAdmission()); } }
+  }
   function fatal(): void {
     if (phase === 'fatal') return;
     phase = 'fatal'; admitted = false;
     // Independent fatal enforcement comes first, even when control cleanup throws.
-    try { native.quarantine(); } finally {
-      try { synchronous(() => control.closeAdmission()); } finally { synchronous(() => transport.closeAdmission()); }
-    }
+    try { native.quarantine(); } finally { closeAdmission(); }
   }
+  const disconnections = trackHostDisconnections(control, fatal);
   const witness = production ? productionSessionShutdown(sessions, prepared.custody) : undefined;
   const shutdown = (opportunity?: ManagementCloseOpportunity, acknowledgement?: Promise<void>) => {
     if (closing) return closing;
@@ -485,7 +592,7 @@ export function createHostLifecycle(prepared: HostPreparation, sessions: Profile
         await arm();
         if (readyPublication) await readyPublication;
         await prepared.instance.phase('closing');
-        await Promise.all([control.retireAll(grace), ...pending]);
+        await Promise.all([control.retireAll(grace), additional?.retire(grace), ...disconnections.pending]);
         witness?.pagesRetired();
         await sessions.flushStorage(); // necessary; explicitly insufficient to mark clean
         await prepared.instance.owner.assert();
@@ -570,17 +677,7 @@ export function createHostLifecycle(prepared: HostPreparation, sessions: Profile
   const lifecycle: HostLifecycle = Object.freeze({
     get phase() { return phase; }, fatal, ready,
     assertAdmission() { if (phase !== 'ready' || !admitted) throw unavailable('browser'); },
-    disconnect(context: ConnectionContext) {
-      if (!context.attachment) return;
-      if (disconnected.has(context)) return; disconnected.add(context);
-      const id = context.attachment.id;
-      try { synchronous(() => control.disconnect(id)); } catch { fatal(); return; }
-      const deadline = now() + 6000;
-      const timer = globalThis.setTimeout(() => { try { fatal(); } catch { /* native already armed */ } }, 6000);
-      const cleanup = Promise.resolve().then(() => control.settleDisconnect(id, deadline));
-      pending.add(cleanup);
-      void cleanup.catch(() => fatal()).finally(() => { clearTimeout(timer); pending.delete(cleanup); }).catch(() => {});
-    },
+    disconnect: disconnections.disconnect,
     close: () => shutdown(),
     beginManagementClose(context: ConnectionContext, request: Extract<Request, { method: 'close' }>) {
       if (!production || phase !== 'ready' || !admitted || closing) throw unavailable('browser');

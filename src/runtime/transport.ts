@@ -292,14 +292,19 @@ export function listenTransport(location: RuntimeLocation, record: RuntimeRecord
 /** Production assembly must choose this entry, with every real protected port. */
 type PrivateUsage = (params: SeqoyaParameters, deadline: number, signal: AbortSignal) => Promise<SeqoyaResult>;
 export function listenProtectedTransport(location: RuntimeLocation, record: RuntimeRecord, platform: PlatformPort,
-  dispatch: ProtectedDispatchPort, privateUsage?: PrivateUsage): Promise<TransportServer> {
+  dispatch: ProtectedDispatchPort, privateUsage?: PrivateUsage, shared?: SharedProfileRuntime): Promise<TransportServer> {
   for (const method of ['enroll', 'guardControl', 'commitResponse', 'redactedFailure', 'forget', 'authorize', 'execute', 'disconnect', 'cancel', 'fatal'] as const)
     if (typeof dispatch[method] !== 'function') throw unavailable('browser');
-  return listenServer(location, record, platform, dispatch, dispatch, privateUsage);
+  if (shared) {
+    assertSharedProfileRuntime(shared);
+    if (shared.instance.location !== location || shared.instance.record !== record || record.phase !== 'starting')
+      throw unavailable('profile');
+  }
+  return listenServer(location, record, platform, dispatch, dispatch, privateUsage, shared);
 }
 async function listenServer(location: RuntimeLocation, record: RuntimeRecord, platform: PlatformPort,
   dispatch: DispatchPort | ProtectedDispatchPort, protectedPort?: ProtectedDispatchPort,
-  privateUsage?: PrivateUsage): Promise<TransportServer> {
+  privateUsage?: PrivateUsage, shared?: SharedProfileRuntime): Promise<TransportServer> {
   let admission = false, sealed = false, agents = 0, management = 0;
   const connections = new Set<() => void>(), retainedCloseStops = new Map<() => void, () => void>(), servers: Server[] = [], scheduler = new Scheduler();
   let fatalLatched = false;
@@ -561,7 +566,7 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
       const path = endpoint === 'agent' ? location.agent : location.management;
       const server = createServer(socket => accepted(socket, endpoint)); servers.push(server);
       server.on('error', () => {
-        if (protectedPort) { fatal(); return; }
+        if (protectedPort) { if (shared && !admission) sealed = true; else fatal(); return; }
         admission = false; for (const stop of [...connections]) stop(); fatal();
       });
       await new Promise<void>((resolve, reject) => {
@@ -586,7 +591,8 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
       const custody = isHostCustody(scope) ? scope : undefined;
       try {
         noteHostStartup(custody, 'protected-ready-validate-before');
-        if (sealed || admission || servers.length !== 2 || ready.phase !== 'ready' ||
+        if ((custody ? shared !== undefined : shared !== scope) ||
+            sealed || admission || servers.length !== 2 || ready.phase !== 'ready' ||
             !sameProcess(recordProcess(ready), recordProcess(record)) || ready.instance !== record.instance || ready.nonce !== record.nonce ||
             ready.profile !== record.profile || ready.profileInstance !== record.profileInstance ||
             ready.profilePathHash !== record.profilePathHash || ready.build !== record.build ||
