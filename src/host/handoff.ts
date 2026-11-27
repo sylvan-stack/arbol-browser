@@ -21,7 +21,9 @@ import { validator } from '../contracts/schema.js';
 import { isSubscriptionHome } from './profile-navigation.js';
 
 function isSubscriptionDashboard(address: string, destination: string): boolean {
-  return address === destination || (destination === 'https://chatgpt.com/settings/usage' && address === destination + '?tab=overview');
+  return address === destination ||
+    (destination === 'https://chatgpt.com/settings/usage' && address === destination + '?tab=overview') ||
+    (destination === 'https://claude.ai/settings/usage' && address === 'https://claude.ai/new#settings/usage');
 }
 
 function isSubscriptionLanding(address: string, destination: string): boolean {
