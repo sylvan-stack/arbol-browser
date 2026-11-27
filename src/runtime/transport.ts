@@ -150,7 +150,7 @@ export async function admitSeqoyaCapture(platform: PlatformPort, binding: Pick<R
   await new Promise<void>((resolve, reject) => {
     const socket = createConnection(path), id = token('req');
     let connected: ProcessIdentity | undefined, hello = false, finished = false;
-    const wait = setTimeout(cancel, Math.min(5000, Math.max(1, deadline - now())));
+    let wait = setTimeout(cancel, Math.min(5000, Math.max(1, deadline - now())));
     function cancel() { finish(false); }
     function finish(accepted: boolean) {
       if (finished) return;
@@ -171,6 +171,10 @@ export async function admitSeqoyaCapture(platform: PlatformPort, binding: Pick<R
         if (!hello) {
           if (value.type !== 'hello' || value.bridge !== 2 || !plain(value.installation)) return cancel();
           hello = true;
+          // Driver identity and subscription verification run before the reply.
+          // Keep the short handshake limit and the original capture deadline.
+          clearTimeout(wait);
+          wait = setTimeout(cancel, Math.min(25_000, Math.max(1, deadline - now())));
           write(socket, { type: 'call', id, method: 'seqoya.browser.usage.' + stage,
             params: { ...params, profile: binding.profile, instance: binding.profileInstance } }, seqoyaUsageLimit);
           return;
