@@ -186,6 +186,14 @@ export async function configureProfileSession(app: ProfileApp, transaction: Engi
   });
 }
 
+export async function assertSharedProfileStorage(app: ProfileApp, state: string): Promise<void> {
+  const shared = sharedStorage.get(app);
+  if (!shared || shared.path !== state) throw profileUnavailable();
+  await assertDirectory(shared.path, shared.identity);
+  const factory = await actualSessionFactory(app);
+  if (actualFactories.get(factory)!.app.getPath('sessionData') !== shared.path) throw profileUnavailable();
+}
+
 /** The additional website and shell remain distinct actual Electron Sessions. */
 export async function bindSharedProfileSessions(app: ProfileApp, transaction: EngineTransaction, owner: SharedProfileOwner):
   Promise<ProfileSessions & { assertBound(): void }> {

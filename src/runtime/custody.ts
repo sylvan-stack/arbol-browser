@@ -2,16 +2,17 @@
  * process, permissive engine authority, flush receipt or native input effect. */
 import { join } from 'node:path';
 import { unavailable } from '../contracts/errors.js';
-import { assertProfile } from '../profiles/records.js';
+import { assertProfile, type ProfileSnapshot } from '../profiles/records.js';
 import { withOwnerLockForCustody, type OwnerLease } from '../profiles/locking.js';
 import { terminateAdoptedBuild, withBuildLockForCustody, type BuildLease } from './build-lease.js';
 import { assertHostStartupContinuity, assertVerifiedHostMetadata, bindArmedHost, type VerifiedHost } from './authorities.js';
 import { assertPlatform, assertWatchdogCustody, type PlatformPort, type WatchdogCustody, type PriorMarkerExpectation, type HostStartupStage, type SharedProfileOwner, type SharedMutationBaseline } from './platform.js';
-import { assertTime, type InstanceOwner, type RuntimeRecord } from './instance.js';
+import { acquireInstance, assertTime, type InstanceOwner } from './instance.js';
 import { claimedHostAttempt } from './process.js';
 import type { NativeBoundaryPreparation } from './bootstrap.js';
 import type { NativeWatchdog } from '../native/watchdog.js';
-import { assertActualSessionFactory, type ActualSessionFactory, type ActualSessionSeal } from '../profiles/session.js';
+import { assertActualSessionFactory, assertSharedProfileStorage, bindSharedProfileSessions, type ProfileApp,
+  type ActualSessionFactory, type ActualSessionSeal } from '../profiles/session.js';
 import { prepareEngine, type EngineTransaction } from '../profiles/compatibility.js';
 import { assertProductionExitAuthority, type ProductionExitAuthority } from './exit.js';
 
@@ -43,9 +44,8 @@ const receipts = new WeakMap<HostCustody, { native: WatchdogCustody; platform: P
 
 /** Prepare storage for an additional profile through the same signed policy
  * and transaction as cold startup. The caller retains the exact Owner lease. */
-export async function prepareSharedProfileEngine(custody: HostCustody, owner: OwnerLease, previous: RuntimeRecord | undefined,
-  exit: ProductionExitAuthority, deadline: number): Promise<Readonly<{ retained: SharedProfileOwner; engine: EngineTransaction }>> {
-  assertProductionExitAuthority(exit);
+async function prepareSharedProfileEngine(custody: HostCustody, owner: OwnerLease, baseline: SharedMutationBaseline,
+  deadline: number): Promise<Readonly<{ retained: SharedProfileOwner; engine: EngineTransaction }>> {
   const primary = custody.instance.owner.profile, target = owner.profile;
   const current = () => {
     assertTime(deadline); assertHostCustody(custody);
@@ -54,7 +54,7 @@ export async function prepareSharedProfileEngine(custody: HostCustody, owner: Ow
       throw unavailable('profile');
   };
   current();
-  const prepared: { baseline?: SharedMutationBaseline; retained?: SharedProfileOwner } = {};
+  const prepared: { retained?: SharedProfileOwner } = {};
   const engine = await prepareEngine(owner, {
     build: custody.build.selection.build,
     manifest: custody.host.signed.manifest,
@@ -65,15 +65,14 @@ export async function prepareSharedProfileEngine(custody: HostCustody, owner: Ow
     },
     async assertPreviousEngineExited(profile) {
       if (profile !== target) throw unavailable('profile');
-      prepared.baseline = await exit.verifySharedBaseline(target, previous, owner, deadline);
       current();
     },
     async beginMutation(lease, marker) {
       current();
-      if (lease !== owner || !prepared.baseline) throw unavailable('profile');
+      if (lease !== owner) throw unavailable('profile');
       const retained = await custody.retainProfileOwner(owner);
       current();
-      const permit = retained.beginMarkerMutation(prepared.baseline, `${JSON.stringify(marker)}\n`);
+      const permit = retained.beginMarkerMutation(baseline, `${JSON.stringify(marker)}\n`);
       prepared.retained = retained;
       return permit;
     },
@@ -81,6 +80,45 @@ export async function prepareSharedProfileEngine(custody: HostCustody, owner: Ow
   if (!prepared.retained) throw unavailable('profile');
   await engine.assertReady(); current();
   return Object.freeze({ retained: prepared.retained, engine });
+}
+
+/** A starting runtime and both Sessions come from one uninterrupted Owner
+ * lease. Only the later authenticated listener/window assembly can make it ready. */
+export async function prepareSharedProfileRuntime(app: ProfileApp, custody: HostCustody, target: ProfileSnapshot,
+  exit: ProductionExitAuthority, deadline: number) {
+  assertProductionExitAuthority(exit);
+  assertHostCustody(custody);
+  const primary = custody.instance.owner.profile, { platform } = receipts.get(custody)!;
+  const current = async () => {
+    assertTime(deadline); assertHostCustody(custody);
+    if (custody.instance.record.phase !== 'ready' || custody.host.identity.layout.scope !== 'installed' ||
+        target.paths.state !== primary.paths.state || target.record.id === primary.record.id) throw unavailable('profile');
+  };
+  await current(); await assertSharedProfileStorage(app, target.paths.state);
+  const preparation: { baseline?: SharedMutationBaseline;
+    engine?: Awaited<ReturnType<typeof prepareSharedProfileEngine>>;
+    sessions?: Awaited<ReturnType<typeof bindSharedProfileSessions>> } = {};
+  const instance = await acquireInstance(target, platform, custody.build.selection.build, {
+    async assertExited(profile, previous, owner) {
+      if (profile !== target || !owner) throw unavailable('profile');
+      preparation.baseline = await exit.verifySharedBaseline(target, previous, owner, deadline);
+    },
+  }, deadline, {
+    assertAdmission: current,
+    async prepare(owner) {
+      await current();
+      if (!preparation.baseline) throw unavailable('profile');
+      preparation.engine = await prepareSharedProfileEngine(custody, owner, preparation.baseline, deadline);
+      preparation.sessions = await bindSharedProfileSessions(app, preparation.engine.engine, preparation.engine.retained);
+      await current();
+    },
+    async failed(owner) {
+      owner.release(); // Additional native descriptions, once retained, remain held until process exit.
+      throw unavailable('profile');
+    },
+  });
+  if (!instance || !preparation.engine || !preparation.sessions) throw unavailable('profile');
+  return Object.freeze({ instance, engine: preparation.engine.engine, retained: preparation.engine.retained, sessions: preparation.sessions });
 }
 /** Observe through only the actual receipt's original provider/handle. This
  * performs no admission, custody assertion, Claim operation or fatal action. */

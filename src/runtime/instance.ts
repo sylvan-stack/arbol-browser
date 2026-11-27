@@ -109,6 +109,9 @@ export interface InstanceAcquisition {
   assertAdmission(): Promise<void>;
   /** Optional read-only assertion before acquiring or inspecting ownership. */
   assertContinuity?(): Promise<void>;
+  /** Additional profile storage is prepared under the same Owner before any
+   * new runtime record is visible to other processes. */
+  prepare?(owner: OwnerLease): Promise<void>;
   /** Once production ownership is acquired, failed preparation retains the
    * actual guard and enters native unwind instead of the Foundation release. */
   failed(owner: OwnerLease): Promise<never>;
@@ -139,6 +142,10 @@ export async function acquireInstance(profile: ProfileSnapshot, platform: Platfo
         if (originalAlive(previous, platform)) throw profileUnavailable();
         await acquisition?.assertAdmission(); await unlink(path);
       }
+    }
+    if (acquisition?.prepare) {
+      await acquisition.prepare(owner);
+      await owner.assert(); await unchanged(location, previous); assertTime(deadline);
     }
     const own = platform.processIdentity(process.pid);
     if (!own || own.uid !== ownerUid()) throw profileUnavailable();
