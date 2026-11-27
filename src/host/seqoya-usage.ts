@@ -1,4 +1,5 @@
 import type { WindowHost } from './windows.js';
+import type { WebContents } from 'electron';
 import { SeqoyaPageRefusal, readSeqoyaPage, type SeqoyaProvider } from './seqoya-page.js';
 
 export interface SeqoyaUsageWindow {
@@ -16,6 +17,7 @@ export interface SeqoyaUsage {
   resetCredits?: { available: number; expiries: string[] };
   deepseekBalance?: string;
   mimoCredits?: { total: string; remaining: string; resetAt: string };
+  minimaxApi?: { balance: string; paymentAt?: string; paid?: string };
   minimax?: {
     activePlan: boolean;
     credits: string;
@@ -27,7 +29,7 @@ export interface SeqoyaUsage {
 
 /** The host evaluates this self-contained reader in an isolated world. Only
  * the fixed typed return value crosses from the operation-owned document. */
-function extractUsage(provider: SeqoyaProvider, observedAt: string): SeqoyaUsage | null {
+function extractUsage(provider: SeqoyaProvider, observedAt: string): SeqoyaUsage | 'minimax-billing' | null {
   const when = Date.parse(observedAt);
   const dialog = provider === 'claude/anthropic';
   const chatgpt = provider === 'codex/chatgpt' || provider === 'pi/chatgpt';
@@ -263,8 +265,9 @@ function extractUsage(provider: SeqoyaProvider, observedAt: string): SeqoyaUsage
       break;
     }
     case 'pi/minimax': {
+      if (contains('Not subscribed to M Plan')) return 'minimax-billing';
       const activePlan = contains('Plan Details');
-      if (!activePlan && !contains('Not subscribed to M Plan')) return null;
+      if (!activePlan) return null;
       const credits = around('Credits', rows => amount(rows[rows.indexOf('credits') - 1]));
       const overview = root.querySelector<HTMLElement>('section[aria-labelledby="plan-usage-overview"]');
       const selected = overview?.querySelector<HTMLElement>('[aria-pressed="true"]');
@@ -292,18 +295,66 @@ function extractUsage(provider: SeqoyaProvider, observedAt: string): SeqoyaUsage
   return result.windows.length || result.minimax ? result : null;
 }
 
-export function captureSeqoyaUsage(host: WindowHost, provider: SeqoyaProvider, deadline: number,
-  signal: AbortSignal, ownerBusy: () => boolean): Promise<SeqoyaUsage> {
-  return readSeqoyaPage(host, provider, deadline, signal, ownerBusy, async (contents, check) => {
-    for (let attempt = 0; attempt < 16; attempt++) {
-      check();
-      const stamp = new Date().toISOString();
-      const code = `(${extractUsage.toString()})(${JSON.stringify(provider)},${JSON.stringify(stamp)})`;
-      const result: SeqoyaUsage | null = await contents.executeJavaScriptInIsolatedWorld(998, [{ code }]);
-      check();
-      if (result && JSON.stringify(result).length <= 16_384) return result;
-      await new Promise<void>(resolve => setTimeout(resolve, 500));
+function extractMiniMaxBilling(observedAt: string): SeqoyaUsage | null {
+  const main = document.querySelector('main');
+  if (!main || main.querySelector('input[type="password"],input[autocomplete="one-time-code"]')) return null;
+  const named = (node: HTMLElement, label: string) => {
+    if (node.getAttribute('aria-label') === label) return true;
+    const reference = node.getAttribute('aria-labelledby');
+    return !!reference && document.getElementById(reference)?.textContent?.trim() === label;
+  };
+  const breakdown = [...main.querySelectorAll<HTMLElement>('[aria-label],[aria-labelledby]')]
+    .find(node => named(node, 'Balance breakdown'));
+  if (!breakdown) return null;
+  const lines = breakdown.innerText.split('\n').map(line => line.trim()).filter(Boolean);
+  const cash = lines.indexOf('Cash');
+  const amount = (value: string | undefined) => {
+    const raw = value?.replace(/^\$/, '').replaceAll(',', '');
+    return raw && /^\d{1,18}(?:\.\d{1,8})?$/.test(raw) ? raw : undefined;
+  };
+  const balance = amount(lines[cash + 1]);
+  if (cash < 0 || cash !== lines.lastIndexOf('Cash') || !lines.includes('Available balance (USD)') || !balance) return null;
+  const summary: NonNullable<SeqoyaUsage['minimaxApi']> = { balance };
+  const table = [...main.querySelectorAll('table')].find(node => named(node, 'Payment History'));
+  const headings = [...(table?.tHead?.rows[0]?.cells ?? [])].map(cell => cell.innerText.trim());
+  const date = headings.indexOf('Date (UTC+0)');
+  const status = headings.indexOf('Results');
+  if (date >= 0 && status === date + 2) {
+    for (const row of [...(table?.tBodies[0]?.rows ?? [])]) {
+      const paymentAt = row.cells[date]?.innerText.trim();
+      const paid = amount(row.cells[date + 1]?.innerText.trim());
+      if (row.cells[status]?.innerText.trim() !== 'Success' || !paid || Number(paid) <= 0
+        || !paymentAt || !/^20\d\d-\d\d-\d\d \d\d:\d\d:\d\d$/.test(paymentAt)) continue;
+      const stamp = Date.parse(paymentAt.replace(' ', 'T') + 'Z');
+      if (Number.isFinite(stamp) && stamp <= Date.parse(observedAt) &&
+        (summary.paymentAt === undefined || paymentAt > summary.paymentAt)) {
+        summary.paymentAt = paymentAt;
+        summary.paid = paid;
+      }
     }
-    throw new SeqoyaPageRefusal('dashboard_unavailable');
-  });
+  }
+  return { observedAt, windows: [], minimaxApi: summary };
+}
+
+async function pollUsage<T>(contents: WebContents, check: () => void, codeFor: (stamp: string) => string): Promise<T> {
+  for (let attempt = 0; attempt < 16; attempt++) {
+    check();
+    const code = codeFor(new Date().toISOString());
+    const result: T | null = await contents.executeJavaScriptInIsolatedWorld(998, [{ code }]);
+    check();
+    if (result && JSON.stringify(result).length <= 16_384) return result;
+    await new Promise<void>(resolve => setTimeout(resolve, 500));
+  }
+  throw new SeqoyaPageRefusal('dashboard_unavailable');
+}
+
+export async function captureSeqoyaUsage(host: WindowHost, provider: SeqoyaProvider, deadline: number,
+  signal: AbortSignal, ownerBusy: () => boolean): Promise<SeqoyaUsage> {
+  const result = await readSeqoyaPage(host, provider, deadline, signal, ownerBusy, (contents, check) =>
+    pollUsage<SeqoyaUsage | 'minimax-billing'>(contents, check,
+      stamp => `(${extractUsage.toString()})(${JSON.stringify(provider)},${JSON.stringify(stamp)})`));
+  if (result !== 'minimax-billing') return result;
+  return readSeqoyaPage(host, provider, deadline, signal, ownerBusy, (contents, check) =>
+    pollUsage<SeqoyaUsage>(contents, check,
+      stamp => `(${extractMiniMaxBilling.toString()})(${JSON.stringify(stamp)})`), 'minimax-billing');
 }

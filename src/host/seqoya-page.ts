@@ -29,6 +29,7 @@ const redirect = (provider: SeqoyaProvider, target: URL, address: string): boole
 export async function readSeqoyaPage<T>(
   host: WindowHost, provider: SeqoyaProvider, deadline: number, signal: AbortSignal,
   ownerBusy: () => boolean, read: (contents: WebContents, check: () => void) => Promise<T>,
+  source: 'usage' | 'minimax-billing' = 'usage',
 ): Promise<T> {
   assertWindowHost(host);
   const window = host.window;
@@ -37,7 +38,12 @@ export async function readSeqoyaPage<T>(
   if (!Number.isFinite(deadline) || deadline <= now() || signal.aborted) {
     throw new SeqoyaPageRefusal('dashboard_unavailable');
   }
-  const target = new URL(seqoyaDestinations[provider]);
+  if (source === 'minimax-billing' && provider !== 'pi/minimax') {
+    throw new SeqoyaPageRefusal('dashboard_unavailable');
+  }
+  const target = new URL(source === 'minimax-billing'
+    ? 'https://platform.minimax.io/console/recharge-records'
+    : seqoyaDestinations[provider]);
   const page = host.createPage();
   active.add(window);
   const contents = page.view.webContents;
