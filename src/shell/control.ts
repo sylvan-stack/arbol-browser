@@ -39,42 +39,51 @@ function updateProfileControls(): void {
 function renderProfiles(): void {
   const entries = profiles?.profiles ?? [];
   if (!entries.length) return;
-  const active = entries.find(entry => entry.id === profiles?.current);
-  const labels = entries.map(entry => {
+  const keys = new Set(entries.map(entry => entry.id + ':' + entry.instance));
+  const existing = new Map<string, HTMLElement>();
+  const focused = document.activeElement as HTMLElement | null;
+  for (const row of profileList.querySelectorAll<HTMLElement>('[data-profile-key]')) {
+    const key = row.dataset.profileKey!;
+    if (keys.has(key)) existing.set(key, row);
+    else row.remove();
+  }
+  let next = profileList.firstElementChild;
+  for (const entry of entries) {
+    const key = entry.id + ':' + entry.instance;
+    const active = entry.id === profiles?.current;
     const name = entry.label ?? profileLabel(entry.id);
-    const row = document.createElement('div');
-    const choice = document.createElement('button');
-    const label = document.createElement('span');
-    label.textContent = entry.unavailable ? name + ' (unavailable)' : name;
-    choice.append(label);
-    choice.type = 'button';
-    choice.className = 'profile';
-    choice.title = label.textContent;
+    const row = existing.get(key) ?? document.createElement('div');
+    const choice = row.firstElementChild as HTMLButtonElement | null ?? document.createElement('button');
+    const label = choice.firstElementChild ?? document.createElement('span');
+    const text = entry.unavailable ? name + ' (unavailable)' : name;
+    if (label.textContent !== text) label.textContent = text;
+    choice.title = text;
     choice.disabled = entry.unavailable === true;
     choice.setAttribute('aria-disabled', String(changingProfile || choice.disabled));
-    choice.dataset.profile = entry.id;
-    if (entry === active) {
+    choice.setAttribute('aria-expanded', String(active));
+    if (!existing.has(key)) {
+      row.dataset.profileKey = key;
+      choice.type = 'button';
+      choice.className = 'profile';
+      choice.append(label);
+      row.append(choice);
+    }
+    if (active) {
       choice.setAttribute('aria-current', 'true');
       choice.setAttribute('aria-controls', 'tabs');
-      choice.setAttribute('aria-expanded', 'true');
+      choice.onclick = null;
+      tabList.setAttribute('aria-label', 'Open tabs in ' + name);
+      if (tabList.parentElement !== row) row.append(tabList);
     } else {
-      choice.setAttribute('aria-expanded', 'false');
+      choice.removeAttribute('aria-current');
+      choice.removeAttribute('aria-controls');
       choice.onclick = () => { void profileAction({ method: 'open', profile: entry.id, instance: entry.instance }); };
     }
-    row.append(choice);
-    return row;
-  });
-  const focused = document.activeElement as HTMLElement | null;
-  const previous = focused?.dataset.profile;
-  profileList.replaceChildren(...labels);
-  if (active) {
-    const current = labels[entries.indexOf(active)]!;
-    tabList.setAttribute('aria-label', 'Open tabs in ' + (active.label ?? profileLabel(active.id)));
-    current.append(tabList);
+    if (row !== next) profileList.insertBefore(row, next);
+    next = row.nextElementSibling;
   }
-  if (previous) [...profileList.querySelectorAll<HTMLButtonElement>('[data-profile]')]
-    .find(choice => choice.dataset.profile === previous)?.focus({ preventScroll: true });
-  else if (focused && tabList.contains(focused)) focused.focus({ preventScroll: true });
+  if (focused && focused !== document.activeElement && profileList.contains(focused))
+    focused.focus({ preventScroll: true });
 }
 async function profileAction(request: ProfileNavigationRequest): Promise<void> {
   const listing = request.method === 'list';
