@@ -17,9 +17,10 @@ const redirect = (provider: SeqoyaProvider, target: URL, address: string): boole
     const url = new URL(address);
     const chatgptOverview = (provider === 'codex/chatgpt' || provider === 'pi/chatgpt') &&
       url.search === '?tab=overview';
-    return url.origin === target.origin && !url.username && !url.password && (!url.search || chatgptOverview) && !url.hash &&
-      (url.pathname === target.pathname || url.pathname === target.pathname + '/' ||
-       (provider === 'claude/anthropic' && url.pathname === '/new'));
+    const claudeUsage = provider === 'claude/anthropic' && url.pathname === '/new' &&
+      (!url.hash || url.hash === '#settings/usage');
+    return url.origin === target.origin && !url.username && !url.password && (!url.search || chatgptOverview) &&
+      (claudeUsage || (!url.hash && (url.pathname === target.pathname || url.pathname === target.pathname + '/')));
   } catch {
     return false;
   }

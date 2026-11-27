@@ -31,9 +31,9 @@ export interface SeqoyaUsage {
  * the fixed typed return value crosses from the operation-owned document. */
 function extractUsage(provider: SeqoyaProvider, observedAt: string): SeqoyaUsage | 'minimax-billing' | null {
   const when = Date.parse(observedAt);
-  const dialog = provider === 'claude/anthropic';
+  const claude = provider === 'claude/anthropic';
   const chatgpt = provider === 'codex/chatgpt' || provider === 'pi/chatgpt';
-  const roots = [...document.querySelectorAll<HTMLElement>(dialog ? '[role="dialog"]' : 'main')];
+  const roots = [...document.querySelectorAll<HTMLElement>(claude ? '[role="dialog"]' : 'main')];
   const shown = (node: HTMLElement) => {
     const style = getComputedStyle(node);
     return node.getClientRects().length > 0 && style.visibility === 'visible' && style.display !== 'none';
@@ -82,16 +82,17 @@ function extractUsage(provider: SeqoyaProvider, observedAt: string): SeqoyaUsage
           if (competingLabels.some(heading => cardText.includes(heading))) break;
         }
         const scope = block;
-        const blockLeaves = chatgpt ? leaves.filter(node => scope.contains(node)) : [];
+        const blockLeaves = chatgpt || claude ? leaves.filter(node => scope.contains(node)) : [];
         if (cardBoundaries && blockLeaves.some(node => node !== anchor && cardBoundaries.has(text(node)))) break;
         const lines = value.split('\n').map(line => line.trim().replace(/\s+/g, ' ')).filter(Boolean);
         const afterLabel = (items: string[]) => {
+          if (claude) items = items.filter(item => !/^[\ue000-\uf8ff]+$/.test(item));
           const start = items.indexOf(label);
           return start >= 0 && items.lastIndexOf(label) === start ? parse(items.slice(start + 1)) : undefined;
         };
         // Inline quota labels may have separate visible elements without
         // line breaks in the surrounding card's innerText.
-        const parsed = afterLabel(lines) ?? (chatgpt ? afterLabel(blockLeaves.map(text)) : undefined);
+        const parsed = afterLabel(lines) ?? afterLabel(blockLeaves.map(text));
         if (parsed !== undefined) return parsed;
       }
     }
@@ -114,11 +115,13 @@ function extractUsage(provider: SeqoyaProvider, observedAt: string): SeqoyaUsage
     return minutes > 0 && minutes <= 35 * 1440 ? iso(when + minutes * 60_000) : undefined;
   };
   const localClock = (line: string | undefined): string | undefined => {
-    const match = line?.match(/^Resets (at|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday) (\d{1,2}):(\d{2}) ([AP]M)$/);
+    const match = line?.match(/^Resets (at|[A-Z][a-z]+) (\d{1,2}):(\d{2}) ([AP]M)$/);
     if (!match || Number(match[2]) < 1 || Number(match[2]) > 12 || Number(match[3]) > 59) return undefined;
+    const day = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+      .findIndex(name => match[1] === name || match[1] === name.slice(0, 3));
+    if (match[1] !== 'at' && day < 0) return undefined;
     const date = new Date(when);
     date.setHours(Number(match[2]) % 12 + (match[4] === 'PM' ? 12 : 0), Number(match[3]), 0, 0);
-    const day = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'].indexOf(match[1] ?? '');
     const offset = day < 0 ? 0 : (day - date.getDay() + 7) % 7;
     date.setDate(date.getDate() + (offset || (date.getTime() <= when ? (day < 0 ? 1 : 7) : 0)));
     return iso(date.getTime());
@@ -184,18 +187,22 @@ function extractUsage(provider: SeqoyaProvider, observedAt: string): SeqoyaUsage
       break;
     }
     case 'claude/anthropic': {
+      if (!contains('Your usage')) return null;
       const plan = around('Your usage', rows => {
         const value = rows[0]?.toLowerCase();
         return value === 'pro' || value === 'max' || value === 'team' || value === 'enterprise' ? value : undefined;
       });
-      if (!plan) return null;
-      result.plan = plan;
+      if (plan) result.plan = plan;
+      const cardBoundaries = new Set(['Current session', 'This week', 'Limit resets', 'Usage credits']);
       for (const [minutes, label] of [[300, 'Current session'], [10080, 'This week']] as const) {
-        const reading = around(label, rows => {
-          const reset = localClock(rows[0]);
-          const used = percentage(rows[1], ' used');
-          return reset && used !== undefined ? { reset, used } : undefined;
-        });
+        const reading = around(label, ([timing, usage]) => {
+          const used = percentage(usage, ' used');
+          if (used === undefined) return undefined;
+          const reset = localClock(timing);
+          if (reset || (minutes === 300 && used === 0 && timing === 'Starts with your first message'))
+            return { reset, used };
+          return undefined;
+        }, root, cardBoundaries);
         if (reading) addWindow(minutes, reading.used, reading.reset);
       }
       const resets = around('Limit resets', rows => creditInventory(rows, false));
