@@ -289,6 +289,14 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
       check();
       if (presentation) await presentation.show(deadline, signal, check, raiseWindow);
       else if (!host.window.isVisible()) host.window.showInactive();
+      check();
+      if (!shared || !nativePresentation || host.isActiveProfile() || signal.aborted ||
+          performance.now() >= deadline || !nativePresentation.profiles.get(host)?.ready()) return;
+      for (const [source, member] of nativePresentation.profiles) {
+        if (!source.isActiveProfile() || !member.ready() || !member.canYield(false)) continue;
+        selectWindowProfile(source, host);
+        break;
+      }
     },
     publish() {
       if (!host.presentationStable()) return; // a real placement co-commit will notify the consistent state
