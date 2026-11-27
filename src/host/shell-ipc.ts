@@ -59,6 +59,7 @@ type NativePresentation = {
     ready(): boolean;
     assertRetained(): void;
     sidebarTabs(): NonNullable<Event['profileTabs']>[number]['tabs'];
+    assertTab(id: string): void;
     selectTab(id: string): void;
     publish(): void;
     canYield(ownerSwitch: boolean): boolean;
@@ -210,7 +211,12 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
       },
       sidebarTabs: () => tabs.all().filter(target => target.page.window === host)
         .slice(0, 7).map(target => ({ id: target.id, title: tabChrome(target).title })),
-      selectTab: id => { tabs.select(host, id); },
+      assertTab(id) {
+        if (tabs.get(id).page.window !== host) throw refused('tab_not_found');
+      },
+      selectTab(id) {
+        if (tabs.selected(host)?.id !== id) tabs.select(host, id);
+      },
       publish: () => registration.publish(),
       canYield: ownerSwitch =>
         !host.window.isDestroyed() && host.window.isEnabled() && (ownerSwitch || !host.window.isFocused()) &&
@@ -229,14 +235,23 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
   const profiles = profileSource && nativePresentation && createProfileNavigation(profileSource.custody, profileSource.platform,
     nativePresentation.value.yieldForSwitch, (id, instance, tab) => {
       const members = nativePresentation.profiles;
+      const source = members.get(host);
+      if (!host.isActiveProfile() || !host.window.isFocused() || !source?.canYield(true)) throw refused('control_refused');
       for (const [target, profile] of members) {
         if (profile.id !== id) continue;
-        if (profile.instance !== instance || !members.get(host)?.canYield(true))
-          throw refused('control_refused');
+        if (profile.instance !== instance) throw refused('control_refused');
         if (!profile.ready()) return false;
         profile.assertRetained();
-        if (tab !== undefined) profile.selectTab(tab);
+        if (tab !== undefined) profile.assertTab(tab);
         selectWindowProfile(host, target);
+        if (tab !== undefined) {
+          try {
+            profile.selectTab(tab);
+          } catch (error) {
+            if (target.isActiveProfile() && source.ready() && profile.canYield(true)) selectWindowProfile(target, host);
+            throw error;
+          }
+        }
         profile.openHome();
         return true;
       }
