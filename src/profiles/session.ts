@@ -1,9 +1,9 @@
 import type { App, Session } from 'electron';
 import { randomBytes } from 'node:crypto';
-import { directory, assertDirectory, profileUnavailable } from './paths.js';
+import { directory, assertDirectory, profileUnavailable, type Identity } from './paths.js';
 import { assertEngineRootStorage, type EngineTransaction } from './compatibility.js';
 import { assertHostCustody, type HostCustody } from '../runtime/custody.js';
-import type { WebsiteSessionReceipt } from '../runtime/platform.js';
+import type { SharedProfileOwner, WebsiteSessionReceipt } from '../runtime/platform.js';
 
 export type ProfileApp = Pick<App, 'isReady' | 'setPath' | 'setAppLogsPath'>;
 export interface SessionFactory {
@@ -68,6 +68,21 @@ export function consumeActualSessionSeal(factory: ActualSessionFactory, seal: Ac
   value.used = true;
   return Object.freeze({ format: 1, websitePath: value.path, shellPartition: value.partition, shellStoragePath: null });
 }
+function openActualProfileSessions(factory: ActualSessionFactory, path: string) {
+  assertActualSessionFactory(factory);
+  const actual = actualFactories.get(factory)!;
+  const website = actual.fromPath.call(actual.api, path, { cache: true });
+  const partition = `shell-${randomBytes(16).toString('hex')}`;
+  const shell = actual.fromPartition.call(actual.api, partition, { cache: false });
+  if (website === shell || website.getStoragePath() !== path || shell.getStoragePath() !== null) throw profileUnavailable();
+  const cookies = website.cookies;
+  const operations: ActualSessionOperations = Object.freeze({ websitePath: website.getStoragePath, shellPath: shell.getStoragePath,
+    dom: website.flushStorageData, cookies, cookieFlush: cookies.flushStore });
+  assertOperations(website, shell, operations);
+  const seal: ActualSessionSeal = Object.freeze({ role: 'actual-session-seal' });
+  actualSeals.set(seal, { factory, website, shell, path, partition, operations, used: false });
+  return { website, shell, operations, seal };
+}
 export function assertProductionSessions(sessions: ProfileSessions, custody: HostCustody): void {
   const actual = actualSessions.get(sessions);
   if (!actual || actual.custody !== custody) throw profileUnavailable(); assertHostCustody(custody);
@@ -93,10 +108,12 @@ export function productionSessionShutdown(sessions: ProfileSessions, custody: Ho
   });
 }
 const configuredApps = new WeakSet<ProfileApp>();
+const sharedStorage = new WeakMap<ProfileApp, Readonly<{ path: string; identity: Identity }>>();
 /** No Electron runtime import: the host injects its own actual app/session objects.
  * Prepared dirty marker and retained owner are mandatory even before setPath.
  * This service creates no windows/views and grants no native input admission. */
-export async function configureProfileSession(app: ProfileApp, transaction: EngineTransaction, custody?: HostCustody): Promise<SessionBinding> {
+export async function configureProfileSession(app: ProfileApp, transaction: EngineTransaction, custody?: HostCustody,
+  useSharedStorage = false): Promise<SessionBinding> {
   if (custody) {
     assertHostCustody(custody);
     if (custody.instance.owner !== transaction.owner) throw profileUnavailable();
@@ -104,6 +121,8 @@ export async function configureProfileSession(app: ProfileApp, transaction: Engi
   }
   await transaction.assertReady();
   const paths = transaction.owner.profile.paths;
+  if (useSharedStorage && custody?.host.identity.layout.scope !== 'installed') throw profileUnavailable();
+  const shared = useSharedStorage ? Object.freeze({ path: paths.state, identity: await directory(paths.state) }) : undefined;
   const data = await directory(paths.data), userData = await directory(paths.userData);
   await directory(paths.logs);
   if (custody) await assertEngineRootStorage(transaction.owner, await directory(paths.root));
@@ -114,8 +133,9 @@ export async function configureProfileSession(app: ProfileApp, transaction: Engi
   app.setPath('userData', paths.userData);
   // Electron allows the network service to persist only within this parent.
   // Keep it separate from the exact website context created at data/.
-  app.setPath('sessionData', custody ? paths.root : paths.userData);
+  app.setPath('sessionData', shared?.path ?? (custody ? paths.root : paths.userData));
   app.setAppLogsPath(paths.logs);
+  if (shared) sharedStorage.set(app, shared);
   let used = false;
   const prebind = async () => {
     if (used || !app.isReady()) throw profileUnavailable(); used = true;
@@ -156,21 +176,44 @@ export async function configureProfileSession(app: ProfileApp, transaction: Engi
         const actual = actualFactories.get(factory)!; assertHostCustody(custody);
         permit = custody.beginSessionUse(factory);
         // NO await or injectable callback between native grant and actual seal.
-        const website = actual.fromPath.call(actual.api, paths.data, { cache: true });
-        const partition = `shell-${randomBytes(16).toString('hex')}`;
-        const shell = actual.fromPartition.call(actual.api, partition, { cache: false });
-        if (website === shell || website.getStoragePath() !== paths.data || shell.getStoragePath() !== null) return permit.abort();
-        const cookies = website.cookies;
-        const operations: ActualSessionOperations = Object.freeze({ websitePath: website.getStoragePath, shellPath: shell.getStoragePath,
-          dom: website.flushStorageData, cookies, cookieFlush: cookies.flushStore });
-        assertOperations(website, shell, operations);
+        const { website, shell, operations, seal } = openActualProfileSessions(factory, paths.data);
         const sessions = sessionsFor(website, shell, () => native, operations);
-        const seal: ActualSessionSeal = Object.freeze({ role: 'actual-session-seal' });
-        actualSeals.set(seal, { factory, website, shell, path: paths.data, partition, operations, used: false });
         native = permit.accept(seal);
         actualSessions.set(sessions, { custody, factory: actual, native, operations, quitting: false });
         await transaction.assertReady(); assertProductionSessions(sessions, custody); return sessions;
       } catch { return permit ? permit.abort() : custody.terminate(); }
+    },
+  });
+}
+
+/** The additional website and shell remain distinct actual Electron Sessions. */
+export async function bindSharedProfileSessions(app: ProfileApp, transaction: EngineTransaction, owner: SharedProfileOwner):
+  Promise<ProfileSessions & { assertBound(): void }> {
+  const { record, paths, dataIdentity } = transaction.owner.profile;
+  const shared = sharedStorage.get(app);
+  if (!shared || shared.path !== paths.state || owner.profile !== record.id || owner.instance !== record.instance)
+    throw profileUnavailable();
+  await transaction.assertReady();
+  await assertDirectory(shared.path, shared.identity); await assertDirectory(paths.data, dataIdentity);
+  const factory = await actualSessionFactory(app), actual = actualFactories.get(factory)!;
+  assertActualSessionFactory(factory);
+  if (actual.app.getPath('sessionData') !== shared.path) throw profileUnavailable();
+  owner.assertRetained();
+  const permit = owner.beginSessionUse(factory);
+  const { website, shell, operations, seal } = openActualProfileSessions(factory, paths.data);
+  const native = permit.accept(seal);
+  const assertBound = () => {
+    assertActualSessionFactory(factory); native.assertBound(); assertOperations(website, shell, operations);
+    if (actual.app.getPath('sessionData') !== shared.path || operations.websitePath.call(website) !== paths.data ||
+        operations.shellPath.call(shell) !== null) throw profileUnavailable();
+  };
+  await transaction.assertReady(); assertBound();
+  return Object.freeze({ website, shell, assertBound,
+    async flushStorage() {
+      await transaction.assertReady(); assertBound();
+      operations.dom.call(website);
+      await operations.cookieFlush.call(operations.cookies);
+      await transaction.assertReady(); assertBound();
     },
   });
 }

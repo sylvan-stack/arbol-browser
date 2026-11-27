@@ -1874,6 +1874,8 @@ struct SharedProfileRetention {
   std::string expectedMarker,intent;
   struct stat markerIdentity{},intentIdentity{},historyIdentity{};
   double deadline=0;
+  bool sessionStarted=false;
+  NSDictionary* sessionFacts=nil;
 };
 static std::map<const arbol_exit::AdditionalOwner*,SharedProfileRetention> sharedOwnerReceipts;
 static bool custodyAttempted = false;
@@ -5213,17 +5215,18 @@ static napi_value acceptSharedProfileMarker(napi_env env,napi_callback_info info
   } @catch(NSException*) { return fail(env); } }
   napi_value out; napi_get_undefined(env,&out); return out;
 }
+static bool sharedProfileMarkerCurrent(const arbol_exit::AdditionalOwner& owner,const SharedProfileRetention& retention) {
+  std::string raw; struct stat actual{}; bool absent;
+  return retention.phase==SharedProfileRetention::MarkerPhase::bound&&sharedProfileCurrent(owner,retention)&&
+    sharedIntentCurrent(retention)&&readSharedMarker(owner,retention,raw,actual,absent)&&!absent&&
+    raw==retention.expectedMarker&&arbol_attempt::sameFile(actual,retention.markerIdentity);
+}
 static napi_value assertSharedProfileMarker(napi_env env,napi_callback_info info) {
   napi_value arg; if(!argument(env,info,&arg)) return fail(env);
   auto known=sharedProfileArgument(env,arg);
-  if(known==sharedOwnerReceipts.end()||known->second.phase!=SharedProfileRetention::MarkerPhase::bound) return fail(env);
-  auto& retained=known->second;
-  @autoreleasepool { @try {
-    std::string raw; struct stat actual{}; bool absent;
-    if(!sharedProfileCurrent(*known->first,retained)||!sharedIntentCurrent(retained)||
-       !readSharedMarker(*known->first,retained,raw,actual,absent)||absent||raw!=retained.expectedMarker||
-       !arbol_attempt::sameFile(actual,retained.markerIdentity)) return fail(env);
-  } @catch(NSException*) { return fail(env); } }
+  if(known==sharedOwnerReceipts.end()) return fail(env);
+  @autoreleasepool { @try { if(!sharedProfileMarkerCurrent(*known->first,known->second)) return fail(env); }
+  @catch(NSException*) { return fail(env); } }
   napi_value out; napi_get_undefined(env,&out); return out;
 }
 static napi_value abortSharedProfileMarker(napi_env env,napi_callback_info info) {
@@ -5231,6 +5234,45 @@ static napi_value abortSharedProfileMarker(napi_env env,napi_callback_info info)
   auto known=sharedProfileArgument(env,arg);
   if(known==sharedOwnerReceipts.end()) return fail(env);
   if(known->second.phase==SharedProfileRetention::MarkerPhase::permitted) known->second.phase=SharedProfileRetention::MarkerPhase::failed;
+  napi_value out; napi_get_undefined(env,&out); return out;
+}
+
+static bool sharedSessionMayStart(const arbol_exit::AdditionalOwner& owner,const SharedProfileRetention& retention) {
+  return !retention.custody->finalization.shared()->closeReceivedUs.load(std::memory_order_acquire)&&
+    sharedProfileMarkerCurrent(owner,retention);
+}
+static napi_value beginSharedProfileSession(napi_env env,napi_callback_info info) {
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env);
+  auto known=sharedProfileArgument(env,arg);
+  if(known==sharedOwnerReceipts.end()||known->second.sessionStarted) return fail(env);
+  @autoreleasepool { @try {
+    if(!sharedSessionMayStart(*known->first,known->second)) return fail(env);
+    known->second.sessionStarted=true;
+  } @catch(NSException*) { return fail(env); } }
+  napi_value out; napi_get_undefined(env,&out); return out;
+}
+static napi_value acceptSharedProfileSession(napi_env env,napi_callback_info info) {
+  napi_value args[2]; size_t n=2; std::string raw;
+  if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok||n!=2||!boundedText(env,args[1],raw)) return fail(env);
+  auto known=sharedProfileArgument(env,args[0]);
+  if(known==sharedOwnerReceipts.end()||!known->second.sessionStarted||known->second.sessionFacts) return fail(env);
+  @autoreleasepool { @try {
+    NSDictionary* facts=arbol_attempt::json(raw);
+    NSString* expected=[known->first->storage[@"profile"] stringByAppendingPathComponent:@"data"];
+    if(!arbol_attempt::keys(facts,@[@"format",@"websitePath",@"shellPartition",@"shellStoragePath"])||
+       ![facts[@"format"] isEqual:@1]||![facts[@"websitePath"] isEqual:expected]||!arbol_boundary::canonical(expected.fileSystemRepresentation)||
+       facts[@"shellStoragePath"]!=NSNull.null||!arbol_attempt::pattern(facts[@"shellPartition"],@"^shell-[0-9a-f]{32}$")||
+       !sharedSessionMayStart(*known->first,known->second)) return fail(env);
+    known->second.sessionFacts=facts;
+  } @catch(NSException*) { return fail(env); } }
+  napi_value out; napi_get_undefined(env,&out); return out;
+}
+static napi_value assertSharedProfileSession(napi_env env,napi_callback_info info) {
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env);
+  auto known=sharedProfileArgument(env,arg);
+  if(known==sharedOwnerReceipts.end()||!known->second.sessionFacts) return fail(env);
+  @autoreleasepool { @try { if(!sharedProfileMarkerCurrent(*known->first,known->second)) return fail(env); }
+  @catch(NSException*) { return fail(env); } }
   napi_value out; napi_get_undefined(env,&out); return out;
 }
 
@@ -5341,6 +5383,9 @@ static napi_value init(napi_env env, napi_value exports) {
     {"acceptSharedProfileMarker",nullptr,acceptSharedProfileMarker,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"assertSharedProfileMarker",nullptr,assertSharedProfileMarker,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"abortSharedProfileMarker",nullptr,abortSharedProfileMarker,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"beginSharedProfileSession",nullptr,beginSharedProfileSession,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"acceptSharedProfileSession",nullptr,acceptSharedProfileSession,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"assertSharedProfileSession",nullptr,assertSharedProfileSession,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"custodyDescriptors",nullptr,custodyDescriptors,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"captureWatchdog",nullptr,captureWatchdog,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"watchdogBind",nullptr,watchdogBind,nullptr,nullptr,nullptr,napi_default,nullptr},
