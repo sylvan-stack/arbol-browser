@@ -68,6 +68,30 @@ export interface ResidentRuntime {
   readonly location: RuntimeLocation;
   readonly record: RuntimeRecord;
 }
+/** Inspect only the discovery pointer and matching physical process/runtime.
+ * The caller must still authenticate the primary Claim and management peer. */
+export async function observeInstalledResident(state: string, platform: PlatformPort): Promise<ResidentRuntime | undefined> {
+  const root = await directory(state), path = currentPath(state);
+  if (!await statOrAbsent(path)) return undefined;
+  const { value } = await readJson(path, 2048);
+  if (!validator('browser.ProfileId')((value as ResidentPointer | null)?.profile) ||
+      !value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 7)
+    throw profileUnavailable();
+  const pointer = value as ResidentPointer;
+  if (pointer.format !== 1 || typeof pointer.pid !== 'number' || !Number.isSafeInteger(pointer.pid) || pointer.pid < 2 ||
+      typeof pointer.processStartId !== 'string' || !/^[1-9][0-9]{0,19}$/.test(pointer.processStartId))
+    throw profileUnavailable();
+  const live = platform.processIdentity(pointer.pid);
+  if (live?.startId !== pointer.processStartId || live.uid !== process.geteuid?.()) return undefined;
+  const profile = await readProfile(profilePaths(pointer.profile, state));
+  const location = await runtimeLocation(profile);
+  const record = location && await readRuntime(location);
+  if (!location || !record || instanceFields.some(key => pointer[key] !== record[key]) ||
+      !originalAlive(record, platform) || record.phase === 'closing') throw profileUnavailable();
+  if (record.phase !== 'ready') return undefined;
+  await assertDirectory(state, root);
+  return Object.freeze({ profile, location, record });
+}
 /** Called only by the current startup election winner. A held lifetime
  * lock with an unreachable resident can never authorize a replacement. */
 export async function discoverInstalledResident(state: string, platform: PlatformPort, gate: HeldLock,
@@ -78,29 +102,8 @@ export async function discoverInstalledResident(state: string, platform: Platfor
     gate.assertIdentity(); await assertDirectory(state, root);
     const vacancy = platform.tryLock(ownerPath(state));
     if (vacancy) { vacancy.release(); return undefined; }
-    const path = currentPath(state);
-    if (await statOrAbsent(path)) {
-      const { value } = await readJson(path, 2048);
-      if (!validator('browser.ProfileId')((value as ResidentPointer | null)?.profile) ||
-          !value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 7)
-        throw profileUnavailable();
-      const pointer = value as ResidentPointer;
-      if (pointer.format !== 1 || typeof pointer.pid !== 'number' || !Number.isSafeInteger(pointer.pid) || pointer.pid < 2 ||
-          typeof pointer.processStartId !== 'string' || !/^[1-9][0-9]{0,19}$/.test(pointer.processStartId))
-        throw profileUnavailable();
-      const live = platform.processIdentity(pointer.pid);
-      if (live?.startId === pointer.processStartId && live.uid === process.geteuid?.()) {
-        const profile = await readProfile(profilePaths(pointer.profile, state));
-        const location = await runtimeLocation(profile);
-        const record = location && await readRuntime(location);
-        if (!location || !record || instanceFields.some(key => pointer[key] !== record[key]) ||
-            !originalAlive(record, platform) || record.phase === 'closing') throw profileUnavailable();
-        if (record.phase === 'ready') {
-          gate.assertIdentity(); await assertDirectory(state, root); assertTime(deadline);
-          return Object.freeze({ profile, location, record });
-        }
-      }
-    }
+    const resident = await observeInstalledResident(state, platform);
+    if (resident) { gate.assertIdentity(); await assertDirectory(state, root); assertTime(deadline); return resident; }
     await setTimeout(Math.min(20, Math.max(1, deadline - now())), undefined, signal ? { signal } : undefined);
   }
 }

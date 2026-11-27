@@ -294,14 +294,16 @@ type PrivateUsage = (params: SeqoyaParameters, deadline: number, signal: AbortSi
 interface ProfileAdmissionScope { readonly profile: string; readonly profileInstance: string }
 interface ProfileAdmissionRequest {
   readonly wire: 1; readonly id: string; readonly method: 'profile-admission';
-  readonly params: ProfileAdmissionScope & Readonly<{ expires: number }>;
+  readonly params: ProfileAdmissionScope & Readonly<{ expires: number; operation: 'open' | 'inspect' }>;
 }
-type PrivateProfileAdmission = (scope: ProfileAdmissionScope, deadline: number, signal: AbortSignal) => Promise<RuntimeRecord>;
+type PrivateProfileAdmission = (scope: ProfileAdmissionRequest['params'], deadline: number,
+  signal: AbortSignal) => Promise<RuntimeRecord | null>;
 const runtimeRecord = validator('wire.RuntimeRecord');
 const profileAdmissionResult = (value: unknown): value is RuntimeRecord | null => value === null || runtimeRecord(value);
 function isProfileAdmissionRequest(value: unknown): value is ProfileAdmissionRequest {
   return plain(value) && Object.keys(value).length === 4 && value.wire === 1 && value.method === 'profile-admission' &&
-    validator('browser.RequestId')(value.id) && plain(value.params) && Object.keys(value.params).length === 3 &&
+    validator('browser.RequestId')(value.id) && plain(value.params) && Object.keys(value.params).length === 4 &&
+    (value.params.operation === 'open' || value.params.operation === 'inspect') &&
     validator('browser.ProfileId')(value.params.profile) && typeof value.params.profileInstance === 'string' &&
     /^prf_[A-Za-z0-9_-]{22}$/.test(value.params.profileInstance) && typeof value.params.expires === 'number' &&
     Number.isSafeInteger(value.params.expires) && value.params.expires > 0;
@@ -675,12 +677,19 @@ export interface RuntimeClient {
   close(): void;
 }
 const usageCalls = new WeakMap<RuntimeClient, (params: SeqoyaParameters, deadline: number) => Promise<SeqoyaResult>>();
-const profileAdmissions = new WeakMap<RuntimeClient, (scope: ProfileAdmissionScope, deadline: number) => Promise<RuntimeRecord>>();
-export function requestProfileAdmission(client: RuntimeClient, scope: ProfileAdmissionScope, deadline: number): Promise<RuntimeRecord> {
+const profileAdmissions = new WeakMap<RuntimeClient, (scope: ProfileAdmissionScope, deadline: number,
+  operation: ProfileAdmissionRequest['params']['operation']) => Promise<RuntimeRecord | null>>();
+export async function requestProfileAdmission(client: RuntimeClient, scope: ProfileAdmissionScope, deadline: number): Promise<RuntimeRecord> {
+  const result = await requestProfileInspection(client, scope, deadline, 'open');
+  if (!result) throw unavailable('profile');
+  return result;
+}
+export function requestProfileInspection(client: RuntimeClient, scope: ProfileAdmissionScope, deadline: number,
+  operation: ProfileAdmissionRequest['params']['operation'] = 'inspect'): Promise<RuntimeRecord | null> {
   const request = profileAdmissions.get(client);
   if (!request) return Promise.reject(unavailable('profile'));
   profileAdmissions.delete(client);
-  return request(scope, deadline);
+  return request(scope, deadline, operation);
 }
 export function requestSeqoyaUsage(client: RuntimeClient, params: SeqoyaParameters, deadline: number): Promise<SeqoyaResult> {
   const call = usageCalls.get(client);
@@ -819,12 +828,13 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
           if (!isSeqoyaRequest(request)) return Promise.reject(unavailable('browser'));
           return send(request, limit, isSeqoyaResult) as Promise<SeqoyaResult>;
         });
-        if (endpoint === 'management') profileAdmissions.set(client, async (scope, limit) => {
+        if (endpoint === 'management') profileAdmissions.set(client, async (scope, limit, operation) => {
           const remaining = Math.min(60_000, limit - now());
           const request: ProfileAdmissionRequest = { wire: 1, id: token('req'), method: 'profile-admission',
-            params: { ...scope, expires: Math.floor(platform.continuousTime() + remaining) } };
+            params: { ...scope, operation, expires: Math.floor(platform.continuousTime() + remaining) } };
           if (remaining <= 0 || !isProfileAdmissionRequest(request)) throw unavailable('profile');
           const result = await send(request, limit, profileAdmissionResult);
+          if (result === null) return null;
           if (!runtimeRecord(result) || result.phase !== 'ready' || result.profile !== scope.profile ||
               result.profileInstance !== scope.profileInstance || !sameProcess(recordProcess(result), recordProcess(record)) ||
               result.build !== record.build) throw unavailable('profile');

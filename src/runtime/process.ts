@@ -18,8 +18,8 @@ import { claimedLayout, selectedLayout, type BuildSelection } from './selection.
 import { ownerLock, withOwnerLockForCustody, type OwnerLease, type RegistryLease } from '../profiles/locking.js';
 import { acquireBuildLease, withBuildLockForCustody, type BuildLease } from './build-lease.js';
 import { createProductionExitAuthority, assertProductionExitAuthority, type ProductionExitAuthority } from './exit.js';
-import { discoverInstalledResident, electInstalledStartup, type ResidentRuntime } from './resident.js';
-import { connectRuntime, requestProfileAdmission, type Endpoint } from './transport.js';
+import { discoverInstalledResident, electInstalledStartup, observeInstalledResident, type ResidentRuntime } from './resident.js';
+import { connectRuntime, requestProfileAdmission, requestProfileInspection, type Endpoint } from './transport.js';
 
 export interface LaunchAttempt {
   readonly format: 1; readonly request: string; readonly nonce: string;
@@ -355,7 +355,18 @@ export async function assertProductionCloseReady(profile: ProfileSnapshot, recor
       if (manifest.assertRetainedReadOnlyStorage(verifiedHost.signed, deadline)) retained = verifiedHost;
     }
     const host = retained ?? await authority.verifyPackagedHost(selection, layout.payload, deadline);
-    await createLaunchTransactions(host, platform, exits, Boolean(retained)).admitted(profile, record, deadline);
+    const attempts = createLaunchTransactions(host, platform, exits, Boolean(retained));
+    const resident = layout.scope === 'installed' ? await observeInstalledResident(profile.paths.state, platform) : undefined;
+    if (resident && resident.record.pid === record.pid && resident.record.processStartId === record.processStartId &&
+        resident.record.profile !== record.profile) {
+      await attempts.admitted(resident.profile, resident.record, deadline);
+      const client = await connectRuntime(resident.location, resident.record, 'management', { ...selection, explicit: false },
+        platform, deadline, 'Profile inspection');
+      try {
+        const inspected = await requestProfileInspection(client, { profile: profile.record.id, profileInstance: profile.record.instance }, deadline);
+        if (!inspected || JSON.stringify(inspected) !== JSON.stringify(record)) throw unavailable('profile');
+      } finally { client.close(); }
+    } else await attempts.admitted(profile, record, deadline);
     await lease.assert(); assertTime(deadline);
   } finally { lease.release(); }
 }
@@ -462,8 +473,15 @@ export async function archiveRemovedRuntime(profile: ProfileSnapshot, owner: Own
   await withOwnerLockForCustody(owner, platform, held => { held.assertIdentity(); });
   const location = await runtimeLocation(profile);
   if (!location) throw unavailable('profile'); // caller's Native full reader creates its stable Claim location
-  const original = await withLaunchAttempt(profile, platform, deadline, tx => tx.current);
+  let original = await withLaunchAttempt(profile, platform, deadline, tx => tx.current);
   await exits.assertClosedUnderOwner(profile, undefined, owner, deadline);
+  if (original?.phase === 'closed') {
+    // The native retirement preserves any immutable shared family Claim
+    // before this profile's own active bookkeeping can be detached.
+    await exits.retire(profile, owner, deadline);
+    original = await withLaunchAttempt(profile, platform, deadline, tx => tx.current);
+    if (original) throw unavailable('profile');
+  }
   await registry.assert(); await owner.assert();
   let outcome: object | undefined;
   const result = await withLaunchAttempt(profile, platform, deadline, tx => {
@@ -518,14 +536,18 @@ export async function archiveRemovedRuntime(profile: ProfileSnapshot, owner: Own
       catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
       const moves: Array<{ parent: Directory; name: string; stat: BigIntStats }> = [];
       const requests = new Set<string>(); if (current) requests.add(current.request);
-      if (history) for (const name of ['previous-claim.json', 'current-attempt.json']) {
+      if (history) for (const name of ['previous-claim.json', 'current-attempt.json', 'shared-current.json']) {
         let entry: ReturnType<typeof regular>;
         try { entry = regular(history, name, 16384); }
         catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue; throw error; }
-        if (entry.value.profile !== profile.paths.root || entry.value.profileInstance !== profile.record.instance ||
+        const shared = name === 'shared-current.json';
+        const scopeMatches = shared ? entry.value.kind === 'shared-profile-mutation' && entry.value.format === 1 :
+          entry.value.profile === profile.paths.root;
+        if (!scopeMatches || entry.value.profileInstance !== profile.record.instance ||
             entry.value.profilePathHash !== location.hash) throw unavailable('profile');
         if (typeof entry.value.request !== 'string' || !/^req_[A-Za-z0-9_-]{22}$/.test(entry.value.request)) throw unavailable('profile');
-        requests.add(entry.value.request); moves.push({ parent: history, name, stat: entry.stat });
+        if (!shared) requests.add(entry.value.request);
+        moves.push({ parent: history, name, stat: entry.stat });
       }
       // Only bounded current authoritative names. Historical authenticated
       // launch/Close files cannot be reused by another nonce/profile instance;

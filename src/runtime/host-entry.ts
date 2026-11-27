@@ -323,12 +323,23 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
   }
   return Object.freeze({
     openInWindow,
-    async admit(scope: Readonly<{ profile: string; profileInstance: string }>, deadline: number, signal: AbortSignal) {
+    async admit(scope: Parameters<AdditionalProfiles['admit']>[0], deadline: number, signal: AbortSignal) {
       const source = state.shell?.host;
       if (!source || signal.aborted) throw unavailable('profile');
       assertCurrent(source, deadline);
       const target = await readProfile(profilePaths(scope.profile, custody.host.policy.stateRoot));
       if (target.record.instance !== scope.profileInstance) throw unavailable('profile');
+      if (scope.operation === 'inspect') {
+        assertCurrent(source, deadline);
+        if (signal.aborted) throw unavailable('profile');
+        if (scope.profile === custody.instance.record.profile) return custody.instance.record;
+        const entry = profiles.get(scope.profile);
+        if (!entry || entry.instance !== scope.profileInstance || entry.runtime?.phase !== 'ready' || !entry.opening) return null;
+        const profile = await entry.opening;
+        assertCurrent(source, deadline); entry.runtime.assertAdmission();
+        if (signal.aborted) throw unavailable('profile');
+        return profile.instance.record;
+      }
       return openProfile(source, target, deadline, signal);
     },
     fence() {
