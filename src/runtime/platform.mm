@@ -2700,6 +2700,26 @@ static std::string sharedFamilyReference(NSString* request,NSString* capabilityD
   return arbol_exit::exitReceiptBytes(@{@"format":@1,@"kind":@"shared-browser-family",
     @"request":request,@"capabilityDigest":capabilityDigest});
 }
+static NSDictionary* sharedFamilyReadyClaim(NSDictionary* attempt) {
+  if(!arbol_attempt::record(attempt)||![attempt[@"stage"] isEqual:@"admitted"]) return nil;
+  NSDictionary* ready=attempt;
+  if([attempt[@"phase"] isEqual:@"closed"]&&attempt[@"runtime"]!=NSNull.null&&
+     [@[@"ready",@"closing"] containsObject:attempt[@"runtime"][@"phase"]]) {
+    // These are the only fields changed by ready -> closing -> closed.
+    NSMutableDictionary* restored=[attempt mutableCopy],*runtime=[attempt[@"runtime"] mutableCopy];
+    runtime[@"phase"]=@"ready";
+    restored[@"phase"]=@"ready"; restored[@"runtime"]=runtime; restored[@"terminal"]=NSNull.null;
+    ready=restored;
+  }
+  if(![ready[@"phase"] isEqual:@"ready"]||!arbol_attempt::record(ready)) return nil;
+  auto raw=arbol_attempt::bytes(ready);
+  return raw.empty()?nil:@{@"request":ready[@"request"],@"profileInstance":ready[@"profileInstance"],
+    @"profilePathHash":ready[@"profilePathHash"],@"digest":arbol_attempt::digest(raw)};
+}
+static NSDictionary* sharedFamilyBuild(NSDictionary* attempt) {
+  return @{@"number":attempt[@"build"],@"sourceDigest":attempt[@"sourceDigest"],
+    @"productDigest":attempt[@"productDigest"],@"candidateDigest":attempt[@"candidateDigest"]};
+}
 static napi_value retainSharedProfileOwner(napi_env env,napi_callback_info info) {
   napi_value args[4]; size_t n=4;
   std::string profileId,instance;
@@ -2777,12 +2797,11 @@ static napi_value retainSharedProfileOwner(napi_env env,napi_callback_info info)
     };
     NSDictionary* attempt=nil; std::string readyRaw;
     if(!readyClaim(readyRaw,attempt)) return fail(env);
+    NSDictionary* readyReference=sharedFamilyReadyClaim(attempt);
+    if(!readyReference||![readyReference[@"digest"] isEqual:arbol_attempt::digest(readyRaw)]) return fail(env);
     NSDictionary* group=@{@"bootSession":c->finalization.value()[@"bootSession"],
       @"capabilityDigest":arbol_attempt::digest(c->finalization.raw()),
-      @"claim":@{@"request":attempt[@"request"],@"profileInstance":attempt[@"profileInstance"],
-        @"profilePathHash":attempt[@"profilePathHash"],@"digest":arbol_attempt::digest(readyRaw)},
-      @"build":@{@"number":attempt[@"build"],@"sourceDigest":attempt[@"sourceDigest"],
-        @"productDigest":attempt[@"productDigest"],@"candidateDigest":attempt[@"candidateDigest"]},
+      @"claim":readyReference,@"build":sharedFamilyBuild(attempt),
       @"main":arbol_boundary::capsuleIdentity(c->context.main,c->context.session),
       @"primary":arbol_boundary::capsuleIdentity(c->context.primary),
       @"custody":arbol_boundary::capsuleIdentity(c->context.custody)};
@@ -3629,6 +3648,51 @@ static bool exitReceiptAt(NSString* path,std::string& raw,NSDictionary* __strong
   directory.fd=open(path.stringByDeletingLastPathComponent.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
   if(directory.fd<0||!arbol_exit::readNativeFile(directory.fd,path.lastPathComponent.UTF8String,raw,identity,arbol_exit::exitReceiptLimit)) return false;
   object=arbol_exit::parseExitReceipt(raw); return object&&directory.finish();
+}
+static bool readLiveSharedClaim(NSString* hash,std::string& raw) {
+  std::string path="/private/tmp/ab-"+std::to_string(geteuid())+"/"+[[hash substringToIndex:32] UTF8String]+"/claim.lock";
+  arbol_exit::NativeFile lock;
+  lock.fd=open(path.c_str(),O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
+  arbol_attempt::Location location; bool absent;
+  // The live pointer may advance independently. The file reader checks its
+  // named inode, then the resolver binds the complete claim to this request.
+  return lock.fd>=0&&arbol_attempt::location(path,lock.fd,location)&&
+    arbol_attempt::readAt(location.directory,"claim.json",raw,absent)&&!absent&&arbol_attempt::unchanged(location);
+}
+static NSDictionary* resolveSharedClosedClaim(NSString* state,NSDictionary* group,double deadline) {
+  using namespace arbol_attempt;
+  NSDictionary* ready=group[@"claim"];
+  if(arbol_boundary::clockMs()>=deadline||!keys(ready,@[@"request",@"profileInstance",@"profilePathHash",@"digest"])||
+     !pattern(ready[@"profilePathHash"],@"^[0-9a-f]{64}$")||!pattern(ready[@"digest"],@"^[0-9a-f]{64}$")||
+     !pattern(ready[@"profileInstance"],@"^prf_[A-Za-z0-9_-]{22}$")) return nil;
+  NSString* hash=ready[@"profilePathHash"],*request=ready[@"request"],*capabilityDigest=group[@"capabilityDigest"];
+  auto reference=sharedFamilyReference(request,capabilityDigest);
+  if(reference.empty()) return nil;
+  NSString* path=[[[state stringByAppendingPathComponent:@"exit-evidence"] stringByAppendingPathComponent:hash] stringByAppendingPathComponent:request];
+  MaintenanceDirectory family;
+  if(!family.openPath(path.fileSystemRepresentation)) return nil;
+  std::string source; struct stat named{};
+  if(!arbol_exit::readNativeFile(family.fd,"shared-family.json",source,named,arbol_exit::exitReceiptLimit)||source!=reference) return nil;
+  std::string raw; struct stat archived{};
+  if(!fstatat(family.fd,"closed-claim.json",&named,AT_SYMLINK_NOFOLLOW)) {
+    if(!arbol_exit::readNativeFile(family.fd,"closed-claim.json",raw,archived,limit)||!sameFile(named,archived)) return nil;
+  } else if(errno!=ENOENT||!readLiveSharedClaim(hash,raw)) return nil;
+  NSDictionary* claim=json(raw);
+  if(!record(claim)||bytes(claim)!=raw||![claim[@"phase"] isEqual:@"closed"]||claim[@"terminal"]==NSNull.null||
+     ![sharedFamilyReadyClaim(claim) isEqual:ready]||![sharedFamilyBuild(claim) isEqual:group[@"build"]]||
+     ![[claim[@"profile"] stringByDeletingLastPathComponent] isEqual:[state stringByAppendingPathComponent:@"profiles"]]) return nil;
+  NSString* terminal=claim[@"terminal"][@"path"];
+  if(![terminal.stringByDeletingLastPathComponent isEqual:path]||
+     ![@[@"activation.json",@"terminal.json"] containsObject:terminal.lastPathComponent]) return nil;
+  std::string terminalRaw; struct stat terminalIdentity{};
+  if(!arbol_exit::readNativeFile(family.fd,terminal.lastPathComponent.UTF8String,terminalRaw,terminalIdentity,arbol_exit::exitReceiptLimit)||
+     ![digest(terminalRaw) isEqual:claim[@"terminal"][@"digest"]]) return nil;
+  NSDictionary* receipt=arbol_exit::parseExitReceipt(terminalRaw);
+  if(![receipt[@"capabilityDigest"] isEqual:capabilityDigest]||![receipt[@"bootSession"] isEqual:group[@"bootSession"]]) return nil;
+  for(NSString* role in @[@"main",@"primary",@"custody"]) if(![receipt[role] isEqual:group[role]]) return nil;
+  for(NSString* field in @[@"request",@"profilePathHash",@"profileInstance",@"build",@"sourceDigest",@"productDigest",@"candidateDigest"])
+    if(![receipt[field] isEqual:claim[field]]) return nil;
+  return family.current()&&arbol_boundary::clockMs()<deadline?claim:nil;
 }
 static bool receiptFrontier(NSDictionary* capability,NSDictionary* frontier,NSString* digest,ExitInspection& job) {
   if(!arbol_attempt::keys(frontier,@[@"format",@"capabilityDigest",@"streams"])||![frontier[@"format"] isEqual:@1]||
@@ -4738,10 +4802,13 @@ static bool inspectExit(ExitInspection& job) {
     if(!job.within()||!directory.openPath([receiptDirectory[@"path"] fileSystemRepresentation],receiptDirectory[@"identity"])) return false;
     struct stat named{};
     if(fstatat(directory.fd,"shared-family.json",&named,AT_SYMLINK_NOFOLLOW)) return errno==ENOENT&&directory.current();
-    std::string marker; struct stat observed{};
-    if(!arbol_exit::readNativeFile(directory.fd,"shared-family.json",marker,observed,arbol_exit::exitReceiptLimit)||
-       !arbol_attempt::sameFile(named,observed)||marker!=sharedFamilyReference(closed[@"request"],receipt[@"capabilityDigest"])) return false;
-    return job.within()&&retainImmutableExitRecord(directory,"closed-claim.json",bytes(closed),job.deadline)&&job.within();
+    NSDictionary* ready=sharedFamilyReadyClaim(closed);
+    if(!ready) return false;
+    NSDictionary* group=@{@"claim":ready,@"build":sharedFamilyBuild(closed),@"bootSession":receipt[@"bootSession"],
+      @"capabilityDigest":receipt[@"capabilityDigest"],@"main":receipt[@"main"],@"primary":receipt[@"primary"],@"custody":receipt[@"custody"]};
+    return job.within()&&[resolveSharedClosedClaim(state,group,job.deadline) isEqual:closed]&&
+      retainImmutableExitRecord(directory,"closed-claim.json",bytes(closed),job.deadline)&&
+      [resolveSharedClosedClaim(state,group,job.deadline) isEqual:closed]&&job.within();
   };
   if(reserve) {
     NSDictionary* next=input[@"pending"]; PackagedLayout nextLayout;
