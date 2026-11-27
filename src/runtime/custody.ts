@@ -5,13 +5,15 @@ import { unavailable } from '../contracts/errors.js';
 import { assertProfile } from '../profiles/records.js';
 import { withOwnerLockForCustody, type OwnerLease } from '../profiles/locking.js';
 import { terminateAdoptedBuild, withBuildLockForCustody, type BuildLease } from './build-lease.js';
-import { assertVerifiedHostMetadata, bindArmedHost, type VerifiedHost } from './authorities.js';
-import { assertPlatform, assertWatchdogCustody, type PlatformPort, type WatchdogCustody, type PriorMarkerExpectation, type HostStartupStage, type SharedProfileOwner } from './platform.js';
-import { assertTime, type InstanceOwner } from './instance.js';
+import { assertHostStartupContinuity, assertVerifiedHostMetadata, bindArmedHost, type VerifiedHost } from './authorities.js';
+import { assertPlatform, assertWatchdogCustody, type PlatformPort, type WatchdogCustody, type PriorMarkerExpectation, type HostStartupStage, type SharedProfileOwner, type ExitInspectionReceipt } from './platform.js';
+import { assertTime, type InstanceOwner, type RuntimeRecord } from './instance.js';
 import { claimedHostAttempt } from './process.js';
 import type { NativeBoundaryPreparation } from './bootstrap.js';
 import type { NativeWatchdog } from '../native/watchdog.js';
 import { assertActualSessionFactory, type ActualSessionFactory, type ActualSessionSeal } from '../profiles/session.js';
+import { prepareEngine, type EngineTransaction } from '../profiles/compatibility.js';
+import { assertProductionExitAuthority, type ProductionExitAuthority } from './exit.js';
 
 export interface HostCustody {
   readonly host: VerifiedHost;
@@ -38,6 +40,48 @@ export interface HostCustody {
   terminate(): never;
 }
 const receipts = new WeakMap<HostCustody, { native: WatchdogCustody; platform: PlatformPort; watchdog?: NativeWatchdog }>();
+
+/** Prepare storage for an additional profile through the same signed policy
+ * and transaction as cold startup. The caller retains the exact Owner lease. */
+export async function prepareSharedProfileEngine(custody: HostCustody, owner: OwnerLease, previous: RuntimeRecord | undefined,
+  exit: ProductionExitAuthority, deadline: number): Promise<Readonly<{ retained: SharedProfileOwner; engine: EngineTransaction }>> {
+  assertProductionExitAuthority(exit);
+  const primary = custody.instance.owner.profile, target = owner.profile;
+  const current = () => {
+    assertTime(deadline); assertHostCustody(custody);
+    if (custody.instance.record.phase !== 'ready' || custody.host.identity.layout.scope !== 'installed' ||
+        target.paths.state !== primary.paths.state || target.record.id === primary.record.id)
+      throw unavailable('profile');
+  };
+  current();
+  const prepared: { baseline?: ExitInspectionReceipt; retained?: SharedProfileOwner } = {};
+  const engine = await prepareEngine(owner, {
+    build: custody.build.selection.build,
+    manifest: custody.host.signed.manifest,
+    async assertTrusted() {
+      current(); await custody.build.assert();
+      await assertHostStartupContinuity(custody.host, deadline, deadline);
+      current();
+    },
+    async assertPreviousEngineExited(profile) {
+      if (profile !== target) throw unavailable('profile');
+      prepared.baseline = await exit.verifySharedBaseline(target, previous, owner, deadline);
+      current();
+    },
+    async beginMutation(lease, marker) {
+      current();
+      if (lease !== owner || !prepared.baseline) throw unavailable('profile');
+      const retained = await custody.retainProfileOwner(owner);
+      current();
+      const permit = retained.beginMarkerMutation(prepared.baseline, `${JSON.stringify(marker)}\n`);
+      prepared.retained = retained;
+      return permit;
+    },
+  });
+  if (!prepared.retained) throw unavailable('profile');
+  await engine.assertReady(); current();
+  return Object.freeze({ retained: prepared.retained, engine });
+}
 /** Observe through only the actual receipt's original provider/handle. This
  * performs no admission, custody assertion, Claim operation or fatal action. */
 export function noteHostStartup(custody: HostCustody | undefined, stage: HostStartupStage): void {

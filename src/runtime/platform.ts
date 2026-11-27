@@ -129,6 +129,7 @@ export interface SharedProfileOwner {
   readonly profile: string;
   readonly instance: string;
   assertRetained(): void;
+  beginMarkerMutation(baseline: ExitInspectionReceipt, bytes: string): import('../profiles/compatibility.js').EngineMutation;
 }
 export type PriorMarkerExpectation = Readonly<{ kind: 'absent' } | {
   kind: 'activated' | 'terminal'; path: string; digest: string;
@@ -224,6 +225,7 @@ export function assertMigrationInspectionReceipt(value: MigrationInspectionRecei
   if (!migrationInspectionReceipts.has(value) || value.epoch !== custody.facts.epoch) throw unavailable('profile');
 }
 const exitInspectionReceipts = new WeakSet<object>();
+const sharedMutationBaselines = new WeakMap<ExitInspectionReceipt, { owner: HeldLock; handle: object }>();
 export function assertExitInspectionReceipt(value: ExitInspectionReceipt): void {
   if (!exitInspectionReceipts.has(value)) throw unavailable('profile');
 }
@@ -438,6 +440,10 @@ interface NativeSupport {
   publishHostReady(handle: object, runtime: string, agent: number, management: number): void;
   retainSharedProfileOwner(handle: object, owner: object, profile: string, instance: string): object;
   assertSharedProfileOwner(receipt: object): void;
+  beginSharedProfileMarker(receipt: object, baseline: object, bytes: string): void;
+  acceptSharedProfileMarker(receipt: object): void;
+  assertSharedProfileMarker(receipt: object): void;
+  abortSharedProfileMarker(receipt: object): void;
   spawnWatchdog(handle: object): { pid: number; reader: number; writer: number };
   assertHostFinalization(handle: object): void;
   latchWatchdogFatal(handle: object): void;
@@ -496,7 +502,7 @@ export function loadPlatform(): PlatformPort {
   let native: NativeSupport;
   try {
     native = createRequire(import.meta.url)(fileURLToPath(new URL('../../native/platform.node', import.meta.url)));
-    for (const name of ['publishHostReady', 'retainSharedProfileOwner', 'assertSharedProfileOwner', 'beginExitInspection', 'pollExitInspection', 'cancelExitInspection', 'beginHostSessionUse', 'acceptHostSessionUse', 'abortHostSessionUse', 'recordPagesRetired', 'recordDOMRequested', 'recordCookieAcknowledged', 'recordQuitIntended', 'captureCloseBudget', 'beginCloseStamp', 'pollCloseStamp', 'cancelCloseStamp', 'beginCloseRetirement', 'pollCloseRetirement', 'consumeCloseRequest', 'armLocalClose', 'beginHostMarkerMutation', 'acceptHostMarkerMutation', 'assertHostMarker', 'abortHostMarkerMutation', 'latchWatchdogFatal', 'prepareHostFinalization', 'spawnWatchdog', 'assertHostFinalization', 'adoptHostBuild', 'terminateAdoptedHost', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
+    for (const name of ['publishHostReady', 'retainSharedProfileOwner', 'assertSharedProfileOwner', 'beginSharedProfileMarker', 'acceptSharedProfileMarker', 'assertSharedProfileMarker', 'abortSharedProfileMarker', 'beginExitInspection', 'pollExitInspection', 'cancelExitInspection', 'beginHostSessionUse', 'acceptHostSessionUse', 'abortHostSessionUse', 'recordPagesRetired', 'recordDOMRequested', 'recordCookieAcknowledged', 'recordQuitIntended', 'captureCloseBudget', 'beginCloseStamp', 'pollCloseStamp', 'cancelCloseStamp', 'beginCloseRetirement', 'pollCloseRetirement', 'consumeCloseRequest', 'armLocalClose', 'beginHostMarkerMutation', 'acceptHostMarkerMutation', 'assertHostMarker', 'abortHostMarkerMutation', 'latchWatchdogFatal', 'prepareHostFinalization', 'spawnWatchdog', 'assertHostFinalization', 'adoptHostBuild', 'terminateAdoptedHost', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
       if (typeof native[name] !== 'function') throw new Error('Missing process support');
   } catch { throw unavailable('profile'); }
   const call = <T>(operation: () => T): T => {
@@ -561,7 +567,23 @@ export function loadPlatform(): PlatformPort {
           if (!additional || additional === a || additional === b) throw unavailable('profile');
           owner.assertIdentity();
           const retained = call(() => native.retainSharedProfileOwner(handle, additional, profile, instance));
-          return Object.freeze({ profile, instance, assertRetained: () => call(() => native.assertSharedProfileOwner(retained)) });
+          return Object.freeze({ profile, instance, assertRetained: () => call(() => native.assertSharedProfileOwner(retained)),
+            beginMarkerMutation(baseline: ExitInspectionReceipt, bytes: string) {
+              const proof = sharedMutationBaselines.get(baseline);
+              if (!proof || proof.owner !== owner || !bytes || Buffer.byteLength(bytes) > 16383) throw unavailable('profile');
+              owner.assertIdentity();
+              call(() => native.beginSharedProfileMarker(retained, proof.handle, bytes));
+              sharedMutationBaselines.delete(baseline);
+              return Object.freeze({
+                accept: () => call(() => native.acceptSharedProfileMarker(retained)),
+                assertBound: () => call(() => native.assertSharedProfileMarker(retained)),
+                abort(): never {
+                  call(() => native.abortSharedProfileMarker(retained));
+                  throw unavailable('profile');
+                },
+              });
+            },
+          });
         },
         consumeClose: (requestId: string, socketFd: number) => closeAdmission(call(() => native.consumeCloseRequest(handle, requestId, socketFd))),
         localClose: () => closeAdmission(call(() => native.armLocalClose(handle))),
@@ -1137,7 +1159,9 @@ export function loadPlatform(): PlatformPort {
             const result: ExitInspectionReceipt = Object.freeze({ kind: value.kind, clean: value.clean,
               prior: Object.freeze({ ...prior, ...(prior.kind !== 'absent' && prior.migration ?
                 { migration: Object.freeze({ ...prior.migration }) } : {}) }), request: value.request });
-            exitInspectionReceipts.add(result); return result;
+            exitInspectionReceipts.add(result);
+            if (input.mode === 'full') sharedMutationBaselines.set(result, { owner, handle });
+            return result;
           }
           await setTimeout(Math.min(5, Math.max(1, deadline - performance.now())));
         }

@@ -1869,6 +1869,11 @@ static std::set<Custody*> nativeCustodies;
 struct SharedProfileRetention {
   Custody* custody;
   arbol_exit::SharedProfileOwnership ownership;
+  enum class MarkerPhase { idle, permitted, bound, failed };
+  MarkerPhase phase=MarkerPhase::idle;
+  std::string expectedMarker,intent;
+  struct stat markerIdentity{},intentIdentity{},historyIdentity{};
+  double deadline=0;
 };
 static std::map<const arbol_exit::AdditionalOwner*,SharedProfileRetention> sharedOwnerReceipts;
 static bool custodyAttempted = false;
@@ -2438,8 +2443,9 @@ static bool absentEngineRootStorage(NSString* profile,NSDictionary* directory,do
   if(close(fd)) ok=false;
   return ok&&arbol_boundary::clockMs()<deadline;
 }
-static bool priorMarkerMatches(Custody* c,const std::string& raw,const struct stat& st,bool absent) {
-  NSDictionary* capability=c->finalization.value(),*prior=capability[@"prior"],*attempt=capability[@"attempt"];
+static bool priorMarkerMatches(NSDictionary* prior,NSDictionary* attempt,NSDictionary* directory,
+  const std::string& raw,const struct stat& st,bool absent) {
+  if(!arbol_exit::priorExpectation(prior)) return false;
   if([prior[@"kind"] isEqual:@"absent"]) return absent;
   NSString* path=prior[@"path"],*state=[attempt[@"profile"] stringByDeletingLastPathComponent].stringByDeletingLastPathComponent;
   NSString* prefix=[[state stringByAppendingPathComponent:@"exit-evidence"] stringByAppendingPathComponent:attempt[@"profilePathHash"]];
@@ -2452,8 +2458,8 @@ static bool priorMarkerMatches(Custody* c,const std::string& raw,const struct st
   if(close(fd)) ok=false;
   NSDictionary* receipt=arbol_exit::parseExitReceipt(bytes); id marker=receipt[@"marker"];
   ok=ok&&[receipt[@"format"] isEqual:@1]&&[receipt[@"profileInstance"] isEqual:attempt[@"profileInstance"]]&&
-    [receipt[@"profilePathHash"] isEqual:attempt[@"profilePathHash"]]&&[receipt[@"profileDirectory"] isEqual:capability[@"profileDirectory"]];
-  if(prior[@"migration"]&&!arbol_exit::migrationPriorMarker(prior,attempt,capability[@"profileDirectory"],marker,marker)) return false;
+    [receipt[@"profilePathHash"] isEqual:attempt[@"profilePathHash"]]&&[receipt[@"profileDirectory"] isEqual:directory];
+  if(prior[@"migration"]&&!arbol_exit::migrationPriorMarker(prior,attempt,directory,marker,marker)) return false;
   if(absent) return ok&&marker==(id)NSNull.null;
   return ok&&arbol_attempt::keys(marker,@[@"identity",@"digest",@"value"])&&
     [marker[@"identity"] isEqual:arbol_exit::fileIdentity(st)]&&[marker[@"digest"] isEqual:arbol_attempt::digest(raw)]&&
@@ -2517,7 +2523,10 @@ static napi_value beginHostMarkerMutation(napi_env env,napi_callback_info info) 
        [permit->attempt[@"expires"] doubleValue]<=arbol_boundary::clockMs()) return fail(env);
     const double mutationDeadline=std::min(deadline,[permit->attempt[@"expires"] doubleValue]);
     std::string previous; struct stat st{}; bool absent;
-    if(!currentMarker(c,previous,st,absent)||!priorMarkerMatches(c,previous,st,absent)||!signedDirty(c,dirty,previous,absent,mutationDeadline)||
+    NSDictionary* capability=c->finalization.value();
+    if(!currentMarker(c,previous,st,absent)||
+       !priorMarkerMatches(capability[@"prior"],capability[@"attempt"],capability[@"profileDirectory"],previous,st,absent)||
+       !signedDirty(c,dirty,previous,absent,mutationDeadline)||
        arbol_boundary::clockMs()>=mutationDeadline) { permit->relinquish(); return fail(env); }
     NSMutableDictionary* next=[permit->attempt mutableCopy]; next[@"stage"]=@"mutation-started";
     permit->dirtyRaw=dirty;
@@ -2836,27 +2845,32 @@ static napi_value retainSharedProfileOwner(napi_env env,napi_callback_info info)
        (!previousAbsent&&!arbol_attempt::sameFile(previousIdentity,checkedIdentity))||
        arbol_boundary::clockMs()>=recordDeadline) return fail(env);
     napi_value out;
-    if(!sharedOwnerReceipts.emplace(receipt,SharedProfileRetention{c,std::move(ownership)}).second||
+    SharedProfileRetention retention{};
+    retention.custody=c; retention.ownership=std::move(ownership);
+    if(!sharedOwnerReceipts.emplace(receipt,std::move(retention)).second||
        napi_create_external(env,receipt,nullptr,nullptr,&out)!=napi_ok)
       return fail(env);
     return out;
   } catch(...) { return refuseTransfer(); } } @catch(NSException*) { return refuseTransfer(); } }
 }
+static auto sharedProfileArgument(napi_env env,napi_value arg) {
+  void* raw=nullptr;
+  if(napi_get_value_external(env,arg,&raw)!=napi_ok) return sharedOwnerReceipts.end();
+  return sharedOwnerReceipts.find(static_cast<const arbol_exit::AdditionalOwner*>(raw));
+}
+static bool sharedProfileCurrent(const arbol_exit::AdditionalOwner& receipt,const SharedProfileRetention& retention) {
+  auto* custody=retention.custody;
+  arbol_exit::AdditionalOwner checked;
+  return custody->finalization.ready(custody->context)&&retention.ownership.current()&&
+    arbol_exit::validateAdditionalOwner(custody->finalization.value()[@"attempt"][@"profile"],receipt.packet,receipt.lock.fd,checked)&&
+    checked.acknowledgement==receipt.acknowledgement;
+}
 static napi_value assertSharedProfileOwner(napi_env env,napi_callback_info info) {
-  napi_value arg; void* raw=nullptr;
-  if(!argument(env,info,&arg)||napi_get_value_external(env,arg,&raw)!=napi_ok) return fail(env);
-  const auto* receipt=static_cast<const arbol_exit::AdditionalOwner*>(raw);
-  auto known=sharedOwnerReceipts.find(receipt);
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env);
+  auto known=sharedProfileArgument(env,arg);
   if(known==sharedOwnerReceipts.end()) return fail(env);
-  auto* custody=known->second.custody;
-  auto* state=custody->finalization.shared();
-  @autoreleasepool { @try {
-    arbol_exit::AdditionalOwner checked;
-    if(!custody->finalization.ready(custody->context)||state->fatal.load(std::memory_order_acquire)||
-       !known->second.ownership.current()||
-       !arbol_exit::validateAdditionalOwner(custody->finalization.value()[@"attempt"][@"profile"],
-         receipt->packet,receipt->lock.fd,checked)||checked.acknowledgement!=receipt->acknowledgement) return fail(env);
-  } @catch(NSException*) { return fail(env); } }
+  @autoreleasepool { @try { if(!sharedProfileCurrent(*known->first,known->second)) return fail(env); }
+  @catch(NSException*) { return fail(env); } }
   napi_value out; napi_get_undefined(env,&out); return out;
 }
 static napi_value latchWatchdogFatal(napi_env env,napi_callback_info info) {
@@ -5061,6 +5075,99 @@ static napi_value cancelExitInspection(napi_env env,napi_callback_info info) {
   job->cancelled.store(true,std::memory_order_release); napi_value out; napi_get_undefined(env,&out); return out;
 }
 
+static bool sharedIntentCurrent(const SharedProfileRetention& retention) {
+  arbol_attempt::MaintenanceDirectory history;
+  std::string raw; struct stat identity{};
+  return !retention.intent.empty()&&history.openPath(retention.ownership.history(),arbol_exit::fileIdentity(retention.historyIdentity))&&
+    arbol_exit::readNativeFile(history.fd,"shared-current.json",raw,identity,arbol_exit::exitReceiptLimit)&&
+    arbol_attempt::sameFile(identity,retention.intentIdentity)&&raw==retention.intent&&history.current();
+}
+static bool readSharedMarker(const arbol_exit::AdditionalOwner& owner,const SharedProfileRetention& retained,
+  std::string& raw,struct stat& identity,bool& absent) {
+  NSDictionary* storage=owner.storage;
+  return currentProfileMarker(storage[@"profile"],storage[@"request"][@"instance"],storage[@"root"],owner.lock,
+    retained.custody->context.build,raw,identity,absent);
+}
+static napi_value beginSharedProfileMarker(napi_env env,napi_callback_info info) {
+  napi_value args[3]; size_t count=3; void* baseline=nullptr; std::string dirty;
+  if(napi_get_cb_info(env,info,&count,args,nullptr,nullptr)!=napi_ok||count!=3||
+     napi_get_value_external(env,args[1],&baseline)!=napi_ok||!boundedText(env,args[2],dirty)) return fail(env);
+  auto known=sharedProfileArgument(env,args[0]);
+  auto* proof=static_cast<ExitInspection*>(baseline);
+  if(known==sharedOwnerReceipts.end()||!exitInspections.count(proof)||proof->state.load(std::memory_order_acquire)!=1||
+     arbol_boundary::clockMs()>=proof->deadline) return fail(env);
+  auto& retained=known->second;
+  auto& owner=*known->first;
+  auto* state=retained.custody->finalization.shared();
+  if(retained.phase!=SharedProfileRetention::MarkerPhase::idle||state->closeReceivedUs.load(std::memory_order_acquire)) return fail(env);
+  @autoreleasepool { @try { try {
+    NSDictionary* ownership=retained.ownership.observations(),*storage=owner.storage,*input=proof->input;
+    if(!ownership||![input[@"mode"] isEqual:@"full"]||proof->maintenance||
+       ![arbol_boundary::capsuleLock(proof->owner) isEqual:arbol_boundary::capsuleLock(owner.lock)]||
+       ![input[@"profile"] isEqual:storage[@"profile"]]||![input[@"profileInstance"] isEqual:storage[@"request"][@"instance"]]||
+       ![input[@"profilePathHash"] isEqual:ownership[@"profilePathHash"]]) return fail(env);
+    NSDictionary* planned=arbol_attempt::json(dirty);
+    if(!nativeMarker(planned)||![planned isEqual:ownership[@"plannedMarker"][@"value"]]||!sharedProfileCurrent(owner,retained)) return fail(env);
+    std::string previous; struct stat identity{}; bool absent;
+    if(!readSharedMarker(owner,retained,previous,identity,absent)) return fail(env);
+    id actual=absent?(id)NSNull.null:@{@"identity":arbol_exit::fileIdentity(identity),@"digest":arbol_attempt::digest(previous),
+      @"value":arbol_attempt::json(previous)};
+    if(![actual isEqual:ownership[@"priorMarker"]]||
+       !priorMarkerMatches(arbol_attempt::json(proof->result)[@"prior"],input,storage[@"root"],previous,identity,absent)) return fail(env);
+    auto* ownershipDigest=retained.ownership.digest();
+    if(!ownershipDigest) return fail(env);
+    const double deadline=std::min(proof->deadline,arbol_boundary::clockMs()+500);
+    arbol_attempt::MaintenanceDirectory history;
+    if(!history.openPath(retained.ownership.history())) return fail(env);
+    retained.phase=SharedProfileRetention::MarkerPhase::failed;
+    retained.intent=arbol_exit::exitReceiptBytes(@{@"format":@1,@"kind":@"shared-profile-mutation",
+      @"request":ownership[@"group"][@"claim"][@"request"],@"profileInstance":input[@"profileInstance"],
+      @"profilePathHash":input[@"profilePathHash"],@"ownershipDigest":ownershipDigest,@"markerDigest":arbol_attempt::digest(dirty)});
+    retained.historyIdentity=history.identity;
+    if(!arbol_exit::publishNativeReceipt(history.fd,"shared-current.json",retained.intent,deadline,retained.intentIdentity)||
+       !sharedIntentCurrent(retained)||!sharedProfileCurrent(owner,retained)||
+       state->closeReceivedUs.load(std::memory_order_acquire)||arbol_boundary::clockMs()>=deadline) return fail(env);
+    retained.expectedMarker=std::move(dirty); retained.deadline=proof->deadline;
+    retained.phase=SharedProfileRetention::MarkerPhase::permitted;
+    napi_value out; napi_get_undefined(env,&out); return out;
+  } catch(...) { return fail(env); } } @catch(NSException*) { return fail(env); } }
+}
+static napi_value acceptSharedProfileMarker(napi_env env,napi_callback_info info) {
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env);
+  auto known=sharedProfileArgument(env,arg);
+  if(known==sharedOwnerReceipts.end()||known->second.phase!=SharedProfileRetention::MarkerPhase::permitted) return fail(env);
+  auto& retained=known->second;
+  retained.phase=SharedProfileRetention::MarkerPhase::failed;
+  @autoreleasepool { @try {
+    std::string raw; bool absent;
+    if(arbol_boundary::clockMs()>=retained.deadline||retained.custody->finalization.shared()->closeReceivedUs.load(std::memory_order_acquire)||
+       !sharedProfileCurrent(*known->first,retained)||!sharedIntentCurrent(retained)||
+       !readSharedMarker(*known->first,retained,raw,retained.markerIdentity,absent)||absent||raw!=retained.expectedMarker) return fail(env);
+    retained.phase=SharedProfileRetention::MarkerPhase::bound;
+  } @catch(NSException*) { return fail(env); } }
+  napi_value out; napi_get_undefined(env,&out); return out;
+}
+static napi_value assertSharedProfileMarker(napi_env env,napi_callback_info info) {
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env);
+  auto known=sharedProfileArgument(env,arg);
+  if(known==sharedOwnerReceipts.end()||known->second.phase!=SharedProfileRetention::MarkerPhase::bound) return fail(env);
+  auto& retained=known->second;
+  @autoreleasepool { @try {
+    std::string raw; struct stat actual{}; bool absent;
+    if(!sharedProfileCurrent(*known->first,retained)||!sharedIntentCurrent(retained)||
+       !readSharedMarker(*known->first,retained,raw,actual,absent)||absent||raw!=retained.expectedMarker||
+       !arbol_attempt::sameFile(actual,retained.markerIdentity)) return fail(env);
+  } @catch(NSException*) { return fail(env); } }
+  napi_value out; napi_get_undefined(env,&out); return out;
+}
+static napi_value abortSharedProfileMarker(napi_env env,napi_callback_info info) {
+  napi_value arg; if(!argument(env,info,&arg)) return fail(env);
+  auto known=sharedProfileArgument(env,arg);
+  if(known==sharedOwnerReceipts.end()) return fail(env);
+  if(known->second.phase==SharedProfileRetention::MarkerPhase::permitted) known->second.phase=SharedProfileRetention::MarkerPhase::failed;
+  napi_value out; napi_get_undefined(env,&out); return out;
+}
+
 static napi_value inspectInstalledMountTopology(napi_env env, napi_callback_info info) {
   size_t count = 2;
   napi_value args[2];
@@ -5164,6 +5271,10 @@ static napi_value init(napi_env env, napi_value exports) {
     {"prepareWatchdogCustody",nullptr,prepareWatchdogCustody,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"retainSharedProfileOwner",nullptr,retainSharedProfileOwner,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"assertSharedProfileOwner",nullptr,assertSharedProfileOwner,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"beginSharedProfileMarker",nullptr,beginSharedProfileMarker,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"acceptSharedProfileMarker",nullptr,acceptSharedProfileMarker,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"assertSharedProfileMarker",nullptr,assertSharedProfileMarker,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"abortSharedProfileMarker",nullptr,abortSharedProfileMarker,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"custodyDescriptors",nullptr,custodyDescriptors,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"captureWatchdog",nullptr,captureWatchdog,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"watchdogBind",nullptr,watchdogBind,nullptr,nullptr,nullptr,napi_default,nullptr},

@@ -30,6 +30,7 @@ export interface ProductionExitAuthority extends ExitAuthority, HostPreviousExit
   /** Only this poll treats protection contention/in-flight closure as pending.
    * It never certifies closure or invokes an external signal on uncertainty. */
   assertClosedUnderOwner(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease, deadline: number): Promise<void>;
+  verifySharedBaseline(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease, deadline: number): Promise<ExitInspectionReceipt>;
   verifySharedFamily(profile: ProfileSnapshot, owner: OwnerLease, request: string, deadline: number): Promise<SharedFamilyExitReceipt>;
   tryClosed(profile: ProfileSnapshot, original: RuntimeRecord, deadline: number, closeHost?: VerifiedHost): Promise<boolean>;
   /** Retires only the independently verified exact closed reservation, retaining
@@ -356,6 +357,9 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
     },
     async assertClosedUnderOwner(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease, deadline: number) {
       await inspect(profile, original, owner, 'full', deadline);
+    },
+    verifySharedBaseline(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease, deadline: number) {
+      return inspect(profile, original, owner, 'full', deadline);
     },
     async verifySharedFamily(profile: ProfileSnapshot, owner: OwnerLease, request: string, deadline: number) {
       assertTime(deadline);

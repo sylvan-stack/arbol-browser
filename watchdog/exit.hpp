@@ -945,6 +945,9 @@ class SharedProfileOwnership {
   struct stat parent_{},identity_{};
   static constexpr const char* filename="shared-owner.json";
 public:
+  NSDictionary* observations() const { return current()?parseExitReceipt(record_):nil; }
+  NSString* digest() const { return current()?arbol_attempt::digest(record_):nil; }
+  std::string history() const { return directory_.substr(0,directory_.rfind('/')); }
   bool current() const {
     arbol_attempt::MaintenanceDirectory held;
     if(record_.empty()||!held.openPath(directory_,fileIdentity(parent_))) return false;
