@@ -60,6 +60,9 @@ function extractUsage(provider: SeqoyaProvider, observedAt: string): SeqoyaUsage
   if (root.querySelector('input[type="password"],input[autocomplete="one-time-code"]')) return null;
   const result: SeqoyaUsage = { observedAt, windows: [] };
   const leaves = visibleLeaves(root);
+  // The weekly heading can be a button with an icon and a direct text node.
+  const anchors = claude ? [...leaves, ...[...root.querySelectorAll<HTMLElement>('button,[role="button"]')]
+    .slice(0, 256).filter(node => node.childElementCount > 0 && shown(node))] : leaves;
   const contains = (value: string) => leaves.some(node => text(node) === value);
   const compact = (value: string) => value.toLowerCase().replace(/\s+/g, '');
   const around = <T>(
@@ -69,8 +72,9 @@ function extractUsage(provider: SeqoyaProvider, observedAt: string): SeqoyaUsage
     cardBoundaries?: ReadonlySet<string>,
   ): T | undefined => {
     const competingLabels = cardBoundaries && [...cardBoundaries].filter(value => value !== label).map(compact);
-    for (const anchor of leaves) {
-      if (!region.contains(anchor) || text(anchor) !== label) continue;
+    for (const anchor of anchors) {
+      const anchorText = claude ? text(anchor).replace(/[\ue000-\uf8ff]+/g, '').trim() : text(anchor);
+      if (!region.contains(anchor) || anchorText !== label) continue;
       let block: HTMLElement | null = anchor.parentElement;
       for (let depth = 0; block && region.contains(block) && block !== root && depth < 5; depth++, block = block.parentElement) {
         const value = block.innerText;
@@ -86,7 +90,7 @@ function extractUsage(provider: SeqoyaProvider, observedAt: string): SeqoyaUsage
         if (cardBoundaries && blockLeaves.some(node => node !== anchor && cardBoundaries.has(text(node)))) break;
         const lines = value.split('\n').map(line => line.trim().replace(/\s+/g, ' ')).filter(Boolean);
         const afterLabel = (items: string[]) => {
-          if (claude) items = items.filter(item => !/^[\ue000-\uf8ff]+$/.test(item));
+          if (claude) items = items.map(item => item.replace(/[\ue000-\uf8ff]+/g, '').trim()).filter(Boolean);
           const start = items.indexOf(label);
           return start >= 0 && items.lastIndexOf(label) === start ? parse(items.slice(start + 1)) : undefined;
         };
@@ -94,6 +98,12 @@ function extractUsage(provider: SeqoyaProvider, observedAt: string): SeqoyaUsage
         // line breaks in the surrounding card's innerText.
         const parsed = afterLabel(lines) ?? afterLabel(blockLeaves.map(text));
         if (parsed !== undefined) return parsed;
+        if (anchor.childElementCount > 0) {
+          const afterButton = blockLeaves.filter(node => !anchor.contains(node) &&
+            (anchor.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0);
+          const buttonReading = afterLabel([label, ...afterButton.map(text)]);
+          if (buttonReading !== undefined) return buttonReading;
+        }
       }
     }
     return undefined;
@@ -195,12 +205,14 @@ function extractUsage(provider: SeqoyaProvider, observedAt: string): SeqoyaUsage
       if (plan) result.plan = plan;
       const cardBoundaries = new Set(['Current session', 'This week', 'Limit resets', 'Usage credits']);
       for (const [minutes, label] of [[300, 'Current session'], [10080, 'This week']] as const) {
-        const reading = around(label, ([timing, usage]) => {
-          const used = percentage(usage, ' used');
-          if (used === undefined) return undefined;
-          const reset = localClock(timing);
-          if (reset || (minutes === 300 && used === 0 && timing === 'Starts with your first message'))
-            return { reset, used };
+        const reading = around(label, rows => {
+          const usage = rows.map(line => percentage(line, ' used')).filter(value => value !== undefined);
+          if (usage.length !== 1) return undefined;
+          const used = usage[0]!;
+          const resets = rows.map(localClock).filter(value => value !== undefined);
+          if (resets.length === 1) return { reset: resets[0], used };
+          if (resets.length === 0 && minutes === 300 && used === 0 && rows.includes('Starts with your first message'))
+            return { reset: undefined, used };
           return undefined;
         }, root, cardBoundaries);
         if (reading) addWindow(minutes, reading.used, reading.reset);
