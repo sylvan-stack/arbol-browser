@@ -1,4 +1,4 @@
-import { app, Menu, nativeImage } from 'electron';
+import { app, Menu, nativeImage, webContents } from 'electron';
 import { resolve, join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
@@ -173,6 +173,11 @@ interface ActualHostAssembly {
   runtime?: import('./lifecycle.js').HostLifecycle;
 }
 function installApplicationMenu(): () => void {
+  const zoomPage = (change?: number) => {
+    const page = webContents.getFocusedWebContents();
+    if (page && !page.isDestroyed() && page.session.getStoragePath() !== null)
+      page.setZoomLevel(change === undefined ? 0 : page.getZoomLevel() + change);
+  };
   const menu = Menu.buildFromTemplate([
     { role: 'appMenu' },
     { role: 'fileMenu' },
@@ -183,7 +188,9 @@ function installApplicationMenu(): () => void {
       { role: 'paste' }, { role: 'pasteAndMatchStyle' }, { role: 'selectAll' },
     ] },
     { label: 'View', submenu: [
-      { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' },
+      { label: 'Actual Size', accelerator: 'CmdOrCtrl+0', click: () => zoomPage() },
+      { label: 'Zoom In', accelerator: 'CmdOrCtrl+Plus', click: () => zoomPage(0.5) },
+      { label: 'Zoom Out', accelerator: 'CmdOrCtrl+-', click: () => zoomPage(-0.5) },
       { type: 'separator' }, { role: 'togglefullscreen' },
     ] },
     { role: 'windowMenu' },

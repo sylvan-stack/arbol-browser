@@ -9,22 +9,51 @@
   <script defer src="control.js"></script>
 </head>
 <body>
-  <header aria-label="Trusted browser controls">
-    <div class="heading"><strong>Arbol Browser</strong><button id="profiles" aria-controls="profile-panel" aria-expanded="false">Profiles</button><button id="new">New tab</button><button id="close-window">Close window</button></div>
-    <section id="profile-panel" aria-label="Browser profiles" hidden>
-      <div class="row"><label for="profile-select">Profile</label><select id="profile-select"></select><button id="profile-open">Open profile</button></div>
-      <form id="profile-create"><label for="profile-id">New profile</label><input id="profile-id" autocomplete="off" maxlength="64" placeholder="work-account" spellcheck="false" required pattern="[a-z](?:[a-z0-9\-]{0,62}[a-z0-9])?" title="Use lowercase letters, digits and hyphens."><button id="profile-add" type="submit">Create</button></form>
-      <p id="profile-status" role="status" aria-live="polite"></p>
-    </section>
-    <nav id="tabs" aria-label="Browser tabs"></nav>
-    <form id="navigate"><label for="address">Open address</label><input id="address" type="url" autocomplete="off" spellcheck="false" placeholder="https://example.com"><button id="go" type="submit">Go</button></form>
-    <div class="row" id="history"><button id="back">Back</button><button id="forward">Forward</button><button id="reload">Reload</button><button id="close-tab">Close tab</button></div>
-    <p id="state" role="status" aria-live="polite">Connecting to browser…</p>
-    <div class="row"><label for="client">Agent</label><select id="client" aria-describedby="privacy"></select><button id="share">Share</button><button id="return">Return control</button><button id="take">Take control</button><button id="recover">Recover page</button></div>
-    <div class="row" id="grants" aria-label="Sharing permissions"></div>
-    <p id="privacy">User control is private. Sharing alone does not return control.</p>
-    <div id="recovery-confirmation" hidden><p>Recovery discards unsaved page state. Interrupted actions will not be replayed.</p><button id="recover-confirm">Recover and discard page state</button><button id="recover-cancel">Keep page</button></div>
-    <p id="problem" role="alert"></p>
+  <header class="toolbar" aria-label="Browser toolbar">
+    <div class="history">
+      <button id="back" class="icon" aria-label="Back" title="Back"><span aria-hidden="true">←</span></button>
+      <button id="forward" class="icon" aria-label="Forward" title="Forward"><span aria-hidden="true">→</span></button>
+      <button id="reload" class="icon" aria-label="Reload" title="Reload"><span aria-hidden="true">↻</span></button>
+    </div>
+    <form id="navigate">
+      <input id="address" type="text" inputmode="url" aria-label="Address" autocomplete="off" spellcheck="false" placeholder="Enter address">
+    </form>
   </header>
+  <aside class="rail" aria-label="Browser navigation">
+    <div class="rail-heading">
+      <h1>Profiles</h1>
+      <button id="new" class="icon" aria-label="New tab" title="New tab">+</button>
+    </div>
+    <nav id="profiles" aria-label="Browser profiles">
+      <div id="profile-list"></div>
+      <div id="tabs" class="tabs" role="group" aria-label="Open tabs"></div>
+    </nav>
+    <p id="state" role="status" aria-live="polite"></p>
+    <p id="problem" role="alert"></p>
+    <details id="tab-actions" hidden>
+      <summary>Tab actions</summary>
+      <div class="actions">
+        <select id="client" aria-label="Agent" hidden></select>
+        <button id="share" hidden>Share</button>
+        <button id="return" hidden>Return control</button>
+        <button id="take" hidden>Take control</button>
+        <button id="recover" hidden>Recover page</button>
+        <div id="grants" class="actions" aria-label="Sharing permissions"></div>
+        <div id="recovery-confirmation" hidden>
+          <p>Recovery discards unsaved page state.</p>
+          <button id="recover-confirm">Recover page</button>
+          <button id="recover-cancel">Cancel</button>
+        </div>
+      </div>
+    </details>
+    <details id="profile-create-panel" hidden>
+      <summary>New profile</summary>
+      <form id="profile-create">
+        <input id="profile-id" aria-label="New profile name" autocomplete="off" maxlength="64" placeholder="profile-name" spellcheck="false" required pattern="[a-z](?:[a-z0-9\-]{0,62}[a-z0-9])?" title="Use lowercase letters, digits and hyphens.">
+        <button id="profile-add" type="submit">Create</button>
+      </form>
+    </details>
+    <p id="profile-status" role="status" aria-live="polite"></p>
+  </aside>
 </body>
 </html>

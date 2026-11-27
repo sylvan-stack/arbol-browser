@@ -1575,6 +1575,20 @@
           },
           "maxItems": 64
         },
+        "tabChrome": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "title": { "type": "string", "maxLength": 160 },
+              "back": { "type": "boolean" },
+              "forward": { "type": "boolean" }
+            },
+            "required": ["title", "back", "forward"],
+            "additionalProperties": false
+          },
+          "maxItems": 64
+        },
         "attachments": {
           "type": "array",
           "items": {

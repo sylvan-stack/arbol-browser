@@ -45,6 +45,18 @@ const senders = new Map<WebContents, Registration>();
 let installed = false;
 const requestShape = validator('browser.ShellRequest'), eventShape = validator('browser.ShellEvent');
 const successShape = validator('browser.ShellSuccess'), failureShape = validator('browser.ShellFailure');
+function tabChrome(target: TabTarget): NonNullable<Event['tabChrome']>[number] {
+  const contents = target.page.view.webContents;
+  const empty = { title: '', back: false, forward: false };
+  if (target.page.retirement() || contents.isDestroyed() || contents.isCrashed()) return empty;
+  const title = contents.getTitle(), address = contents.getURL();
+  const displayTitle = title && title !== address && title !== 'about:blank' ? title : URL.parse(address)?.hostname ?? '';
+  return {
+    title: [...displayTitle.replace(/[\p{Cc}\p{Cf}\p{Cs}]/gu, '')].slice(0, 160).join('').trim(),
+    back: contents.navigationHistory.canGoBack(),
+    forward: contents.navigationHistory.canGoForward(),
+  };
+}
 function authenticated(event: IpcMainInvokeEvent): Registration {
   const current = senders.get(event.sender);
   if (!current) throw unavailable('browser');
@@ -118,10 +130,11 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
     if (disposed || revision >= Number.MAX_SAFE_INTEGER) return authority.exhausted();
     const selected = tabs.selected(host);
     const targets = tabs.all().filter(target => target.page.window === host);
-    // Send real selection first without adding contract fields; retain visual order in the renderer.
+    // Send real selection first and keep the owner-only chrome aligned with that same order.
     const ordered = selected && targets.includes(selected) ? [selected, ...targets.filter(target => target !== selected)] : targets;
     const value: Event = { ui: 1, event: 'state', revision: ++revision,
       tabs: ordered.map(target => structuredClone(tabs.state(target))),
+      tabChrome: ordered.map(tabChrome),
       attachments: authority.attachments().map(entry => ({ id: entry.id, label: entry.label })) };
     if (!eventShape(value)) throw unavailable('browser');
     return value;
@@ -184,6 +197,8 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
       if (loaded) throw unavailable('browser'); loaded = true;
       snapshot(); // initial authority/projection must validate before any load
       await host.shell.webContents.loadURL(shellURL);
+      await host.shell.webContents.setVisualZoomLevelLimits(1, 1);
+      host.shell.webContents.setZoomFactor(1);
       assertShellRegistration(registration, host);
       registration.publish(); prepared = true;
     },
@@ -215,16 +230,26 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
     },
     dispose() {
       if (disposed) return; disposed = true;
-      unsubscribe(); unsubscribePresentation(); senders.delete(host.shell.webContents); registrations.delete(registration);
+      unsubscribe(); unsubscribePresentation(); unsubscribeChrome(); clearTimeout(chromeTimer);
+      senders.delete(host.shell.webContents); registrations.delete(registration);
     },
   });
   installTransport(); senders.set(host.shell.webContents, current); registrations.set(registration, current);
   let unsubscribe: () => void = () => {};
   let unsubscribePresentation: () => void = () => {};
+  let unsubscribeChrome: () => void = () => {};
+  let chromeTimer: ReturnType<typeof setTimeout> | undefined;
   try {
     snapshot();
     unsubscribe = authority.subscribe(() => registration.publish());
     unsubscribePresentation = host.onPresentation(() => {}, () => { if (!disposed) registration.publish(); });
+    unsubscribeChrome = host.onTabChromeChange(() => {
+      if (!prepared || disposed || chromeTimer) return;
+      chromeTimer = setTimeout(() => {
+        chromeTimer = undefined;
+        if (!disposed) registration.publish();
+      }, 100);
+    });
     host.shell.webContents.once('destroyed', () => registration.dispose());
     return registration;
   } catch (error) { registration.dispose(); throw error; }

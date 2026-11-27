@@ -13,6 +13,9 @@ import { unavailable } from '../contracts/errors.js';
 /** Resolved only in the physical lib/host graph, never relative to a bundled entry. */
 export const shellURL = new URL('../shell/index.html', import.meta.url).href;
 const preloadPath = fileURLToPath(new URL('../shell/preload.cjs', import.meta.url));
+// Keep these native offsets aligned with the trusted shell stylesheet.
+const toolbarHeight = 48;
+const sidebarWidth = (width: number) => width < 720 ? 168 : 216;
 export interface PageSurface {
   readonly view: WebContentsView;
   readonly window: WindowHost;
@@ -46,6 +49,7 @@ export interface WindowHost {
   owns(page: PageSurface): boolean;
   presentationStable(): boolean;
   onPresentation(fence: (pages: readonly PageSurface[]) => void, changed: (pages: readonly PageSurface[]) => void): () => void;
+  onTabChromeChange(changed: () => void): () => void;
   guardRetirementTransition(operation: () => void): void;
   close(): Promise<void>;
 }
@@ -84,7 +88,7 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
       sessions.website.getStoragePath() === null || realpathSync(preloadPath) !== preloadPath ||
       realpathSync(fileURLToPath(shellURL)) !== fileURLToPath(shellURL)) throw unavailable('browser');
   const window = new BaseWindow({ width: 1120, height: 800, minWidth: 560, minHeight: 480,
-    title: 'Arbol Browser', show: false });
+    title: 'Arbol Browser', titleBarStyle: 'hidden', trafficLightPosition: { x: 14, y: 16 }, show: false });
   const shell = new WebContentsView({ webPreferences: { ...preferences(sessions.shell), preload: preloadPath } });
   let shellBinding = boundary.native.ownership.bind(window.getNativeWindowHandle(), shell.webContents.id,
     () => { window.contentView.addChildView(shell); });
@@ -103,6 +107,7 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
   let placementDepth = 0, placementVersion = 0;
   const pendingPresentation = new Set<PageSurface>(), categories = new Map<PageSurface, string>();
   const observers = new Set<{ fence: (pages: readonly PageSurface[]) => void; changed: (pages: readonly PageSurface[]) => void }>();
+  const chromeObservers = new Set<() => void>();
   const category = (page: PageSurface) => {
     const active = selected === page, visible = page.view.getVisible();
     if (!active && visible) return 'invalid';
@@ -156,7 +161,7 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
     if (closing || window.isDestroyed()) return;
     try {
       const { width, height } = window.getContentBounds();
-      shell.setBounds({ x: 0, y: 0, width, height: Math.min(272, height) });
+      shell.setBounds({ x: 0, y: 0, width, height });
       presentSelection(selected);
     } catch { return boundary.fatal.fail('native_retirement_unavailable'); }
   };
@@ -197,8 +202,10 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
         present(active: boolean) {
           if (retired) return;
           const { width, height } = window.getContentBounds();
+          const x = sidebarWidth(width);
           view.setVisible(active);
-          view.setBounds({ x: 0, y: 272, width, height: Math.max(0, height - 272) });
+          // Website and hit-test shield cover only the content beside the shell controls.
+          view.setBounds({ x, y: toolbarHeight, width: Math.max(0, width - x), height: Math.max(0, height - toolbarHeight) });
           shield.setBounds(view.getBounds()); shield.setVisible(active && current.blocked);
         },
         retirement: () => retirementRecords.get(page),
@@ -229,6 +236,10 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
       // Keep Electron's actual modal only for the selected foreground user page.
       // The capability provider can install stricter document checks around this listener.
       const contents = view.webContents, emitter = contents as unknown as EventEmitter;
+      const chromeChanged = () => { if (!closing && !retired) for (const changed of chromeObservers) changed(); };
+      contents.on('page-title-updated', chromeChanged);
+      contents.on('did-navigate', chromeChanged);
+      contents.on('did-navigate-in-page', chromeChanged);
       const raw = EventEmitter.prototype.rawListeners.call(emitter, '-run-dialog');
       const listeners = EventEmitter.prototype.listeners.call(emitter, '-run-dialog');
       type DialogReply = (accepted: boolean, value: string) => void;
@@ -265,6 +276,10 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
     onPresentation(fence: (pages: readonly PageSurface[]) => void, changed: (pages: readonly PageSurface[]) => void) {
       assertWindowHost(host); const observer = { fence, changed }; observers.add(observer);
       return () => { observers.delete(observer); };
+    },
+    onTabChromeChange(changed: () => void) {
+      assertWindowHost(host); chromeObservers.add(changed);
+      return () => { chromeObservers.delete(changed); };
     },
     clearSelection(page: PageSurface, commit: () => void = () => {}) {
       assertPageSurface(page);
