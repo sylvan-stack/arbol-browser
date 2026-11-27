@@ -17,7 +17,7 @@ import { ownerLock, withOwnerLockForCustody, type OwnerLease } from '../profiles
 import { acquireBuildLease, withBuildLockForCustody, type BuildLease } from './build-lease.js';
 import { assertHostCloseContinuity, assertHostStartupContinuity, assertHostStartupSnapshot, assertVerifiedHostMetadata, physicalJson, verifyPackagedHost, verifyPackagedOpenHost, type VerifiedHost } from './authorities.js';
 import { assertPlatform, assertExitInspectionReceipt, assertSharedFamilyExitReceipt, type PlatformPort, type ExitInspectionReceipt,
-  type PriorMarkerExpectation, type SharedFamilyExitReceipt } from './platform.js';
+  type PriorMarkerExpectation, type SharedFamilyExitReceipt, type SharedMutationBaseline } from './platform.js';
 import { withLaunchAttempt, type LaunchAttempt } from './process.js';
 import { now, assertTime, runtimeLocation, type RuntimeRecord } from './instance.js';
 import { buildLocation, claimedLayout, selectedLayout, type BuildSelection, type PackagedLayout } from './selection.js';
@@ -30,7 +30,7 @@ export interface ProductionExitAuthority extends ExitAuthority, HostPreviousExit
   /** Only this poll treats protection contention/in-flight closure as pending.
    * It never certifies closure or invokes an external signal on uncertainty. */
   assertClosedUnderOwner(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease, deadline: number): Promise<void>;
-  verifySharedBaseline(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease, deadline: number): Promise<ExitInspectionReceipt>;
+  verifySharedBaseline(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease, deadline: number): Promise<SharedMutationBaseline>;
   verifySharedFamily(profile: ProfileSnapshot, owner: OwnerLease, request: string, deadline: number): Promise<SharedFamilyExitReceipt>;
   tryClosed(profile: ProfileSnapshot, original: RuntimeRecord, deadline: number, closeHost?: VerifiedHost): Promise<boolean>;
   /** Retires only the independently verified exact closed reservation, retaining
@@ -358,8 +358,17 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
     async assertClosedUnderOwner(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease, deadline: number) {
       await inspect(profile, original, owner, 'full', deadline);
     },
-    verifySharedBaseline(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease, deadline: number) {
-      return inspect(profile, original, owner, 'full', deadline);
+    async verifySharedBaseline(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease, deadline: number) {
+      assertTime(deadline);
+      if (owner.profile !== profile) throw unavailable('profile');
+      await owner.assert();
+      const hash = createHash('sha256').update(profile.paths.root, 'utf8').digest('hex');
+      const current = join(profile.paths.state, 'exit-evidence', hash, 'shared-current.json');
+      if (!await statOrAbsent(current)) return inspect(profile, original, owner, 'full', deadline);
+      const { value } = await readJson(current, 16384);
+      const request = (value as { request?: unknown } | null)?.request;
+      if (!validator('browser.RequestId')(request)) throw unavailable('profile');
+      return authority.verifySharedFamily(profile, owner, request, deadline);
     },
     async verifySharedFamily(profile: ProfileSnapshot, owner: OwnerLease, request: string, deadline: number) {
       assertTime(deadline);

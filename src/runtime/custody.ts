@@ -6,7 +6,7 @@ import { assertProfile } from '../profiles/records.js';
 import { withOwnerLockForCustody, type OwnerLease } from '../profiles/locking.js';
 import { terminateAdoptedBuild, withBuildLockForCustody, type BuildLease } from './build-lease.js';
 import { assertHostStartupContinuity, assertVerifiedHostMetadata, bindArmedHost, type VerifiedHost } from './authorities.js';
-import { assertPlatform, assertWatchdogCustody, type PlatformPort, type WatchdogCustody, type PriorMarkerExpectation, type HostStartupStage, type SharedProfileOwner, type ExitInspectionReceipt } from './platform.js';
+import { assertPlatform, assertWatchdogCustody, type PlatformPort, type WatchdogCustody, type PriorMarkerExpectation, type HostStartupStage, type SharedProfileOwner, type SharedMutationBaseline } from './platform.js';
 import { assertTime, type InstanceOwner, type RuntimeRecord } from './instance.js';
 import { claimedHostAttempt } from './process.js';
 import type { NativeBoundaryPreparation } from './bootstrap.js';
@@ -54,7 +54,7 @@ export async function prepareSharedProfileEngine(custody: HostCustody, owner: Ow
       throw unavailable('profile');
   };
   current();
-  const prepared: { baseline?: ExitInspectionReceipt; retained?: SharedProfileOwner } = {};
+  const prepared: { baseline?: SharedMutationBaseline; retained?: SharedProfileOwner } = {};
   const engine = await prepareEngine(owner, {
     build: custody.build.selection.build,
     manifest: custody.host.signed.manifest,

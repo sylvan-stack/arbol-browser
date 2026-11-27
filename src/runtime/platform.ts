@@ -129,7 +129,7 @@ export interface SharedProfileOwner {
   readonly profile: string;
   readonly instance: string;
   assertRetained(): void;
-  beginMarkerMutation(baseline: ExitInspectionReceipt, bytes: string): import('../profiles/compatibility.js').EngineMutation;
+  beginMarkerMutation(baseline: SharedMutationBaseline, bytes: string): import('../profiles/compatibility.js').EngineMutation;
 }
 export type PriorMarkerExpectation = Readonly<{ kind: 'absent' } | {
   kind: 'activated' | 'terminal'; path: string; digest: string;
@@ -163,6 +163,7 @@ export interface SharedFamilyExitReceipt {
   readonly capabilityDigest: string;
   readonly ownershipDigest: string;
 }
+export type SharedMutationBaseline = ExitInspectionReceipt | SharedFamilyExitReceipt;
 export interface MigrationSourceObservation {
   readonly bundle: MaintenanceFileEvidence['identity']; readonly bundleStamp: string;
   readonly policy: MaintenanceFileEvidence; readonly policyStamp: string;
@@ -225,7 +226,7 @@ export function assertMigrationInspectionReceipt(value: MigrationInspectionRecei
   if (!migrationInspectionReceipts.has(value) || value.epoch !== custody.facts.epoch) throw unavailable('profile');
 }
 const exitInspectionReceipts = new WeakSet<object>();
-const sharedMutationBaselines = new WeakMap<ExitInspectionReceipt, { owner: HeldLock; handle: object }>();
+const sharedMutationBaselines = new WeakMap<SharedMutationBaseline, { owner: HeldLock; handle: object }>();
 export function assertExitInspectionReceipt(value: ExitInspectionReceipt): void {
   if (!exitInspectionReceipts.has(value)) throw unavailable('profile');
 }
@@ -568,7 +569,7 @@ export function loadPlatform(): PlatformPort {
           owner.assertIdentity();
           const retained = call(() => native.retainSharedProfileOwner(handle, additional, profile, instance));
           return Object.freeze({ profile, instance, assertRetained: () => call(() => native.assertSharedProfileOwner(retained)),
-            beginMarkerMutation(baseline: ExitInspectionReceipt, bytes: string) {
+            beginMarkerMutation(baseline: SharedMutationBaseline, bytes: string) {
               const proof = sharedMutationBaselines.get(baseline);
               if (!proof || proof.owner !== owner || !bytes || Buffer.byteLength(bytes) > 16383) throw unavailable('profile');
               owner.assertIdentity();
@@ -1115,7 +1116,9 @@ export function loadPlatform(): PlatformPort {
             if (performance.now() >= deadline || call(() => native.continuousTime()) >= nativeDeadline) throw unavailable('profile');
             const receipt = Object.freeze({ request, profileInstance, profilePathHash,
               capabilityDigest: value.capabilityDigest, ownershipDigest: value.ownershipDigest });
-            sharedFamilyExitReceipts.add(receipt); return receipt;
+            sharedFamilyExitReceipts.add(receipt);
+            sharedMutationBaselines.set(receipt, { owner, handle });
+            return receipt;
           }
           await setTimeout(Math.min(5, Math.max(1, deadline - performance.now())));
         }
