@@ -613,7 +613,8 @@ static napi_value activateProfileWindow(napi_env env, napi_callback_info info) {
 static napi_value seqoyaBackendArguments(napi_env env, napi_callback_info info) {
   napi_value args[5], out; size_t count = 5; int pid; std::string start, runtime, entry, lock;
   if (napi_get_cb_info(env,info,&count,args,nullptr,nullptr)!=napi_ok || count!=5 ||
-      !integer(env,args[0],&pid) || pid<2 || !string(env,args[1],start) ||
+      !integer(env,args[0],&pid) || pid<2 || !boundedText(env,args[1],start,20) || start.front()=='0' ||
+      !std::all_of(start.begin(),start.end(),[](char digit) { return digit>='0' && digit<='9'; }) ||
       !string(env,args[2],runtime) || !string(env,args[3],entry) || !string(env,args[4],lock)) return fail(env);
   const auto matches = [&]() -> bool {
     @autoreleasepool { @try {

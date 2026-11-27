@@ -78,6 +78,8 @@ export async function readSeqoyaPage<T>(
   };
   try {
     page.setNativeBlocked(true);
+    // Size the hidden surface for the same dashboard layout as visible tabs.
+    page.present(false);
     contents.on('will-navigate', event => limitNavigation(event, event.url, true));
     contents.on('will-frame-navigate', event => limitNavigation(event, event.url, event.isMainFrame));
     contents.on('will-redirect', (event, address, _, main) => limitNavigation(event, address, main));
