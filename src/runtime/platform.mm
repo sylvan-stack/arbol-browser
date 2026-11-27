@@ -2683,6 +2683,23 @@ static napi_value assertHostFinalization(napi_env env,napi_callback_info info) {
      c->finalization.shared()->transfer.load(std::memory_order_acquire)!=2) return fail(env);
   napi_value out; napi_get_undefined(env,&out); return out;
 }
+static bool retainImmutableExitRecord(const arbol_attempt::MaintenanceDirectory& directory,const char* filename,
+  const std::string& expected,double deadline) {
+  if(expected.empty()||arbol_boundary::clockMs()>=deadline||!directory.current()) return false;
+  struct stat named{};
+  if(!fstatat(directory.fd,filename,&named,AT_SYMLINK_NOFOLLOW)) {
+    std::string actual; struct stat opened{};
+    return arbol_exit::readNativeFile(directory.fd,filename,actual,opened,arbol_exit::exitReceiptLimit)&&
+      arbol_attempt::sameFile(named,opened)&&actual==expected&&directory.current()&&arbol_boundary::clockMs()<deadline;
+  }
+  return errno==ENOENT&&arbol_exit::publishNativeReceipt(directory.fd,filename,expected,deadline,named)&&directory.current();
+}
+static std::string sharedFamilyReference(NSString* request,NSString* capabilityDigest) {
+  if(!arbol_attempt::pattern(request,@"^req_[A-Za-z0-9_-]{22}$")||
+     !arbol_attempt::pattern(capabilityDigest,@"^[0-9a-f]{64}$")) return {};
+  return arbol_exit::exitReceiptBytes(@{@"format":@1,@"kind":@"shared-browser-family",
+    @"request":request,@"capabilityDigest":capabilityDigest});
+}
 static napi_value retainSharedProfileOwner(napi_env env,napi_callback_info info) {
   napi_value args[4]; size_t n=4;
   std::string profileId,instance;
@@ -2774,7 +2791,11 @@ static napi_value retainSharedProfileOwner(napi_env env,napi_callback_info info)
       @"digest":arbol_attempt::digest(previousRaw),@"value":arbol_attempt::json(previousRaw)};
     NSDictionary* verified=nil; std::string verifiedRaw,checkedMarker;
     struct stat checkedIdentity{}; bool checkedAbsent;
-    if(!ownership.publish(*receipt,group,previous,recordDeadline)||!readyClaim(verifiedRaw,verified)||verifiedRaw!=readyRaw||
+    NSDictionary* familyDirectory=c->finalization.value()[@"receiptDirectory"];
+    arbol_attempt::MaintenanceDirectory family;
+    if(!family.openPath([familyDirectory[@"path"] fileSystemRepresentation],familyDirectory[@"identity"])||
+       !retainImmutableExitRecord(family,"shared-family.json",sharedFamilyReference(attempt[@"request"],group[@"capabilityDigest"]),recordDeadline)||
+       !ownership.publish(*receipt,group,previous,recordDeadline)||!readyClaim(verifiedRaw,verified)||verifiedRaw!=readyRaw||
        !arbol_exit::validateAdditionalOwner(primary,packet,lock.fd,checked)||checked.acknowledgement!=expected||
        !readMarker(checkedMarker,checkedIdentity,checkedAbsent)||checkedAbsent!=previousAbsent||checkedMarker!=previousRaw||
        (!previousAbsent&&!arbol_attempt::sameFile(previousIdentity,checkedIdentity))||
@@ -4708,6 +4729,20 @@ static bool inspectExit(ExitInspection& job) {
   };
   if(!verify()||!physical()||(!runtimeMissing&&!unchanged(claim.at))||!reclaim()) return false;
   reverify=[&] { return verify()&&physical()&&(!runtimeMissing?unchanged(claim.at):missingRuntime.current()); };
+  auto preserveSharedFamily=[&] {
+    // Only a process family that accepted additional custody needs to remain
+    // addressable after this live profile pointer rotates to another request.
+    if(!data||![data isEqual:closed]) return true;
+    NSDictionary* receiptDirectory=capability[@"receiptDirectory"];
+    arbol_attempt::MaintenanceDirectory directory;
+    if(!job.within()||!directory.openPath([receiptDirectory[@"path"] fileSystemRepresentation],receiptDirectory[@"identity"])) return false;
+    struct stat named{};
+    if(fstatat(directory.fd,"shared-family.json",&named,AT_SYMLINK_NOFOLLOW)) return errno==ENOENT&&directory.current();
+    std::string marker; struct stat observed{};
+    if(!arbol_exit::readNativeFile(directory.fd,"shared-family.json",marker,observed,arbol_exit::exitReceiptLimit)||
+       !arbol_attempt::sameFile(named,observed)||marker!=sharedFamilyReference(closed[@"request"],receipt[@"capabilityDigest"])) return false;
+    return job.within()&&retainImmutableExitRecord(directory,"closed-claim.json",bytes(closed),job.deadline)&&job.within();
+  };
   if(reserve) {
     NSDictionary* next=input[@"pending"]; PackagedLayout nextLayout;
     // This privileged transition is distinct from generic Role::starter. Repeat
@@ -4716,7 +4751,7 @@ static bool inspectExit(ExitInspection& job) {
     if(!verify()||!physical()||!sameProfile(next)||!claimedLayout(next,nextLayout)||!transition(nil,next,Role::starter)||
        job.nextBuild.path!=std::string([next[@"buildGuard"] UTF8String])||
        !verifiedSignature(nextLayout,next)||
-       (current&&[current[@"request"] isEqual:next[@"request"]])||historyMissing) return false;
+       (current&&[current[@"request"] isEqual:next[@"request"]])||historyMissing||!preserveSharedFamily()) return false;
     // Persist predecessor first, newest immutable reservation second, and only
     // then install pending atomically. Interrupted publication fails closed:
     // a missing/mismatched newest claim cannot fall back to an older witness.
@@ -4727,7 +4762,7 @@ static bool inspectExit(ExitInspection& job) {
        !job.within()||
        !replace(claim.at,currentRaw,absent,bytes(next))) return false;
   } else if(retire) {
-    if(!current||![current isEqual:closed]||historyMissing||!verify()||
+    if(!current||![current isEqual:closed]||historyMissing||!verify()||!preserveSharedFamily()||
        !writeExitHistory(history.fd,"previous-claim.json",closed,job)||!job.within()||
        unlinkat(claim.at.directory,"claim.json",0)||fsync(claim.at.directory)||!unchanged(claim.at)) return false;
   }
