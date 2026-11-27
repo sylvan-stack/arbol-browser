@@ -143,8 +143,11 @@ function extractUsage(provider: SeqoyaProvider, observedAt: string): SeqoyaUsage
       result.plan = plus ? 'plus' : pro200 && provider === 'codex/chatgpt' ? 'pro-200' : 'pro';
       for (const [minutes, label] of [[300, '5-hour limit'], [10080, 'Weekly limit']] as const) {
         const reading = around(label, rows => {
-          const resets = rows.map(countdown).filter((value): value is string => value !== undefined);
-          const remaining = rows.map(line => percentage(line, ' left')).filter((value): value is number => value !== undefined);
+          const nextSection = rows.findIndex(row =>
+            /^(?:5-hour limit|Weekly limit|Usage limit resets|Credits|Connected App Limits)(?:\s|$)/.test(row));
+          const card = nextSection < 0 ? rows : rows.slice(0, nextSection);
+          const resets = card.map(countdown).filter((value): value is string => value !== undefined);
+          const remaining = card.map(line => percentage(line, ' left')).filter((value): value is number => value !== undefined);
           return resets.length === 1 && remaining.length === 1 ? { reset: resets[0], left: remaining[0]! } : undefined;
         });
         if (reading) addWindow(minutes, 100 - reading.left, reading.reset);
