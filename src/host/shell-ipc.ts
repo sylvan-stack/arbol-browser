@@ -329,19 +329,32 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
       const source = [...nativePresentation.profiles].find(([member]) => member.isActiveProfile());
       if (!source?.[1].ready() || !source[1].canYield(true)) throw unavailable('profile');
       guard();
-      // Prepare the admitted selection in the target scope before revealing it.
-      if (tabs.selected(host) !== target) tabs.select(host, target.id);
-      if (source[0] !== host) selectWindowProfile(source[0], host);
+      const previous = tabs.selected(host);
       const assertSelected = () => {
         guard();
         if (!host.isActiveProfile() || tabs.selected(host) !== target || !member.ready() || !member.canYield(true))
           throw unavailable('profile');
       };
-      await registration.show(deadline, signal, false, assertSelected);
-      assertSelected();
-      if (!host.window.isVisible() || host.window.isMinimized()) throw unavailable('browser');
-      app.focus({ steal: true });
-      host.window.focus();
+      try {
+        // Prepare the admitted selection in the target scope before revealing it.
+        if (previous !== target) tabs.select(host, target.id);
+        if (source[0] !== host) selectWindowProfile(source[0], host);
+        await registration.show(deadline, signal, false, assertSelected);
+        assertSelected();
+        if (!host.window.isVisible() || host.window.isMinimized()) throw unavailable('browser');
+        app.focus({ steal: true });
+        host.window.focus();
+      } catch (error) {
+        // A later selection owns the window if it changed while presentation waited.
+        try {
+          if (host.isActiveProfile() && tabs.selected(host) === target && member.canYield(true)) {
+            if (source[0] !== host && source[1].ready() && source[1].canYield(true)) selectWindowProfile(host, source[0]);
+            else if (source[0] === host && previous && previous !== target && tabs.get(previous.id) === previous)
+              tabs.select(host, previous.id);
+          }
+        } catch { /* Keep the original presentation failure. */ }
+        throw error;
+      }
     },
     async subscriptionHome() {
       if (installedProfile) return readSubscriptionHome(installedProfile);
