@@ -2460,14 +2460,14 @@ static bool priorMarkerMatches(NSDictionary* prior,NSDictionary* attempt,NSDicti
   NSString* path=prior[@"path"],*state=[attempt[@"profile"] stringByDeletingLastPathComponent].stringByDeletingLastPathComponent;
   NSString* prefix=[[state stringByAppendingPathComponent:@"exit-evidence"] stringByAppendingPathComponent:attempt[@"profilePathHash"]];
   if(![path hasPrefix:[prefix stringByAppendingString:@"/"]]||
-     ![@[@"activation.json",@"terminal.json"] containsObject:path.lastPathComponent]||!arbol_boundary::canonical(path.fileSystemRepresentation)) return false;
+     !arbol_exit::priorReceiptLeaf(prior,path.lastPathComponent)||!arbol_boundary::canonical(path.fileSystemRepresentation)) return false;
   int fd=open(path.stringByDeletingLastPathComponent.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC); if(fd<0) return false;
   std::string bytes; struct stat receiptIdentity{};
   bool ok=arbol_exit::readNativeFile(fd,path.lastPathComponent.UTF8String,bytes,receiptIdentity,arbol_exit::exitReceiptLimit)&&
     [arbol_attempt::digest(bytes) isEqual:prior[@"digest"]];
   if(close(fd)) ok=false;
   NSDictionary* receipt=arbol_exit::parseExitReceipt(bytes); id marker=receipt[@"marker"];
-  ok=ok&&[receipt[@"format"] isEqual:@1]&&[receipt[@"profileInstance"] isEqual:attempt[@"profileInstance"]]&&
+  ok=ok&&arbol_exit::priorReceiptKind(prior,receipt)&&[receipt[@"format"] isEqual:@1]&&[receipt[@"profileInstance"] isEqual:attempt[@"profileInstance"]]&&
     [receipt[@"profilePathHash"] isEqual:attempt[@"profilePathHash"]]&&[receipt[@"profileDirectory"] isEqual:directory];
   if(prior[@"migration"]&&!arbol_exit::migrationPriorMarker(prior,attempt,directory,marker,marker)) return false;
   if(absent) return ok&&marker==(id)NSNull.null;
@@ -3502,6 +3502,9 @@ struct ExitInspection {
   std::string sharedIntent;
   struct stat sharedIntentIdentity{};
   id sharedMarker=nil;
+  NSDictionary* sharedPrior=nil;
+  NSDictionary* sharedDirectory=nil;
+  NSDictionary* sharedMain=nil;
   arbol_boundary::Lock owner,build,dataBuild,nextBuild,registry,activeBuild; NSDictionary* input=nil; std::string result,activeBundle; double deadline=0;
   // Captured only on the owning N-API thread. Worker uses its private Context
   // fields and genuinely shared atomic state, never the live mutable Context
@@ -4474,9 +4477,25 @@ static bool inspectSharedFamilyExit(ExitInspection& job) {
        !sameFile(markerNamed,boundMarker.identity)||boundMarker.content!=sharedMarkerBinding(intentFile.content,actualMarker)||
        !boundMarker.current()) return false;
   } else if(errno!=ENOENT) return false;
+  // This is a marker expectation after full physical family exit, never a
+  // claim of clean shutdown for this additional Session.
+  auto baseline=arbol_exit::exitReceiptBytes(@{@"format":@1,@"kind":@"shared-profile-baseline",
+    @"request":request,@"profileInstance":input[@"profileInstance"],@"profilePathHash":hash,
+    @"profileDirectory":storage[@"root"],@"marker":actualMarker,@"ownershipDigest":digest(ownerRecord.content),
+    @"exitDigest":closed[@"terminal"][@"digest"]});
+  MaintenanceDirectory entry;
+  std::string checked; struct stat checkedIdentity{}; bool checkedAbsent;
+  if(!entry.openPath(familyEntry.fileSystemRepresentation)||
+     !retainImmutableExitRecord(entry,"shared-baseline.json",baseline,job.deadline)||
+     !intentFile.current()||!exactTarget()||!currentProfileMarker(profile,input[@"profileInstance"],storage[@"root"],
+       job.owner,job.build,checked,checkedIdentity,checkedAbsent)||
+     ![markerObservation(checked,checkedIdentity,checkedAbsent) isEqual:actualMarker]||!entry.current()) return false;
   job.sharedIntent=intentFile.content;
   job.sharedIntentIdentity=intentFile.identity;
   job.sharedMarker=actualMarker;
+  job.sharedPrior=@{@"kind":@"shared",@"path":[familyEntry stringByAppendingPathComponent:@"shared-baseline.json"],@"digest":digest(baseline)};
+  job.sharedDirectory=storage[@"root"];
+  job.sharedMain=group[@"main"];
   job.result=bytes(@{@"format":@1,@"kind":@"shared-family-exited",@"request":request,@"profileInstance":input[@"profileInstance"],
     @"profilePathHash":hash,@"capabilityDigest":receipt[@"capabilityDigest"],@"ownershipDigest":digest(ownerRecord.content)});
   return !job.result.empty()&&job.within();

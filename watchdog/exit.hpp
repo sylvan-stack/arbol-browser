@@ -1003,10 +1003,21 @@ inline bool priorExpectation(id prior) {
   if(keys(prior,@[@"kind"])&&[prior[@"kind"] isEqual:@"absent"]) return true;
   bool migrated=[prior isKindOfClass:NSDictionary.class]&&prior[@"migration"]!=nil;
   if(!keys(prior,migrated?@[@"kind",@"path",@"digest",@"migration"]:@[@"kind",@"path",@"digest"])||
-     ![@[@"activated",@"terminal"] containsObject:prior[@"kind"]]||!path(prior[@"path"])||
+     ![@[@"activated",@"terminal",@"shared"] containsObject:prior[@"kind"]]||!path(prior[@"path"])||
      !pattern(prior[@"digest"],@"^[0-9a-f]{64}$")) return false;
+  if([prior[@"kind"] isEqual:@"shared"]) return !migrated&&profileFormat==2;
   return !migrated||(profileFormat==2&&keys(prior[@"migration"],@[@"path",@"digest"])&&
     path(prior[@"migration"][@"path"])&&pattern(prior[@"migration"][@"digest"],@"^[0-9a-f]{64}$"));
+}
+inline bool priorReceiptLeaf(NSDictionary* prior,NSString* leaf) {
+  return [prior[@"kind"] isEqual:@"shared"]?[leaf isEqual:@"shared-baseline.json"]:
+    [@[@"activation.json",@"terminal.json"] containsObject:leaf];
+}
+inline bool priorReceiptKind(NSDictionary* prior,NSDictionary* receipt) {
+  return ![prior[@"kind"] isEqual:@"shared"]||
+    ([receipt[@"format"] isEqual:@1]&&[receipt[@"kind"] isEqual:@"shared-profile-baseline"]&&
+     arbol_attempt::pattern(receipt[@"ownershipDigest"],@"^[0-9a-f]{64}$")&&
+     arbol_attempt::pattern(receipt[@"exitDigest"],@"^[0-9a-f]{64}$"));
 }
 inline bool migrationPriorMarker(NSDictionary* prior,NSDictionary* attempt,NSDictionary* directory,id original,id __strong& converted);
 class HostCapability {
@@ -1602,10 +1613,10 @@ public:
     }
     NSDictionary* prior=value_[@"prior"];
     bool matches=[prior[@"kind"] isEqual:@"absent"]&&absent;
-    if([@[@"activated",@"terminal"] containsObject:prior[@"kind"]]) {
+    if([@[@"activated",@"terminal",@"shared"] containsObject:prior[@"kind"]]) {
       NSString* path=prior[@"path"],*state=profile.stringByDeletingLastPathComponent.stringByDeletingLastPathComponent;
       NSString* prefix=[[state stringByAppendingPathComponent:@"exit-evidence"] stringByAppendingPathComponent:value_[@"attempt"][@"profilePathHash"]];
-      if(![path hasPrefix:[prefix stringByAppendingString:@"/"]]||![@[@"activation.json",@"terminal.json"] containsObject:path.lastPathComponent]||
+      if(![path hasPrefix:[prefix stringByAppendingString:@"/"]]||!priorReceiptLeaf(prior,path.lastPathComponent)||
          !arbol_boundary::canonical(path.fileSystemRepresentation)) return nil;
       NativeFile parent; parent.fd=open(path.stringByDeletingLastPathComponent.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
       std::string previous; struct stat identity{};
@@ -1614,7 +1625,7 @@ public:
       NSDictionary* receipt=parseExitReceipt(previous);
       id expected=receipt[@"marker"];
       bool migrated=!prior[@"migration"]||migrationPriorMarker(prior,value_[@"attempt"],value_[@"profileDirectory"],expected,expected);
-      matches=receipt&&migrated&&[receipt[@"profileInstance"] isEqual:value_[@"attempt"][@"profileInstance"]]&&
+      matches=receipt&&migrated&&priorReceiptKind(prior,receipt)&&[receipt[@"profileInstance"] isEqual:value_[@"attempt"][@"profileInstance"]]&&
         [receipt[@"profilePathHash"] isEqual:value_[@"attempt"][@"profilePathHash"]]&&[receipt[@"profileDirectory"] isEqual:value_[@"profileDirectory"]]&&
         [expected isEqual:marker];
       if(!parent.finish()) return nil;
