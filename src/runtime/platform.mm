@@ -1874,7 +1874,7 @@ struct SharedProfileRetention {
   std::string expectedMarker,intent;
   struct stat markerIdentity{},intentIdentity{},historyIdentity{};
   double deadline=0;
-  bool sessionStarted=false;
+  bool sessionStarted=false, readyAttempted=false;
   NSDictionary* sessionFacts=nil;
 };
 static std::map<const arbol_exit::AdditionalOwner*,SharedProfileRetention> sharedOwnerReceipts;
@@ -5276,6 +5276,60 @@ static napi_value assertSharedProfileSession(napi_env env,napi_callback_info inf
   napi_value out; napi_get_undefined(env,&out); return out;
 }
 
+static napi_value publishSharedProfileReady(napi_env env,napi_callback_info info) {
+  napi_value args[5]; size_t count=5; std::string encoded; int agent,management;
+  if(napi_get_cb_info(env,info,&count,args,nullptr,nullptr)!=napi_ok||count!=5||!boundedText(env,args[1],encoded)||
+     !integer(env,args[2],&agent)||!integer(env,args[3],&management)||agent==management) return fail(env);
+  auto known=sharedProfileArgument(env,args[0]);
+  auto* lock=claimLock(env,args[4]);
+  if(known==sharedOwnerReceipts.end()||!lock) return fail(env);
+  auto& retained=known->second;
+  if(!retained.sessionFacts||retained.readyAttempted) return fail(env);
+  retained.readyAttempted=true;
+  @autoreleasepool { @try { try {
+    const auto& owner=*known->first;
+    const auto& context=retained.custody->context;
+    NSDictionary* runtime=arbol_attempt::json(encoded);
+    NSString* profile=owner.storage[@"profile"];
+    NSString* hash=arbol_attempt::digest(profile.fileSystemRepresentation);
+    NSDictionary* claim=retained.ownership.observations()[@"group"][@"claim"];
+    NSString* build=claim[@"build"];
+    NSString* start=[NSString stringWithUTF8String:std::to_string(context.main.start).c_str()];
+    if(!runtime||!build||!arbol_attempt::runtime(runtime,@{@"profile":profile,@"profileInstance":owner.storage[@"instance"],
+        @"profilePathHash":hash,@"build":build})||![runtime[@"phase"] isEqual:@"ready"]||
+       ![runtime[@"pid"] isEqual:@(context.main.pid)]||![runtime[@"processStartId"] isEqual:start]||
+       !sharedSessionMayStart(owner,retained)) return fail(env);
+    arbol_attempt::Location location;
+    auto leaf=sharedFamilyRuntimeLeaf(hash);
+    if(!arbol_attempt::location(lock->path,lock->fd,location)||location.path!=leaf) return fail(env);
+    NSString* socketLeaf=[NSString stringWithUTF8String:leaf.substr(std::string("/private").size()).c_str()];
+    if(![runtime[@"agentSocket"] isEqual:[socketLeaf stringByAppendingPathComponent:@"agent.sock"]]||
+       ![runtime[@"managementSocket"] isEqual:[socketLeaf stringByAppendingPathComponent:@"manage.sock"]]) return fail(env);
+    const double deadline=std::min(retained.deadline,arbol_boundary::clockMs()+1000);
+    std::string actual; struct stat record{},agentBefore{},managementBefore{};
+    if(arbol_boundary::clockMs()>=deadline||
+       !readyListener(agent,runtime[@"agentSocket"],agentBefore)||!readyListener(management,runtime[@"managementSocket"],managementBefore)||
+       !arbol_exit::readNativeFile(location.directory,"runtime.json",actual,record,arbol_attempt::limit)||
+       ![arbol_attempt::json(actual) isEqual:runtime]) return fail(env);
+    NSString* ownership=retained.ownership.digest();
+    NSString* request=claim[@"request"];
+    if(!ownership||!request) return fail(env);
+    const auto receipt=arbol_exit::exitReceiptBytes(@{@"format":@1,@"kind":@"shared-browser-ready",@"request":request,
+      @"runtimeDigest":arbol_attempt::digest(actual),@"ownershipDigest":ownership,
+      @"agent":arbol_exit::fileIdentity(agentBefore),@"management":arbol_exit::fileIdentity(managementBefore)});
+    const auto name=std::string("shared-ready-")+[runtime[@"instance"] UTF8String]+".json";
+    std::string after; struct stat published{},current{},agentAfter{},managementAfter{};
+    if(receipt.empty()||!arbol_exit::publishNativeReceipt(location.directory,name,receipt,deadline,published)||
+       !readyListener(agent,runtime[@"agentSocket"],agentAfter)||!readyListener(management,runtime[@"managementSocket"],managementAfter)||
+       ![arbol_exit::fileIdentity(agentBefore) isEqual:arbol_exit::fileIdentity(agentAfter)]||
+       ![arbol_exit::fileIdentity(managementBefore) isEqual:arbol_exit::fileIdentity(managementAfter)]||
+       !arbol_exit::readNativeFile(location.directory,"runtime.json",after,current,arbol_attempt::limit)||
+       !arbol_attempt::sameFile(record,current)||actual!=after||!arbol_attempt::unchanged(location)||
+       !sharedSessionMayStart(owner,retained)||arbol_boundary::clockMs()>=deadline) return fail(env);
+    napi_value out; napi_get_undefined(env,&out); return out;
+  } catch(...) { return fail(env); } } @catch(NSException*) { return fail(env); } }
+}
+
 static napi_value inspectInstalledMountTopology(napi_env env, napi_callback_info info) {
   size_t count = 2;
   napi_value args[2];
@@ -5386,6 +5440,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"beginSharedProfileSession",nullptr,beginSharedProfileSession,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"acceptSharedProfileSession",nullptr,acceptSharedProfileSession,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"assertSharedProfileSession",nullptr,assertSharedProfileSession,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"publishSharedProfileReady",nullptr,publishSharedProfileReady,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"custodyDescriptors",nullptr,custodyDescriptors,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"captureWatchdog",nullptr,captureWatchdog,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"watchdogBind",nullptr,watchdogBind,nullptr,nullptr,nullptr,napi_default,nullptr},

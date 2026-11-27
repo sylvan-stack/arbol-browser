@@ -129,6 +129,7 @@ export interface SharedProfileOwner {
   readonly profile: string;
   readonly instance: string;
   assertRetained(): void;
+  ready(runtime: import('./instance.js').RuntimeRecord, agent: number, management: number, claim: HeldLock): void;
   beginMarkerMutation(baseline: SharedMutationBaseline, bytes: string): import('../profiles/compatibility.js').EngineMutation;
   beginSessionUse(factory: ActualSessionFactory): Readonly<{
     accept(seal: ActualSessionSeal): SharedProfileSessionReceipt;
@@ -452,6 +453,7 @@ interface NativeSupport {
   beginSharedProfileSession(receipt: object): void;
   acceptSharedProfileSession(receipt: object, facts: string): void;
   assertSharedProfileSession(receipt: object): void;
+  publishSharedProfileReady(receipt: object, runtime: string, agent: number, management: number, claim: object): void;
   spawnWatchdog(handle: object): { pid: number; reader: number; writer: number };
   assertHostFinalization(handle: object): void;
   latchWatchdogFatal(handle: object): void;
@@ -510,7 +512,7 @@ export function loadPlatform(): PlatformPort {
   let native: NativeSupport;
   try {
     native = createRequire(import.meta.url)(fileURLToPath(new URL('../../native/platform.node', import.meta.url)));
-    for (const name of ['publishHostReady', 'retainSharedProfileOwner', 'assertSharedProfileOwner', 'beginSharedProfileMarker', 'acceptSharedProfileMarker', 'assertSharedProfileMarker', 'abortSharedProfileMarker', 'beginSharedProfileSession', 'acceptSharedProfileSession', 'assertSharedProfileSession', 'beginExitInspection', 'pollExitInspection', 'cancelExitInspection', 'beginHostSessionUse', 'acceptHostSessionUse', 'abortHostSessionUse', 'recordPagesRetired', 'recordDOMRequested', 'recordCookieAcknowledged', 'recordQuitIntended', 'captureCloseBudget', 'beginCloseStamp', 'pollCloseStamp', 'cancelCloseStamp', 'beginCloseRetirement', 'pollCloseRetirement', 'consumeCloseRequest', 'armLocalClose', 'beginHostMarkerMutation', 'acceptHostMarkerMutation', 'assertHostMarker', 'abortHostMarkerMutation', 'latchWatchdogFatal', 'prepareHostFinalization', 'spawnWatchdog', 'assertHostFinalization', 'adoptHostBuild', 'terminateAdoptedHost', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
+    for (const name of ['publishHostReady', 'publishSharedProfileReady', 'retainSharedProfileOwner', 'assertSharedProfileOwner', 'beginSharedProfileMarker', 'acceptSharedProfileMarker', 'assertSharedProfileMarker', 'abortSharedProfileMarker', 'beginSharedProfileSession', 'acceptSharedProfileSession', 'assertSharedProfileSession', 'beginExitInspection', 'pollExitInspection', 'cancelExitInspection', 'beginHostSessionUse', 'acceptHostSessionUse', 'abortHostSessionUse', 'recordPagesRetired', 'recordDOMRequested', 'recordCookieAcknowledged', 'recordQuitIntended', 'captureCloseBudget', 'beginCloseStamp', 'pollCloseStamp', 'cancelCloseStamp', 'beginCloseRetirement', 'pollCloseRetirement', 'consumeCloseRequest', 'armLocalClose', 'beginHostMarkerMutation', 'acceptHostMarkerMutation', 'assertHostMarker', 'abortHostMarkerMutation', 'latchWatchdogFatal', 'prepareHostFinalization', 'spawnWatchdog', 'assertHostFinalization', 'adoptHostBuild', 'terminateAdoptedHost', 'continuousTime', 'processProvenance', 'readLaunchAttempt', 'writeLaunchAttempt', 'tryLock', 'assertLock', 'releaseLock', 'processIdentity', 'peerIdentity', 'publishDirectory', 'trySharedLock', 'groupCensus', 'prepareWatchdogCustody', 'custodyDescriptors', 'captureWatchdog', 'watchdogBind', 'watchdogAssert', 'terminateProfileNow'] as const)
       if (typeof native[name] !== 'function') throw new Error('Missing process support');
   } catch { throw unavailable('profile'); }
   const call = <T>(operation: () => T): T => {
@@ -576,6 +578,12 @@ export function loadPlatform(): PlatformPort {
           owner.assertIdentity();
           const retained = call(() => native.retainSharedProfileOwner(handle, additional, profile, instance));
           return Object.freeze({ profile, instance, assertRetained: () => call(() => native.assertSharedProfileOwner(retained)),
+            ready(runtime: import('./instance.js').RuntimeRecord, agent: number, management: number, claim: HeldLock) {
+              const held = locks.get(claim);
+              if (!held || ![agent, management].every(fd => Number.isSafeInteger(fd) && fd >= 3) || agent === management)
+                throw unavailable('profile');
+              call(() => native.publishSharedProfileReady(retained, JSON.stringify(runtime), agent, management, held));
+            },
             beginSessionUse(factory: ActualSessionFactory) {
               assertActualSessionFactory(factory);
               call(() => native.beginSharedProfileSession(retained));

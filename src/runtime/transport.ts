@@ -10,7 +10,7 @@ import { ownerUid, profileUnavailable } from '../profiles/paths.js';
 import type { PlatformPort, ProcessIdentity } from './platform.js';
 import { assertSocket, now, token, originalAlive, sameProcess, recordProcess,
   type RuntimeRecord, type RuntimeLocation } from './instance.js';
-import { noteHostStartup } from './custody.js';
+import { assertSharedProfileRuntime, isHostCustody, noteHostStartup, type HostCustody, type SharedProfileRuntime } from './custody.js';
 import { expectedBuild, type BuildSelection } from './selection.js';
 import { isSeqoyaReply, isSeqoyaRequest, isSeqoyaResult, plain, seqoyaUsageLimit,
   type SeqoyaParameters, type SeqoyaReply, type SeqoyaRequest, type SeqoyaResult } from './seqoya-wire.js';
@@ -266,15 +266,21 @@ export function assertManagementCloseOpportunity(value: ManagementCloseOpportuni
   if (!actual || actual.context !== context || actual.request !== request || now() >= value.grace) throw unavailable('browser');
 }
 interface ProtectedReadyServer {
-  open(custody: import('./custody.js').HostCustody, record: RuntimeRecord, guard: () => void, control: () => void): void;
+  open(scope: HostCustody | SharedProfileRuntime, record: RuntimeRecord, guard: () => void, control: () => void): void;
 }
 const protectedReadyServers = new WeakMap<TransportServer, ProtectedReadyServer>();
 /** Actual bound protected listeners only. Native Claim commit and the guarded
  * JS gates occur in one synchronous turn, before any peer callback can run. */
-export function openProtectedReady(server: TransportServer, custody: import('./custody.js').HostCustody,
+export function openProtectedReady(server: TransportServer, custody: HostCustody,
   record: RuntimeRecord, guard: () => void, control: () => void): void {
   const actual = protectedReadyServers.get(server); if (!actual) return custody.terminate();
   actual.open(custody, record, guard, control);
+}
+export function openSharedProtectedReady(server: TransportServer, runtime: SharedProfileRuntime,
+  guard: () => void, control: () => void): void {
+  const actual = protectedReadyServers.get(server);
+  if (!actual) throw unavailable('profile');
+  actual.open(runtime, runtime.instance.record, guard, control);
 }
 /** Explicit injected infrastructure compatibility. This supplies no production
  * page authority. Existing Foundation callers keep their success-only commit. */
@@ -576,25 +582,41 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
     },
   });
   if (protectedPort) protectedReadyServers.set(result, {
-    open(custody, ready, guard, control) {
+    open(scope, ready, guard, control) {
+      const custody = isHostCustody(scope) ? scope : undefined;
       try {
         noteHostStartup(custody, 'protected-ready-validate-before');
         if (sealed || admission || servers.length !== 2 || ready.phase !== 'ready' ||
             !sameProcess(recordProcess(ready), recordProcess(record)) || ready.instance !== record.instance || ready.nonce !== record.nonce ||
-            ready.profileInstance !== record.profileInstance || ready.profilePathHash !== record.profilePathHash || ready.build !== record.build ||
-            ready.agentSocket !== location.agent || ready.managementSocket !== location.management) return custody.terminate();
+            ready.profile !== record.profile || ready.profileInstance !== record.profileInstance ||
+            ready.profilePathHash !== record.profilePathHash || ready.build !== record.build ||
+            ready.agentSocket !== location.agent || ready.managementSocket !== location.management) throw unavailable('profile');
         const handles = servers.map(server => (server as unknown as { _handle?: { fd?: number } })._handle?.fd);
-        if (handles.some(value => !Number.isSafeInteger(value) || value! < 3) || handles[0] === handles[1]) return custody.terminate();
-        if (guard() !== undefined) return custody.terminate();
+        if (handles.some(value => !Number.isSafeInteger(value) || value! < 3) || handles[0] === handles[1]) throw unavailable('profile');
+        if (guard() !== undefined) throw unavailable('profile');
         noteHostStartup(custody, 'protected-ready-validate-after');
         noteHostStartup(custody, 'protected-claim-ready-before');
-        custody.ready(ready, handles[0]!, handles[1]!);
+        if (isHostCustody(scope)) {
+          scope.ready(ready, handles[0]!, handles[1]!);
+        } else {
+          assertSharedProfileRuntime(scope);
+          if (scope.instance.location !== location || scope.instance.record !== ready) throw unavailable('profile');
+          location.assertSync();
+          const claim = platform.tryLock(join(location.leaf, 'claim.lock'));
+          if (!claim) throw unavailable('profile');
+          try { scope.retained.ready(ready, handles[0]!, handles[1]!, claim); }
+          finally { claim.release(); }
+        }
         noteHostStartup(custody, 'protected-claim-ready-after');
         // No await, event-loop return or peer dispatch between durable native
         // attestation and this exact generation's actual gate opening.
-        if (guard() !== undefined || control() !== undefined || guard() !== undefined || sealed) return custody.terminate();
+        if (guard() !== undefined || control() !== undefined || guard() !== undefined || sealed) throw unavailable('profile');
         admission = true;
-      } catch { fatal(); return custody.terminate(); }
+      } catch {
+        if (custody) { fatal(); return custody.terminate(); }
+        result.closeAdmission();
+        throw unavailable('profile');
+      }
     },
   });
   return result;
