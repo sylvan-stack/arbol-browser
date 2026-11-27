@@ -339,7 +339,7 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
 export async function inspectOrCloseProductionProfile(profile: ProfileSnapshot, record: RuntimeRecord,
   selection: import('./selection.js').BuildSelection, platform: PlatformPort,
   exits: ProductionExitAuthority, deadline: number, verifiedHost?: VerifiedHost, operation: 'inspect' | 'close' = 'inspect',
-  budget?: CloseBudget): Promise<'standalone' | 'active' | 'dormant' | 'closing' | 'closed' | 'exiting'> {
+  budget?: CloseBudget): Promise<'standalone' | 'active' | 'dormant' | 'closing' | 'closed' | 'exiting' | 'unconfirmed-close'> {
   const lease = await acquireBuildLease(selection, platform);
   try {
     const address = new URL('./authorities.js', import.meta.url).href;
@@ -363,7 +363,7 @@ export async function inspectOrCloseProductionProfile(profile: ProfileSnapshot, 
       const client = await connectRuntime(resident.location, resident.record, 'management', { ...selection, explicit: false },
         platform, deadline, 'Profile inspection');
       try {
-        const scope = { profile: profile.record.id, profileInstance: profile.record.instance };
+        const scope = { profile: profile.record.id, profileInstance: profile.record.instance, runtimeInstance: record.instance };
         if (operation === 'close') {
           if (!budget) throw unavailable('profile');
           return await requestProfileClosure(client, scope, deadline, budget);
@@ -400,7 +400,7 @@ export function createProductionProcessIntegration(host: VerifiedHost, selection
     const profile = target.record.id, profileInstance = target.record.instance;
     const management = await connectRuntime(resident.location, resident.record, 'management', selection, platform, deadline, label, signal);
     let record: RuntimeRecord;
-    try { record = await requestProfileAdmission(management, { profile, profileInstance }, deadline); }
+    try { record = await requestProfileAdmission(management, { profile, profileInstance, runtimeInstance: null }, deadline); }
     finally { management.close(); }
     const location = await runtimeLocation(target);
     if (!location || JSON.stringify(record) !== JSON.stringify(await readRuntime(location)) ||

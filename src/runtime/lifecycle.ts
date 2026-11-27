@@ -185,13 +185,16 @@ async function closeProductionProfile(profile: ProfileSnapshot, selection: Build
     original = observed;
   }
   if (await exits.tryClosed(profile, original, deadline)) return { profile: profile.record.id, closed: false, dataRemoved: false };
-  let requested = false;
+  let requested = false, unconfirmedScope = false;
   if (originalAlive(original, platform) && original.phase === 'ready' && location && now() < grace) {
     const status = await within(grace, () => inspectOrCloseProductionProfile(profile, original,
       selection, platform, exits, grace, closeHost, 'close', command.native));
     if (status === 'closed' || status === 'dormant')
       return { profile: profile.record.id, closed: status === 'closed', dataRemoved: false };
-    if (status === 'exiting') requested = true;
+    if (status === 'exiting' || status === 'unconfirmed-close') {
+      requested = true;
+      unconfirmedScope = status === 'unconfirmed-close';
+    }
     else if (status === 'standalone') {
       const client = await acquireWithin(grace,
         () => connectRuntime(location, original, 'management', selection, platform, grace, 'Explicit close'), value => value.close());
@@ -209,6 +212,13 @@ async function closeProductionProfile(profile: ProfileSnapshot, selection: Build
   while (now() < deadline) {
     if (await exits.tryClosed(profile, original, deadline, requested ? closeHost : undefined))
       return { profile: profile.record.id, closed: requested, dataRemoved: false };
+    if (unconfirmedScope && originalAlive(original, platform)) {
+      try {
+        const status = await within(deadline, () => inspectOrCloseProductionProfile(profile, original,
+          selection, platform, exits, deadline, closeHost));
+        if (status === 'dormant') return { profile: profile.record.id, closed: true, dataRemoved: false };
+      } catch { assertTime(deadline); }
+    }
     await setTimeout(Math.min(10, Math.max(1, deadline - now())));
   }
   throw profileUnavailable();
@@ -410,11 +420,12 @@ export interface HostLifecycle {
   lastWindowClosed(): void;
 }
 const hostLifecycles = new WeakSet<object>();
-const residentClosers = new WeakMap<HostLifecycle, (opportunity: ResidentCloseOpportunity) => Promise<void>>();
-export async function closeAdmittedResident(lifecycle: HostLifecycle, opportunity: ResidentCloseOpportunity): Promise<void> {
+const residentClosers = new WeakMap<HostLifecycle, (opportunity: ResidentCloseOpportunity, acknowledgement: Promise<void>) => Promise<void>>();
+export async function closeAdmittedResident(lifecycle: HostLifecycle, opportunity: ResidentCloseOpportunity,
+  acknowledgement: Promise<void>): Promise<void> {
   const close = residentClosers.get(lifecycle);
   if (!close) throw unavailable('browser');
-  await close(opportunity);
+  await close(opportunity, acknowledgement);
 }
 export function assertHostLifecycle(value: HostLifecycle): void {
   if (!hostLifecycles.has(value)) throw unavailable('browser');
@@ -711,7 +722,7 @@ export function createHostLifecycle(prepared: HostPreparation, sessions: Profile
     },
     lastWindowClosed() { if (control.windowCount() === 0) void shutdown().catch(() => {}); },
   });
-  if (production && additional) residentClosers.set(lifecycle, opportunity =>
-    shutdown(takeResidentExit(opportunity, transport)));
+  if (production && additional) residentClosers.set(lifecycle, (opportunity, acknowledgement) =>
+    shutdown(takeResidentExit(opportunity, transport), acknowledgement));
   hostLifecycles.add(lifecycle); return lifecycle;
 }

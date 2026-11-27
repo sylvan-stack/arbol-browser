@@ -390,9 +390,10 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
       if (!runtime) throw unavailable('profile');
       const admitted = authorize((id, fd) => custody.consumeClose(id, fd));
       closing = true;
-      return { result: 'exiting', afterReply: () => {
-        void lifecycle.closeAdmittedResident(runtime, admitted).catch(() => {});
-      } };
+      let finished!: () => void;
+      const acknowledgement = new Promise<void>(resolve => { finished = resolve; });
+      void lifecycle.closeAdmittedResident(runtime, admitted, acknowledgement).catch(() => {});
+      return { result: 'exiting', afterReply: finished };
     }
     const retire = scope.control.ownership.control.retireProfileTabs;
     if (!retire) throw unavailable('profile');
@@ -435,8 +436,9 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
       if (target.record.instance !== scope.profileInstance) throw unavailable('profile');
       if (scope.operation === 'open') return { result: await openProfile(source, target, deadline, signal) };
       const selected = scope.profile === custody.instance.record.profile ? primary : profiles.get(scope.profile)?.scope;
-      if (!selected) return { result: 'dormant' };
-      if (selected.instance.record.profileInstance !== scope.profileInstance) throw unavailable('profile');
+      if (!selected || selected.instance.record.profileInstance !== scope.profileInstance ||
+          selected.instance.record.instance !== scope.runtimeInstance || selected.instance.record.phase !== 'ready')
+        throw unavailable('profile');
       const guard = () => {
         assertCurrent(source, deadline);
         if (signal.aborted) throw unavailable('profile');

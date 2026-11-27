@@ -297,13 +297,14 @@ export function listenTransport(location: RuntimeLocation, record: RuntimeRecord
 }
 /** Production assembly must choose this entry, with every real protected port. */
 type PrivateUsage = (params: SeqoyaParameters, deadline: number, signal: AbortSignal) => Promise<SeqoyaResult>;
-interface ProfileAdmissionScope { readonly profile: string; readonly profileInstance: string }
+interface ProfileAdmissionScope { readonly profile: string; readonly profileInstance: string; readonly runtimeInstance: string | null }
 interface ProfileAdmissionRequest {
   readonly wire: 1; readonly id: string; readonly method: 'profile-admission';
   readonly params: ProfileAdmissionScope & Readonly<{ expires: number; operation: 'open' | 'inspect' | 'close' }>;
 }
 export type ProfileOperationStatus = 'dormant' | 'closing' | 'closed' | 'exiting';
 type ProfileOperationResult = RuntimeRecord | ProfileOperationStatus | null;
+type ProfileClientResult = ProfileOperationResult | 'unconfirmed-close';
 export interface ResidentCloseOpportunity { readonly admission: CloseAdmission; readonly deadline: number; readonly grace: number }
 export type AuthorizeResidentClose = (consume: (id: string, fd: number) => CloseAdmission) => ResidentCloseOpportunity;
 const residentCloseOpportunities = new WeakMap<ResidentCloseOpportunity, TransportServer>();
@@ -321,8 +322,9 @@ const profileAdmissionResult = (value: unknown): value is ProfileOperationResult
   value === null || value === 'dormant' || value === 'closing' || value === 'closed' || value === 'exiting' || runtimeRecord(value);
 function isProfileAdmissionRequest(value: unknown): value is ProfileAdmissionRequest {
   return plain(value) && Object.keys(value).length === 4 && value.wire === 1 && value.method === 'profile-admission' &&
-    validator('browser.RequestId')(value.id) && plain(value.params) && Object.keys(value.params).length === 4 &&
+    validator('browser.RequestId')(value.id) && plain(value.params) && Object.keys(value.params).length === 5 &&
     (value.params.operation === 'open' || value.params.operation === 'inspect' || value.params.operation === 'close') &&
+    (value.params.operation === 'open' ? value.params.runtimeInstance === null : validator('browser.InstanceId')(value.params.runtimeInstance)) &&
     validator('browser.ProfileId')(value.params.profile) && typeof value.params.profileInstance === 'string' &&
     /^prf_[A-Za-z0-9_-]{22}$/.test(value.params.profileInstance) && typeof value.params.expires === 'number' &&
     Number.isSafeInteger(value.params.expires) && value.params.expires > 0;
@@ -477,6 +479,7 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
           profileAdmissionStarted = true; seen.add(value.id);
           residentCommands.add(stop);
           let authorized = false;
+          let residentExit: ResidentCloseOpportunity | undefined;
           const authorizeClose: AuthorizeResidentClose | undefined = value.params.operation === 'close' ? consume => {
             if (authorized || dead || sealed || !admission || connection.signal.aborted ||
                 !residentCommands.has(stop) || now() >= deadline) throw unavailable('profile');
@@ -487,7 +490,11 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
             if (nativeClose.kind !== 'profile' && nativeClose.kind !== 'management') throw unavailable('profile');
             const close = Object.freeze({ admission: nativeClose, deadline: sampled + Math.max(0, nativeClose.overall - nativeNow),
               grace: Math.min(deadline, sampled + Math.max(0, nativeClose.grace - nativeNow)) });
-            if (nativeClose.kind === 'management') residentCloseOpportunities.set(close, result);
+            if (nativeClose.kind === 'management') {
+              residentExit = close;
+              residentCloseOpportunities.set(close, result);
+              retainedCloseStops.set(stop, () => { clearInterval(heartbeat); });
+            }
             return close;
           } : undefined;
           void (async () => {
@@ -500,10 +507,17 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
                   result.profile !== value.params.profile || result.profileInstance !== value.params.profileInstance ||
                   !sameProcess(recordProcess(result), recordProcess(record)) || result.build !== record.build)))
                 throw unavailable('profile');
+              if (Boolean(residentExit) !== (result === 'exiting')) throw unavailable('profile');
               writeFrame(socket, Buffer.from(JSON.stringify({ wire: 1, id: value.id, method: 'profile-admission-result', result }) + '\n'), 16384, () => {
                 checkPeer();
-                if (dead || sealed || !admission || connection.signal.aborted || now() >= deadline) throw unavailable('browser');
+                if (dead || connection.signal.aborted || now() >= deadline ||
+                    (residentExit ? !retainedCloseStops.has(stop) || now() >= residentExit.grace : sealed || !admission))
+                  throw unavailable('browser');
               });
+              if (residentExit) {
+                socket.end();
+                closeDrain = setTimeout(stop, Math.max(1, residentExit.deadline - now())); closeDrain.unref();
+              }
             } catch { stop(); }
             finally { residentCommands.delete(stop); reply.afterReply?.(); }
           })();
@@ -727,7 +741,7 @@ export interface RuntimeClient {
 }
 const usageCalls = new WeakMap<RuntimeClient, (params: SeqoyaParameters, deadline: number) => Promise<SeqoyaResult>>();
 const profileAdmissions = new WeakMap<RuntimeClient, (scope: ProfileAdmissionScope, deadline: number,
-  operation: ProfileAdmissionRequest['params']['operation'], budget?: CloseBudget) => Promise<ProfileOperationResult>>();
+  operation: ProfileAdmissionRequest['params']['operation'], budget?: CloseBudget) => Promise<ProfileClientResult>>();
 export async function requestProfileAdmission(client: RuntimeClient, scope: ProfileAdmissionScope, deadline: number): Promise<RuntimeRecord> {
   const result = await profileOperation(client, scope, deadline, 'open');
   if (!runtimeRecord(result)) throw unavailable('profile');
@@ -740,13 +754,14 @@ export async function requestProfileInspection(client: RuntimeClient, scope: Pro
   return result;
 }
 export async function requestProfileClosure(client: RuntimeClient, scope: ProfileAdmissionScope, deadline: number,
-  budget: CloseBudget): Promise<Exclude<ProfileOperationStatus, 'closing'>> {
+  budget: CloseBudget): Promise<Exclude<ProfileOperationStatus, 'closing'> | 'unconfirmed-close'> {
   const result = await profileOperation(client, scope, deadline, 'close', budget);
-  if (result !== 'closed' && result !== 'dormant' && result !== 'exiting') throw unavailable('profile');
+  if (result !== 'closed' && result !== 'dormant' && result !== 'exiting' && result !== 'unconfirmed-close')
+    throw unavailable('profile');
   return result;
 }
 function profileOperation(client: RuntimeClient, scope: ProfileAdmissionScope, deadline: number,
-  operation: ProfileAdmissionRequest['params']['operation'], budget?: CloseBudget): Promise<ProfileOperationResult> {
+  operation: ProfileAdmissionRequest['params']['operation'], budget?: CloseBudget): Promise<ProfileClientResult> {
   const request = profileAdmissions.get(client);
   if (!request) return Promise.reject(unavailable('profile'));
   profileAdmissions.delete(client);
@@ -802,6 +817,7 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
   const lost = new AbortController();
   let stopReason: RuntimeTermination = 'lost';
   let closeRequest: string | undefined, closeWritten = false, explicitCloseRefusal: BrowserFailure | undefined;
+  let residentCloseRequest: string | undefined, residentCloseWritten = false;
   let dead = false, hello: Contract<'wire.HelloResult'>['result'] | undefined;
   const pending = new Map<string, PendingReply>();
   let heartbeat: NodeJS.Timeout, lastPong = now(), pingId: string | undefined;
@@ -842,7 +858,10 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
           if (!originalAlive(record, platform)) { stop('lost'); return; }
         }
       }
-      try { verify(); } catch (error) { if (endpoint === 'agent') { stop('lost'); return; } throw error; }
+      try { verify(); } catch (error) {
+        if (endpoint === 'agent' || (residentCloseRequest && pending.has(residentCloseRequest))) { stop('lost'); return; }
+        throw error;
+      }
       if (!hello) {
         if (!validator('wire.HelloResult')(value) || value.id !== helloId) throw unavailable('browser');
         const result = value.result;
@@ -868,7 +887,11 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
           return new Promise((resolve, reject) => {
             const timeout = setTimeout(() => stop('timeout'), Math.max(1, limit - now()));
             pending.set(request.id, { check, resolve, reject, timer: timeout, ...(cancel ? { cancel } : {}) });
-            try { verify(); write(socket, request, 1024 * 1024); if (request.id === closeRequest) closeWritten = true; } catch { stop('refused'); }
+            try {
+              verify(); write(socket, request, 1024 * 1024);
+              if (request.id === closeRequest) closeWritten = true;
+              if (request.id === residentCloseRequest) residentCloseWritten = true;
+            } catch { stop('refused'); }
           });
         };
         const client: RuntimeClient = Object.freeze({ hello, signal: lost.signal, close: () => stop('client-closed'),
@@ -895,11 +918,18 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
             params: { ...scope, operation, expires: Math.floor(platform.continuousTime() + remaining) } };
           if (remaining <= 0 || !isProfileAdmissionRequest(request)) throw unavailable('profile');
           if (operation === 'close') {
-            if (!budget || dead || pending.size) throw unavailable('profile');
+            if (!budget || dead || pending.size || residentCloseRequest || closeRequest) throw unavailable('profile');
+            residentCloseRequest = request.id;
             verify();
             await platform.stampCloseRequest(budget, location.leaf, record, request.id, fd(socket));
           }
-          const result = await send(request, limit, profileAdmissionResult);
+          let result: unknown;
+          try { result = await send(request, limit, profileAdmissionResult); }
+          catch (error) {
+            if (operation === 'close' && dead && residentCloseWritten && (stopReason === 'lost' || stopReason === 'timeout'))
+              return 'unconfirmed-close';
+            throw error;
+          }
           if (!runtimeRecord(result)) {
             if (!profileAdmissionResult(result)) throw unavailable('profile');
             return result;
