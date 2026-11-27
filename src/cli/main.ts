@@ -80,7 +80,7 @@ async function installedLaunch(cutoff: number): Promise<InstalledLaunch | undefi
   return { selection, host, platform, lock, deadline: Math.min(cutoff, deadline) };
 }
 async function productionPorts(selection: BuildSelection, observation?: ColdObservation, openCutoff?: number,
-  installed?: InstalledLaunch, profileOperation?: 'list' | 'change'): Promise<ProductionPorts> {
+  installed?: InstalledLaunch, profileOperation?: 'list' | 'create' | 'remove'): Promise<ProductionPorts> {
   if (openCutoff !== undefined && performance.now() >= openCutoff) throw unavailable('browser');
   noteCold(observation, 'runtime-imports');
   const [{ loadPlatform }, { createProcessService, createProfileRuntime },
@@ -116,14 +116,19 @@ async function productionPorts(selection: BuildSelection, observation?: ColdObse
       process.versions.modules !== pinnedRuntime.modules || process.versions.napi !== pinnedRuntime.napi ||
       process.platform !== pinnedRuntime.platform || process.arch !== pinnedRuntime.arch) throw unavailable('browser');
   noteCold(observation, 'repeated-host-trust');
-  const listingHost = profileOperation === 'list' ? installed?.host : undefined;
-  if (openCutoff !== undefined || listingHost) await authorities.assertHostStartupContinuity(host, deadline, openCutoff ?? deadline);
-  else await host.assertTrusted(deadline);
+  const profileHost = profileOperation === 'list' || profileOperation === 'remove' ? installed?.host : undefined;
+  if (profileOperation === 'remove' && profileHost) {
+    // Revalidate the authenticated snapshot on its retained read-only image.
+    // Removal still acquires the exact profile Owner and checks native exit evidence.
+    await authorities.assertHostStartupSnapshot(profileHost, deadline);
+  } else if (openCutoff !== undefined || profileHost) {
+    await authorities.assertHostStartupContinuity(host, deadline, openCutoff ?? deadline);
+  } else await host.assertTrusted(deadline);
   noteCold(observation, 'native-platform');
   const platform = installed?.platform ?? loadPlatform();
   noteCold(observation, 'production-adapters');
   const startingHost = installed && openCutoff !== undefined ? host : undefined;
-  const exits = createProductionExitAuthority(platform, selection, startingHost, listingHost);
+  const exits = createProductionExitAuthority(platform, selection, startingHost, profileHost);
   const openObservation = observation ? authorities.createOpenCommandObservation() : undefined;
   if (observation && openObservation) observation.open = openObservation;
   const integration = createProductionProcessIntegration(host, selection, platform, exits, openObservation, openCutoff);
@@ -131,7 +136,7 @@ async function productionPorts(selection: BuildSelection, observation?: ColdObse
   let profiles: CommandPorts['profiles'] | undefined;
   if (profileOperation) {
     const { createProfileService } = await import('../profiles/manage.js');
-    profiles = createProfileService({ state, platform: () => platform, runtime: createProfileRuntime(platform, selection, exits, listingHost) });
+    profiles = createProfileService({ state, platform: () => platform, runtime: createProfileRuntime(platform, selection, exits, profileHost) });
   }
   return Object.freeze({
     ...(profiles ? { profiles } : {}),
@@ -231,7 +236,7 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
     if (ports === defaultPorts) installed = await installedLaunch(commandCutoff);
     const openCutoff = ports === defaultPorts && (command.kind === 'open' || command.kind === 'seqoya-usage')
       ? installed?.deadline ?? commandCutoff : undefined;
-    if (ports === defaultPorts && (command.kind === 'open' || command.kind === 'profiles-create'))
+    if (ports === defaultPorts && (command.kind === 'open' || command.kind === 'profiles-create' || command.kind === 'profiles-remove'))
       observation = { stage: 'package-metadata' };
     let activePorts: ProductionPorts = ports;
     if (ports === defaultPorts && command.kind !== 'info') {
@@ -240,7 +245,7 @@ export async function runCli(args: readonly string[], ports: CommandPorts = defa
       noteCold(observation, 'selected-build');
       const selection = installed?.selection ?? consumePackagedSelection(metadata.build, resolve(fileURLToPath(new URL('../../', import.meta.url))));
       const profileOperation = command.kind === 'profiles-list' ? 'list' :
-        command.kind === 'profiles-create' || command.kind === 'profiles-remove' ? 'change' : undefined;
+        command.kind === 'profiles-create' ? 'create' : command.kind === 'profiles-remove' ? 'remove' : undefined;
       activePorts = await productionPorts(selection, observation, openCutoff, installed, profileOperation);
     }
     let result: unknown;
