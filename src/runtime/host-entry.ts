@@ -288,6 +288,7 @@ async function assembleAfterReady(prepared: HostPreparation, sessions: ProfileSe
     noteHostStartup(prepared.custody, 'host-lifecycle-ready-before');
     await runtime.ready();
     noteHostStartup(prepared.custody, 'host-lifecycle-ready-after'); current();
+    shell.registration.setRuntimeReady(() => runtime.phase === 'ready' && !state.closed);
     if (showEmptyWhenReady && shell.tabs.all().length === 0) {
       runtime.assertAdmission();
       await shell.registration.offerForegroundPresentation(deadline, () => {

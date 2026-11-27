@@ -77,7 +77,7 @@ function renderProfiles(): void {
   else if (focused && tabList.contains(focused)) focused.focus({ preventScroll: true });
 }
 async function profileAction(request: ProfileNavigationRequest): Promise<void> {
-  if (changingProfile) return;
+  if (changingProfile || state?.profileNavigationReady !== true) return;
   changingProfile = true; updateProfileControls();
   if (request.method !== 'list' || !profiles)
     profileStatus.textContent = request.method === 'open' ? 'Opening profile…' : request.method === 'create' ? 'Creating profile…' : 'Loading profiles…';
@@ -108,6 +108,7 @@ function accept(value: State, snapshot = false) {
   newestRevision = Math.max(newestRevision, value.revision);
   if (state && value.revision <= state.revision) { if (snapshot && value.revision === state.revision) synchronized = state.revision >= newestRevision; render(); return; }
   if (!snapshot && state && value.revision !== state.revision + 1) { synchronized = false; render(); void resync(); return; }
+  const canLoadProfiles = value.profileNavigationReady && !state?.profileNavigationReady;
   state = value; synchronized = value.revision >= newestRevision;
   const nextTab = value.tabs[0]?.tab ?? ''; // authoritative versioned native selection, never a reply
   if (nextTab !== selected) { tabActions.open = false; recoveryTab = ''; }
@@ -115,6 +116,7 @@ function accept(value: State, snapshot = false) {
   const ids = value.tabs.map(tab => tab.tab);
   tabOrder = [...tabOrder.filter(id => ids.includes(id)), ...ids.filter(id => !tabOrder.includes(id))];
   render();
+  if (canLoadProfiles) void profileAction({ method: 'list' });
 }
 async function resync(force = false): Promise<void> {
   if (syncTask) { await syncTask; if (!force) return; return resync(true); }
@@ -246,4 +248,4 @@ element<HTMLFormElement>('navigate').onsubmit = event => {
   void send(current() ? 'user_navigate' : 'new_tab', { url });
 };
 api.subscribe(value => accept(value));
-render(); void resync(); void profileAction({ method: 'list' });
+render(); void resync();

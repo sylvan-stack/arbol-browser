@@ -27,6 +27,7 @@ export interface ShellRegistration {
   /** The only supported loader; handlers and the initial projection already exist. */
   load(): Promise<void>;
   assertLoaded(): void;
+  setRuntimeReady(isReady: () => boolean): void;
   offerPresentation(): void;
   offerForegroundPresentation(deadline: number, mayShowEmpty: () => boolean): Promise<void>;
   show(deadline: number, signal: AbortSignal, raiseWindow?: boolean, guard?: () => void): Promise<void>;
@@ -124,6 +125,7 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
   assertWindowHost(host); assertTabRegistry(tabs); host.assertHealthy(); authority.assertReady();
   if (senders.has(host.shell.webContents)) throw unavailable('browser');
   let revision = 0, loaded = false, prepared = false, disposed = false;
+  let runtimeReady = () => false;
   const ids = new Set<string>();
   const snapshot = (): Event => {
     host.assertHealthy(); authority.assertReady();
@@ -135,6 +137,7 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
     const value: Event = { ui: 1, event: 'state', revision: ++revision,
       tabs: ordered.map(target => structuredClone(tabs.state(target))),
       tabChrome: ordered.map(tabChrome),
+      ...(profiles && runtimeReady() ? { profileNavigationReady: true as const } : {}),
       attachments: authority.attachments().map(entry => ({ id: entry.id, label: entry.label })) };
     if (!eventShape(value)) throw unavailable('browser');
     return value;
@@ -206,6 +209,11 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
       assertShellRegistration(registration, host);
       if (!prepared || disposed || host.shell.webContents.getURL() !== shellURL) throw unavailable('browser');
     },
+    setRuntimeReady(isReady: () => boolean) {
+      assertPresentable();
+      runtimeReady = isReady;
+      registration.publish();
+    },
     offerPresentation() {
       assertPresentable();
       if (presentation) { presentation.offer(); return; }
@@ -244,10 +252,10 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
     unsubscribe = authority.subscribe(() => registration.publish());
     unsubscribePresentation = host.onPresentation(() => {}, () => { if (!disposed) registration.publish(); });
     unsubscribeChrome = host.onTabChromeChange(() => {
-      if (!prepared || disposed || chromeTimer) return;
+      if (!prepared || disposed || !runtimeReady() || chromeTimer) return;
       chromeTimer = setTimeout(() => {
         chromeTimer = undefined;
-        if (!disposed) registration.publish();
+        if (!disposed && runtimeReady()) registration.publish();
       }, 100);
     });
     host.shell.webContents.once('destroyed', () => registration.dispose());
