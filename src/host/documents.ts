@@ -532,7 +532,17 @@ export class HostDocuments implements DocumentAuthority {
   presentationChanged(page: PageSurface): void {
     for (const record of this.records.values()) if (record.page === page && this.alive(record) && !record.fault && record.presentationPending) {
       record.presentationPending = false; record.presentation = presentationCategory(page);
-      this.emit(record, 'changed'); this.authority().changed(); this.schedule(record);
+      this.emit(record, 'changed'); this.authority().changed();
+      if (page.window.presentationStable()) this.schedule(record);
+      else {
+        // A shared profile switch publishes placement before its synchronous
+        // commit clears the switching flag. Recheck the same placement afterward.
+        const epoch = record.presentationEpoch;
+        queueMicrotask(() => {
+          if (record.presentationEpoch === epoch && !record.presentationPending && page.window.presentationStable())
+            this.schedule(record);
+        });
+      }
     }
   }
   presentedEpoch(receipt: HostDocument): number {
