@@ -58,6 +58,9 @@ type NativePresentation = {
     readonly instance: string;
     ready(): boolean;
     assertRetained(): void;
+    sidebarTabs(): NonNullable<Event['profileTabs']>[number]['tabs'];
+    selectTab(id: string): void;
+    publish(): void;
     canYield(ownerSwitch: boolean): boolean;
     openHome(): void;
   }>;
@@ -118,12 +121,13 @@ function installTransport() {
   ipcMain.handle('browser-shell:profiles', async (event, request: unknown) => {
     const current = authenticated(event);
     if (!current.profiles) return null;
+    let firstCheck = true;
     const check = () => {
-      if (authenticated(event) !== current) throw unavailable('browser');
+      if (!firstCheck && authenticated(event) !== current) throw unavailable('browser');
+      firstCheck = false;
       current.authority.assertOperational();
     };
     try {
-      check();
       const isFocused = () => current.host.isActiveProfile() && current.host.window.isFocused();
       if ((request as { method?: unknown } | null)?.method !== 'list' && !isFocused()) throw refused('control_refused');
       const state = await current.profiles(request, check, isFocused);
@@ -161,6 +165,7 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
     ? (shared?.runtime?.instance ?? profileSource.custody.instance).owner.profile : undefined;
   let openingHome: Promise<void> | undefined;
   let revision = 0, loaded = false, prepared = false, disposed = false;
+  let lastSidebarTabs = '';
   let runtimeReady = () => false;
   const ids = new Set<string>();
   const snapshot = (): Event => {
@@ -173,6 +178,8 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
     const value: Event = { ui: 1, event: 'state', revision: ++revision,
       tabs: ordered.map(target => structuredClone(tabs.state(target))),
       tabChrome: ordered.map(tabChrome),
+      ...(nativePresentation ? { profileTabs: [...nativePresentation.profiles.values()]
+        .flatMap(member => member.ready() ? [{ id: member.id, instance: member.instance, tabs: member.sidebarTabs() }] : []) } : {}),
       ...(profiles && runtimeReady() ? { profileNavigationReady: true as const } : {}),
       attachments: authority.attachments().map(entry => ({ id: entry.id, label: entry.label })) };
     if (!eventShape(value)) throw unavailable('browser');
@@ -198,11 +205,13 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
     nativePresentation.profiles.set(host, { id, instance,
       ready: () => runtimeReady() && prepared && !disposed,
       assertRetained() {
-        if (shared?.runtime) {
-          assertSharedProfileRuntime(shared.runtime);
-          shared.runtime.retained.assertRetained();
-        } else assertHostCustody(profileSource.custody);
+        if (shared?.runtime) assertSharedProfileRuntime(shared.runtime);
+        else assertHostCustody(profileSource.custody);
       },
+      sidebarTabs: () => tabs.all().filter(target => target.page.window === host)
+        .slice(0, 7).map(target => ({ id: target.id, title: tabChrome(target).title })),
+      selectTab: id => { tabs.select(host, id); },
+      publish: () => registration.publish(),
       canYield: ownerSwitch =>
         !host.window.isDestroyed() && host.window.isEnabled() && (ownerSwitch || !host.window.isFocused()) &&
         tabs.all().filter(target => target.page.window === host).every(target => tabs.state(target).handoff === 'idle'),
@@ -218,7 +227,7 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
   }
   const presentation = nativePresentation?.value;
   const profiles = profileSource && nativePresentation && createProfileNavigation(profileSource.custody, profileSource.platform,
-    nativePresentation.value.yieldForSwitch, (id, instance) => {
+    nativePresentation.value.yieldForSwitch, (id, instance, tab) => {
       const members = nativePresentation.profiles;
       for (const [target, profile] of members) {
         if (profile.id !== id) continue;
@@ -226,6 +235,7 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
           throw refused('control_refused');
         if (!profile.ready()) return false;
         profile.assertRetained();
+        if (tab !== undefined) profile.selectTab(tab);
         selectWindowProfile(host, target);
         profile.openHome();
         return true;
@@ -412,6 +422,14 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
       assertShellRegistration(registration, host);
       const value = snapshot();
       if (loaded && host.shell.webContents.getURL() === shellURL) host.shell.webContents.send('browser-shell:state', value);
+      const sidebarTabs = JSON.stringify(nativePresentation?.profiles.get(host)?.sidebarTabs() ?? []);
+      if (sidebarTabs !== lastSidebarTabs) {
+        lastSidebarTabs = sidebarTabs;
+        if (!host.isActiveProfile()) {
+          const current = [...(nativePresentation?.profiles ?? [])].find(([member]) => member.isActiveProfile());
+          current?.[1].publish();
+        }
+      }
     },
     dispose() {
       if (disposed) return; disposed = true;

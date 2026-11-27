@@ -17,7 +17,7 @@ import { connectRuntime } from '../runtime/transport.js';
 
 export type ProfileNavigationRequest = { method: 'list' } |
   { method: 'create'; profile: string } |
-  { method: 'open'; profile: string; instance: string };
+  { method: 'open'; profile: string; instance: string; tab?: string };
 export interface ProfileNavigationEntry {
   readonly id: string;
   readonly instance: string;
@@ -90,7 +90,7 @@ async function labels(state: string): Promise<Map<string, { instance: string; la
 }
 
 export function createProfileNavigation(custody: HostCustody, platform: PlatformPort,
-  yieldPresentation: () => () => void, selectLocal: (profile: string, instance: string) => boolean,
+  yieldPresentation: () => () => void, selectLocal: (profile: string, instance: string, tab?: string) => boolean,
   shared?: Readonly<{ runtime?: SharedProfileRuntime; isReady(profile: string, instance: string): boolean;
     openInWindow(profile: ProfileSnapshot, deadline: number): Promise<void> }>): ProfileNavigation | undefined {
   assertHostCustody(custody);
@@ -127,8 +127,9 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
     } finally { registry.release(); }
   }
 
-  async function open(id: string, instance: string, check: () => void, isFocused: () => boolean): Promise<void> {
-    if (shared && selectLocal(id, instance)) return;
+  async function open(id: string, instance: string, check: () => void, isFocused: () => boolean, tab?: string): Promise<void> {
+    if (shared && selectLocal(id, instance, tab)) return;
+    if (tab !== undefined) throw profileUnavailable();
     const profile = await readProfile(profilePaths(id, state));
     if (profile.record.instance !== instance) throw profileUnavailable();
     check();
@@ -188,7 +189,7 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
     };
     if (request.method === 'list' && keys === 'method') return list(check);
     if (!((request.method === 'create' && keys === 'method,profile') ||
-          (request.method === 'open' && keys === 'instance,method,profile'))) throw invalidInput();
+          (request.method === 'open' && (keys === 'instance,method,profile' || keys === 'instance,method,profile,tab')))) throw invalidInput();
     const id = profileId(request.profile, request.method === 'create');
     if (changing) throw profileUnavailable();
     changing = true;
@@ -198,12 +199,13 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
         if (/^seqoya-[0-9a-f]{32}$/.test(id)) throw invalidInput();
         await createProfile(id, undefined, platform, state);
       } else {
-        const { instance } = request;
+        const { instance, tab } = request;
         if (typeof instance !== 'string' || !instancePattern.test(instance)) throw invalidInput();
+        if (keys.endsWith(',tab') && (typeof tab !== 'string' || !/^tab_[A-Za-z0-9_-]{22}$/.test(tab))) throw invalidInput();
         const snapshot = catalogue ?? await list(check);
         if (!snapshot.profiles.some(profile => profile.id === id && profile.instance === instance && !profile.unavailable))
           throw profileUnavailable();
-        if (id !== selected.record.id) await open(id, instance, check, isFocused);
+        if (id !== selected.record.id) await open(id, instance, check, isFocused, typeof tab === 'string' ? tab : undefined);
         return snapshot;
       }
       return await list(check);

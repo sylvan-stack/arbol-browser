@@ -19,9 +19,8 @@ let tabOrder: string[] = [], focusKey = '';
 const requests = new Set<string>();
 const profileList = element('profile-list'), tabList = element('tabs');
 const tabActions = element<HTMLDetailsElement>('tab-actions');
-const profileCreate = element<HTMLDetailsElement>('profile-create-panel');
 let tabListKey = '';
-const profileName = element<HTMLInputElement>('profile-id'), profileStatus = element('profile-status');
+const profileStatus = element('profile-status');
 const profileStatusHome = profileStatus.parentElement!;
 let profiles: ProfileNavigationState | undefined, changingProfile = false, refreshingProfiles = false, profileRevision = 0;
 let openingProfileKey = '';
@@ -32,17 +31,14 @@ function profileLabel(id: string): string {
   return id.split('-').map(word => word ? word[0]!.toUpperCase() + word.slice(1) : '').join(' ');
 }
 function updateProfileControls(): void {
-  profileCreate.hidden = !profiles;
-  profileName.disabled = changingProfile || !profiles;
-  button('profile-add').disabled = profileName.disabled;
-  for (const choice of profileList.querySelectorAll<HTMLButtonElement>('button'))
-    choice.setAttribute('aria-disabled', String(changingProfile || choice.disabled));
+  profileList.setAttribute('aria-busy', String(changingProfile));
 }
 function renderProfiles(): void {
   if (!openingProfileKey && profileStatus.parentElement !== profileStatusHome) profileStatusHome.append(profileStatus);
   const entries = profiles?.profiles ?? [];
   if (!entries.length) return;
   const keys = new Set(entries.map(entry => entry.id + ':' + entry.instance));
+  const chrome = new Map(state?.profileTabs?.map(profile => [profile.id + ':' + profile.instance, profile.tabs]));
   const existing = new Map<string, HTMLElement>();
   const focused = document.activeElement as HTMLElement | null;
   for (const row of profileList.querySelectorAll<HTMLElement>('[data-profile-key]')) {
@@ -51,7 +47,7 @@ function renderProfiles(): void {
     else row.remove();
   }
   let next = profileList.firstElementChild;
-  for (const entry of entries) {
+  for (const [index, entry] of entries.entries()) {
     const key = entry.id + ':' + entry.instance;
     const active = entry.id === profiles?.current;
     const opening = key === openingProfileKey;
@@ -59,12 +55,14 @@ function renderProfiles(): void {
     const row = existing.get(key) ?? document.createElement('div');
     const choice = row.firstElementChild as HTMLButtonElement | null ?? document.createElement('button');
     const label = choice.firstElementChild ?? document.createElement('span');
+    if (!existing.has(key)) row.className = 'profile-card';
+    row.dataset.color = String(index % 12);
+    row.toggleAttribute('data-active', active);
     const text = entry.unavailable ? name + ' (unavailable)' : name;
     if (label.textContent !== text) label.textContent = text;
     choice.title = text;
     choice.disabled = entry.unavailable === true;
     choice.setAttribute('aria-disabled', String(changingProfile || choice.disabled));
-    choice.setAttribute('aria-expanded', String(active || opening));
     choice.toggleAttribute('data-opening', opening);
     if (!existing.has(key)) {
       row.dataset.profileKey = key;
@@ -84,6 +82,33 @@ function renderProfiles(): void {
       choice.removeAttribute('aria-controls');
       choice.onclick = () => { void profileAction({ method: 'open', profile: entry.id, instance: entry.instance }); };
     }
+    let inactiveTabs = row.querySelector<HTMLDivElement>('.inactive-tabs');
+    if (active) inactiveTabs?.remove();
+    else {
+      const links = chrome.get(key) ?? [];
+      const signature = JSON.stringify(links);
+      if (!inactiveTabs) {
+        inactiveTabs = document.createElement('div');
+        inactiveTabs.className = 'tabs inactive-tabs';
+        inactiveTabs.setAttribute('role', 'group');
+        row.append(inactiveTabs);
+      }
+      inactiveTabs.setAttribute('aria-label', 'Open tabs in ' + name);
+      if (inactiveTabs.dataset.tabs !== signature) {
+        inactiveTabs.dataset.tabs = signature;
+        inactiveTabs.replaceChildren(...links.map(link => {
+          const node = document.createElement('button');
+          node.type = 'button';
+          node.className = 'tab';
+          node.textContent = link.title || 'New tab';
+          node.title = node.textContent;
+          node.dir = 'auto';
+          node.dataset.key = link.id;
+          node.onclick = () => { void profileAction({ method: 'open', profile: entry.id, instance: entry.instance, tab: link.id }); };
+          return node;
+        }));
+      }
+    }
     if (opening && profileStatus.parentElement !== row) row.append(profileStatus);
     if (row !== next) profileList.insertBefore(row, next);
     next = row.nextElementSibling;
@@ -92,20 +117,22 @@ function renderProfiles(): void {
     focused.focus({ preventScroll: true });
 }
 async function profileAction(request: ProfileNavigationRequest): Promise<void> {
+  if (request.method === 'create') return;
   const listing = request.method === 'list';
   if (changingProfile || (listing && refreshingProfiles) || state?.profileNavigationReady !== true) return;
   const revision = listing ? profileRevision : ++profileRevision;
   if (listing) refreshingProfiles = true;
   else {
     changingProfile = true;
-    if (request.method === 'open') {
+    if (request.method === 'open' && !state?.profileTabs?.some(profile =>
+      profile.id === request.profile && profile.instance === request.instance)) {
       openingProfileKey = request.profile + ':' + request.instance;
       renderProfiles();
     }
     updateProfileControls();
   }
   if (!listing || !profiles)
-    profileStatus.textContent = request.method === 'open' ? 'Opening profile…' : request.method === 'create' ? 'Creating profile…' : 'Loading profiles…';
+    profileStatus.textContent = request.method === 'open' ? openingProfileKey ? 'Opening profile…' : '' : 'Loading profiles…';
   try {
     const result = await api.profiles(request);
     if (revision !== profileRevision) return;
@@ -115,11 +142,7 @@ async function profileAction(request: ProfileNavigationRequest): Promise<void> {
       profiles = result;
       renderProfiles();
     }
-    if (request.method === 'create') {
-      profileName.value = '';
-      profileCreate.open = false;
-    }
-    profileStatus.textContent = request.method === 'create' ? 'Profile created.' : '';
+    profileStatus.textContent = '';
   } catch {
     if (revision === profileRevision) profileStatus.textContent = 'Could not load or change the Browser profiles.';
   }
@@ -133,7 +156,6 @@ async function profileAction(request: ProfileNavigationRequest): Promise<void> {
       }
     }
     updateProfileControls();
-    if (request.method === 'create' && !profileCreate.open) profileCreate.querySelector('summary')?.focus();
   }
 }
 const current = () => state?.tabs.find(tab => tab.tab === selected);
@@ -145,7 +167,9 @@ function accept(value: State, snapshot = false) {
   if (state && value.revision <= state.revision) { if (snapshot && value.revision === state.revision) synchronized = state.revision >= newestRevision; render(); return; }
   if (!snapshot && state && value.revision !== state.revision + 1) { synchronized = false; render(); void resync(); return; }
   const canLoadProfiles = value.profileNavigationReady && !state?.profileNavigationReady;
+  const tabsChanged = JSON.stringify(state?.profileTabs) !== JSON.stringify(value.profileTabs);
   state = value; synchronized = value.revision >= newestRevision;
+  if (tabsChanged && profiles) renderProfiles();
   const nextTab = value.tabs[0]?.tab ?? ''; // authoritative versioned native selection, never a reply
   if (nextTab !== selected) { tabActions.open = false; recoveryTab = ''; }
   selected = nextTab;
@@ -235,7 +259,8 @@ function render() {
     tab?.controller.kind === 'agent' ? tab.controller.label + ' controls this tab' :
     tab && tab.pageAvailability !== 'ready' ? 'Page ' + tab.pageAvailability : '';
   element('state').textContent = status;
-  button('new').disabled = !idleRequest;
+  button('new').disabled = !idleRequest || entries.length >= 7;
+  button('new').title = entries.length >= 7 ? 'Close a tab before opening an eighth tab in this profile' : 'New tab';
   const canNavigate = idleRequest && !!user && idle;
   const chrome = state?.tabChrome?.[0];
   button('back').disabled = !canNavigate || !chrome?.back;
@@ -264,12 +289,11 @@ function render() {
   if (focusKey) [...document.querySelectorAll<HTMLElement>('[data-key]')].find(node => node.dataset.key === focusKey)?.focus();
 }
 button('new').onclick = () => { void send('new_tab'); };
-window.addEventListener('focus', () => { void profileAction({ method: 'list' }); });
-profileCreate.addEventListener('toggle', () => { if (profileCreate.open) profileName.focus(); });
-element<HTMLFormElement>('profile-create').onsubmit = event => {
-  event.preventDefault();
-  void profileAction({ method: 'create', profile: profileName.value.trim() });
-};
+let profileRefresh: ReturnType<typeof setTimeout> | undefined;
+window.addEventListener('focus', () => {
+  clearTimeout(profileRefresh);
+  profileRefresh = setTimeout(() => { if (document.hasFocus()) void profileAction({ method: 'list' }); }, 600);
+});
 for (const method of ['back', 'forward', 'reload', 'take'] as const) button(method).onclick = () => { void send(method); };
 button('recover').onclick = () => { recoveryTab = selected; render(); button('recover-cancel').focus(); };
 button('recover-confirm').onclick = () => { if (recoveryTab === selected) { recoveryTab = ''; void send('recover'); } };

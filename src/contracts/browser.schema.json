@@ -1590,6 +1590,32 @@
           "maxItems": 64
         },
         "profileNavigationReady": { "const": true },
+        "profileTabs": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string", "pattern": "^[a-z](?:[a-z0-9-]{0,62}[a-z0-9])?$" },
+              "instance": { "type": "string", "pattern": "^prf_[A-Za-z0-9_-]{22}$" },
+              "tabs": {
+                "type": "array",
+                "maxItems": 7,
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": { "type": "string", "pattern": "^tab_[A-Za-z0-9_-]{22}$" },
+                    "title": { "type": "string", "maxLength": 160 }
+                  },
+                  "required": ["id", "title"],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": ["id", "instance", "tabs"],
+            "additionalProperties": false
+          }
+        },
         "attachments": {
           "type": "array",
           "items": {

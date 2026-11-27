@@ -46,8 +46,29 @@ body { margin: 0; overflow: hidden; }
 .rail-heading, .tab-row { display: flex; align-items: center; justify-content: space-between; }
 .rail-heading { margin: 0 0 4px; padding-inline: 7px 0; }
 h1 { margin: 0; font-size: 13px; }
-#profile-list, .tabs, .actions, #profile-create { display: grid; gap: 2px; }
+#profile-list, .tabs, .actions { display: grid; gap: 2px; }
 #profile-list, .tabs { grid-template-columns: minmax(0, 1fr); }
+#profile-list { gap: 6px; }
+.profile-card {
+  --profile-color: #d7a479;
+  padding: 3px;
+  border: 1px solid color-mix(in srgb, var(--profile-color) 38%, var(--border));
+  border-inline-start: 3px solid var(--profile-color);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--profile-color) 8%, var(--panel));
+}
+.profile-card[data-active] { background: color-mix(in srgb, var(--profile-color) 17%, var(--panel)); }
+.profile-card[data-color='1'] { --profile-color: #dcb464; }
+.profile-card[data-color='2'] { --profile-color: #b8c56d; }
+.profile-card[data-color='3'] { --profile-color: #92c18d; }
+.profile-card[data-color='4'] { --profile-color: #70bdaf; }
+.profile-card[data-color='5'] { --profile-color: #7ac0d4; }
+.profile-card[data-color='6'] { --profile-color: #8caee5; }
+.profile-card[data-color='7'] { --profile-color: #9fa0e8; }
+.profile-card[data-color='8'] { --profile-color: #be9cdd; }
+.profile-card[data-color='9'] { --profile-color: #d59ac5; }
+.profile-card[data-color='10'] { --profile-color: #de92a3; }
+.profile-card[data-color='11'] { --profile-color: #de9c83; }
 .profile, .tab { min-width: 0; }
 .profile {
   display: flex;
@@ -57,17 +78,34 @@ h1 { margin: 0; font-size: 13px; }
   min-height: 30px;
   text-align: left;
 }
-.profile::before { content: '›'; color: var(--muted); font-size: 16px; }
-.profile[aria-expanded='true']::before { transform: rotate(90deg); }
+.profile::before { content: ''; width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--profile-color); }
 .profile:is([aria-current='true'], [data-opening]) { font-weight: 600; }
 .profile[data-opening] { background: var(--inset); opacity: 1; }
 .profile + #profile-status { margin-inline-start: 16px; }
 .profile span, .tab { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.tabs { margin: 3px 0 6px 8px; padding-left: 6px; border-left: 1px solid var(--border); }
+.tabs { margin: 2px 0 3px 7px; padding-inline-start: 3px; }
+.inactive-tabs:empty { display: none; }
 .tab-row { min-height: 28px; gap: 2px; border-radius: 6px; }
 .tab-row:has([aria-current='page']) { background: var(--inset); }
-.tab[aria-current='page'] { box-shadow: inset 2px 0 var(--accent); }
-.tab { flex: 1; min-height: 28px; text-align: left; }
+.tab[aria-current='page'] { box-shadow: inset 2px 0 var(--profile-color); }
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-height: 28px;
+  text-align: left;
+}
+.tab::before { content: ''; width: 4px; height: 12px; flex: none; border-radius: 2px; background: var(--tab-color, var(--profile-color)); }
+.tabs > :nth-child(2) { --tab-color: #dcb464; }
+.tabs > :nth-child(3) { --tab-color: #92c18d; }
+.tabs > :nth-child(4) { --tab-color: #7ac0d4; }
+.tabs > :nth-child(5) { --tab-color: #9fa0e8; }
+.tabs > :nth-child(6) { --tab-color: #d59ac5; }
+.tabs > :nth-child(7) { --tab-color: #de9c83; }
+.tab-row:nth-child(even) .tab, .inactive-tabs .tab:nth-child(even) {
+  background: color-mix(in srgb, var(--profile-color) 10%, var(--panel));
+}
 button, input, select {
   border: 1px solid transparent;
   border-radius: 6px;
@@ -84,8 +122,8 @@ button:disabled, button[aria-disabled='true'], input:disabled, select:disabled {
 .tab-close { width: 24px; height: 24px; font-size: 15px; }
 details { margin: 6px 2px 0; }
 summary { border-radius: 6px; padding: 6px; }
-.actions, #profile-create { margin: 4px 0 0; }
-.actions button, #profile-add { text-align: left; }
+.actions { margin: 4px 0 0; }
+.actions button { text-align: left; }
 p { margin: 6px 4px; color: var(--muted); overflow-wrap: anywhere; }
 p:empty, #grants:empty { display: none; }
 #problem { color: #ffb6b0; }

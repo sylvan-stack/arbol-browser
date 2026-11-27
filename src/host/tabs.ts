@@ -188,7 +188,8 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
     inherited?: TabState, inheritedBudget?: PopupBudget, background = false, scope?: AgentOpenScope, opener?: TabTarget): Promise<TabTarget> {
     lifecycle.assertAdmission(); assertWindowHost(window); url = creator ? agentURL(url) : userURL(url);
     if (windowClosures.has(window)) throw refused('control_refused', 'This browser window is closing.');
-    if (tabs.size >= 64) throw refused('control_refused', 'Close an existing tab before opening another.');
+    if (tabs.size >= 64 || [...tabs.values()].filter(tab => tab.page.window === window).length >= 7)
+      throw refused('control_refused', 'A profile can have up to seven open tabs. Close a tab before opening another.');
     if (creator && !lifecycle.connected(creator.id)) throw refused('control_refused');
     if (creator && !inheritedBudget && !scope) throw refused('control_refused');
     const budget: PopupBudget | undefined = creator ? inheritedBudget ?? { count: 0, client: creator.id, active: true, ...(scope ? { scope } : {}) } : undefined;
