@@ -187,7 +187,7 @@ async function closeProductionProfile(profile: ProfileSnapshot, selection: Build
   if (await exits.tryClosed(profile, original, deadline)) return { profile: profile.record.id, closed: false, dataRemoved: false };
   let requested = false, unconfirmedScope = false;
   if (originalAlive(original, platform) && original.phase === 'ready' && location && now() < grace) {
-    const status = await within(grace, () => inspectOrCloseProductionProfile(profile, original,
+    const status = await within(deadline, () => inspectOrCloseProductionProfile(profile, original,
       selection, platform, exits, grace, closeHost, 'close', command.native));
     if (status === 'closed' || status === 'dormant')
       return { profile: profile.record.id, closed: status === 'closed', dataRemoved: false };
@@ -214,8 +214,9 @@ async function closeProductionProfile(profile: ProfileSnapshot, selection: Build
       return { profile: profile.record.id, closed: requested, dataRemoved: false };
     if (unconfirmedScope && originalAlive(original, platform)) {
       try {
-        const status = await within(deadline, () => inspectOrCloseProductionProfile(profile, original,
-          selection, platform, exits, deadline, closeHost));
+        const probe = Math.min(deadline, now() + 500);
+        const status = await within(probe, () => inspectOrCloseProductionProfile(profile, original,
+          selection, platform, exits, probe, closeHost));
         if (status === 'dormant') return { profile: profile.record.id, closed: true, dataRemoved: false };
       } catch { assertTime(deadline); }
     }

@@ -469,7 +469,12 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
           }, 2000);
           return;
         }
-        if (sealed || !admission) throw unavailable('browser');
+        if (sealed || !admission) {
+          if (retainedCloseStops.has(stop) && (validator('wire.Ping')(value) ||
+              (validator('wire.Response')(value) && value.id === pingId && value.ok && !Object.keys(value.result).length)))
+            return;
+          throw unavailable('browser');
+        }
         checkPeer();
         if (isProfileAdmissionRequest(value)) {
           if (endpoint !== 'management' || !privateProfileAdmission || profileAdmissionStarted ||
@@ -511,7 +516,7 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
               writeFrame(socket, Buffer.from(JSON.stringify({ wire: 1, id: value.id, method: 'profile-admission-result', result }) + '\n'), 16384, () => {
                 checkPeer();
                 if (dead || connection.signal.aborted || now() >= deadline ||
-                    (residentExit ? !retainedCloseStops.has(stop) || now() >= residentExit.grace : sealed || !admission))
+                    (residentExit ? !sealed || admission || !retainedCloseStops.has(stop) || now() >= residentExit.grace : sealed || !admission))
                   throw unavailable('browser');
               });
               if (residentExit) {
@@ -858,8 +863,26 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
           if (!originalAlive(record, platform)) { stop('lost'); return; }
         }
       }
-      try { verify(); } catch (error) {
-        if (endpoint === 'agent' || (residentCloseRequest && pending.has(residentCloseRequest))) { stop('lost'); return; }
+      const residentClose = residentCloseRequest ? pending.get(residentCloseRequest) : undefined;
+      if (residentClose) {
+        if (plain(value) && value.method === 'profile-admission-result' && value.wire === 1 &&
+            Object.keys(value).length === 4 && value.id === residentCloseRequest) {
+          const result = value.result;
+          if (result === null) {
+            stop('refused'); return;
+          }
+          if (result !== 'closed' && result !== 'dormant' && result !== 'exiting') throw unavailable('browser');
+          try { verify(); } catch { stop('lost'); return; }
+          pending.delete(residentCloseRequest!); clearTimeout(residentClose.timer); residentClose.resolve(result); return;
+        }
+        if (!(validator('wire.Ping')(value) && !seen.has(value.id) && seen.size < 65536) &&
+            !(validator('wire.Response')(value) && value.id === pingId && value.ok && !Object.keys(value.result).length))
+          throw unavailable('browser');
+        // A queued heartbeat cannot settle this request. Leave any following
+        // Close reply or the socket's actual terminal event to do so.
+        try { verify(); } catch { return; }
+      } else try { verify(); } catch (error) {
+        if (endpoint === 'agent') { stop('lost'); return; }
         throw error;
       }
       if (!hello) {
