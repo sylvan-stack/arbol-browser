@@ -793,14 +793,18 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
             if (subscriptionOpen) {
               const ready = target, page = ready.page, contents = page.view.webContents;
               const address = contents.getURL();
+              const document = authority.document(ready);
+              const generation = tabs().state(ready).generation;
               const guard = () => {
                 if (signal.aborted || performance.now() >= deadline || context.canForegroundSubscription?.() !== true ||
                     ready.page !== page || page.window !== host || page.retirement() || contents.isDestroyed() ||
                     contents.getURL() !== address || !isSubscriptionLanding(address, destination) ||
                     tabs().get(ready.id) !== ready) throw refused('control_refused');
                 const state = tabs().state(ready);
-                if (state.controller.kind !== 'user' || state.handoff !== 'idle' || state.pageAvailability !== 'ready')
+                if (state.generation !== generation || state.controller.kind !== 'user' || state.handoff !== 'idle' ||
+                    state.pageAvailability !== 'ready')
                   throw refused('control_refused');
+                authority.assertDocument(ready, document);
               };
               await registration.foreground(ready, deadline, signal, guard);
               void registration.rememberSubscriptionHome(destination).catch(() => {});
