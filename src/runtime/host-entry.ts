@@ -243,6 +243,7 @@ function usageFor(transports: typeof import('./transport.js'), platform: Platfor
 
 interface AdditionalProfiles {
   openInWindow(source: WindowHost, target: ProfileSnapshot, deadline: number): Promise<void>;
+  admit: NonNullable<Parameters<typeof import('./transport.js').listenProtectedTransport>[6]>;
   fence(): void;
   retire(deadline: number): Promise<void>;
 }
@@ -250,7 +251,7 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
   port: NativeShellPort, platform: PlatformPort, exits: ProductionExitAuthority,
   bootstrap: typeof import('./bootstrap.js'), lifecycle: typeof import('./lifecycle.js'),
   transports: typeof import('./transport.js')): AdditionalProfiles {
-  type Entry = { instance: string; opening?: Promise<void>; runtime?: SharedProfileLifecycle };
+  type Entry = { instance: string; opening?: Promise<SharedProfileRuntime>; runtime?: SharedProfileLifecycle };
   const profiles = new Map<string, Entry>();
   let closing = false;
   const assertCurrent = (source: WindowHost, deadline: number) => {
@@ -258,28 +259,37 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
     if (closing || state.closed || source.window !== state.shell?.host.window || !state.runtime) throw unavailable('profile');
     state.runtime.assertAdmission(); custody.assertRetained(); source.assertHealthy();
   };
-  async function openInWindow(source: WindowHost, target: ProfileSnapshot, deadline: number): Promise<void> {
-    assertCurrent(source, deadline);
+  async function openProfile(source: WindowHost, target: ProfileSnapshot, deadline: number, signal?: AbortSignal): Promise<RuntimeRecord> {
+    const assertOpeningCurrent = () => {
+      assertCurrent(source, deadline);
+      if (signal?.aborted) throw unavailable('profile');
+    };
+    assertOpeningCurrent();
     const { id, instance } = target.record;
     if (id === custody.instance.record.profile || target.paths.state !== custody.host.policy.stateRoot) throw unavailable('profile');
     let entry = profiles.get(id);
     if (!entry) { entry = { instance }; profiles.set(id, entry); }
     if (entry.instance !== instance) throw unavailable('profile');
-    entry.opening ??= openEntry(entry, source, target, deadline);
-    await entry.opening;
-    assertCurrent(source, deadline);
+    entry.opening ??= openEntry(entry, source, target, deadline, assertOpeningCurrent);
+    const profile = await entry.opening;
+    assertOpeningCurrent();
     entry.runtime!.assertAdmission();
+    return profile.instance.record;
   }
-  async function openEntry(entry: Entry, source: WindowHost, target: ProfileSnapshot, deadline: number): Promise<void> {
+  async function openInWindow(source: WindowHost, target: ProfileSnapshot, deadline: number): Promise<void> {
+    await openProfile(source, target, deadline);
+  }
+  async function openEntry(entry: Entry, source: WindowHost, target: ProfileSnapshot, deadline: number,
+    assertOpeningCurrent: () => void): Promise<SharedProfileRuntime> {
     let profile: SharedProfileRuntime | undefined, shell: TrustedShellIntegration | undefined, transport: TransportServer | undefined;
     try {
       const prepared = profile = await prepareSharedProfileRuntime(app, custody, target, exits, deadline);
-      assertCurrent(source, deadline);
+      assertOpeningCurrent();
       const control = await bootstrap.prepareSharedRendererControl(boundary, prepared, deadline);
-      assertCurrent(source, deadline);
+      assertOpeningCurrent();
       shell = await bootstrap.integrateSharedProfileShell(port, prepared, source, control.ownership.lifecycle,
         control.ownership.shell, openInWindow, deadline);
-      assertCurrent(source, deadline);
+      assertOpeningCurrent();
       control.bind(shell.tabs, shell.host, shell.registration);
       const { instance } = prepared;
       transport = await transports.listenProtectedTransport(instance.location, instance.record, platform, control.ownership.dispatch,
@@ -287,12 +297,13 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
           control, shell, () => entry.runtime), prepared);
       const runtime = entry.runtime = lifecycle.createSharedProfileLifecycle(prepared, transport, control.ownership.control, deadline);
       control.ownership.bindRuntime(runtime);
-      assertCurrent(source, deadline);
+      assertOpeningCurrent();
       await shell.registration.load();
-      assertCurrent(source, deadline);
+      assertOpeningCurrent();
       await runtime.ready();
       assertCurrent(source, deadline);
       shell.registration.setRuntimeReady(() => runtime.phase === 'ready' && !closing && !state.closed);
+      return prepared;
     } catch (error) {
       if (entry.runtime) await entry.runtime.close();
       else {
@@ -310,6 +321,14 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
   }
   return Object.freeze({
     openInWindow,
+    async admit(scope: Readonly<{ profile: string; profileInstance: string }>, deadline: number, signal: AbortSignal) {
+      const source = state.shell?.host;
+      if (!source || signal.aborted) throw unavailable('profile');
+      assertCurrent(source, deadline);
+      const target = await readProfile(profilePaths(scope.profile, custody.host.policy.stateRoot));
+      if (target.record.instance !== scope.profileInstance) throw unavailable('profile');
+      return openProfile(source, target, deadline, signal);
+    },
     fence() {
       closing = true;
       for (const entry of profiles.values()) entry.runtime?.fence();
@@ -366,7 +385,7 @@ async function assembleAfterReady(prepared: HostPreparation, sessions: ProfileSe
     noteHostStartup(prepared.custody, 'host-listeners-before');
     const transport = await transports.listenProtectedTransport(prepared.instance.location, prepared.instance.record, platform,
       control.ownership.dispatch, usageFor(transports, platform, prepared.instance,
-        () => prepared.custody.assertRetained(), control, shell, () => state.runtime));
+        () => prepared.custody.assertRetained(), control, shell, () => state.runtime), undefined, group?.admit);
     noteHostStartup(prepared.custody, 'host-listeners-after');
     state.transport = transport; current();
     const shutdown = sessionModule.productionSessionShutdown(sessions, prepared.custody);

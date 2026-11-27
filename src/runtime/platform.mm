@@ -5292,10 +5292,10 @@ static napi_value publishSharedProfileReady(napi_env env,napi_callback_info info
     NSDictionary* runtime=arbol_attempt::json(encoded);
     NSString* profile=owner.storage[@"profile"];
     NSString* hash=arbol_attempt::digest(profile.fileSystemRepresentation);
-    NSDictionary* claim=retained.ownership.observations()[@"group"][@"claim"];
-    NSString* build=claim[@"build"];
+    NSDictionary* group=retained.ownership.observations()[@"group"];
+    NSString* build=group[@"build"][@"number"];
     NSString* start=[NSString stringWithUTF8String:std::to_string(context.main.start).c_str()];
-    if(!runtime||!build||!arbol_attempt::runtime(runtime,@{@"profile":profile,@"profileInstance":owner.storage[@"instance"],
+    if(!runtime||!build||!arbol_attempt::runtime(runtime,@{@"profile":profile,@"profileInstance":owner.storage[@"request"][@"instance"],
         @"profilePathHash":hash,@"build":build})||![runtime[@"phase"] isEqual:@"ready"]||
        ![runtime[@"pid"] isEqual:@(context.main.pid)]||![runtime[@"processStartId"] isEqual:start]||
        !sharedSessionMayStart(owner,retained)) return fail(env);
@@ -5312,7 +5312,7 @@ static napi_value publishSharedProfileReady(napi_env env,napi_callback_info info
        !arbol_exit::readNativeFile(location.directory,"runtime.json",actual,record,arbol_attempt::limit)||
        ![arbol_attempt::json(actual) isEqual:runtime]) return fail(env);
     NSString* ownership=retained.ownership.digest();
-    NSString* request=claim[@"request"];
+    NSString* request=group[@"claim"][@"request"];
     if(!ownership||!request) return fail(env);
     const auto receipt=arbol_exit::exitReceiptBytes(@{@"format":@1,@"kind":@"shared-browser-ready",@"request":request,
       @"runtimeDigest":arbol_attempt::digest(actual),@"ownershipDigest":ownership,

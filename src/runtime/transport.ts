@@ -291,8 +291,24 @@ export function listenTransport(location: RuntimeLocation, record: RuntimeRecord
 }
 /** Production assembly must choose this entry, with every real protected port. */
 type PrivateUsage = (params: SeqoyaParameters, deadline: number, signal: AbortSignal) => Promise<SeqoyaResult>;
+interface ProfileAdmissionScope { readonly profile: string; readonly profileInstance: string }
+interface ProfileAdmissionRequest {
+  readonly wire: 1; readonly id: string; readonly method: 'profile-admission';
+  readonly params: ProfileAdmissionScope & Readonly<{ expires: number }>;
+}
+type PrivateProfileAdmission = (scope: ProfileAdmissionScope, deadline: number, signal: AbortSignal) => Promise<RuntimeRecord>;
+const runtimeRecord = validator('wire.RuntimeRecord');
+const profileAdmissionResult = (value: unknown): value is RuntimeRecord | null => value === null || runtimeRecord(value);
+function isProfileAdmissionRequest(value: unknown): value is ProfileAdmissionRequest {
+  return plain(value) && Object.keys(value).length === 4 && value.wire === 1 && value.method === 'profile-admission' &&
+    validator('browser.RequestId')(value.id) && plain(value.params) && Object.keys(value.params).length === 3 &&
+    validator('browser.ProfileId')(value.params.profile) && typeof value.params.profileInstance === 'string' &&
+    /^prf_[A-Za-z0-9_-]{22}$/.test(value.params.profileInstance) && typeof value.params.expires === 'number' &&
+    Number.isSafeInteger(value.params.expires) && value.params.expires > 0;
+}
 export function listenProtectedTransport(location: RuntimeLocation, record: RuntimeRecord, platform: PlatformPort,
-  dispatch: ProtectedDispatchPort, privateUsage?: PrivateUsage, shared?: SharedProfileRuntime): Promise<TransportServer> {
+  dispatch: ProtectedDispatchPort, privateUsage?: PrivateUsage, shared?: SharedProfileRuntime,
+  privateProfileAdmission?: PrivateProfileAdmission): Promise<TransportServer> {
   for (const method of ['enroll', 'guardControl', 'commitResponse', 'redactedFailure', 'forget', 'authorize', 'execute', 'disconnect', 'cancel', 'fatal'] as const)
     if (typeof dispatch[method] !== 'function') throw unavailable('browser');
   if (shared) {
@@ -300,11 +316,11 @@ export function listenProtectedTransport(location: RuntimeLocation, record: Runt
     if (shared.instance.location !== location || shared.instance.record !== record || record.phase !== 'starting')
       throw unavailable('profile');
   }
-  return listenServer(location, record, platform, dispatch, dispatch, privateUsage, shared);
+  return listenServer(location, record, platform, dispatch, dispatch, privateUsage, shared, privateProfileAdmission);
 }
 async function listenServer(location: RuntimeLocation, record: RuntimeRecord, platform: PlatformPort,
   dispatch: DispatchPort | ProtectedDispatchPort, protectedPort?: ProtectedDispatchPort,
-  privateUsage?: PrivateUsage, shared?: SharedProfileRuntime): Promise<TransportServer> {
+  privateUsage?: PrivateUsage, shared?: SharedProfileRuntime, privateProfileAdmission?: PrivateProfileAdmission): Promise<TransportServer> {
   let admission = false, sealed = false, agents = 0, management = 0;
   const connections = new Set<() => void>(), retainedCloseStops = new Map<() => void, () => void>(), servers: Server[] = [], scheduler = new Scheduler();
   let fatalLatched = false;
@@ -323,7 +339,7 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
     let closeDrain: NodeJS.Timeout | undefined;
     let helloTimer: NodeJS.Timeout, heartbeat: NodeJS.Timeout;
     let pingId: string | undefined, lastPong = now();
-    let usageStarted = false;
+    let usageStarted = false, profileAdmissionStarted = false;
     const stop = () => {
       if (dead) return; dead = true; connections.delete(stop); retainedCloseStops.delete(stop); clearTimeout(closeDrain);
       if (context) managementConnections.delete(context);
@@ -429,6 +445,29 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
         }
         if (sealed || !admission) throw unavailable('browser');
         checkPeer();
+        if (isProfileAdmissionRequest(value)) {
+          if (endpoint !== 'management' || !privateProfileAdmission || profileAdmissionStarted ||
+              seen.has(value.id) || seen.size >= 65536) throw unavailable('browser');
+          const deadline = now() + Math.min(60_000, value.params.expires - platform.continuousTime());
+          if (now() >= deadline) throw unavailable('browser');
+          profileAdmissionStarted = true; seen.add(value.id);
+          void (async () => {
+            let result: RuntimeRecord | null;
+            try { result = await privateProfileAdmission(value.params, deadline, connection.signal); }
+            catch { result = null; }
+            try {
+              if (!profileAdmissionResult(result) || (result && (result.phase !== 'ready' ||
+                  result.profile !== value.params.profile || result.profileInstance !== value.params.profileInstance ||
+                  !sameProcess(recordProcess(result), recordProcess(record)) || result.build !== record.build)))
+                throw unavailable('profile');
+              writeFrame(socket, Buffer.from(JSON.stringify({ wire: 1, id: value.id, method: 'profile-admission-result', result }) + '\n'), 16384, () => {
+                checkPeer();
+                if (dead || sealed || !admission || connection.signal.aborted || now() >= deadline) throw unavailable('browser');
+              });
+            } catch { stop(); }
+          })();
+          return;
+        }
         if (isSeqoyaRequest(value)) {
           if (endpoint !== 'management' || !privateUsage || usageStarted || seen.has(value.id) || seen.size >= 65536)
             throw unavailable('browser');
@@ -636,6 +675,13 @@ export interface RuntimeClient {
   close(): void;
 }
 const usageCalls = new WeakMap<RuntimeClient, (params: SeqoyaParameters, deadline: number) => Promise<SeqoyaResult>>();
+const profileAdmissions = new WeakMap<RuntimeClient, (scope: ProfileAdmissionScope, deadline: number) => Promise<RuntimeRecord>>();
+export function requestProfileAdmission(client: RuntimeClient, scope: ProfileAdmissionScope, deadline: number): Promise<RuntimeRecord> {
+  const request = profileAdmissions.get(client);
+  if (!request) return Promise.reject(unavailable('profile'));
+  profileAdmissions.delete(client);
+  return request(scope, deadline);
+}
 export function requestSeqoyaUsage(client: RuntimeClient, params: SeqoyaParameters, deadline: number): Promise<SeqoyaResult> {
   const call = usageCalls.get(client);
   if (!call) return Promise.reject(unavailable('browser'));
@@ -741,7 +787,8 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
             if (!pingId) { pingId = token('req'); seen.add(pingId); write(socket, { wire: 1, id: pingId, method: 'ping', params: {} }); }
           } catch { stop(); }
         }, 2000);
-        const send = (request: Request | SeqoyaRequest | Contract<'wire.Cancel'>, limit: number, check: (value: unknown) => boolean,
+        const send = (request: Request | SeqoyaRequest | ProfileAdmissionRequest | Contract<'wire.Cancel'>,
+          limit: number, check: (value: unknown) => boolean,
           cancel?: PendingReply['cancel']): Promise<unknown> => {
           const maximum = request.method === 'cancel' ? 64 : 32;
           if (endpoint === 'agent' && seen.size >= 65536) stop();
@@ -772,6 +819,17 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
           if (!isSeqoyaRequest(request)) return Promise.reject(unavailable('browser'));
           return send(request, limit, isSeqoyaResult) as Promise<SeqoyaResult>;
         });
+        if (endpoint === 'management') profileAdmissions.set(client, async (scope, limit) => {
+          const remaining = Math.min(60_000, limit - now());
+          const request: ProfileAdmissionRequest = { wire: 1, id: token('req'), method: 'profile-admission',
+            params: { ...scope, expires: Math.floor(platform.continuousTime() + remaining) } };
+          if (remaining <= 0 || !isProfileAdmissionRequest(request)) throw unavailable('profile');
+          const result = await send(request, limit, profileAdmissionResult);
+          if (!runtimeRecord(result) || result.phase !== 'ready' || result.profile !== scope.profile ||
+              result.profileInstance !== scope.profileInstance || !sameProcess(recordProcess(result), recordProcess(record)) ||
+              result.build !== record.build) throw unavailable('profile');
+          return Object.freeze(result);
+        });
         if (endpoint === 'management') actualCloseClients.set(client, async (budget, limit) => {
           if (dead || closeRequest || pending.size || now() >= limit) return { kind: 'refused', error: unavailable('browser') };
           const request: Extract<Request, { method: 'close' }> = { wire: 1, id: token('req'), method: 'close', params: {} };
@@ -798,6 +856,12 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
       if (endpoint === 'management' && isSeqoyaReply(value)) {
         const entry = pending.get(value.id);
         if (!entry || entry.check !== isSeqoyaResult) throw unavailable('browser');
+        pending.delete(value.id); clearTimeout(entry.timer); entry.resolve(value.result); return;
+      }
+      if (endpoint === 'management' && plain(value) && value.method === 'profile-admission-result') {
+        if (value.wire !== 1 || Object.keys(value).length !== 4 || !validator('browser.RequestId')(value.id)) throw unavailable('browser');
+        const entry = pending.get(value.id);
+        if (!entry || entry.check !== profileAdmissionResult || !entry.check(value.result)) throw unavailable('browser');
         pending.delete(value.id); clearTimeout(entry.timer); entry.resolve(value.result); return;
       }
       if (!validator('wire.Response')(value)) throw unavailable('browser');
