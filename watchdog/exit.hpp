@@ -952,8 +952,8 @@ public:
     return readNativeFile(held.fd,filename,actual,named,exitReceiptLimit)&&
       arbol_attempt::sameFile(named,identity_)&&actual==record_&&held.current();
   }
-  bool publish(const AdditionalOwner& owner,NSDictionary* group,double deadline) {
-    if(!directory_.empty()||!arbol_boundary::lockIdentity(owner.lock)) return false;
+  bool publish(const AdditionalOwner& owner,NSDictionary* group,id previousMarker,double deadline) {
+    if(!directory_.empty()||!previousMarker||!arbol_boundary::lockIdentity(owner.lock)) return false;
     NSString* profile=owner.storage[@"profile"],*request=group[@"claim"][@"request"];
     if(!profile||!arbol_attempt::pattern(request,@"^req_[A-Za-z0-9_-]{22}$")) return false;
     NSString* hash=arbol_attempt::digest(profile.fileSystemRepresentation);
@@ -971,7 +971,7 @@ public:
     }
     directory_=parent->path; parent_=parent->identity;
     auto raw=exitReceiptBytes(@{@"format":@1,@"kind":@"shared-profile-owner",@"profilePathHash":hash,
-      @"storage":owner.storage,@"group":group});
+      @"storage":owner.storage,@"group":group,@"priorMarker":previousMarker});
     if(raw.empty()||!parent->current()||!arbol_boundary::lockIdentity(owner.lock)||
        !publishNativeReceipt(parent->fd,filename,raw,deadline,identity_)||!parent->current()) return false;
     record_=std::move(raw);

@@ -2343,21 +2343,28 @@ static bool markerAt(int directory,std::string& raw,struct stat& st,bool& absent
     arbol_attempt::sameFile(before,last)&&arbol_attempt::sameFile(last,after);
   if(ok) st=last; if(close(fd)) ok=false; return ok;
 }
-static bool currentMarker(Custody* c,std::string& raw,struct stat& st,bool& absent) {
-  if(!c->finalization.present()||!c->finalization.metadata()) return false;
-  NSDictionary* capability=c->finalization.value(); NSString* profile=capability[@"attempt"][@"profile"];
+static bool currentProfileMarker(NSString* profile,NSString* instance,NSDictionary* identity,
+  const arbol_boundary::Lock& owner,const arbol_boundary::Lock& build,std::string& raw,struct stat& st,bool& absent) {
   int fd=open(profile.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC); if(fd<0) return false;
   struct stat root{},named{},after{},lastName{};
   bool ok=!fstat(fd,&root)&&!lstat(profile.fileSystemRepresentation,&named)&&S_ISDIR(root.st_mode)&&
-    [arbol_exit::fileIdentity(root) isEqual:capability[@"profileDirectory"]]&&root.st_dev==named.st_dev&&root.st_ino==named.st_ino&&
+    [arbol_exit::fileIdentity(root) isEqual:identity]&&root.st_dev==named.st_dev&&root.st_ino==named.st_ino&&
     markerAt(fd,raw,st,absent);
-  if(ok&&!absent) ok=nativeMarker(arbol_attempt::json(raw))&&
-    [arbol_attempt::json(raw)[@"profileInstance"] isEqual:capability[@"attempt"][@"profileInstance"]];
+  if(ok&&!absent) {
+    NSDictionary* marker=arbol_attempt::json(raw);
+    ok=nativeMarker(marker)&&[marker[@"profileInstance"] isEqual:instance];
+  }
   ok=ok&&!fstat(fd,&after)&&!lstat(profile.fileSystemRepresentation,&lastName)&&
-    [arbol_exit::fileIdentity(after) isEqual:capability[@"profileDirectory"]]&&after.st_dev==lastName.st_dev&&after.st_ino==lastName.st_ino&&
-    arbol_boundary::lockIdentity(c->context.owner)&&arbol_boundary::lockIdentity(c->context.build);
+    [arbol_exit::fileIdentity(after) isEqual:identity]&&after.st_dev==lastName.st_dev&&after.st_ino==lastName.st_ino&&
+    arbol_boundary::lockIdentity(owner)&&arbol_boundary::lockIdentity(build);
   if(ok&&absent) { struct stat check{}; errno=0; ok=fstatat(fd,"engine.json",&check,AT_SYMLINK_NOFOLLOW)<0&&errno==ENOENT; }
   if(close(fd)) ok=false; return ok;
+}
+static bool currentMarker(Custody* c,std::string& raw,struct stat& st,bool& absent) {
+  if(!c->finalization.present()||!c->finalization.metadata()) return false;
+  NSDictionary* capability=c->finalization.value(),*attempt=capability[@"attempt"];
+  return currentProfileMarker(attempt[@"profile"],attempt[@"profileInstance"],capability[@"profileDirectory"],
+    c->context.owner,c->context.build,raw,st,absent);
 }
 // Only this exact signed compatibility inventory has the package's one-MiB
 // codec. Small policy, all attempts/Close/markers and the separate exit receipt
@@ -2678,13 +2685,13 @@ static napi_value assertHostFinalization(napi_env env,napi_callback_info info) {
 }
 static napi_value retainSharedProfileOwner(napi_env env,napi_callback_info info) {
   napi_value args[4]; size_t n=4;
-  std::string id,instance;
+  std::string profileId,instance;
   if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok||n!=4||
-     !boundedText(env,args[2],id,64)||!boundedText(env,args[3],instance,26)) return fail(env);
+     !boundedText(env,args[2],profileId,64)||!boundedText(env,args[3],instance,26)) return fail(env);
   auto* c=custodyArgument(env,args[0]);
   auto* owner=claimLock(env,args[1]);
   if(!c||!owner||!c->bound||!c->hostRequired||!c->profileChannelsReady||!c->websiteSession||c->mutation||c->sessionUse||
-     !c->finalization.ready(c->context)||c->additionalOwners.count(id)||
+     !c->finalization.ready(c->context)||c->additionalOwners.count(profileId)||
      !arbol_exit::ownerChannel(c->profileChannels[0].fd)||!arbol_exit::ownerChannel(c->profileChannels[1].fd))
     return fail(env);
   auto* state=c->finalization.shared();
@@ -2701,14 +2708,21 @@ static napi_value retainSharedProfileOwner(napi_env env,napi_callback_info info)
     arbol_exit::NativeFile retained; retained.fd=lock.fd;
     NSString* primary=c->finalization.value()[@"attempt"][@"profile"];
     std::string packet=arbol_attempt::bytes(@{
-      @"id":[NSString stringWithUTF8String:id.c_str()],@"instance":[NSString stringWithUTF8String:instance.c_str()],
+      @"id":[NSString stringWithUTF8String:profileId.c_str()],@"instance":[NSString stringWithUTF8String:instance.c_str()],
       @"device":[NSString stringWithUTF8String:std::to_string(lock.device).c_str()],
       @"inode":[NSString stringWithUTF8String:std::to_string(lock.inode).c_str()]});
     arbol_exit::AdditionalOwner exact;
     if(!arbol_exit::validateAdditionalOwner(primary,packet,retained.fd,exact)||exact.lock.path!=lock.path||
-       (exact.lock.inode==c->context.owner.inode&&exact.lock.device==c->context.owner.device)||
+       (exact.lock.inode==c->context.owner.inode&&exact.lock.device==c->context.owner.device)) return fail(env);
+    NSDictionary* storage=exact.storage;
+    auto readMarker=[&](std::string& raw,struct stat& identity,bool& absent) {
+      return currentProfileMarker(storage[@"profile"],storage[@"request"][@"instance"],storage[@"root"],
+        lock,c->context.build,raw,identity,absent);
+    };
+    std::string previousRaw; struct stat previousIdentity{}; bool previousAbsent;
+    if(!readMarker(previousRaw,previousIdentity,previousAbsent)||
        !arbol_exit::retainAdditionalOwner(c->additionalOwners,std::move(exact))) return fail(env);
-    auto* receipt=&c->additionalOwners.at(id);
+    auto* receipt=&c->additionalOwners.at(profileId);
     const auto& expected=receipt->acknowledgement;
     // Retain in the main process before transferring to either peer. The two
     // acknowledgements have no admission or release effect on their own.
@@ -2756,9 +2770,14 @@ static napi_value retainSharedProfileOwner(napi_env env,napi_callback_info info)
       @"primary":arbol_boundary::capsuleIdentity(c->context.primary),
       @"custody":arbol_boundary::capsuleIdentity(c->context.custody)};
     arbol_exit::SharedProfileOwnership ownership;
-    NSDictionary* verified=nil; std::string verifiedRaw;
-    if(!ownership.publish(*receipt,group,recordDeadline)||!readyClaim(verifiedRaw,verified)||verifiedRaw!=readyRaw||
+    id previous=previousAbsent?(id)NSNull.null:@{@"identity":arbol_exit::fileIdentity(previousIdentity),
+      @"digest":arbol_attempt::digest(previousRaw),@"value":arbol_attempt::json(previousRaw)};
+    NSDictionary* verified=nil; std::string verifiedRaw,checkedMarker;
+    struct stat checkedIdentity{}; bool checkedAbsent;
+    if(!ownership.publish(*receipt,group,previous,recordDeadline)||!readyClaim(verifiedRaw,verified)||verifiedRaw!=readyRaw||
        !arbol_exit::validateAdditionalOwner(primary,packet,lock.fd,checked)||checked.acknowledgement!=expected||
+       !readMarker(checkedMarker,checkedIdentity,checkedAbsent)||checkedAbsent!=previousAbsent||checkedMarker!=previousRaw||
+       (!previousAbsent&&!arbol_attempt::sameFile(previousIdentity,checkedIdentity))||
        arbol_boundary::clockMs()>=recordDeadline) return fail(env);
     napi_value out;
     if(!sharedOwnerReceipts.emplace(receipt,SharedProfileRetention{c,std::move(ownership)}).second||
