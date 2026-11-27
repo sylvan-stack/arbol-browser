@@ -537,7 +537,7 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
       closing = true;
       queued.clear();
       clearImmediate(worker);
-      background?.controller.abort();
+      if (background && !background.mutating) background.controller.abort();
       for (const entry of profiles.values()) entry.runtime?.fence();
     },
     async retire(deadline: number) {

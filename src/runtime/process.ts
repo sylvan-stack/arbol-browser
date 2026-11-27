@@ -63,17 +63,20 @@ function detachResult(kind: 'detached' | 'uncertain'): object {
  * Every capability closes before yielding back to its caller. Async callbacks
  * are refused and their later continuations cannot mutate the transaction. */
 export async function withLaunchAttempt<T>(profile: ProfileSnapshot, platform: PlatformPort, deadline: number,
-  operation: (transaction: AttemptTransaction) => T): Promise<T> {
+  operation: (transaction: AttemptTransaction) => T, signal?: AbortSignal): Promise<T> {
+  signal?.throwIfAborted();
   assertPlatform(platform); assertTime(deadline); await assertProfile(profile);
   const location = await runtimeLocation(profile, true); if (!location) throw unavailable('profile');
   let held: HeldLock | undefined, active = false;
   try {
     const contention = Math.min(deadline, now() + 10000);
     while (!held) {
+      signal?.throwIfAborted();
       assertTime(contention); await location.assert();
       held = platform.tryLock(join(location.leaf, 'claim.lock')) ?? undefined;
-      if (!held) await setTimeout(Math.min(25, Math.max(1, contention - now())));
+      if (!held) await setTimeout(Math.min(25, Math.max(1, contention - now())), undefined, { signal });
     }
+    signal?.throwIfAborted();
     assertTime(deadline); location.assertSync(); held.assertIdentity();
     let raw = platform.readLaunchAttempt(held);
     let current = raw === null ? undefined : parseAttempt(raw, location);

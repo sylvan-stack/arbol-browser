@@ -129,7 +129,11 @@ export async function prepareSharedProfileRuntime(app: ProfileApp, custody: Host
       await current();
     },
     async failed(owner) {
-      owner.release(); // Additional native descriptions, once retained, remain held until process exit.
+      try {
+        if (signal && preparation.sessions) await preparation.sessions.flushStorage();
+      } finally {
+        owner.release(); // Additional native descriptions, once retained, remain held until process exit.
+      }
       throw unavailable('profile');
     },
   });

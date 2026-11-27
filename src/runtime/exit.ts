@@ -137,11 +137,12 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
     ? new Map([[listingHost.identity.layout.buildRoot, listingHost]]) : undefined;
   const inspect = async (profile: ProfileSnapshot, previous: RuntimeRecord | undefined, owner: OwnerLease,
     mode: 'prior' | 'host' | 'full' | 'retire' | 'reserve' | 'withdraw', deadline: number, currentBuild?: BuildLease,
-    pending?: LaunchAttempt, closeHost?: VerifiedHost, shared?: SharedFamilyExitReceipt): Promise<ExitInspectionReceipt> => {
+    pending?: LaunchAttempt, closeHost?: VerifiedHost, shared?: SharedFamilyExitReceipt, signal?: AbortSignal): Promise<ExitInspectionReceipt> => {
+    signal?.throwIfAborted();
     assertTime(deadline); await owner.assert(); await assertProfile(profile);
     if (owner.profile !== profile) throw unavailable('profile');
     const location = await runtimeLocation(profile, true); if (!location) throw unavailable('profile');
-    const current = await withLaunchAttempt(profile, platform, deadline, transaction => transaction.current);
+    const current = await withLaunchAttempt(profile, platform, deadline, transaction => transaction.current, signal);
     // Pre-arm reads outside-profile proof only; marker inspection is explicitly
     // behind the actual native enrolled host capability in the separate mode.
     const actualMode = mode === 'prior' && current?.stage === 'retained' ? 'host' : mode;
@@ -318,7 +319,7 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
             profilePathHash: location.hash, runtimeLeaf: physicalLeaf, bundle: candidate && !receiptWhole ? claimedLayout(candidate).bundle :
               pending ? claimedLayout(pending).bundle : selectedLayout(build.selection, resolve(fileURLToPath(new URL('../../', import.meta.url)))).bundle,
             attempt: candidate ?? null, previous: previous ?? null, dataAttempt: dataAttempt ?? null, pending: pending ?? null,
-          }, deadline, { ...(data ? { data } : {}), ...(next ? { next } : {}), ...(shared ? { shared } : {}) });
+          }, deadline, { ...(data ? { data } : {}), ...(next ? { next } : {}), ...(shared ? { shared } : {}) }, signal);
           const withNext = (data?: import('./platform.js').HeldLock) => actualMode === 'reserve' && currentBuild ?
             withBuildLockForCustody(currentBuild, platform, next => invoke(data, next)) : invoke(data);
           return dataBuild ? withBuildLockForCustody(dataBuild, platform, data => withNext(data)) : withNext();
@@ -402,15 +403,11 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
     },
     async verifySharedBaseline(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease, deadline: number,
       preparation?: AbortSignal) {
-      if (preparation) {
-        const shared = await readSharedPredecessor(profile, owner, deadline, preparation);
-        if (!shared) throw unavailable('profile');
-        return shared;
-      }
+      if (preparation && (process.type !== 'browser' || startingHost?.identity.layout.scope !== 'installed')) throw unavailable('profile');
       let shared: SharedFamilyExitReceipt | undefined;
-      try { shared = await readSharedPredecessor(profile, owner, deadline); }
-      catch { assertTime(deadline); }
-      return shared ?? inspect(profile, original, owner, 'full', deadline);
+      try { shared = await readSharedPredecessor(profile, owner, deadline, preparation); }
+      catch { preparation?.throwIfAborted(); assertTime(deadline); }
+      return shared ?? inspect(profile, original, owner, 'full', deadline, undefined, undefined, undefined, undefined, preparation);
     },
     async verifySharedFamily(profile: ProfileSnapshot, owner: OwnerLease, request: string, deadline: number, signal?: AbortSignal) {
       signal?.throwIfAborted();

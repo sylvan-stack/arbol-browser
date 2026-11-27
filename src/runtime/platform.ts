@@ -349,7 +349,8 @@ export interface PlatformPort {
   /** Actual held owner and independently verified OLD Build; native claims,
    * complete receipts, physical metadata/marker/frontiers and full original
    * absence are verified off the caller event loop under the original bound. */
-  inspectExit(owner: HeldLock, build: HeldLock, input: NativeExitInput, deadline: number, guards?: ExitInspectionGuards): Promise<ExitInspectionReceipt>;
+  inspectExit(owner: HeldLock, build: HeldLock, input: NativeExitInput, deadline: number,
+    guards?: ExitInspectionGuards, signal?: AbortSignal): Promise<ExitInspectionReceipt>;
   /** Verifies the owning process family under the target Owner and original signed Build. */
   inspectSharedFamilyExit(owner: HeldLock, build: HeldLock, input: SharedFamilyExitInput, deadline: number, signal?: AbortSignal): Promise<SharedFamilyExitReceipt>;
   inspectMigration(custody: MaintenanceCustody, registry: HeldLock, owner: HeldLock, build: HeldLock | MaintenanceGuard,
@@ -1163,7 +1164,9 @@ export function loadPlatform(): PlatformPort {
         throw unavailable('profile');
       } finally { call(() => native.cancelExitInspection(handle)); }
     },
-    async inspectExit(owner: HeldLock, build: HeldLock, input: NativeExitInput, deadline: number, guards?: ExitInspectionGuards): Promise<ExitInspectionReceipt> {
+    async inspectExit(owner: HeldLock, build: HeldLock, input: NativeExitInput, deadline: number,
+      guards?: ExitInspectionGuards, signal?: AbortSignal): Promise<ExitInspectionReceipt> {
+      signal?.throwIfAborted();
       const actualOwner = locks.get(owner), actualBuild = locks.get(build);
       if (!actualOwner || !actualBuild || !Number.isFinite(deadline)) throw unavailable('profile');
       owner.assertIdentity(); build.assertIdentity();
@@ -1180,6 +1183,7 @@ export function loadPlatform(): PlatformPort {
         actualData ?? null, actualNext ?? null, ...(shared ? [shared.handle] : [])));
       try {
         while (performance.now() < deadline && call(() => native.continuousTime()) < nativeDeadline) {
+          signal?.throwIfAborted();
           const raw = call(() => native.pollExitInspection(handle));
           if (raw !== null) {
             if (typeof raw !== 'string' || !raw.length || Buffer.byteLength(raw) > 16384) throw unavailable('profile');
@@ -1208,7 +1212,7 @@ export function loadPlatform(): PlatformPort {
             if (input.mode === 'full') sharedMutationBaselines.set(result, { owner, handle });
             return result;
           }
-          await setTimeout(Math.min(5, Math.max(1, deadline - performance.now())));
+          await setTimeout(Math.min(5, Math.max(1, deadline - performance.now())), undefined, { signal });
         }
         throw unavailable('profile');
       } finally { call(() => native.cancelExitInspection(handle)); }
