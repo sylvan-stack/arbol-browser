@@ -33,7 +33,9 @@ export interface ShellRegistration {
   offerPresentation(): void;
   offerForegroundPresentation(deadline: number, mayShowEmpty: () => boolean): Promise<void>;
   show(deadline: number, signal: AbortSignal, raiseWindow?: boolean, guard?: () => void): Promise<void>;
-  foreground(target: TabTarget, deadline: number, signal: AbortSignal, guard: () => void, ready: () => boolean): Promise<void>;
+  foregroundShell(deadline: number, signal: AbortSignal, guard: () => void): Promise<void>;
+  foreground(target: TabTarget, deadline: number, signal: AbortSignal, guard: () => void,
+    ready: () => boolean, shellRaised?: boolean): Promise<void>;
   subscriptionHome(): Promise<string | undefined>;
   rememberSubscriptionHome(url: string): Promise<void>;
   publish(): void;
@@ -321,7 +323,23 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
         break;
       }
     },
-    async foreground(target: TabTarget, deadline: number, signal: AbortSignal, guard: () => void, ready: () => boolean) {
+    async foregroundShell(deadline: number, signal: AbortSignal, guard: () => void) {
+      const check = () => {
+        guard();
+        assertPresentable();
+        if (!runtimeReady() || host.window.isDestroyed() || !host.window.isEnabled())
+          throw unavailable('browser');
+      };
+      if (!presentation) throw unavailable('browser');
+      // Use the existing native frame. The account check still gates any
+      // change to its selected profile, selected tab or website URL.
+      await presentation.show(deadline, signal, check);
+      check();
+      app.focus({ steal: true });
+      host.window.focus();
+    },
+    async foreground(target: TabTarget, deadline: number, signal: AbortSignal, guard: () => void,
+      ready: () => boolean, shellRaised = false) {
       assertPresentable();
       if (!nativePresentation || !runtimeReady() || host.window.isDestroyed() ||
           !host.window.isEnabled()) throw unavailable('browser');
@@ -349,8 +367,10 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
           assertSelected();
         }
         if (!host.window.isVisible() || host.window.isMinimized()) throw unavailable('browser');
-        app.focus({ steal: true });
-        host.window.focus();
+        if (!shellRaised) {
+          app.focus({ steal: true });
+          host.window.focus();
+        }
       } catch (error) {
         // A later selection owns the window if it changed while presentation waited.
         try {

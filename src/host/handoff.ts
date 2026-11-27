@@ -333,7 +333,9 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
   let phase: 'prepared' | 'live' | 'closed' = 'prepared';
   let registry: TabRegistry | undefined, runtime: HostLifecycle | undefined, everBound = false;
   let presented = false;
-  const preparedPresentations = new WeakMap<ConnectionContext, { host: WindowHost; deadline: number; empty: boolean }>();
+  const preparedPresentations = new WeakMap<ConnectionContext, {
+    host: WindowHost; deadline: number; empty: boolean; shellRaised?: boolean;
+  }>();
   const openedDestinations = new WeakMap<TabTarget, { page: PageSurface; destination: string; committedURL: string }>();
   const windows = new Map<WindowHost, ShellRegistration>();
   const contexts = new Map<string, ConnectionContext>(), attempted = new WeakSet<ConnectionContext>();
@@ -759,9 +761,20 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
           live();
           assertShellRegistration(registration, host);
           const mayShowEarly = () => tabs().all().length === 0 || (host.window.isVisible() && !host.window.isMinimized());
-          // The subscription preparation reserves this handoff without showing a blank window.
+          // The explicit click can focus Browser chrome before the account
+          // approval. It cannot yet choose a profile, tab or website.
           if (showEmpty && subscriptionProfile) {
-            preparedPresentations.set(context, { host, deadline: performance.now() + 60_000, empty });
+            let shellRaised = false;
+            try {
+              await registration.foregroundShell(deadline, signal, () => {
+                live();
+                if (signal.aborted || performance.now() >= deadline || context.canForegroundSubscription?.() !== true)
+                  throw refused('control_refused');
+              });
+              shellRaised = true;
+              presented = true;
+            } catch { /* The approved navigation can still present the window once ready. */ }
+            preparedPresentations.set(context, { host, deadline: performance.now() + 60_000, empty, shellRaised });
           } else if (!subscriptionOpen && (!showEmpty || mayShowEarly())) {
             await registration.show(deadline, signal, showEmpty || url !== undefined, showEmpty ? () => {
               if (!mayShowEarly()) throw refused('control_refused');
@@ -806,7 +819,7 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
                 authority.assertDocument(ready, document);
               };
               await registration.foreground(ready, deadline, signal, guard,
-                () => document.ready && tabs().state(ready).pageAvailability === 'ready');
+                () => document.ready && tabs().state(ready).pageAvailability === 'ready', prepared?.shellRaised);
               void registration.rememberSubscriptionHome(destination).catch(() => {});
               presented = true;
             }
