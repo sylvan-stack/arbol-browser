@@ -773,7 +773,8 @@ inline bool readNativeFile(int directory,const std::string& name,std::string& ra
 
 // These endpoints carry Owner descriptors only. The existing heartbeat and
 // the startup/exit capabilities keep their independent channels and formats.
-constexpr int additionalOwnerEndpoint=21, childOwnerEndpoint=22;
+using arbol_boundary::additionalOwnerEndpoint;
+using arbol_boundary::childOwnerEndpoint;
 constexpr size_t ownerPacketLimit=512, additionalOwnerLimit=4095;
 
 inline bool ownerChannel(int fd) {

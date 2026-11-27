@@ -392,6 +392,7 @@ inline Lock appAdmission(Identity& app) {
 }
 // Every child mapping first duplicates its actual source ABOVE all reserved
 // targets. Ordered dup2 actions must never overwrite a later source descriptor.
+inline constexpr int additionalOwnerEndpoint=21, childOwnerEndpoint=22;
 class SpawnCopies {
   std::vector<int> copies_;
 public:
@@ -399,7 +400,7 @@ public:
   ~SpawnCopies() { (void)closeCopies(); }
   bool closeCopies() { bool ok=true; for(int fd:copies_) if(close(fd)) ok=false; copies_.clear(); return ok; }
   bool map(posix_spawn_file_actions_t& actions,int source,int target) {
-    if(source<0||target<0||target>14) return false;
+    if(source<0||target<0||(target>14&&target!=additionalOwnerEndpoint&&target!=childOwnerEndpoint)) return false;
     int copy=fcntl(source,F_DUPFD_CLOEXEC,64); if(copy<0) return false;
     copies_.push_back(copy); return !posix_spawn_file_actions_adddup2(&actions,copy,target);
   }
