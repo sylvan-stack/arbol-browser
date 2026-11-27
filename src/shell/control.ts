@@ -22,7 +22,7 @@ const tabActions = element<HTMLDetailsElement>('tab-actions');
 const profileCreate = element<HTMLDetailsElement>('profile-create-panel');
 let tabListKey = '';
 const profileName = element<HTMLInputElement>('profile-id'), profileStatus = element('profile-status');
-let profiles: ProfileNavigationState | undefined, changingProfile = false;
+let profiles: ProfileNavigationState | undefined, changingProfile = false, refreshingProfiles = false, profileRevision = 0;
 
 function profileLabel(id: string): string {
   if (id === 'default') return 'Default';
@@ -77,12 +77,16 @@ function renderProfiles(): void {
   else if (focused && tabList.contains(focused)) focused.focus({ preventScroll: true });
 }
 async function profileAction(request: ProfileNavigationRequest): Promise<void> {
-  if (changingProfile || state?.profileNavigationReady !== true) return;
-  changingProfile = true; updateProfileControls();
-  if (request.method !== 'list' || !profiles)
+  const listing = request.method === 'list';
+  if (changingProfile || (listing && refreshingProfiles) || state?.profileNavigationReady !== true) return;
+  const revision = listing ? profileRevision : ++profileRevision;
+  if (listing) refreshingProfiles = true;
+  else { changingProfile = true; updateProfileControls(); }
+  if (!listing || !profiles)
     profileStatus.textContent = request.method === 'open' ? 'Opening profile…' : request.method === 'create' ? 'Creating profile…' : 'Loading profiles…';
   try {
     const result = await api.profiles(request);
+    if (revision !== profileRevision) return;
     if (!result) { profileStatus.textContent = ''; return; }
     if ('error' in result) { profileStatus.textContent = result.error; return; }
     if (JSON.stringify(result) !== JSON.stringify(profiles)) {
@@ -94,9 +98,13 @@ async function profileAction(request: ProfileNavigationRequest): Promise<void> {
       profileCreate.open = false;
     }
     profileStatus.textContent = request.method === 'create' ? 'Profile created.' : '';
-  } catch { profileStatus.textContent = 'Could not load or change the Browser profiles.'; }
+  } catch {
+    if (revision === profileRevision) profileStatus.textContent = 'Could not load or change the Browser profiles.';
+  }
   finally {
-    changingProfile = false; updateProfileControls();
+    if (listing) refreshingProfiles = false;
+    else changingProfile = false;
+    updateProfileControls();
     if (request.method === 'create' && !profileCreate.open) profileCreate.querySelector('summary')?.focus();
   }
 }
