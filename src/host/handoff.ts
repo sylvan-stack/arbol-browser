@@ -592,6 +592,12 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
       await bounded(deadline, () => Promise.all([...(cleanup ? [cleanup] : []), ...pending]).then(() => {}));
       if (cleanups.get(id) === cleanup) cleanups.delete(id);
     },
+    async retireProfileTabs(deadline) {
+      const actual = tabs();
+      await bounded(deadline, () => Promise.all([...windows.keys()].map(host => actual.retireWindowTabs(host))
+        .concat([...cleanups.values()], [...tentativeWork.values()].flatMap(values => [...values]))).then(() => {}));
+      if (actual.all().length || contexts.size) throw unavailable('profile');
+    },
     async retireAll(deadline) {
       if (!registry) {
         if (windows.size !== 0 || initial.size !== 0 || tentativeWork.size !== 0) return authority.exhausted(); return;

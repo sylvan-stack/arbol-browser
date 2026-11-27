@@ -15,7 +15,7 @@ import { profilePaths, profileId, profileUnavailable, stateDirectory, registryEx
 /** ABR-3 supplies verified runtime/peer/process-tree inspection. A boolean from a
  * runtime record alone is not evidence. running must revalidate after awaits. */
 export interface ProfileRuntimePort {
-  running(profile: ProfileSnapshot, ownerAvailable: boolean, owner?: OwnerLease, registry?: RegistryLease): Promise<boolean>;
+  running(profile: ProfileSnapshot, ownerAvailable: boolean, owner?: OwnerLease, registry?: RegistryLease): Promise<boolean | 'dormant'>;
   /** Caller retains owner + registry; confirm all previous owned helpers are gone. */
   assertClosed(profile: ProfileSnapshot, owner?: OwnerLease, registry?: RegistryLease, purpose?: 'remove'): Promise<void>;
   /** Production coordinates exact runtime archive and the actual profile detach
@@ -99,7 +99,7 @@ export function createProfileService(options: {
         for (const profile of records) {
           const owner = await ownerLock(profile, os, false);
           try {
-            let running: boolean;
+            let running: boolean | 'dormant';
             try {
               running = await runtime.running(profile, owner !== null, owner ?? undefined, registry);
             } catch (error) {
@@ -112,11 +112,10 @@ export function createProfileService(options: {
               continue;
             }
             // A verified running host cannot coexist with our exclusive owner lock.
-            if (owner && running) throw profileUnavailable();
-            if (!owner && !running) throw profileUnavailable();
+            if (owner ? running !== false : running === false) throw profileUnavailable();
             await registry.assert(); await assertProfile(profile);
             if (owner) await owner.assert();
-            profiles.push({ ...profile.record, running });
+            profiles.push({ ...profile.record, running: running === true });
           } finally { owner?.release(); }
         }
         await registry.assert();

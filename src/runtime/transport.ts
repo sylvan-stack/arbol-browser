@@ -269,6 +269,12 @@ interface ProtectedReadyServer {
   open(scope: HostCustody | SharedProfileRuntime, record: RuntimeRecord, guard: () => void, control: () => void): void;
 }
 const protectedReadyServers = new WeakMap<TransportServer, ProtectedReadyServer>();
+const profileTraffic = new WeakMap<TransportServer, (enabled: boolean) => Promise<void>>();
+export function setProfileTraffic(server: TransportServer, enabled: boolean): Promise<void> {
+  const set = profileTraffic.get(server);
+  if (!set) throw unavailable('profile');
+  return set(enabled);
+}
 /** Actual bound protected listeners only. Native Claim commit and the guarded
  * JS gates occur in one synchronous turn, before any peer callback can run. */
 export function openProtectedReady(server: TransportServer, custody: HostCustody,
@@ -294,16 +300,19 @@ type PrivateUsage = (params: SeqoyaParameters, deadline: number, signal: AbortSi
 interface ProfileAdmissionScope { readonly profile: string; readonly profileInstance: string }
 interface ProfileAdmissionRequest {
   readonly wire: 1; readonly id: string; readonly method: 'profile-admission';
-  readonly params: ProfileAdmissionScope & Readonly<{ expires: number; operation: 'open' | 'inspect' }>;
+  readonly params: ProfileAdmissionScope & Readonly<{ expires: number; operation: 'open' | 'inspect' | 'close' }>;
 }
+export type ProfileOperationStatus = 'dormant' | 'closed' | 'exiting';
+type ProfileOperationResult = RuntimeRecord | ProfileOperationStatus | null;
 type PrivateProfileAdmission = (scope: ProfileAdmissionRequest['params'], deadline: number,
-  signal: AbortSignal) => Promise<RuntimeRecord | null>;
+  signal: AbortSignal) => Promise<Readonly<{ result: ProfileOperationResult; afterReply?: () => void }>>;
 const runtimeRecord = validator('wire.RuntimeRecord');
-const profileAdmissionResult = (value: unknown): value is RuntimeRecord | null => value === null || runtimeRecord(value);
+const profileAdmissionResult = (value: unknown): value is ProfileOperationResult =>
+  value === null || value === 'dormant' || value === 'closed' || value === 'exiting' || runtimeRecord(value);
 function isProfileAdmissionRequest(value: unknown): value is ProfileAdmissionRequest {
   return plain(value) && Object.keys(value).length === 4 && value.wire === 1 && value.method === 'profile-admission' &&
     validator('browser.RequestId')(value.id) && plain(value.params) && Object.keys(value.params).length === 4 &&
-    (value.params.operation === 'open' || value.params.operation === 'inspect') &&
+    (value.params.operation === 'open' || value.params.operation === 'inspect' || value.params.operation === 'close') &&
     validator('browser.ProfileId')(value.params.profile) && typeof value.params.profileInstance === 'string' &&
     /^prf_[A-Za-z0-9_-]{22}$/.test(value.params.profileInstance) && typeof value.params.expires === 'number' &&
     Number.isSafeInteger(value.params.expires) && value.params.expires > 0;
@@ -323,8 +332,10 @@ export function listenProtectedTransport(location: RuntimeLocation, record: Runt
 async function listenServer(location: RuntimeLocation, record: RuntimeRecord, platform: PlatformPort,
   dispatch: DispatchPort | ProtectedDispatchPort, protectedPort?: ProtectedDispatchPort,
   privateUsage?: PrivateUsage, shared?: SharedProfileRuntime, privateProfileAdmission?: PrivateProfileAdmission): Promise<TransportServer> {
-  let admission = false, sealed = false, agents = 0, management = 0;
+  let admission = false, sealed = false, profileEnabled = true, agents = 0, management = 0;
   const connections = new Set<() => void>(), retainedCloseStops = new Map<() => void, () => void>(), servers: Server[] = [], scheduler = new Scheduler();
+  const residentCommands = new Set<() => void>();
+  const privateProfileWork = new Set<Promise<void>>();
   let fatalLatched = false;
   const fatal = () => {
     sealed = true; admission = false;
@@ -343,7 +354,7 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
     let pingId: string | undefined, lastPong = now();
     let usageStarted = false, profileAdmissionStarted = false;
     const stop = () => {
-      if (dead) return; dead = true; connections.delete(stop); retainedCloseStops.delete(stop); clearTimeout(closeDrain);
+      if (dead) return; dead = true; connections.delete(stop); residentCommands.delete(stop); retainedCloseStops.delete(stop); clearTimeout(closeDrain);
       if (context) managementConnections.delete(context);
       clearTimeout(helloTimer); clearInterval(heartbeat);
       try {
@@ -361,7 +372,8 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
       } finally { socket.destroy(); }
     };
     connections.add(stop);
-    try { if (!admission || connections.size > 64) throw capacityFailure(); identity = peer(socket, platform); }
+    const ordinaryPeer = () => profileEnabled || (endpoint === 'management' && privateProfileAdmission !== undefined);
+    try { if (!admission || !ordinaryPeer() || connections.size > 64) throw capacityFailure(); identity = peer(socket, platform); }
     catch { stop(); return; }
     function control(value: unknown, kind: ControlFrameKind): void {
       if (!protectedPort) { write(socket, value); return; }
@@ -397,7 +409,7 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
           if (p.instance !== record.instance || p.nonce !== record.nonce || p.profile !== record.profile ||
               p.profileInstance !== record.profileInstance || (p.expectedBuild !== undefined && p.expectedBuild !== record.build))
             throw unavailable('browser');
-          if (!admission || (endpoint === 'agent' ? agents >= 32 : management >= 32)) throw capacityFailure();
+          if (!admission || !ordinaryPeer() || (endpoint === 'agent' ? agents >= 32 : management >= 32)) throw capacityFailure();
           checkPeer(); seen.add(value.id); handshaking = false;
           const attachment = endpoint === 'agent' ? Object.freeze({ id: token('att'), label: sanitizedLabel(p.label) }) : undefined;
           context = Object.freeze({ endpoint, peer: identity, signal: connection.signal, ...(attachment ? { attachment } : {}) });
@@ -449,16 +461,18 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
         checkPeer();
         if (isProfileAdmissionRequest(value)) {
           if (endpoint !== 'management' || !privateProfileAdmission || profileAdmissionStarted ||
-              seen.has(value.id) || seen.size >= 65536) throw unavailable('browser');
+              usageStarted || active.size || seen.has(value.id) || seen.size >= 65536) throw unavailable('browser');
           const deadline = now() + Math.min(60_000, value.params.expires - platform.continuousTime());
           if (now() >= deadline) throw unavailable('browser');
           profileAdmissionStarted = true; seen.add(value.id);
+          residentCommands.add(stop);
           void (async () => {
-            let result: RuntimeRecord | null;
-            try { result = await privateProfileAdmission(value.params, deadline, connection.signal); }
-            catch { result = null; }
+            let reply: Awaited<ReturnType<PrivateProfileAdmission>> = { result: null };
+            try { reply = await privateProfileAdmission(value.params, deadline, connection.signal); }
+            catch { /* The private refusal carries no profile data. */ }
             try {
-              if (!profileAdmissionResult(result) || (result && (result.phase !== 'ready' ||
+              const { result } = reply;
+              if (!profileAdmissionResult(result) || (runtimeRecord(result) && (result.phase !== 'ready' ||
                   result.profile !== value.params.profile || result.profileInstance !== value.params.profileInstance ||
                   !sameProcess(recordProcess(result), recordProcess(record)) || result.build !== record.build)))
                 throw unavailable('profile');
@@ -467,15 +481,17 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
                 if (dead || sealed || !admission || connection.signal.aborted || now() >= deadline) throw unavailable('browser');
               });
             } catch { stop(); }
+            finally { residentCommands.delete(stop); reply.afterReply?.(); }
           })();
           return;
         }
         if (isSeqoyaRequest(value)) {
-          if (endpoint !== 'management' || !privateUsage || usageStarted || seen.has(value.id) || seen.size >= 65536)
+          if (!profileEnabled || profileAdmissionStarted || endpoint !== 'management' ||
+              !privateUsage || usageStarted || seen.has(value.id) || seen.size >= 65536)
             throw unavailable('browser');
           usageStarted = true; seen.add(value.id);
           const id = value.id, deadline = now() + 35_000;
-          void (async () => {
+          const work = (async () => {
             let result: SeqoyaResult;
             try { result = await privateUsage(value.params, deadline, connection.signal); }
             catch { result = { status: 'dashboard_unavailable' }; }
@@ -488,6 +504,8 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
               });
             } catch { stop(); }
           })();
+          privateProfileWork.add(work);
+          void work.finally(() => { privateProfileWork.delete(work); }).catch(() => {});
           return;
         }
         if (validator('wire.Response')(value)) {
@@ -501,6 +519,7 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
         if (seen.has(request.id) || seen.size >= 65536) throw unavailable('browser');
         seen.add(request.id);
         if (request.method === 'ping') { response(request.id, {}, 'pong'); return; }
+        if (!profileEnabled || residentCommands.has(stop)) throw unavailable('profile');
         if (request.method === 'cancel') {
           const target = active.get(request.params.request);
           if (target) {
@@ -666,6 +685,12 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
       }
     },
   });
+  if (shared || privateProfileAdmission) profileTraffic.set(result, enabled => {
+    if (sealed || !admission) throw unavailable('profile');
+    profileEnabled = enabled;
+    if (!enabled) for (const stop of [...connections]) if (!residentCommands.has(stop)) stop();
+    return enabled ? Promise.resolve() : Promise.all(privateProfileWork).then(() => {});
+  });
   return result;
 }
 
@@ -678,14 +703,25 @@ export interface RuntimeClient {
 }
 const usageCalls = new WeakMap<RuntimeClient, (params: SeqoyaParameters, deadline: number) => Promise<SeqoyaResult>>();
 const profileAdmissions = new WeakMap<RuntimeClient, (scope: ProfileAdmissionScope, deadline: number,
-  operation: ProfileAdmissionRequest['params']['operation']) => Promise<RuntimeRecord | null>>();
+  operation: ProfileAdmissionRequest['params']['operation']) => Promise<ProfileOperationResult>>();
 export async function requestProfileAdmission(client: RuntimeClient, scope: ProfileAdmissionScope, deadline: number): Promise<RuntimeRecord> {
-  const result = await requestProfileInspection(client, scope, deadline, 'open');
-  if (!result) throw unavailable('profile');
+  const result = await profileOperation(client, scope, deadline, 'open');
+  if (!runtimeRecord(result)) throw unavailable('profile');
   return result;
 }
-export function requestProfileInspection(client: RuntimeClient, scope: ProfileAdmissionScope, deadline: number,
-  operation: ProfileAdmissionRequest['params']['operation'] = 'inspect'): Promise<RuntimeRecord | null> {
+export async function requestProfileInspection(client: RuntimeClient, scope: ProfileAdmissionScope, deadline: number):
+  Promise<RuntimeRecord | 'dormant'> {
+  const result = await profileOperation(client, scope, deadline, 'inspect');
+  if (result !== 'dormant' && !runtimeRecord(result)) throw unavailable('profile');
+  return result;
+}
+export async function requestProfileClosure(client: RuntimeClient, scope: ProfileAdmissionScope, deadline: number): Promise<ProfileOperationStatus> {
+  const result = await profileOperation(client, scope, deadline, 'close');
+  if (result !== 'closed' && result !== 'dormant' && result !== 'exiting') throw unavailable('profile');
+  return result;
+}
+function profileOperation(client: RuntimeClient, scope: ProfileAdmissionScope, deadline: number,
+  operation: ProfileAdmissionRequest['params']['operation']): Promise<ProfileOperationResult> {
   const request = profileAdmissions.get(client);
   if (!request) return Promise.reject(unavailable('profile'));
   profileAdmissions.delete(client);
@@ -834,7 +870,7 @@ export async function connectRuntime(location: RuntimeLocation, record: RuntimeR
             params: { ...scope, operation, expires: Math.floor(platform.continuousTime() + remaining) } };
           if (remaining <= 0 || !isProfileAdmissionRequest(request)) throw unavailable('profile');
           const result = await send(request, limit, profileAdmissionResult);
-          if (result === null) return null;
+          if (result === null || result === 'dormant' || result === 'closed' || result === 'exiting') return result;
           if (!runtimeRecord(result) || result.phase !== 'ready' || result.profile !== scope.profile ||
               result.profileInstance !== scope.profileInstance || !sameProcess(recordProcess(result), recordProcess(record)) ||
               result.build !== record.build) throw unavailable('profile');

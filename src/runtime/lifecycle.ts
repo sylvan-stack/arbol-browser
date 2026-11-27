@@ -6,7 +6,7 @@ import { nativeLifetimeReadiness, preflightPageAdmission } from './bootstrap.js'
 import { assertAdoptedBuildClosing } from './build-lease.js';
 import { assertSharedProfileRuntime, noteHostStartup, isHostCustody, type SharedProfileRuntime } from './custody.js';
 import { isProductionExitAuthority, type ProductionExitAuthority } from './exit.js';
-import { archiveRemovedRuntime, assertProductionCloseReady } from './process.js';
+import { archiveRemovedRuntime, inspectOrCloseProductionProfile } from './process.js';
 import { assertPlatform, type PlatformPort, type GroupProcess } from './platform.js';
 import type { BuildSelection } from './selection.js';
 import { admitSeqoyaCapture, requestManagementClose, requestSeqoyaUsage, reserveManagementClose, openProtectedReady,
@@ -114,7 +114,14 @@ export function createProfileRuntime(platform: PlatformPort, selection: BuildSel
       const location = await runtimeLocation(profile), record = location ? await readRuntime(location) : undefined;
       if (!location || !record || !originalAlive(record, platform)) throw profileUnavailable();
       const deadline = now() + 5000;
-      if (isProductionExitAuthority(exits)) await assertProductionCloseReady(profile, record, selection, platform, exits, deadline, listingHost);
+      if (isProductionExitAuthority(exits)) {
+        const status = await inspectOrCloseProductionProfile(profile, record, selection, platform, exits, deadline, listingHost);
+        if (status === 'dormant') {
+          await registry?.assert(); await assertProfile(profile);
+          if (JSON.stringify(record) !== JSON.stringify(await readRuntime(location)) || !originalAlive(record, platform)) throw profileUnavailable();
+          return 'dormant' as const;
+        }
+      }
       const client = await connectRuntime(location, record, 'management', { ...selection, explicit: false }, platform, deadline, 'Profile inspection');
       try {
         await registry?.assert(); await assertProfile(profile);
@@ -180,16 +187,22 @@ async function closeProductionProfile(profile: ProfileSnapshot, selection: Build
   if (await exits.tryClosed(profile, original, deadline)) return { profile: profile.record.id, closed: false, dataRemoved: false };
   let requested = false;
   if (originalAlive(original, platform) && original.phase === 'ready' && location && now() < grace) {
-    await within(grace, () => assertProductionCloseReady(profile, original, selection, platform, exits, grace, closeHost));
-    const client = await acquireWithin(grace,
-      () => connectRuntime(location, original, 'management', selection, platform, grace, 'Explicit close'), value => value.close());
-    try {
-      const observed = await requestManagementClose(client, command.native, grace);
-      if (observed.kind === 'refused') throw observed.error;
-      if (observed.kind === 'malformed') throw unavailable('browser');
-      if (observed.kind === 'lost' && (!observed.stamped || !observed.written)) throw unavailable('browser');
-      requested = true; // ordinary ACK or separately classified genuine loss only
-    } finally { client.close(); }
+    const status = await within(grace, () => inspectOrCloseProductionProfile(profile, original,
+      selection, platform, exits, grace, closeHost, 'close'));
+    if (status === 'closed' || status === 'dormant')
+      return { profile: profile.record.id, closed: status === 'closed', dataRemoved: false };
+    if (status === 'exiting') requested = true;
+    else if (status === 'standalone') {
+      const client = await acquireWithin(grace,
+        () => connectRuntime(location, original, 'management', selection, platform, grace, 'Explicit close'), value => value.close());
+      try {
+        const observed = await requestManagementClose(client, command.native, grace);
+        if (observed.kind === 'refused') throw observed.error;
+        if (observed.kind === 'malformed') throw unavailable('browser');
+        if (observed.kind === 'lost' && (!observed.stamped || !observed.written)) throw unavailable('browser');
+        requested = true;
+      } finally { client.close(); }
+    } else throw unavailable('profile');
   }
   // In-flight native custody, including main-already-dead, is pending until the
   // independent exact complete family/marker inspection passes. No PID signals.
@@ -380,6 +393,7 @@ export interface HostControlPort {
   disconnect(attachment: string): void;
   /** One concurrent all-tab cleanup, including drain/retire and destroyed proof. */
   settleDisconnect(attachment: string, deadline: number): Promise<void>;
+  retireProfileTabs?(deadline: number): Promise<void>;
   retireAll(deadline: number): Promise<void>;
   windowCount(): number;
 }
@@ -680,7 +694,7 @@ export function createHostLifecycle(prepared: HostPreparation, sessions: Profile
     disconnect: disconnections.disconnect,
     close: () => shutdown(),
     beginManagementClose(context: ConnectionContext, request: Extract<Request, { method: 'close' }>) {
-      if (!production || phase !== 'ready' || !admitted || closing) throw unavailable('browser');
+      if (!production || additional || phase !== 'ready' || !admitted || closing) throw unavailable('browser');
       const opportunity = reserveManagementClose(context, request, socket => prepared.custody.consumeClose(request.id, socket));
       let finish!: () => void, finished = false;
       const acknowledgement = new Promise<void>(resolve => { finish = resolve; });

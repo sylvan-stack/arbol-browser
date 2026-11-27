@@ -250,18 +250,32 @@ function hasHandoff(control: RendererControl, shell: TrustedShellIntegration): b
 interface AdditionalProfiles {
   openInWindow(source: WindowHost, target: ProfileSnapshot, deadline: number): Promise<void>;
   admit: NonNullable<Parameters<typeof import('./transport.js').listenProtectedTransport>[6]>;
+  bindPrimary(scope: LogicalProfile): void;
+  primaryActive(): boolean;
   activeHandoff(): boolean;
   fence(): void;
   retire(deadline: number): Promise<void>;
+}
+interface LogicalProfile {
+  instance: InstanceOwner;
+  runtime: HostLifecycle;
+  control: RendererControl;
+  shell: TrustedShellIntegration;
+  transport: TransportServer;
+  flush(): Promise<void>;
+  phase: 'active' | 'closing' | 'dormant';
+  retirement?: Promise<void>;
 }
 function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, boundary: NativeFailureBoundary,
   port: NativeShellPort, platform: PlatformPort, exits: ProductionExitAuthority,
   bootstrap: typeof import('./bootstrap.js'), lifecycle: typeof import('./lifecycle.js'),
   transports: typeof import('./transport.js')): AdditionalProfiles {
-  type Entry = { instance: string; opening?: Promise<SharedProfileRuntime>; runtime?: SharedProfileLifecycle; activeHandoff?: () => boolean };
+  type Entry = { instance: string; opening?: Promise<LogicalProfile>; runtime?: SharedProfileLifecycle; scope?: LogicalProfile };
   const profiles = new Map<string, Entry>();
+  let primary: LogicalProfile | undefined;
   let closing = false;
-  const activeHandoff = () => [...profiles.values()].some(entry => entry.activeHandoff?.());
+  const activeHandoff = () => [...profiles.values()].some(({ scope }) =>
+    scope?.phase === 'active' && scope.shell.host.isActiveProfile() && hasHandoff(scope.control, scope.shell));
   const assertCurrent = (source: WindowHost, deadline: number) => {
     assertTime(deadline);
     if (closing || state.closed || source.window !== state.shell?.host.window || !state.runtime) throw unavailable('profile');
@@ -274,21 +288,25 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
     };
     assertOpeningCurrent();
     const { id, instance } = target.record;
-    if (id === custody.instance.record.profile || target.paths.state !== custody.host.policy.stateRoot) throw unavailable('profile');
+    if (target.paths.state !== custody.host.policy.stateRoot) throw unavailable('profile');
+    if (id === custody.instance.record.profile) {
+      if (!primary || instance !== primary.instance.record.profileInstance) throw unavailable('profile');
+      return activate(primary, assertOpeningCurrent);
+    }
     let entry = profiles.get(id);
     if (!entry) { entry = { instance }; profiles.set(id, entry); }
     if (entry.instance !== instance) throw unavailable('profile');
-    entry.opening ??= openEntry(entry, source, target, deadline, assertOpeningCurrent);
-    const profile = await entry.opening;
-    assertOpeningCurrent();
-    entry.runtime!.assertAdmission();
-    return profile.instance.record;
+    entry.opening ??= openEntry(entry, source, target, deadline, assertOpeningCurrent).catch(error => {
+      delete entry.opening;
+      throw error;
+    });
+    return activate(await entry.opening, assertOpeningCurrent);
   }
   async function openInWindow(source: WindowHost, target: ProfileSnapshot, deadline: number): Promise<void> {
     await openProfile(source, target, deadline);
   }
   async function openEntry(entry: Entry, source: WindowHost, target: ProfileSnapshot, deadline: number,
-    assertOpeningCurrent: () => void): Promise<SharedProfileRuntime> {
+    assertOpeningCurrent: () => void): Promise<LogicalProfile> {
     let profile: SharedProfileRuntime | undefined, shell: TrustedShellIntegration | undefined, transport: TransportServer | undefined;
     try {
       const prepared = profile = await prepareSharedProfileRuntime(app, custody, target, exits, deadline);
@@ -297,8 +315,6 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
       assertOpeningCurrent();
       shell = await bootstrap.integrateSharedProfileShell(port, prepared, source, control.ownership.lifecycle,
         control.ownership.shell, openInWindow, deadline);
-      const exactShell = shell;
-      entry.activeHandoff = () => exactShell.host.isActiveProfile() && hasHandoff(control, exactShell);
       assertOpeningCurrent();
       control.bind(shell.tabs, shell.host, shell.registration);
       const { instance } = prepared;
@@ -315,8 +331,11 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
       assertOpeningCurrent();
       await runtime.ready();
       assertCurrent(source, deadline);
-      shell.registration.setRuntimeReady(() => runtime.phase === 'ready' && !closing && !state.closed);
-      return prepared;
+      const scope: LogicalProfile = { instance, runtime, control, shell, transport, phase: 'active',
+        flush: () => prepared.sessions.flushStorage() };
+      shell.registration.setRuntimeReady(() => scope.phase === 'active' && runtime.phase === 'ready' && !closing && !state.closed);
+      entry.scope = scope;
+      return scope;
     } catch (error) {
       if (entry.runtime) await entry.runtime.close();
       else {
@@ -332,27 +351,84 @@ function additionalProfiles(custody: HostCustody, state: ActualHostAssembly, bou
       throw error;
     }
   }
+  async function activate(scope: LogicalProfile, guard: () => void): Promise<RuntimeRecord> {
+    if (scope.retirement) await scope.retirement;
+    guard(); scope.runtime.assertAdmission();
+    if (scope.phase === 'dormant') {
+      void transports.setProfileTraffic(scope.transport, true);
+      scope.phase = 'active';
+      scope.shell.registration.publish();
+    }
+    if (scope.phase !== 'active') throw unavailable('profile');
+    return scope.instance.record;
+  }
+  async function closeProfile(scope: LogicalProfile, guard: () => void, deadline: number):
+    ReturnType<AdditionalProfiles['admit']> {
+    if (scope.retirement) await scope.retirement;
+    guard(); scope.runtime.assertAdmission();
+    if (scope.phase === 'dormant') return { result: 'dormant' };
+    if (scope.phase !== 'active' || scope.shell.host.hasForegroundWork()) throw unavailable('profile');
+    const { selectWindowProfile } = await import('../host/windows.js');
+    guard();
+    if (scope.phase !== 'active' || scope.shell.host.hasForegroundWork() ||
+        [...profiles.values()].some(entry => entry.opening && !entry.scope && entry.runtime?.phase !== 'fatal')) throw unavailable('profile');
+    const peers = [primary, ...[...profiles.values()].map(entry => entry.scope)]
+      .filter((peer): peer is LogicalProfile => !!peer && peer !== scope && peer.phase === 'active');
+    const next = peers[0];
+    if (!next) {
+      const runtime = state.runtime;
+      if (!runtime) throw unavailable('profile');
+      closing = true;
+      return { result: 'exiting', afterReply: () => {
+        setImmediate(() => { void runtime.close().catch(() => {}); });
+      } };
+    }
+    if (scope.shell.host.isActiveProfile()) selectWindowProfile(scope.shell.host, next.shell.host);
+    const retire = scope.control.ownership.control.retireProfileTabs;
+    if (!retire) throw unavailable('profile');
+    scope.phase = 'closing';
+    const draining = transports.setProfileTraffic(scope.transport, false);
+    scope.retirement = (async () => {
+      await Promise.all([retire(deadline), draining]);
+      await scope.flush();
+      scope.runtime.assertAdmission();
+      await scope.instance.owner.assert();
+      scope.phase = 'dormant';
+      scope.shell.registration.publish();
+    })();
+    await scope.retirement;
+    delete scope.retirement;
+    guard();
+    return { result: 'closed' };
+  }
   return Object.freeze({
     openInWindow,
+    bindPrimary(scope: LogicalProfile) {
+      if (primary || scope.instance !== custody.instance || scope.runtime !== state.runtime || scope.shell !== state.shell) throw unavailable('profile');
+      primary = scope;
+    },
+    primaryActive: () => primary?.phase === 'active' && !closing,
     activeHandoff,
-    async admit(scope: Parameters<AdditionalProfiles['admit']>[0], deadline: number, signal: AbortSignal) {
+    async admit(scope: Parameters<AdditionalProfiles['admit']>[0], deadline: number, signal: AbortSignal):
+      ReturnType<AdditionalProfiles['admit']> {
       const source = state.shell?.host;
       if (!source || signal.aborted) throw unavailable('profile');
       assertCurrent(source, deadline);
       const target = await readProfile(profilePaths(scope.profile, custody.host.policy.stateRoot));
       if (target.record.instance !== scope.profileInstance) throw unavailable('profile');
-      if (scope.operation === 'inspect') {
+      if (scope.operation === 'open') return { result: await openProfile(source, target, deadline, signal) };
+      const selected = scope.profile === custody.instance.record.profile ? primary : profiles.get(scope.profile)?.scope;
+      if (!selected) return { result: 'dormant' };
+      if (selected.instance.record.profileInstance !== scope.profileInstance) throw unavailable('profile');
+      const guard = () => {
         assertCurrent(source, deadline);
         if (signal.aborted) throw unavailable('profile');
-        if (scope.profile === custody.instance.record.profile) return custody.instance.record;
-        const entry = profiles.get(scope.profile);
-        if (!entry || entry.instance !== scope.profileInstance || entry.runtime?.phase !== 'ready' || !entry.opening) return null;
-        const profile = await entry.opening;
-        assertCurrent(source, deadline); entry.runtime.assertAdmission();
-        if (signal.aborted) throw unavailable('profile');
-        return profile.instance.record;
-      }
-      return openProfile(source, target, deadline, signal);
+      };
+      guard();
+      if (scope.operation === 'close') return closeProfile(selected, guard, deadline);
+      selected.runtime.assertAdmission();
+      if (selected.phase === 'closing') throw unavailable('profile');
+      return { result: selected.phase === 'dormant' ? 'dormant' : selected.instance.record };
     },
     fence() {
       closing = true;
@@ -419,6 +495,14 @@ async function assembleAfterReady(prepared: HostPreparation, sessions: ProfileSe
     noteHostStartup(prepared.custody, 'host-lifecycle-bind-before');
     const runtime = lifecycle.createHostLifecycle(prepared, sessions, transport, control.ownership.control, native, deadline, platform, group);
     state.runtime = runtime; control.ownership.bindRuntime(runtime);
+    group?.bindPrimary({ instance: prepared.instance, runtime, control, shell, transport, phase: 'active', async flush() {
+      sessionModule.assertProductionSessions(sessions, prepared.custody);
+      runtime.assertAdmission();
+      sessions.website.flushStorageData();
+      await sessions.website.cookies.flushStore();
+      sessionModule.assertProductionSessions(sessions, prepared.custody);
+      runtime.assertAdmission();
+    } });
     noteHostStartup(prepared.custody, 'host-lifecycle-bind-after');
     app.on('before-quit', event => {
       if (shutdown.isQuitting()) return;
@@ -431,7 +515,7 @@ async function assembleAfterReady(prepared: HostPreparation, sessions: ProfileSe
     noteHostStartup(prepared.custody, 'host-lifecycle-ready-before');
     await runtime.ready();
     noteHostStartup(prepared.custody, 'host-lifecycle-ready-after'); current();
-    shell.registration.setRuntimeReady(() => runtime.phase === 'ready' && !state.closed);
+    shell.registration.setRuntimeReady(() => runtime.phase === 'ready' && !state.closed && (!group || group.primaryActive()));
     if (showEmptyWhenReady && shell.tabs.all().length === 0) {
       runtime.assertAdmission();
       await shell.registration.offerForegroundPresentation(deadline, () => {

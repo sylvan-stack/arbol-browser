@@ -196,15 +196,16 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
       const members = nativePresentation.profiles;
       for (const [target, profile] of members) {
         if (profile.id !== id) continue;
-        if (profile.instance !== instance || !profile.ready() || !members.get(host)?.canYield(true))
+        if (profile.instance !== instance || !members.get(host)?.canYield(true))
           throw refused('control_refused');
+        if (!profile.ready()) return false;
         selectWindowProfile(host, target);
         return true;
       }
       return false;
     }, shared && { ...(shared.runtime ? { runtime: shared.runtime } : {}),
       isReady: (id, instance) => [...nativePresentation.profiles.values()]
-        .some(member => member.id === id && member.instance === instance && member.ready()),
+        .some(member => member.id === id && member.instance === instance),
       openInWindow: (profile, deadline) => shared.openInWindow(host, profile, deadline) });
   const assertPresentable = () => { registration.assertLoaded(); authority.assertOperational(); };
   const current: Registration = { host, authority, snapshot, ...(profiles ? { profiles } : {}),
@@ -220,7 +221,11 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
         } else if (request.method === 'select') {
           state = tabs.state(tabs.select(host, request.params.tab));
         } else if (request.method === 'close_window') {
-          await tabs.closeWindow(host);
+          if (shared) await new Promise<void>(resolve => {
+            host.window.once('closed', () => resolve());
+            host.window.close();
+          });
+          else await tabs.closeWindow(host);
         } else {
           const target = tabs.get(request.params.tab);
           if (target.page.window !== host) throw refused('tab_not_found');

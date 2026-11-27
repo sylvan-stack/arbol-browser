@@ -51,6 +51,7 @@ export interface TabRegistry {
     assertCurrent: () => void, publish: () => void): void;
   closeUser(window: WindowHost, id: string, generation: number): Promise<void>;
   closeAgent(client: string, id: string, generation: number): Promise<void>;
+  retireWindowTabs(window: WindowHost): Promise<void>;
   closeWindow(window: WindowHost): Promise<void>;
   beginPopupAction(target: TabTarget, generation: number): () => void;
 }
@@ -137,6 +138,15 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
   }
   function retire(target: TabTarget): Promise<void> {
     const pending = prepareRetirement(target); pending.start(); return pending.promise;
+  }
+  async function retireWindowTabs(window: WindowHost): Promise<void> {
+    assertWindowHost(window);
+    const pending = [...tabs.values()].filter(target => target.page.window === window).map(prepareRetirement);
+    await Promise.all(pending.map(target => target.ready));
+    for (const target of pending) target.start();
+    await Promise.all(pending.map(target => target.promise));
+    if ([...tabs.values()].some(target => target.page.window === window)) throw unavailable('profile');
+    selection.delete(window);
   }
   function installPageEvents(target: TabTarget, page: PageSurface) {
     // Closures keep the originating page. A stale event cannot resolve the
@@ -313,21 +323,14 @@ export function createTabRegistry(lifecycle: TabLifecycle): TabRegistry {
       if (current.controller.kind !== 'agent' || current.controller.client !== client) throw refused('control_refused');
       await retire(target);
     },
+    retireWindowTabs,
     closeWindow(window: WindowHost) {
       const pending = windowClosures.get(window); if (pending) return pending;
       assertWindowHost(window);
       let resolve!: () => void, reject!: (reason: unknown) => void;
       const promise = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
       windowClosures.set(window, promise); // precedes every invalidation/native callback
-      try {
-        const pendingTabs = [...tabs.values()].filter(target => target.page.window === window).map(prepareRetirement);
-        // Reentrant close can join a record still inside invalidate. Await every
-        // synchronous preparation before the first new native detach/close.
-        void Promise.all(pendingTabs.map(target => target.ready)).then(() => {
-          for (const target of pendingTabs) target.start();
-          return Promise.all(pendingTabs.map(target => target.promise));
-        }).then(() => { selection.delete(window); return window.close(); }).then(resolve, reject);
-      } catch (error) { reject(error); }
+      void retireWindowTabs(window).then(() => window.close()).then(resolve, reject);
       return promise;
     },
     beginPopupAction(target: TabTarget, expected: number) {

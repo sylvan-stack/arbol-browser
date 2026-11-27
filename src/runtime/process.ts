@@ -19,7 +19,7 @@ import { ownerLock, withOwnerLockForCustody, type OwnerLease, type RegistryLease
 import { acquireBuildLease, withBuildLockForCustody, type BuildLease } from './build-lease.js';
 import { createProductionExitAuthority, assertProductionExitAuthority, type ProductionExitAuthority } from './exit.js';
 import { discoverInstalledResident, electInstalledStartup, observeInstalledResident, type ResidentRuntime } from './resident.js';
-import { connectRuntime, requestProfileAdmission, requestProfileInspection, type Endpoint } from './transport.js';
+import { connectRuntime, requestProfileAdmission, requestProfileInspection, requestProfileClosure, type Endpoint } from './transport.js';
 
 export interface LaunchAttempt {
   readonly format: 1; readonly request: string; readonly nonce: string;
@@ -335,10 +335,11 @@ export function createLaunchTransactions(host: VerifiedHost, platform: PlatformP
   });
 }
 
-/** Close joins an existing exact admitted host only; never reserves or starts. */
-export async function assertProductionCloseReady(profile: ProfileSnapshot, record: RuntimeRecord,
+/** Inspect/Close joins an existing exact host only. Neither operation starts a profile. */
+export async function inspectOrCloseProductionProfile(profile: ProfileSnapshot, record: RuntimeRecord,
   selection: import('./selection.js').BuildSelection, platform: PlatformPort,
-  exits: ProductionExitAuthority, deadline: number, verifiedHost?: VerifiedHost): Promise<void> {
+  exits: ProductionExitAuthority, deadline: number, verifiedHost?: VerifiedHost, operation: 'inspect' | 'close' = 'inspect'):
+  Promise<'standalone' | 'active' | 'dormant' | 'closed' | 'exiting'> {
   const lease = await acquireBuildLease(selection, platform);
   try {
     const address = new URL('./authorities.js', import.meta.url).href;
@@ -357,17 +358,23 @@ export async function assertProductionCloseReady(profile: ProfileSnapshot, recor
     const host = retained ?? await authority.verifyPackagedHost(selection, layout.payload, deadline);
     const attempts = createLaunchTransactions(host, platform, exits, Boolean(retained));
     const resident = layout.scope === 'installed' ? await observeInstalledResident(profile.paths.state, platform) : undefined;
-    if (resident && resident.record.pid === record.pid && resident.record.processStartId === record.processStartId &&
-        resident.record.profile !== record.profile) {
+    if (resident && resident.record.pid === record.pid && resident.record.processStartId === record.processStartId) {
       await attempts.admitted(resident.profile, resident.record, deadline);
       const client = await connectRuntime(resident.location, resident.record, 'management', { ...selection, explicit: false },
         platform, deadline, 'Profile inspection');
       try {
-        const inspected = await requestProfileInspection(client, { profile: profile.record.id, profileInstance: profile.record.instance }, deadline);
-        if (!inspected || JSON.stringify(inspected) !== JSON.stringify(record)) throw unavailable('profile');
+        const scope = { profile: profile.record.id, profileInstance: profile.record.instance };
+        if (operation === 'close') return await requestProfileClosure(client, scope, deadline);
+        const inspected = await requestProfileInspection(client, scope, deadline);
+        if (inspected === 'dormant') return inspected;
+        if (JSON.stringify(inspected) !== JSON.stringify(record)) throw unavailable('profile');
+        await lease.assert(); assertTime(deadline);
+        return 'active';
       } finally { client.close(); }
-    } else await attempts.admitted(profile, record, deadline);
+    }
+    await attempts.admitted(profile, record, deadline);
     await lease.assert(); assertTime(deadline);
+    return 'standalone';
   } finally { lease.release(); }
 }
 
@@ -387,17 +394,14 @@ export function createProductionProcessIntegration(host: VerifiedHost, selection
     attempts: LaunchAttemptPort, deadline: number, label?: string, signal?: AbortSignal) {
     await attempts.admitted(resident.profile, resident.record, deadline);
     if (selection.explicit && selection.build !== resident.record.build) throw unavailable('browser');
-    let location = resident.location, record = resident.record;
     const profile = target.record.id, profileInstance = target.record.instance;
-    if (profile !== record.profile) {
-      const management = await connectRuntime(location, record, 'management', selection, platform, deadline, label, signal);
-      try { record = await requestProfileAdmission(management, { profile, profileInstance }, deadline); }
-      finally { management.close(); }
-      const targetLocation = await runtimeLocation(target);
-      if (!targetLocation || JSON.stringify(record) !== JSON.stringify(await readRuntime(targetLocation))) throw unavailable('profile');
-      location = targetLocation;
-    }
-    if (record.profile !== profile || record.profileInstance !== profileInstance) throw unavailable('profile');
+    const management = await connectRuntime(resident.location, resident.record, 'management', selection, platform, deadline, label, signal);
+    let record: RuntimeRecord;
+    try { record = await requestProfileAdmission(management, { profile, profileInstance }, deadline); }
+    finally { management.close(); }
+    const location = await runtimeLocation(target);
+    if (!location || JSON.stringify(record) !== JSON.stringify(await readRuntime(location)) ||
+        record.profile !== profile || record.profileInstance !== profileInstance) throw unavailable('profile');
     assertTime(deadline);
     const client = await connectRuntime(location, record, endpoint, selection, platform, deadline, label, signal);
     return { client, record, alreadyRunning: true };
