@@ -100,7 +100,11 @@ export interface EngineTransaction {
   /** Does not release ownership; keep owner/build protection until this settles. */
   completeExit(evidence: EngineExitEvidence): Promise<void>;
 }
-const preparedOwners = new WeakSet<OwnerLease>();
+export interface EngineInspection {
+  /** A single continuation bound to the inspected Owner and prior marker. */
+  prepare(): Promise<EngineTransaction>;
+}
+const inspectedOwners = new WeakSet<OwnerLease>();
 interface StoredMarker { readonly marker: Readonly<EngineMarker>; readonly identity: Identity }
 async function storedMarker(profile: ProfileSnapshot): Promise<StoredMarker | undefined> {
   if (!await statOrAbsent(profile.paths.engine)) return undefined;
@@ -112,6 +116,11 @@ async function storedMarker(profile: ProfileSnapshot): Promise<StoredMarker | un
 async function emptyDirectory(path: string): Promise<boolean> {
   const entries = await opendir(path);
   try { return await entries.read() === null; } finally { await entries.close(); }
+}
+async function assertFreshStorage(profile: ProfileSnapshot): Promise<void> {
+  // A missing marker never adopts existing native storage, even after a crash.
+  if (!await emptyDirectory(profile.paths.data) || !await emptyDirectory(profile.paths.userData) ||
+      (await storageNames(profile.paths.root)).some(name => !nonEngineRootNames.has(name))) throw profileUnavailable();
 }
 async function assertMarker(profile: ProfileSnapshot, expected: StoredMarker | undefined): Promise<void> {
   const current = await storedMarker(profile);
@@ -138,16 +147,16 @@ async function replaceMarker(owner: OwnerLease, expected: StoredMarker | undefin
  * No major-version, management-format or lexical-version inference is used. */
 export type EnginePreparationStage = 'engine-owner-policy' | 'marker-read' | 'existing-marker-compatibility' |
   'fresh-marker-compatibility' | 'verified-prior-exit' | 'native-marker-permit';
-export async function prepareEngine(owner: OwnerLease, authority: EngineAuthority,
-  observation?: (stage: EnginePreparationStage) => void): Promise<EngineTransaction> {
+export async function inspectEngine(owner: OwnerLease, authority: EngineAuthority,
+  observation?: (stage: EnginePreparationStage) => void): Promise<EngineInspection> {
   // The production caller closes over its original custody only. Foundation
   // supplies nothing; this helper never participates in a check or failure.
   const note = (stage: EnginePreparationStage) => { try { observation?.(stage); } catch { /* warning only */ } };
   try {
     // Consume before the first await. Failed preparation also requires a fresh
     // ownership transaction; no same-lease retry may race a prior continuation.
-    if (preparedOwners.has(owner)) throw profileUnavailable();
-    preparedOwners.add(owner);
+    if (inspectedOwners.has(owner)) throw profileUnavailable();
+    inspectedOwners.add(owner);
     note('engine-owner-policy');
     await owner.assert();
     const profile = owner.profile;
@@ -166,10 +175,8 @@ export async function prepareEngine(owner: OwnerLease, authority: EngineAuthorit
           !manifest.compatibleReaderKeys.includes(previous.marker.requiredReader)) throw profileUnavailable();
     } else {
       note('fresh-marker-compatibility');
-      // Missing marker never adopts existing native storage, even after a crash.
-      if (manifest.dataEpoch !== 1 || !await emptyDirectory(profile.paths.data) ||
-          !await emptyDirectory(profile.paths.userData) ||
-          (await storageNames(profile.paths.root)).some(name => !nonEngineRootNames.has(name))) throw profileUnavailable();
+      if (manifest.dataEpoch !== 1) throw profileUnavailable();
+      await assertFreshStorage(profile);
     }
     note('verified-prior-exit');
     await authority.assertPreviousEngineExited(profile);
@@ -178,33 +185,53 @@ export async function prepareEngine(owner: OwnerLease, authority: EngineAuthorit
       dataEpoch: manifest.dataEpoch, lastWriterBuild: build, lastWriterChromium: manifest.runtime.chromium,
       lastWriterElectron: manifest.runtime.electron, requiredReader: manifest.writerKey, cleanExit: false };
     if (!validator('profile2.EngineMarker')(dirty)) throw profileUnavailable();
-    note('native-marker-permit');
-    const mutation = await authority.beginMutation?.(owner, Object.freeze({ ...dirty }));
-    let current: StoredMarker;
-    try { current = await replaceMarker(owner, previous, dirty); mutation?.accept(); }
-    catch (error) { if (mutation) return mutation.abort(); throw error; }
-    let phase: 'prepared' | 'closing' | 'clean' | 'failed' = 'prepared';
-    return Object.freeze({ owner, marker: current.marker,
-      async assertReady() {
-        if (phase !== 'prepared') throw profileUnavailable();
-        await owner.assert(); await assertMarker(profile, current);
-        mutation?.assertBound();
-      },
-      async completeExit(evidence: EngineExitEvidence) {
-        // A real host cannot certify its own future process death or publish
-        // clean while disappearing. Its original retained native finalizer is
-        // the only production clean writer. Foundation's explicit port remains.
-        if (mutation) throw profileUnavailable();
-        if (phase !== 'prepared') throw profileUnavailable();
-        phase = 'closing';
-        try {
-          await owner.assert(); await assertMarker(profile, current);
-          await evidence.assertCompleteExitAndFlush(profile);
-          await owner.assert(); await assertMarker(profile, current);
-          current = await replaceMarker(owner, current, { ...dirty, cleanExit: true });
-          phase = 'clean';
-        } catch { phase = 'failed'; throw profileUnavailable(); }
-      },
-    });
+    const beginMutation = authority.beginMutation?.bind(authority);
+    let consumed = false;
+    return Object.freeze({ async prepare(): Promise<EngineTransaction> {
+      if (consumed) throw profileUnavailable();
+      consumed = true;
+      try {
+        await owner.assert();
+        if (!previous) await assertFreshStorage(profile);
+        await assertMarker(profile, previous);
+        note('native-marker-permit');
+        const mutation = await beginMutation?.(owner, Object.freeze(dirty));
+        return await bindEngineMarker(owner, previous, dirty, mutation);
+      } catch (error) { if (error instanceof BrowserFailure) throw error; throw profileUnavailable(); }
+    } });
   } catch (error) { if (error instanceof BrowserFailure) throw error; throw profileUnavailable(); }
+}
+
+async function bindEngineMarker(owner: OwnerLease, previous: StoredMarker | undefined, dirty: EngineMarker,
+  mutation: EngineMutation | undefined): Promise<EngineTransaction> {
+  const profile = owner.profile;
+  let current: StoredMarker;
+  try { current = await replaceMarker(owner, previous, dirty); mutation?.accept(); }
+  catch (error) { if (mutation) return mutation.abort(); throw error; }
+  let phase: 'prepared' | 'closing' | 'clean' | 'failed' = 'prepared';
+  return Object.freeze({ owner, marker: current.marker,
+    async assertReady() {
+      if (phase !== 'prepared') throw profileUnavailable();
+      await owner.assert(); await assertMarker(profile, current);
+      mutation?.assertBound();
+    },
+    async completeExit(evidence: EngineExitEvidence) {
+      // A real host cannot certify its own future process death or publish
+      // clean while disappearing. Its retained native finalizer does that.
+      if (mutation || phase !== 'prepared') throw profileUnavailable();
+      phase = 'closing';
+      try {
+        await owner.assert(); await assertMarker(profile, current);
+        await evidence.assertCompleteExitAndFlush(profile);
+        await owner.assert(); await assertMarker(profile, current);
+        current = await replaceMarker(owner, current, { ...dirty, cleanExit: true });
+        phase = 'clean';
+      } catch { phase = 'failed'; throw profileUnavailable(); }
+    },
+  });
+}
+
+export async function prepareEngine(owner: OwnerLease, authority: EngineAuthority,
+  observation?: (stage: EnginePreparationStage) => void): Promise<EngineTransaction> {
+  return (await inspectEngine(owner, authority, observation)).prepare();
 }
