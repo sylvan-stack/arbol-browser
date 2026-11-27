@@ -59,21 +59,28 @@ function extractUsage(provider: SeqoyaProvider, observedAt: string): SeqoyaUsage
   const result: SeqoyaUsage = { observedAt, windows: [] };
   const leaves = visibleLeaves(root);
   const contains = (value: string) => leaves.some(node => text(node) === value);
+  const compact = (value: string) => value.toLowerCase().replace(/\s+/g, '');
   const around = <T>(
     label: string,
     parse: (lines: string[]) => T | undefined,
     region = root,
     cardBoundaries?: ReadonlySet<string>,
   ): T | undefined => {
+    const competingLabels = cardBoundaries && [...cardBoundaries].filter(value => value !== label).map(compact);
     for (const anchor of leaves) {
       if (!region.contains(anchor) || text(anchor) !== label) continue;
       let block: HTMLElement | null = anchor.parentElement;
       for (let depth = 0; block && region.contains(block) && block !== root && depth < 5; depth++, block = block.parentElement) {
         const value = block.innerText;
         if (value.length > 4096) break;
+        // A heading with decorative children can be absent from the leaf scan
+        // and share a rendered line with adjacent text.
+        if (competingLabels) {
+          const cardText = compact(value);
+          if (competingLabels.some(heading => cardText.includes(heading))) break;
+        }
         const scope = block;
         const blockLeaves = chatgpt ? leaves.filter(node => scope.contains(node)) : [];
-        // A common wrapper can merge another card's heading into an innerText line.
         if (cardBoundaries && blockLeaves.some(node => node !== anchor && cardBoundaries.has(text(node)))) break;
         const lines = value.split('\n').map(line => line.trim().replace(/\s+/g, ' ')).filter(Boolean);
         const afterLabel = (items: string[]) => {
