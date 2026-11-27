@@ -58,8 +58,10 @@ h1 { margin: 0; font-size: 13px; }
   text-align: left;
 }
 .profile::before { content: '›'; color: var(--muted); font-size: 16px; }
-.profile[aria-current='true']::before { transform: rotate(90deg); }
-.profile[aria-current='true'] { font-weight: 600; }
+.profile[aria-expanded='true']::before { transform: rotate(90deg); }
+.profile:is([aria-current='true'], [data-opening]) { font-weight: 600; }
+.profile[data-opening] { background: var(--inset); opacity: 1; }
+.profile + #profile-status { margin-inline-start: 16px; }
 .profile span, .tab { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .tabs { margin: 3px 0 6px 8px; padding-left: 6px; border-left: 1px solid var(--border); }
 .tab-row { min-height: 28px; gap: 2px; border-radius: 6px; }

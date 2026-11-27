@@ -3,7 +3,7 @@ import { app, ipcMain, type IpcMainInvokeEvent, type WebContents } from 'electro
 import type { Contract } from '../contracts/generated.js';
 import { validator } from '../contracts/schema.js';
 import { invalidInput, publicFailure, unavailable } from '../contracts/errors.js';
-import { assertSharedProfileRuntime, type HostCustody, type SharedProfileRuntime } from '../runtime/custody.js';
+import { assertHostCustody, assertSharedProfileRuntime, type HostCustody, type SharedProfileRuntime } from '../runtime/custody.js';
 import type { ProfileSnapshot } from '../profiles/records.js';
 import type { PlatformPort } from '../runtime/platform.js';
 import { createProfileNavigation, readSubscriptionHome, rememberSubscriptionHome, type ProfileNavigation } from './profile-navigation.js';
@@ -57,6 +57,7 @@ type NativePresentation = {
     readonly id: string;
     readonly instance: string;
     ready(): boolean;
+    assertRetained(): void;
     canYield(ownerSwitch: boolean): boolean;
     openHome(): void;
   }>;
@@ -196,6 +197,12 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
     if ([...nativePresentation.profiles.values()].some(profile => profile.id === id)) throw unavailable('browser');
     nativePresentation.profiles.set(host, { id, instance,
       ready: () => runtimeReady() && prepared && !disposed,
+      assertRetained() {
+        if (shared?.runtime) {
+          assertSharedProfileRuntime(shared.runtime);
+          shared.runtime.retained.assertRetained();
+        } else assertHostCustody(profileSource.custody);
+      },
       canYield: ownerSwitch =>
         !host.window.isDestroyed() && host.window.isEnabled() && (ownerSwitch || !host.window.isFocused()) &&
         tabs.all().filter(target => target.page.window === host).every(target => tabs.state(target).handoff === 'idle'),
@@ -218,6 +225,7 @@ export function registerShellIPC(host: WindowHost, tabs: TabRegistry, authority:
         if (profile.instance !== instance || !members.get(host)?.canYield(true))
           throw refused('control_refused');
         if (!profile.ready()) return false;
+        profile.assertRetained();
         selectWindowProfile(host, target);
         profile.openHome();
         return true;

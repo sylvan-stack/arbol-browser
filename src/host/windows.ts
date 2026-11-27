@@ -180,8 +180,8 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
   const observe = (work: () => void) => {
     try { synchronous(work); } catch { return boundary.fatal.fail('native_retirement_unavailable'); }
   };
-  const presentSelection = (next: PageSurface | undefined, owns = () => true) => {
-    for (const page of pages) if (!page.retirement()) {
+  const presentSelection = (next: PageSurface | undefined, owns = () => true, targets: Iterable<PageSurface> = pages) => {
+    for (const page of targets) if (!page.retirement()) {
       if (!owns()) throw unavailable('browser'); page.present(active() && page === next);
       if (!owns()) throw unavailable('browser');
     }
@@ -196,7 +196,7 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
       for (const observer of observers) observe(() => observer.fence(affected));
       if (version !== placementVersion) throw unavailable('browser');
       selected = next;
-      presentSelection(next, () => version === placementVersion);
+      presentSelection(next, () => version === placementVersion, explicit);
       if (version !== placementVersion) throw unavailable('browser');
       synchronous(commit); // actual registry selection/binding co-commit, while publication is deferred
       if (version !== placementVersion) throw unavailable('browser');
@@ -398,7 +398,7 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
   };
   const refresh = () => {
     try {
-      const affected = [...pages].filter(page => !page.retirement());
+      const affected = [...pages].filter(page => !page.retirement() && (page === selected || page.view.getVisible()));
       selectPhysical(selected, () => { shell.setVisible(active()); }, affected);
     } catch { return boundary.fatal.fail('native_retirement_unavailable'); }
   };

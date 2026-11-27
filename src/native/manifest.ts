@@ -601,8 +601,9 @@ const retainedStartupVerifiers: Readonly<Record<string, string>> = Object.freeze
   '43': 'b614b11811172e13538d13376b0ad14b6b933ced',
   '44': 'dbb96edb79401ba9d259f5241cfd72ac8e5506f2',
   '45': 'a311c910976707c12b309a40b9390a75c07d6a71',
+  '48': '603ba013effb8d69fe478ea5697b2dfc6fe2e406',
 });
-const retainedDirectVerifiers = new Set(['31', '32', '33', '34', '35', '36', '37', '38', '39', '3b', '3c', '3d', '3e', '3f', '40', '41', '42', '43', '44', '45']);
+const retainedDirectVerifiers = new Set(['31', '32', '33', '34', '35', '36', '37', '38', '39', '3b', '3c', '3d', '3e', '3f', '40', '41', '42', '43', '44', '45', '48']);
 function hasRetainedStartupVerifier(root: string, deadline: number): boolean {
   const expected = retainedStartupVerifiers[basename(dirname(dirname(root)))];
   if (!expected) return false;

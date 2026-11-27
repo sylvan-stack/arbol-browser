@@ -128,6 +128,7 @@ export function createProfileNavigation(custody: HostCustody, platform: Platform
   }
 
   async function open(id: string, instance: string, check: () => void, isFocused: () => boolean): Promise<void> {
+    if (shared && selectLocal(id, instance)) return;
     const profile = await readProfile(profilePaths(id, state));
     if (profile.record.instance !== instance) throw profileUnavailable();
     check();

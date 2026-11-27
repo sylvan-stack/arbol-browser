@@ -22,7 +22,9 @@ const tabActions = element<HTMLDetailsElement>('tab-actions');
 const profileCreate = element<HTMLDetailsElement>('profile-create-panel');
 let tabListKey = '';
 const profileName = element<HTMLInputElement>('profile-id'), profileStatus = element('profile-status');
+const profileStatusHome = profileStatus.parentElement!;
 let profiles: ProfileNavigationState | undefined, changingProfile = false, refreshingProfiles = false, profileRevision = 0;
+let openingProfileKey = '';
 
 function profileLabel(id: string): string {
   if (id === 'default') return 'Default';
@@ -37,6 +39,7 @@ function updateProfileControls(): void {
     choice.setAttribute('aria-disabled', String(changingProfile || choice.disabled));
 }
 function renderProfiles(): void {
+  if (!openingProfileKey && profileStatus.parentElement !== profileStatusHome) profileStatusHome.append(profileStatus);
   const entries = profiles?.profiles ?? [];
   if (!entries.length) return;
   const keys = new Set(entries.map(entry => entry.id + ':' + entry.instance));
@@ -51,6 +54,7 @@ function renderProfiles(): void {
   for (const entry of entries) {
     const key = entry.id + ':' + entry.instance;
     const active = entry.id === profiles?.current;
+    const opening = key === openingProfileKey;
     const name = entry.label ?? profileLabel(entry.id);
     const row = existing.get(key) ?? document.createElement('div');
     const choice = row.firstElementChild as HTMLButtonElement | null ?? document.createElement('button');
@@ -60,7 +64,8 @@ function renderProfiles(): void {
     choice.title = text;
     choice.disabled = entry.unavailable === true;
     choice.setAttribute('aria-disabled', String(changingProfile || choice.disabled));
-    choice.setAttribute('aria-expanded', String(active));
+    choice.setAttribute('aria-expanded', String(active || opening));
+    choice.toggleAttribute('data-opening', opening);
     if (!existing.has(key)) {
       row.dataset.profileKey = key;
       choice.type = 'button';
@@ -79,6 +84,7 @@ function renderProfiles(): void {
       choice.removeAttribute('aria-controls');
       choice.onclick = () => { void profileAction({ method: 'open', profile: entry.id, instance: entry.instance }); };
     }
+    if (opening && profileStatus.parentElement !== row) row.append(profileStatus);
     if (row !== next) profileList.insertBefore(row, next);
     next = row.nextElementSibling;
   }
@@ -90,7 +96,14 @@ async function profileAction(request: ProfileNavigationRequest): Promise<void> {
   if (changingProfile || (listing && refreshingProfiles) || state?.profileNavigationReady !== true) return;
   const revision = listing ? profileRevision : ++profileRevision;
   if (listing) refreshingProfiles = true;
-  else { changingProfile = true; updateProfileControls(); }
+  else {
+    changingProfile = true;
+    if (request.method === 'open') {
+      openingProfileKey = request.profile + ':' + request.instance;
+      renderProfiles();
+    }
+    updateProfileControls();
+  }
   if (!listing || !profiles)
     profileStatus.textContent = request.method === 'open' ? 'Opening profile…' : request.method === 'create' ? 'Creating profile…' : 'Loading profiles…';
   try {
@@ -112,7 +125,13 @@ async function profileAction(request: ProfileNavigationRequest): Promise<void> {
   }
   finally {
     if (listing) refreshingProfiles = false;
-    else changingProfile = false;
+    else {
+      changingProfile = false;
+      if (openingProfileKey) {
+        openingProfileKey = '';
+        renderProfiles();
+      }
+    }
     updateProfileControls();
     if (request.method === 'create' && !profileCreate.open) profileCreate.querySelector('summary')?.focus();
   }
