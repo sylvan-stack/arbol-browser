@@ -137,9 +137,10 @@ export interface SharedProfileOwner {
 }
 export interface SharedProfileSessionReceipt { assertBound(): void }
 export type PriorMarkerExpectation = Readonly<{ kind: 'absent' } | {
-  kind: 'activated' | 'terminal'; path: string; digest: string;
+  kind: 'activated' | 'terminal' | 'shared'; path: string; digest: string;
   migration?: Readonly<{ path: string; digest: string }>;
 }>;
+type ExitInspectionGuards = Readonly<{ data?: HeldLock; next?: HeldLock; shared?: SharedFamilyExitReceipt }>;
 export interface NativeExitInput {
   readonly format: 1;
   readonly mode: 'prior' | 'host' | 'full' | 'retire' | 'reserve' | 'withdraw';
@@ -346,7 +347,7 @@ export interface PlatformPort {
   /** Actual held owner and independently verified OLD Build; native claims,
    * complete receipts, physical metadata/marker/frontiers and full original
    * absence are verified off the caller event loop under the original bound. */
-  inspectExit(owner: HeldLock, build: HeldLock, input: NativeExitInput, deadline: number, guards?: Readonly<{ data?: HeldLock; next?: HeldLock }>): Promise<ExitInspectionReceipt>;
+  inspectExit(owner: HeldLock, build: HeldLock, input: NativeExitInput, deadline: number, guards?: ExitInspectionGuards): Promise<ExitInspectionReceipt>;
   /** Verifies the owning process family under the target Owner and original signed Build. */
   inspectSharedFamilyExit(owner: HeldLock, build: HeldLock, input: SharedFamilyExitInput, deadline: number): Promise<SharedFamilyExitReceipt>;
   inspectMigration(custody: MaintenanceCustody, registry: HeldLock, owner: HeldLock, build: HeldLock | MaintenanceGuard,
@@ -1152,7 +1153,7 @@ export function loadPlatform(): PlatformPort {
         throw unavailable('profile');
       } finally { call(() => native.cancelExitInspection(handle)); }
     },
-    async inspectExit(owner: HeldLock, build: HeldLock, input: NativeExitInput, deadline: number, guards?: Readonly<{ data?: HeldLock; next?: HeldLock }>): Promise<ExitInspectionReceipt> {
+    async inspectExit(owner: HeldLock, build: HeldLock, input: NativeExitInput, deadline: number, guards?: ExitInspectionGuards): Promise<ExitInspectionReceipt> {
       const actualOwner = locks.get(owner), actualBuild = locks.get(build);
       if (!actualOwner || !actualBuild || !Number.isFinite(deadline)) throw unavailable('profile');
       owner.assertIdentity(); build.assertIdentity();
@@ -1161,10 +1162,12 @@ export function loadPlatform(): PlatformPort {
       const nativeDeadline = nativeNow + Math.min(10000, deadline - sampled);
       const actualData = guards?.data ? locks.get(guards.data) : null, actualNext = guards?.next ? locks.get(guards.next) : null;
       if ((guards?.data && !actualData) || (guards?.next && !actualNext)) throw unavailable('profile');
+      const shared = guards?.shared && sharedMutationBaselines.get(guards.shared);
+      if (guards?.shared && (!sharedFamilyExitReceipts.has(guards.shared) || shared?.owner !== owner)) throw unavailable('profile');
       guards?.data?.assertIdentity(); guards?.next?.assertIdentity();
       const handle = call(() => native.beginExitInspection(actualOwner, actualBuild,
         JSON.stringify({ ...input, dataAttempt: input.dataAttempt ?? null, pending: input.pending ?? null }), nativeDeadline,
-        actualData ?? null, actualNext ?? null));
+        actualData ?? null, actualNext ?? null, ...(shared ? [shared.handle] : [])));
       try {
         while (performance.now() < deadline && call(() => native.continuousTime()) < nativeDeadline) {
           const raw = call(() => native.pollExitInspection(handle));
@@ -1177,13 +1180,15 @@ export function loadPlatform(): PlatformPort {
               throw unavailable('profile');
             const prior = value.prior;
             if (!prior || (prior.kind === 'absent' ? Object.keys(prior).join(',') !== 'kind' :
-                !['activated', 'terminal'].includes(prior.kind) || Object.keys(prior).sort().join(',') !==
+                !['activated', 'terminal', 'shared'].includes(prior.kind) || Object.keys(prior).sort().join(',') !==
                   (prior.migration === undefined ? 'digest,kind,path' : 'digest,kind,migration,path') ||
                 !isAbsolute(prior.path) || !/^[0-9a-f]{64}$/.test(prior.digest))) throw unavailable('profile');
             if (prior.kind !== 'absent' && prior.migration !== undefined &&
                 (!prior.migration || Object.keys(prior.migration).sort().join(',') !== 'digest,path' ||
                   typeof prior.migration.path !== 'string' || !isAbsolute(prior.migration.path) ||
                   typeof prior.migration.digest !== 'string' || !/^[0-9a-f]{64}$/.test(prior.migration.digest))) throw unavailable('profile');
+            if (prior.kind === 'shared' && (!shared || value.kind !== 'terminal' || prior.migration !== undefined))
+              throw unavailable('profile');
             owner.assertIdentity(); build.assertIdentity(); guards?.data?.assertIdentity(); guards?.next?.assertIdentity();
             if (performance.now() >= deadline || call(() => native.continuousTime()) >= nativeDeadline) throw unavailable('profile');
             const result: ExitInspectionReceipt = Object.freeze({ kind: value.kind, clean: value.clean,

@@ -128,13 +128,14 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
   assertPlatform(platform);
   type OldProof = { host: VerifiedHost; build: BuildLease };
   const priorProofs = new WeakMap<OwnerLease, Map<string, OldProof>>();
+  const priorSharedProofs = new WeakMap<OwnerLease, SharedFamilyExitReceipt>();
   // The command creates this authority once. Retain immutable package proofs,
   // while every row still takes its own original Build and Profile locks.
   const listingBuilds = listingHost?.identity.layout.scope === 'installed'
     ? new Map([[listingHost.identity.layout.buildRoot, listingHost]]) : undefined;
   const inspect = async (profile: ProfileSnapshot, previous: RuntimeRecord | undefined, owner: OwnerLease,
     mode: 'prior' | 'host' | 'full' | 'retire' | 'reserve' | 'withdraw', deadline: number, currentBuild?: BuildLease,
-    pending?: LaunchAttempt, closeHost?: VerifiedHost): Promise<ExitInspectionReceipt> => {
+    pending?: LaunchAttempt, closeHost?: VerifiedHost, shared?: SharedFamilyExitReceipt): Promise<ExitInspectionReceipt> => {
     assertTime(deadline); await owner.assert(); await assertProfile(profile);
     if (owner.profile !== profile) throw unavailable('profile');
     const location = await runtimeLocation(profile, true); if (!location) throw unavailable('profile');
@@ -309,7 +310,7 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
             profilePathHash: location.hash, runtimeLeaf: physicalLeaf, bundle: candidate && !receiptWhole ? claimedLayout(candidate).bundle :
               pending ? claimedLayout(pending).bundle : selectedLayout(build.selection, resolve(fileURLToPath(new URL('../../', import.meta.url)))).bundle,
             attempt: candidate ?? null, previous: previous ?? null, dataAttempt: dataAttempt ?? null, pending: pending ?? null,
-          }, deadline, { ...(data ? { data } : {}), ...(next ? { next } : {}) });
+          }, deadline, { ...(data ? { data } : {}), ...(next ? { next } : {}), ...(shared ? { shared } : {}) });
           const withNext = (data?: import('./platform.js').HeldLock) => actualMode === 'reserve' && currentBuild ?
             withBuildLockForCustody(currentBuild, platform, next => invoke(data, next)) : invoke(data);
           return dataBuild ? withBuildLockForCustody(dataBuild, platform, data => withNext(data)) : withNext();
@@ -324,6 +325,39 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
       return result;
     } finally { for (const build of new Set(release)) build.release(); }
   };
+  const readSharedPredecessor = async (profile: ProfileSnapshot, owner: OwnerLease, deadline: number):
+    Promise<SharedFamilyExitReceipt | undefined> => {
+    assertTime(deadline);
+    if (owner.profile !== profile) throw unavailable('profile');
+    await owner.assert();
+    const hash = createHash('sha256').update(profile.paths.root, 'utf8').digest('hex');
+    const cursor = join(profile.paths.state, 'exit-evidence', hash, 'shared-current.json');
+    if (!await statOrAbsent(cursor)) return undefined;
+    const { value } = await readJson(cursor, 16384);
+    const request = (value as { request?: unknown } | null)?.request;
+    if (!validator('browser.RequestId')(request)) throw unavailable('profile');
+    return authority.verifySharedFamily(profile, owner, request, deadline);
+  };
+  const inspectLatest = async (profile: ProfileSnapshot, previous: RuntimeRecord | undefined, owner: OwnerLease,
+    mode: 'prior' | 'full' | 'retire' | 'reserve', deadline: number, build?: BuildLease,
+    pending?: LaunchAttempt, closeHost?: VerifiedHost): Promise<ExitInspectionReceipt> => {
+    if (mode === 'prior') {
+      // The enrolled host must recheck the same proof as pre-enrollment.
+      // The native reader also compares the immutable capability's digest.
+      let shared = priorSharedProofs.get(owner);
+      if (!shared) try { shared = await readSharedPredecessor(profile, owner, deadline); }
+      catch { assertTime(deadline); }
+      const result = await inspect(profile, previous, owner, mode, deadline, build, pending, closeHost, shared);
+      if (shared) priorSharedProofs.set(owner, shared);
+      return result;
+    }
+    try { return await inspect(profile, previous, owner, mode, deadline, build, pending, closeHost); }
+    catch (error) {
+      const shared = await readSharedPredecessor(profile, owner, deadline);
+      if (!shared) throw error;
+      return inspect(profile, previous, owner, mode, deadline, build, pending, closeHost, shared);
+    }
+  };
   const withOwner = async <T>(profile: ProfileSnapshot, supplied: OwnerLease | undefined, deadline: number,
     operation: (owner: OwnerLease) => Promise<T>): Promise<T> => {
     const owner = supplied ?? await ownerLock(profile, platform, false, deadline);
@@ -337,38 +371,32 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
       // Host prior verification reads only independent outside-profile evidence;
       // actual marker comparison remains behind genuine Native enrollment.
       const mode = process.type === 'browser' ? 'prior' : 'full';
-      await withOwner(profile, owner, deadline, held => inspect(profile, previous, held, mode, deadline));
+      await withOwner(profile, owner, deadline, held => inspectLatest(profile, previous, held, mode, deadline));
     },
     async priorExpectation(profile: ProfileSnapshot, previous: RuntimeRecord | undefined,
       owner: OwnerLease, build: BuildLease, deadline: number): Promise<PriorMarkerExpectation> {
-      const result = await inspect(profile, previous, owner, 'prior', deadline, build);
+      const result = await inspectLatest(profile, previous, owner, 'prior', deadline, build);
       return result.prior;
     },
     async assertCompleteExitAndFlush(profile: ProfileSnapshot) {
       const deadline = now() + 10000;
       await withOwner(profile, undefined, deadline, async held => {
-        const result = await inspect(profile, undefined, held, 'full', deadline);
+        const result = await inspectLatest(profile, undefined, held, 'full', deadline);
         if (!result.clean) throw unavailable('profile');
       });
     },
     async assertCensus(profile: ProfileSnapshot, original: RuntimeRecord, _group: readonly import('./platform.js').GroupProcess[]) {
       const deadline = now() + 10000;
-      await withOwner(profile, undefined, deadline, held => inspect(profile, original, held, 'full', deadline));
+      await withOwner(profile, undefined, deadline, held => inspectLatest(profile, original, held, 'full', deadline));
     },
     async assertClosedUnderOwner(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease, deadline: number) {
-      await inspect(profile, original, owner, 'full', deadline);
+      await inspectLatest(profile, original, owner, 'full', deadline);
     },
     async verifySharedBaseline(profile: ProfileSnapshot, original: RuntimeRecord | undefined, owner: OwnerLease, deadline: number) {
-      assertTime(deadline);
-      if (owner.profile !== profile) throw unavailable('profile');
-      await owner.assert();
-      const hash = createHash('sha256').update(profile.paths.root, 'utf8').digest('hex');
-      const current = join(profile.paths.state, 'exit-evidence', hash, 'shared-current.json');
-      if (!await statOrAbsent(current)) return inspect(profile, original, owner, 'full', deadline);
-      const { value } = await readJson(current, 16384);
-      const request = (value as { request?: unknown } | null)?.request;
-      if (!validator('browser.RequestId')(request)) throw unavailable('profile');
-      return authority.verifySharedFamily(profile, owner, request, deadline);
+      let shared: SharedFamilyExitReceipt | undefined;
+      try { shared = await readSharedPredecessor(profile, owner, deadline); }
+      catch { assertTime(deadline); }
+      return shared ?? inspect(profile, original, owner, 'full', deadline);
     },
     async verifySharedFamily(profile: ProfileSnapshot, owner: OwnerLease, request: string, deadline: number) {
       assertTime(deadline);
@@ -417,7 +445,7 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
       assertTime(deadline);
       if (closeHost) assertVerifiedHostMetadata(closeHost, deadline);
       const owner = await ownerLock(profile, platform, false, deadline); if (!owner) return false;
-      try { await inspect(profile, original, owner, 'full', deadline, undefined, undefined, closeHost); return true; }
+      try { await inspectLatest(profile, original, owner, 'full', deadline, undefined, undefined, closeHost); return true; }
       catch { assertTime(deadline); return false; }
       finally { owner.release(); }
     },
@@ -437,7 +465,7 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
       if (build.selection.directory !== host.identity.layout.buildRoot || pending.buildRoot !== build.selection.directory ||
           pending.candidateDigest !== host.signed.snapshotDigest || pending.sourceDigest !== host.identity.sourceDigest ||
           pending.productDigest !== host.identity.productDigest) throw unavailable('profile');
-      await inspect(profile, undefined, owner, 'reserve', deadline, build, pending);
+      await inspectLatest(profile, undefined, owner, 'reserve', deadline, build, pending);
     },
     async withdraw(profile: ProfileSnapshot, owner: OwnerLease, deadline: number) {
       const current = await withLaunchAttempt(profile, platform, deadline, transaction => transaction.current);
@@ -446,7 +474,7 @@ export function createProductionExitAuthority(platform: PlatformPort, selection:
       await inspect(profile, undefined, owner, 'withdraw', deadline);
     },
     async retire(profile: ProfileSnapshot, owner: OwnerLease, deadline: number) {
-      await inspect(profile, undefined, owner, 'retire', deadline);
+      await inspectLatest(profile, undefined, owner, 'retire', deadline);
     },
   });
   authorities.add(authority); return authority;

@@ -3505,6 +3505,8 @@ struct ExitInspection {
   NSDictionary* sharedPrior=nil;
   NSDictionary* sharedDirectory=nil;
   NSDictionary* sharedMain=nil;
+  NSString* sharedBuild=nil;
+  const ExitInspection* sharedPredecessor=nullptr;
   arbol_boundary::Lock owner,build,dataBuild,nextBuild,registry,activeBuild; NSDictionary* input=nil; std::string result,activeBundle; double deadline=0;
   // Captured only on the owning N-API thread. Worker uses its private Context
   // fields and genuinely shared atomic state, never the live mutable Context
@@ -3814,16 +3816,17 @@ static bool migrationPublishedMetadata(NSDictionary* receipt,NSDictionary* entry
     if(fstatat(profile.fd,name.UTF8String,&child,AT_SYMLINK_NOFOLLOW)||!S_ISDIR(child.st_mode)||
        child.st_dev!=profile.identity.st_dev||![maintenanceIdentity(child) isEqual:entry[key]]) return false;
   }
-  if(receipt[@"convertedMarker"]==NSNull.null) {
+  const bool historicalMarker=job.sharedPredecessor!=nullptr;
+  if(!historicalMarker&&receipt[@"convertedMarker"]==NSNull.null) {
     errno=0; if(!fstatat(profile.fd,"engine.json",&child,AT_SYMLINK_NOFOLLOW)||errno!=ENOENT) return false;
-  } else if(!marker.openPath(profile.path+"/engine.json",0600,65536,true)||
+  } else if(!historicalMarker&&(!marker.openPath(profile.path+"/engine.json",0600,65536,true)||
       ([receipt[@"originalMarker"][@"identity"][@"device"] isEqual:receipt[@"convertedMarker"][@"identity"][@"device"]]&&
        [receipt[@"originalMarker"][@"identity"][@"inode"] isEqual:receipt[@"convertedMarker"][@"identity"][@"inode"]])||
       ![maintenanceIdentity(marker.identity) isEqual:receipt[@"convertedMarker"][@"identity"]]||
       ![digest(marker.content) isEqual:receipt[@"convertedMarker"][@"sha256"]]||
-      ![strictManagementObject(marker.content,65536) isEqual:migrationContent(receipt[@"convertedMarker"],true)]) return false;
+      ![strictManagementObject(marker.content,65536) isEqual:migrationContent(receipt[@"convertedMarker"],true)])) return false;
   return state.current()&&profiles.current()&&profile.current()&&record.current()&&
-    (receipt[@"convertedMarker"]==NSNull.null||marker.current())&&job.within();
+    (historicalMarker||receipt[@"convertedMarker"]==NSNull.null||marker.current())&&job.within();
 }
 static bool migrationPublishedMetadata(RetainedMigrationProof& proof,ExitInspection& job) {
   return proof.current()&&migrationPublishedMetadata(proof.chain.receipt,proof.chain.entry,proof.chain.transaction,job);
@@ -4249,10 +4252,10 @@ static bool migrationNeverOpened(NSDictionary* receipt,ExitInspection& job) {
     PackagedLayout layout; if(!claimedLayout(data,layout)) return false;
     NSString* bundle=[NSString stringWithUTF8String:layout.bundle.c_str()];
     if(!verifyClosedReceipt(data,capability,receipt,frontier,job,job.build,bundle)||
-       !receiptMarker(capability,receipt[@"marker"],job)) return false;
+       (!job.sharedPredecessor&&!receiptMarker(capability,receipt[@"marker"],job))) return false;
     clean=[[data[@"terminal"][@"path"] lastPathComponent] isEqual:@"activation.json"];
   } else {
-    if(!migrationNeverOpened(proof.chain.receipt,job)) return false;
+    if(!job.sharedPredecessor&&!migrationNeverOpened(proof.chain.receipt,job)) return false;
   }
   NSDictionary* derived=@{@"classification":data?(clean?@"clean":@"dirty"):@"never-opened",@"clean":@(clean),
     @"closedClaimSha256":closed?(id)digest(bytes(closed)):NSNull.null,@"dataClaimSha256":data?(id)digest(bytes(data)):NSNull.null,
@@ -4496,9 +4499,28 @@ static bool inspectSharedFamilyExit(ExitInspection& job) {
   job.sharedPrior=@{@"kind":@"shared",@"path":[familyEntry stringByAppendingPathComponent:@"shared-baseline.json"],@"digest":digest(baseline)};
   job.sharedDirectory=storage[@"root"];
   job.sharedMain=group[@"main"];
+  job.sharedBuild=group[@"build"][@"number"];
   job.result=bytes(@{@"format":@1,@"kind":@"shared-family-exited",@"request":request,@"profileInstance":input[@"profileInstance"],
     @"profilePathHash":hash,@"capabilityDigest":receipt[@"capabilityDigest"],@"ownershipDigest":digest(ownerRecord.content)});
   return !job.result.empty()&&job.within();
+}
+
+static bool currentSharedPredecessor(ExitInspection& job,NSString* history) {
+  const auto& proof=*job.sharedPredecessor;
+  if(!job.within()||!proof.sharedDirectory||!proof.sharedMain||!proof.sharedBuild||proof.sharedIntent.empty()||
+     !arbol_exit::priorExpectation(proof.sharedPrior)) return false;
+  for(NSString* key in @[@"profile",@"profileInstance",@"profilePathHash"])
+    if(![proof.input[key] isEqual:job.input[key]]) return false;
+  using namespace arbol_attempt;
+  MaintenanceFile cursor,baseline;
+  NSString* path=proof.sharedPrior[@"path"];
+  std::string marker; struct stat identity{}; bool absent;
+  return cursor.openPath([[history stringByAppendingPathComponent:@"shared-current.json"] fileSystemRepresentation],
+           0600,arbol_exit::exitReceiptLimit,true)&&sameFile(cursor.identity,proof.sharedIntentIdentity)&&cursor.content==proof.sharedIntent&&
+    [path hasPrefix:[history stringByAppendingString:@"/"]]&&arbol_exit::priorReceiptLeaf(proof.sharedPrior,path.lastPathComponent)&&
+    baseline.openPath(path.fileSystemRepresentation,0600,arbol_exit::exitReceiptLimit,true)&&[digest(baseline.content) isEqual:proof.sharedPrior[@"digest"]]&&
+    currentProfileMarker(job.input[@"profile"],job.input[@"profileInstance"],proof.sharedDirectory,job.owner,job.build,marker,identity,absent)&&
+    [markerObservation(marker,identity,absent) isEqual:proof.sharedMarker]&&cursor.current()&&baseline.current()&&job.within();
 }
 
 static bool inspectExit(ExitInspection& job) {
@@ -4661,8 +4683,9 @@ static bool inspectExit(ExitInspection& job) {
         @"marker":migrationSource.markerAbsent?(id)NSNull.null:migrationSource.marker.record()});
       return !job.result.empty()&&job.within()&&migrationSource.current()&&(!runtimeMissing||missingRuntime.current());
     }
-    NSDictionary* expectation=data?@{@"kind":clean?@"activated":@"terminal",@"path":data[@"terminal"][@"path"],@"digest":data[@"terminal"][@"digest"]}:@{@"kind":@"absent"};
-    if(data&&job.appliedMigration) {
+    NSDictionary* expectation=job.sharedPredecessor?job.sharedPredecessor->sharedPrior:
+      data?@{@"kind":clean?@"activated":@"terminal",@"path":data[@"terminal"][@"path"],@"digest":data[@"terminal"][@"digest"]}:@{@"kind":@"absent"};
+    if(!job.sharedPredecessor&&data&&job.appliedMigration) {
       NSMutableDictionary* migrated=[expectation mutableCopy]; migrated[@"migration"]=job.appliedMigration; expectation=migrated;
     }
     job.result=bytes(@{@"format":@1,@"kind":kind,@"clean":@(clean),@"prior":expectation,@"request":request?:(id)NSNull.null});
@@ -4681,6 +4704,15 @@ static bool inspectExit(ExitInspection& job) {
     if(!record(cancelled)||!job.within()||!replace(claim.at,currentRaw,false,bytes(cancelled))) return false;
     return result(@"withdrawn",nil,current[@"request"]);
   }
+  const bool shared=job.sharedPredecessor!=nullptr;
+  if(shared&&!currentSharedPredecessor(job,historyPath)) return false;
+  auto sharedRuntime=[&](NSDictionary* previous) {
+    if(!shared||previous==(id)NSNull.null) return false;
+    const auto& proof=*job.sharedPredecessor;
+    return runtime(previous,@{@"profile":profile,@"profileInstance":input[@"profileInstance"],
+      @"profilePathHash":input[@"profilePathHash"],@"build":proof.sharedBuild})&&
+      [previous[@"pid"] isEqual:proof.sharedMain[@"pid"]]&&[previous[@"processStartId"] isEqual:proof.sharedMain[@"startId"]];
+  };
   // Long read-only verification yields this same stable short Claim while
   // preserving actual Owner and every old/data/new Build open description.
   if(!runtimeMissing&&!migration&&flock(claim.fd,LOCK_UN)) return false;
@@ -4720,6 +4752,8 @@ static bool inspectExit(ExitInspection& job) {
          arbol_boundary::current(c.main)!=1||!c.primaryMonitor()||!c.monitor(c.custody,true)||
          !arbol_boundary::lockIdentity(c.owner)||!arbol_boundary::lockIdentity(c.build)||
          !receiptMetadata(job.hostCapability,current,job)) return false;
+      if([job.hostCapability[@"prior"][@"kind"] isEqual:@"shared"]!=bool(job.sharedPredecessor)||
+         (job.sharedPredecessor&&![job.hostCapability[@"prior"] isEqual:job.sharedPredecessor->sharedPrior])) return false;
     }
   } else if(hostMode) return false;
   if(progress||checked) {
@@ -4881,9 +4915,10 @@ static bool inspectExit(ExitInspection& job) {
         if(!exitReceiptAt(closed[@"terminal"][@"path"],raw,unusedReceipt,identity)||
            ![digest(raw) isEqual:closed[@"terminal"][@"digest"]]) return false;
       }
-      if(!closed&&(input[@"previous"]!=NSNull.null||retire)) return false;
+      if(!closed&&((input[@"previous"]!=NSNull.null&&!sharedRuntime(input[@"previous"]))||retire)) return false;
     } else if(!closed) {
-      if(expected!=(id)NSNull.null||input[@"dataAttempt"]!=NSNull.null||input[@"previous"]!=NSNull.null||retire) return false;
+      if(expected!=(id)NSNull.null||input[@"dataAttempt"]!=NSNull.null||
+         (input[@"previous"]!=NSNull.null&&!sharedRuntime(input[@"previous"]))||retire) return false;
     } else {
       PackagedLayout layout;
       if(!claimedLayout(closed,layout)||expected==(id)NSNull.null||![closed isEqual:expected]||!sameProfile(closed)||
@@ -4906,11 +4941,11 @@ static bool inspectExit(ExitInspection& job) {
         if(covered) {
           if(!applyReceipt(data,wholeReceipt)||!withReceipt([&] {
             return verifyClosedReceipt(data,capability,receipt,frontier,job,job.build,bundle)&&
-              (prior||receiptMarker(capability,receipt[@"marker"],job));
+              (prior||shared||receiptMarker(capability,receipt[@"marker"],job));
           })) return false;
         } else if(guard.fd<0||guard.path!=std::string([data[@"buildGuard"] UTF8String])||!verifiedSignature(dataLayout,data)||
             !verifyClosedReceipt(data,capability,receipt,frontier,job,guard,bundle)||
-            (!prior&&!receiptMarker(capability,receipt[@"marker"],job))) return false;
+            (!prior&&!shared&&!receiptMarker(capability,receipt[@"marker"],job))) return false;
       }
       if(closed&&input[@"previous"]!=NSNull.null) {
         NSDictionary* previous=input[@"previous"];
@@ -4922,9 +4957,9 @@ static bool inspectExit(ExitInspection& job) {
         bool prefix=unused&&runtime(previous,closed)&&[previous[@"phase"] isEqual:@"starting"]&&
           [previous[@"pid"] isEqual:unusedReceipt[@"actor"][@"pid"]]&&
           [previous[@"processStartId"] isEqual:unusedReceipt[@"actor"][@"startId"]];
-        if(!latest&&!writer&&!prefix) return false;
+        if(!latest&&!writer&&!prefix&&!sharedRuntime(previous)) return false;
       }
-    if(!data&&!prior) {
+    if(!data&&!prior&&!shared) {
       arbol_exit::NativeFile root; root.fd=open(profile.fileSystemRepresentation,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
       std::string raw; struct stat marker{}; bool missing;
       if(root.fd<0||!markerAt(root.fd,raw,marker,missing)||!missing||!root.finish()) return false;
@@ -4933,13 +4968,13 @@ static bool inspectExit(ExitInspection& job) {
   };
   auto physical=[&] {
     if(data&&!withReceipt([&] { return receiptMetadata(capability,data,job)&&receiptFrontier(capability,frontier,receipt[@"capabilityDigest"],job)&&
-       (prior||receiptMarker(capability,receipt[@"marker"],job)); })) return false;
+       (prior||shared||receiptMarker(capability,receipt[@"marker"],job)); })) return false;
     if(unused) {
       std::string raw; NSDictionary* checked=nil; struct stat identity{};
       if(!exitReceiptAt(closed[@"terminal"][@"path"],raw,checked,identity)||
          ![digest(raw) isEqual:closed[@"terminal"][@"digest"]]||![checked isEqual:unusedReceipt]) return false;
     }
-    return job.within();
+    return job.within()&&(!shared||currentSharedPredecessor(job,historyPath));
   };
   if(!verify()||!physical()||(!runtimeMissing&&!unchanged(claim.at))||!reclaim()) return false;
   reverify=[&] { return verify()&&physical()&&(!runtimeMissing?unchanged(claim.at):missingRuntime.current()); };
@@ -4983,12 +5018,25 @@ static bool inspectExit(ExitInspection& job) {
        !writeExitHistory(history.fd,"previous-claim.json",closed,job)||!job.within()||
        unlinkat(claim.at.directory,"claim.json",0)||fsync(claim.at.directory)||!unchanged(claim.at)) return false;
   }
-  NSString* kind=data?([receipt[@"kind"] isEqual:@"activated-exit"]?@"activated":@"terminal"):@"never-opened";
+  // A later ordinary writer can supersede this older cursor under the same
+  // Owner. Its next warm opening may replace only these exact cursor bytes.
+  if(!historyMissing&&[input[@"mode"] isEqual:@"full"]) {
+    constexpr const char* name="shared-current.json";
+    struct stat named{}; errno=0;
+    if(!fstatat(history.fd,name,&named,AT_SYMLINK_NOFOLLOW)) {
+      if(!arbol_exit::readNativeFile(history.fd,name,job.sharedIntent,job.sharedIntentIdentity,arbol_exit::exitReceiptLimit)||
+         !sameFile(named,job.sharedIntentIdentity)) return false;
+      NSDictionary* value=arbol_exit::parseExitReceipt(job.sharedIntent);
+      if(![value[@"kind"] isEqual:@"shared-profile-mutation"]||![value[@"profilePathHash"] isEqual:input[@"profilePathHash"]]||
+         ![value[@"profileInstance"] isEqual:input[@"profileInstance"]]) return false;
+    } else if(errno!=ENOENT) return false;
+  }
+  NSString* kind=shared?@"terminal":data?([receipt[@"kind"] isEqual:@"activated-exit"]?@"activated":@"terminal"):@"never-opened";
   return result(kind,data,closed?closed[@"request"]:nil)&&(historyMissing||history.finish());
 }
 static napi_value beginExitInspection(napi_env env,napi_callback_info info) {
   napi_value args[8]; size_t n=8; void *ownerValue=nullptr,*buildValue=nullptr; std::string input; double deadline;
-  if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok||(n!=6&&n!=8)||napi_get_value_external(env,args[0],&ownerValue)!=napi_ok||
+  if(napi_get_cb_info(env,info,&n,args,nullptr,nullptr)!=napi_ok||(n<6||n>8)||napi_get_value_external(env,args[0],&ownerValue)!=napi_ok||
      napi_get_value_external(env,args[1],&buildValue)!=napi_ok||!boundedText(env,args[2],input,65536)||
      napi_get_value_double(env,args[3],&deadline)!=napi_ok||!std::isfinite(deadline)||deadline<=arbol_boundary::clockMs()||
      deadline>arbol_boundary::clockMs()+10000||!arbol_boundary::retainNativeImage()) return fail(env);
@@ -5009,9 +5057,21 @@ static napi_value beginExitInspection(napi_env env,napi_callback_info info) {
     registry=static_cast<HeldLock*>(registryValue);
     if(!liveLocks.count(registry)||registry->mode!=LOCK_EX||
        registry->path!=std::string([maintenanceCustody->stateRoot() UTF8String])+"/registry.lock") return fail(env);
-  } else if(n!=6) return fail(env);
+  } else if(n!=6&&n!=7) return fail(env);
   if(!liveLocks.count(owner)||!liveLocks.count(build)||owner->mode!=LOCK_EX||
      (build->mode!=LOCK_SH&&!(migration&&originalMaintenanceBuildHandle(build)))) return fail(env);
+  ExitInspection* sharedPredecessor=nullptr;
+  if(n==7) {
+    void* raw=nullptr;
+    if(![@[@"prior",@"host",@"full",@"retire",@"reserve"] containsObject:parsed[@"mode"]]||
+       napi_get_value_external(env,args[6],&raw)!=napi_ok) return fail(env);
+    sharedPredecessor=static_cast<ExitInspection*>(raw);
+    if(!exitInspections.count(sharedPredecessor)||sharedPredecessor->state.load(std::memory_order_acquire)!=1||
+       ![sharedPredecessor->input[@"mode"] isEqual:@"shared-family"]||
+       sharedPredecessor->owner.path!=owner->path||sharedPredecessor->owner.inode!=owner->ino||
+       sharedPredecessor->owner.device!=static_cast<uint64_t>(owner->dev)) return fail(env);
+    deadline=std::min(deadline,sharedPredecessor->deadline);
+  }
   if(migration && (arbol_attempt::qualificationNativePublicationPoint(maintenanceCustody->interruption[@"point"]) ||
      arbol_attempt::qualificationProgressPoint(maintenanceCustody->interruption[@"point"])) &&
      [@[@"migrate-recover",@"migrate-commit"] containsObject:parsed[@"mode"]]) {
@@ -5034,6 +5094,7 @@ static napi_value beginExitInspection(napi_env env,napi_callback_info info) {
     if(!liveLocks.count(additional[i])||(additional[i]->mode!=LOCK_SH&&!(migration&&originalMaintenanceBuildHandle(additional[i])))) return fail(env);
   }
   auto* job=new ExitInspection; job->owner=duplicateHeld(owner); job->build=duplicateHeld(build); job->deadline=deadline;
+  job->sharedPredecessor=sharedPredecessor;
   if(arbol_attempt::profileFormat==2&&!migration) {
     NSDictionary* self=arbol_attempt::processRecord(getpid());
     NSString* executable=self[@"executable"];
