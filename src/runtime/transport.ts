@@ -12,7 +12,7 @@ import { assertSocket, now, token, originalAlive, sameProcess, recordProcess,
   type RuntimeRecord, type RuntimeLocation } from './instance.js';
 import { assertSharedProfileRuntime, isHostCustody, noteHostStartup, type HostCustody, type SharedProfileRuntime } from './custody.js';
 import { expectedBuild, type BuildSelection } from './selection.js';
-import { isSeqoyaReply, isSeqoyaRequest, isSeqoyaResult, plain, seqoyaProfilePattern, seqoyaUsageLimit,
+import { isSeqoyaReply, isSeqoyaRequest, isSeqoyaResult, plain, seqoyaUsageLimit,
   type SeqoyaParameters, type SeqoyaReply, type SeqoyaRequest, type SeqoyaResult } from './seqoya-wire.js';
 
 export type Endpoint = 'agent' | 'management';
@@ -453,7 +453,7 @@ async function listenServer(location: RuntimeLocation, record: RuntimeRecord, pl
           if (!admission || !ordinaryPeer() || (endpoint === 'agent' ? agents >= 32 : management >= 32)) throw capacityFailure();
           checkPeer(); seen.add(value.id); handshaking = false;
           const attachment = endpoint === 'agent' ? Object.freeze({ id: token('att'), label: sanitizedLabel(p.label) }) : undefined;
-          const subscription = protectedPort && endpoint === 'management' && seqoyaProfilePattern.test(record.profile);
+          const subscription = protectedPort && endpoint === 'management' && record.profile !== 'default';
           const canForegroundSubscription = () => {
             try {
               if (dead || sealed || !admission || !profileEnabled || connection.signal.aborted) return false;

@@ -306,7 +306,8 @@ export function createProcessService(options: { selection: BuildSelection; platf
       noteOpenCommand(options.observation, 'open-current-signed-start');
       if (input.approve && (input.url === undefined || input.profileInstance === undefined ||
           input.creationRequest === undefined)) throw profileUnavailable();
-      const subscriptionOpen = input.creationRequest !== undefined && seqoyaProfilePattern.test(profile.record.id) &&
+      const subscriptionOpen = input.creationRequest !== undefined &&
+        (input.approve !== undefined || seqoyaProfilePattern.test(profile.record.id)) &&
         Object.values(seqoyaDestinations).some(url => url === input.url);
       const attached = await acquireWithin(deadline,
         () => integration.start(profile, 'management', deadline, contentionDeadline, undefined, undefined,

@@ -18,7 +18,6 @@ import { assertHostLifecycle, type HostControlPort, type HostLifecycle } from '.
 import type { ConnectionContext, ProtectedDispatchPort, Request, ControlFrameKind } from '../runtime/transport.js';
 import { BrowserFailure, ForegroundWorkRequired, unavailable } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
-import { seqoyaProfilePattern } from '../runtime/seqoya-wire.js';
 import { isSubscriptionHome } from './profile-navigation.js';
 
 function isSubscriptionDashboard(address: string, destination: string): boolean {
@@ -734,12 +733,12 @@ export function createOwnershipHost(boundary: NativeFailureBoundary, documents: 
           if (request.method === 'close') throw unavailable('browser');
           const host = windowForOpen();
           const info = operations.info();
-          const subscriptionProfile = seqoyaProfilePattern.test(info.profile) && context.canForegroundSubscription?.() === true;
           const registration = windows.get(host);
           if (!registration) throw unavailable('browser');
           assertShellRegistration(registration, host);
           const url = request.params.url;
           const showEmpty = request.params.showEmpty === true;
+          const subscriptionProfile = (showEmpty || isSubscriptionHome(url)) && context.canForegroundSubscription?.() === true;
           const empty = tabs().all().length === 0;
           const home = !showEmpty && url === undefined && empty
             ? await registration.subscriptionHome().catch(() => undefined) : undefined;

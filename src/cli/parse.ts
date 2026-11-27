@@ -1,6 +1,6 @@
 import { invalidInput } from '../contracts/errors.js';
 import { validator } from '../contracts/schema.js';
-import { isSeqoyaProvider, seqoyaProfilePattern, type SeqoyaProvider } from '../runtime/seqoya-wire.js';
+import { isSeqoyaProvider, seqoyaDestinations, type SeqoyaProvider } from '../runtime/seqoya-wire.js';
 
 export type Command =
   | { kind: 'info' }
@@ -60,7 +60,7 @@ export function parse(args: readonly string[]): Command {
   if (command === 'seqoya-usage' && words.length === 1) {
     allowed('--profile', '--profile-instance', '--provider');
     const profile = options.get('--profile'), instance = options.get('--profile-instance'), provider = options.get('--provider');
-    if (typeof profile !== 'string' || !seqoyaProfilePattern.test(profile) ||
+    if (!profileId(profile) || profile === 'default' ||
         typeof instance !== 'string' || !profileInstance.test(instance) || !isSeqoyaProvider(provider)) throw invalidInput();
     return { kind: 'seqoya-usage', profile, profileInstance: instance, provider };
   }
@@ -77,8 +77,8 @@ export function parse(args: readonly string[]): Command {
       if (request !== undefined && (typeof instance !== 'string' || typeof request !== 'string' ||
           !creationRequest.test(request))) throw invalidInput();
       const awaitApproval = options.has('--await-approval');
-      if (awaitApproval && (typeof url !== 'string' || !url.startsWith('https://') || typeof request !== 'string' ||
-          !seqoyaProfilePattern.test(profile))) throw invalidInput();
+      if (awaitApproval && (profile === 'default' || typeof request !== 'string' ||
+          !Object.values(seqoyaDestinations).some(destination => destination === url))) throw invalidInput();
       return { kind: 'open', profile, ...(awaitApproval ? { awaitApproval: true } : {}),
         ...(typeof url === 'string' ? { url: checkedUrl(url) } : {}),
         ...(typeof instance === 'string' ? { profileInstance: instance } : {}),
