@@ -1,4 +1,4 @@
-import type { ArmedHostSnapshot, HostCustody } from '../runtime/custody.js';
+import { assertSharedProfileRuntime, isHostCustody, type ArmedHostSnapshot, type HostCustody, type SharedProfileRuntime } from '../runtime/custody.js';
 import type { ProfileSessions } from '../profiles/session.js';
 import { webFrameMain, type WebContents } from 'electron';
 import { performance } from 'node:perf_hooks';
@@ -304,12 +304,19 @@ export interface RendererControl {
  * Native custody and owned metadata. There is no EngineAuthority, normal launch
  * path, permissive engine operation or dependency on a later Tools adapter. */
 export function createRendererControl(boundary: NativeFailureBoundary, identity: ControlIdentity,
-  protection: { sessions: ProfileSessions; custody: HostCustody },
+  protection: { sessions: ProfileSessions; custody: HostCustody | SharedProfileRuntime },
   proof: ArmedHostSnapshot): RendererControl {
   assertNativeFailureBoundary(boundary);
   if (identity.contract !== 1 || !validator('browser.ProfileId')(identity.profile) ||
       !validator('browser.InstanceId')(identity.instance) || !validator('browser.Build')(identity.build) ||
       Object.keys(identity).sort().join(',') !== 'build,contract,instance,profile') throw unavailable('browser');
+  if (!isHostCustody(protection.custody)) {
+    const scope = protection.custody;
+    assertSharedProfileRuntime(scope, boundary.watchdog);
+    const record = scope.instance.record;
+    if (record.phase !== 'starting' || scope.sessions !== protection.sessions || record.profile !== identity.profile ||
+        record.instance !== identity.instance || record.build !== identity.build) throw unavailable('profile');
+  }
   const info = Object.freeze({ contract: 1 as const, profile: identity.profile, instance: identity.instance, build: identity.build });
   const documents = new HostDocuments(boundary), readiness = new PageReadiness(boundary, documents);
   const registrations = new Map<WindowHost, ShellRegistration>();

@@ -84,8 +84,15 @@ async function prepareSharedProfileEngine(custody: HostCustody, owner: OwnerLeas
 
 /** A starting runtime and both Sessions come from one uninterrupted Owner
  * lease. Only the later authenticated listener/window assembly can make it ready. */
+export interface SharedProfileRuntime {
+  readonly instance: InstanceOwner;
+  readonly engine: EngineTransaction;
+  readonly retained: SharedProfileOwner;
+  readonly sessions: Awaited<ReturnType<typeof bindSharedProfileSessions>>;
+}
+const sharedProfileRuntimes = new WeakMap<SharedProfileRuntime, HostCustody>();
 export async function prepareSharedProfileRuntime(app: ProfileApp, custody: HostCustody, target: ProfileSnapshot,
-  exit: ProductionExitAuthority, deadline: number) {
+  exit: ProductionExitAuthority, deadline: number): Promise<SharedProfileRuntime> {
   assertProductionExitAuthority(exit);
   assertHostCustody(custody);
   const primary = custody.instance.owner.profile, { platform } = receipts.get(custody)!;
@@ -118,7 +125,18 @@ export async function prepareSharedProfileRuntime(app: ProfileApp, custody: Host
     },
   });
   if (!instance || !preparation.engine || !preparation.sessions) throw unavailable('profile');
-  return Object.freeze({ instance, engine: preparation.engine.engine, retained: preparation.engine.retained, sessions: preparation.sessions });
+  const runtime = Object.freeze({ instance, engine: preparation.engine.engine, retained: preparation.engine.retained, sessions: preparation.sessions });
+  sharedProfileRuntimes.set(runtime, custody);
+  return runtime;
+}
+export function assertSharedProfileRuntime(runtime: SharedProfileRuntime, watchdog?: NativeWatchdog): HostCustody {
+  const custody = sharedProfileRuntimes.get(runtime);
+  if (!custody || (watchdog && receipts.get(custody)?.watchdog !== watchdog) ||
+      runtime.engine.owner !== runtime.instance.owner || runtime.instance.record.build !== custody.build.selection.build ||
+      runtime.retained.profile !== runtime.instance.record.profile || runtime.retained.instance !== runtime.instance.record.profileInstance)
+    throw unavailable('profile');
+  assertHostCustody(custody); runtime.sessions.assertBound();
+  return custody;
 }
 /** Observe through only the actual receipt's original provider/handle. This
  * performs no admission, custody assertion, Claim operation or fatal action. */
@@ -146,6 +164,42 @@ const armedSnapshots = new WeakMap<ArmedHostSnapshot, {
   consume: () => void; used: boolean;
 }>();
 const preparingSnapshots = new WeakSet<HostCustody>();
+const sharedSnapshots = new WeakMap<ArmedHostSnapshot, {
+  trust: import('../native/manifest.js').CandidateTrust; purpose: 'ownership' | 'window'; operation: object;
+  assertCurrent(): void; consume(): void; used: boolean;
+}>();
+const sharedConstruction = new WeakMap<SharedProfileRuntime, Set<'ownership' | 'window'>>();
+export async function prepareSharedProfileConstruction(runtime: SharedProfileRuntime, trust: import('../native/manifest.js').CandidateTrust,
+  purpose: 'ownership' | 'window', operation: object, deadline: number): Promise<ArmedHostSnapshot> {
+  const custody = assertSharedProfileRuntime(runtime), record = runtime.instance.record;
+  const assertCurrent = () => {
+    assertTime(deadline); assertSharedProfileRuntime(runtime);
+    if (runtime.instance.record !== record || record.phase !== 'starting' || custody.instance.record.phase !== 'ready')
+      throw unavailable('profile');
+  };
+  assertCurrent();
+  if (!operation || trust.bundle !== custody.host.signed.bundle || trust.snapshotDigest !== custody.host.signed.snapshotDigest)
+    throw unavailable('profile');
+  const reserved = sharedConstruction.get(runtime) ?? new Set<'ownership' | 'window'>();
+  if (reserved.has(purpose)) throw unavailable('profile');
+  reserved.add(purpose); sharedConstruction.set(runtime, reserved);
+  try {
+    await runtime.instance.owner.assert(); await runtime.engine.assertReady(); assertCurrent();
+    const address = new URL('../native/manifest.js', import.meta.url).href;
+    const manifest = await import(address) as typeof import('../native/manifest.js');
+    let consume: () => void;
+    if (manifest.assertRetainedReadOnlyStorage(trust, deadline)) {
+      consume = () => { if (!manifest.assertRetainedReadOnlyStorage(trust, deadline)) throw unavailable('browser'); };
+    } else {
+      const proof = await manifest.compareSignedSnapshot(trust, deadline);
+      consume = () => manifest.consumeSignedSnapshot(proof, trust, deadline);
+    }
+    assertCurrent();
+    const snapshot = Object.freeze({ deadline });
+    sharedSnapshots.set(snapshot, { trust, purpose, operation, assertCurrent, consume, used: false });
+    return snapshot;
+  } catch (error) { reserved.delete(purpose); throw error; }
+}
 export function prepareArmedHostSnapshot(custody: HostCustody, trust: import('../native/manifest.js').CandidateTrust,
   purpose: SnapshotPurpose, operation: object, deadline: number): Promise<ArmedHostSnapshot> {
   return prepareSnapshot(custody, trust, purpose, operation, deadline, false);
@@ -186,6 +240,13 @@ async function prepareSnapshot(custody: HostCustody, trust: import('../native/ma
 }
 export function consumeArmedHostSnapshot(receipt: ArmedHostSnapshot, trust: import('../native/manifest.js').CandidateTrust,
   purpose: SnapshotPurpose, operation: object): void {
+  const shared = sharedSnapshots.get(receipt);
+  if (shared) {
+    if (shared.used || shared.trust !== trust || shared.purpose !== purpose || shared.operation !== operation) throw unavailable('profile');
+    shared.used = true;
+    shared.assertCurrent(); shared.consume(); shared.assertCurrent();
+    return;
+  }
   const actual = armedSnapshots.get(receipt);
   if (!actual) throw unavailable('browser');
   try {

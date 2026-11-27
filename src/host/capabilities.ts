@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import type { WebContents, WebFrameMain } from 'electron';
 import { BrowserFailure } from '../contracts/errors.js';
 import { assertProductionSessions, type ProfileSessions } from '../profiles/session.js';
-import type { HostCustody } from '../runtime/custody.js';
+import { assertSharedProfileRuntime, isHostCustody, type HostCustody, type SharedProfileRuntime } from '../runtime/custody.js';
 import { assertNativeFailureBoundary } from '../runtime/bootstrap.js';
 import { assertNativeFeatures } from '../native/features.js';
 import { staleSnapshot, type RecoveryTransition, type TabAuthority } from './authority.js';
@@ -61,7 +61,7 @@ export class HostCapabilities {
   private readonly extensionList;
   private readonly removeDocuments: () => void;
   constructor(readonly authority: TabAuthority, readonly documents: HostDocuments, readonly readiness: PageReadiness,
-    readonly sessions: ProfileSessions, readonly custody: HostCustody,
+    readonly sessions: ProfileSessions, readonly custody: HostCustody | SharedProfileRuntime,
     private readonly userPolicy?: UserPermissionPolicy) {
     if (authority.documents !== documents || readiness.documents !== documents || readiness.boundary !== authority.boundary ||
         sessions.website === sessions.shell || installed.has(sessions.website)) throw unavailableBoundary();
@@ -122,7 +122,12 @@ export class HostCapabilities {
   private identity(): void {
     try {
       assertNativeFailureBoundary(this.authority.boundary); assertNativeFeatures();
-      assertProductionSessions(this.sessions, this.custody); this.authority.assertHealthy();
+      if (isHostCustody(this.custody)) assertProductionSessions(this.sessions, this.custody);
+      else {
+        assertSharedProfileRuntime(this.custody, this.authority.boundary.watchdog);
+        if (this.sessions !== this.custody.sessions) throw unavailableBoundary();
+      }
+      this.authority.assertHealthy();
       const website = this.sessions.website;
       if (website.setPermissionRequestHandler !== this.requestHandler || website.setPermissionCheckHandler !== this.checkHandler ||
           website.setDisplayMediaRequestHandler !== this.captureHandler || website.extensions !== this.extensions ||

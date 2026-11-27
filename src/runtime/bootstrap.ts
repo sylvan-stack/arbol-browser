@@ -1,4 +1,5 @@
-import { isHostCustody, noteHostStartup, prepareArmedHostSnapshot, prepareStartupConstructionSnapshot, type HostCustody } from './custody.js';
+import { assertSharedProfileRuntime, isHostCustody, noteHostStartup, prepareArmedHostSnapshot, prepareSharedProfileConstruction,
+  prepareStartupConstructionSnapshot, type HostCustody, type SharedProfileRuntime } from './custody.js';
 import { assertAdoptedBuildClosing, assertAdoptedBuildContinuity } from './build-lease.js';
 import { unavailable } from '../contracts/errors.js';
 import type { CommandPorts } from './ports.js';
@@ -379,4 +380,19 @@ export async function prepareRendererControl(boundary: NativeFailureBoundary, pr
     profile: prepared.instance.record.profile, instance: prepared.instance.record.instance, build: prepared.instance.record.build });
   const proof = await prepareStartupConstructionSnapshot(prepared.custody, boundary.native.trust, 'ownership', identity, deadline);
   return control.createRendererControl(boundary, identity, { sessions, custody: prepared.custody }, proof);
+}
+
+export async function prepareSharedRendererControl(boundary: NativeFailureBoundary, runtime: SharedProfileRuntime,
+  deadline: number): Promise<import('../host/recovery.js').RendererControl> {
+  assertNativeFailureBoundary(boundary);
+  assertSharedProfileRuntime(runtime, boundary.watchdog);
+  const record = runtime.instance.record;
+  if (record.phase !== 'starting') throw unavailable('profile');
+  const moduleURL = new URL('../host/recovery.js', import.meta.url).href;
+  const control = await import(moduleURL) as typeof import('../host/recovery.js');
+  assertNativeFailureBoundary(boundary);
+  if (runtime.instance.record !== record) throw unavailable('profile');
+  const identity = Object.freeze({ contract: 1 as const, profile: record.profile, instance: record.instance, build: record.build });
+  const proof = await prepareSharedProfileConstruction(runtime, boundary.native.trust, 'ownership', identity, deadline);
+  return control.createRendererControl(boundary, identity, { sessions: runtime.sessions, custody: runtime }, proof);
 }
