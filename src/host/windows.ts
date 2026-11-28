@@ -2,6 +2,8 @@ import { consumeArmedHostSnapshot, type ArmedHostSnapshot } from '../runtime/cus
 import { BaseWindow, WebContentsView, View, type Input, type Session } from 'electron';
 import { EventEmitter } from 'node:events';
 import { fileURLToPath } from 'node:url';
+import { homedir } from 'node:os';
+import { join, sep } from 'node:path';
 import { realpathSync } from 'node:fs';
 import type { ProfileSessions } from '../profiles/session.js';
 import type { NativeFailureBoundary } from '../runtime/bootstrap.js';
@@ -9,6 +11,7 @@ import type { Binding } from '../native/api.js';
 import { bindingKey } from '../native/retirement.js';
 import { assertCandidateTrust } from '../native/manifest.js';
 import { unavailable } from '../contracts/errors.js';
+import installation from '../runtime/installation-paths.json' with { type: 'json' };
 
 /** Resolved only in the physical lib/host graph, never relative to a bundled entry. */
 export const shellURL = new URL('../shell/index.html', import.meta.url).href;
@@ -68,19 +71,35 @@ interface BrowserFrame {
   active: WindowHost | undefined;
   switching: boolean;
   closing: boolean;
+  /** True when this Browser is a temporary Build, which frames its window (BLD-0.29). */
+  readonly temporary: boolean;
 }
 const browserFrames = new WeakMap<NativeFailureBoundary, BrowserFrame>();
 const profileFrames = new WeakMap<WindowHost, BrowserFrame>();
 const retirementRecords = new WeakMap<PageSurface, PageRetirement>();
+// The temporary-Build frame: three points wide, in the temporary-Build colour of the design system.
+const temporaryFrameWidth = 3;
+const temporaryFrameStyle = `html::after { content: ''; position: fixed; inset: 0; z-index: 2147483647;
+  border: ${temporaryFrameWidth}px solid #ff9f0a; pointer-events: none; }
+@media (prefers-color-scheme: light) { html::after { border-color: #ff9500; } }`;
+/** The Build number when this Browser does not run from the installed stable mount, else undefined (BLD-0.29). */
+function temporaryBuild(bundle: string): string | undefined {
+  const installed = join(homedir(), ...installation.stableBuilds) + sep;
+  if (bundle.startsWith(installed)) return undefined;
+  return /[/]arbol-browser[/]([0-9a-f]+)[/]app[/][^/]+$/.exec(bundle)?.[1] ?? '';
+}
 function browserFrame(boundary: NativeFailureBoundary): BrowserFrame {
   const existing = browserFrames.get(boundary);
   if (existing) {
     if (existing.closing || existing.window.isDestroyed()) throw unavailable('browser');
     return existing;
   }
+  const build = temporaryBuild(boundary.native.trust.bundle);
+  const title = build === undefined ? 'Arbol Browser' : `Arbol Browser · temporary Build${build && ` ${build}`}`;
   const window = new BaseWindow({ width: 1120, height: 800, minWidth: 560, minHeight: 480,
-    title: 'Arbol Browser', titleBarStyle: 'hidden', trafficLightPosition: { x: 14, y: 16 }, show: false });
-  const frame: BrowserFrame = { window, profiles: new Map(), active: undefined, switching: false, closing: false };
+    title, titleBarStyle: 'hidden', trafficLightPosition: { x: 14, y: 16 }, show: false });
+  const frame: BrowserFrame = { window, profiles: new Map(), active: undefined, switching: false, closing: false,
+    temporary: build !== undefined };
   browserFrames.set(boundary, frame);
   window.on('close', event => {
     event.preventDefault();
@@ -155,6 +174,10 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
   shellBinding = boundary.native.ownership.mark(bindingKey(shellBinding), false);
   if (shellBinding.blocked || shellBinding.retired) return boundary.fatal.fail('native_boundary_unavailable');
   shell.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  // The shell covers the whole window, so it draws the frame of a temporary Build. A stable Build adds nothing.
+  if (frame.temporary) shell.webContents.on('dom-ready', () => {
+    void shell.webContents.insertCSS(temporaryFrameStyle).catch(() => {});
+  });
   shell.webContents.on('before-input-event', (event, input) => {
     if (clipboardShortcut(input)) event.preventDefault();
   });
@@ -267,9 +290,12 @@ export function createWindowHost(sessions: ProfileSessions, boundary: NativeFail
           if (retired) return;
           const { width, height } = window.getContentBounds();
           const x = sidebarWidth(width);
+          // A temporary Build leaves its frame visible at the right and bottom edges of the website.
+          const edge = frame.temporary ? temporaryFrameWidth : 0;
           view.setVisible(active);
           // Website and hit-test shield cover only the content beside the shell controls.
-          view.setBounds({ x, y: toolbarHeight, width: Math.max(0, width - x), height: Math.max(0, height - toolbarHeight) });
+          view.setBounds({ x, y: toolbarHeight, width: Math.max(0, width - x - edge),
+            height: Math.max(0, height - toolbarHeight - edge) });
           shield.setBounds(view.getBounds()); shield.setVisible(active && current.blocked);
         },
         retirement: () => retirementRecords.get(page),
